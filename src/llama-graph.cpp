@@ -2089,7 +2089,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant V un-rotation: attention output is in WHT-rotated space
     // Apply WHT^{-1} before the output projection (wo)
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+    // Gate on V type (not K type) to support asymmetric K/V cache configurations
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
         ggml_tensor * rot_inv = mctx_cur->get_turbo_rotation_inv();
         if (rot_inv && rot_inv->buffer) {
             const int64_t hd = rot_inv->ne[0]; // 128
