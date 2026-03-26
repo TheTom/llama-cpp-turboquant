@@ -186,6 +186,40 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// TurboQuant: per-block quantize for turbo3_0 (no rotation — rotation is at 128-element group level)
+// 3-bit centroids split as 2-bit low (qs) + 1-bit high (signs)
+static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ x, block_turbo3_0 * __restrict__ y) {
+    // Midpoints between adjacent 3-bit centroids
+    const float mid[7] = { -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f };
+
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO3; j++) norm_sq += x[j] * x[j];
+    float norm = sqrtf(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+    y->norm = __float2half(norm);
+
+    // Zero the packed fields
+    for (int j = 0; j < QK_TURBO3 / 4; j++) y->qs[j] = 0;
+    for (int j = 0; j < QK_TURBO3 / 8; j++) y->signs[j] = 0;
+
+    for (int j = 0; j < QK_TURBO3; j++) {
+        float val = x[j] * inv_norm;
+        uint8_t idx;
+        if      (val < mid[0]) idx = 0;
+        else if (val < mid[1]) idx = 1;
+        else if (val < mid[2]) idx = 2;
+        else if (val < mid[3]) idx = 3;
+        else if (val < mid[4]) idx = 4;
+        else if (val < mid[5]) idx = 5;
+        else if (val < mid[6]) idx = 6;
+        else                   idx = 7;
+
+        y->qs[j / 4]    |= (idx & 0x3) << ((j % 4) * 2);
+        if (idx & 0x4) y->signs[j / 8] |= (1 << (j % 8));
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

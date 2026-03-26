@@ -124,6 +124,10 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
     endif()
 
+    # TurboQuant: always compile turbo flash attention instances
+    file(GLOB   SRCS "template-instances/fattn-vec*turbo*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}

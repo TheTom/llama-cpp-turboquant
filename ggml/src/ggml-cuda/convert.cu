@@ -659,6 +659,73 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+// TurboQuant dequantize kernels (turbo → fp16/fp32)
+// turbo3: 3-bit centroids (2-bit qs + 1-bit signs) * norm
+static __device__ const float turbo_cv_centroids_3bit[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+template <typename dst_t>
+static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+
+    const block_turbo3_0 * x = (const block_turbo3_0 *)vx;
+    const int64_t ib = i / QK_TURBO3;
+    const int     j  = i % QK_TURBO3;
+
+    const float norm = __half2float(x[ib].norm);
+    const uint8_t low2 = (x[ib].qs[j/4] >> ((j%4)*2)) & 0x3;
+    const uint8_t hi1  = (x[ib].signs[j/8] >> (j%8)) & 0x1;
+    const uint8_t idx  = low2 | (hi1 << 2);
+
+    y[i] = (dst_t)(turbo_cv_centroids_3bit[idx] * norm);
+}
+
+template <typename dst_t>
+static void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int block_size = 256;
+    const int n_blocks = (k + block_size - 1) / block_size;
+    dequantize_block_turbo3_0<<<n_blocks, block_size, 0, stream>>>(vx, y, k);
+}
+
+// turbo4: (centroid[3-bit idx] + qjl_sign * qjl_scale) * norm
+template <typename dst_t>
+static __global__ void dequantize_block_turbo4_0(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+
+    const block_turbo4_0 * x = (const block_turbo4_0 *)vx;
+    const int64_t ib = i / QK_TURBO4;
+    const int     j  = i % QK_TURBO4;
+
+    const float norm  = __half2float(x[ib].norm);
+    const float rnorm = __half2float(x[ib].rnorm);
+    const float qjl_scale = 1.2533141373155003f / 128.0f * rnorm;
+
+    // Unpack 3-bit index
+    const int bit_offset = j * 3;
+    const int byte_idx = bit_offset / 8;
+    const int bit_pos  = bit_offset % 8;
+    uint16_t raw = (uint16_t)x[ib].qs[byte_idx];
+    if (byte_idx + 1 < QK_TURBO4 * 3 / 8) {
+        raw |= (uint16_t)x[ib].qs[byte_idx + 1] << 8;
+    }
+    const uint8_t idx = (uint8_t)((raw >> bit_pos) & 0x7);
+    const float centroid = turbo_cv_centroids_3bit[idx];
+    const float sign = (x[ib].signs[j / 8] & (1 << (j % 8))) ? 1.0f : -1.0f;
+
+    y[i] = (dst_t)((centroid + sign * qjl_scale) * norm);
+}
+
+template <typename dst_t>
+static void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int block_size = 256;
+    const int n_blocks = (k + block_size - 1) / block_size;
+    dequantize_block_turbo4_0<<<n_blocks, block_size, 0, stream>>>(vx, y, k);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -719,6 +786,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
+        case GGML_TYPE_TURBO4_0:
+            return dequantize_row_turbo4_0_cuda;
         default:
             return nullptr;
     }
