@@ -633,17 +633,41 @@ constant half turbo_centroids_3bit_h[8] = {
 // Vec: 4 elements per call (il ∈ {0..7}), returns type4
 // GitHub issue #39: Fused Q·Centroid compressed attention
 //
-// Tested approaches:
-//   float cn[8]: SPILL (32 bytes, 0.879x) — Metal register file too small
-//   half cn_norm[8]: SPILL (16 bytes, 0.869x) — array indexing forces stack
-//   constant half[8] + float norm: BASELINE (0.905x) — current best
+// BIT-ARITHMETIC DECODE: compute centroid from index bits using pure math.
+// ZERO memory access (no constant, no stack, no threadgroup).
+// Eliminates the fundamental Metal limitation where array[variable_index]
+// spills to thread stack memory.
 //
-// The fundamental issue: Metal can't do data-dependent indexing into registers.
-// Any array with variable index goes to thread stack memory, which is slower
-// than constant memory for an 8-entry LUT. This is unlike CUDA where register
-// arrays with small indices stay in the register file.
+// The 8 centroids have structure: 4 magnitudes × 2 signs.
+// Magnitude from 2-bit index: magv = M0 + b0*D1 + b1*D2 + b0*b1*D3
+// Sign from 1-bit: positive (sign=1) or negative with reversed mag order (sign=0)
 //
-// Keeping the proven constant half[8] approach.
+// Codex-derived formula, verified against all 8 centroid values.
+//
+// Tested approaches and results (M5 Max decode tok/s):
+//   constant half[8] + norm:  77.4 (0.905x) — previous best
+//   float cn[8] registers:    75.2 (0.879x) — spill
+//   half cn_norm[8]:          74.4 (0.869x) — spill
+//   BIT-ARITHMETIC:           ?.? — THIS EXPERIMENT
+
+// Constants for bit-arithmetic centroid computation
+constant float TURBO_M0 = 0.021460f;  // smallest magnitude
+constant float TURBO_D1 = 0.044257f;  // m1 - m0
+constant float TURBO_D2 = 0.096372f;  // m2 - m0
+constant float TURBO_D3 = 0.028596f;  // m3 - m0 - d1 - d2 (interaction term)
+
+// Compute centroid value from 3-bit index using pure arithmetic.
+// No memory access — all scalar operations on registers.
+inline float turbo_centroid_from_bits(uint8_t qs_2bit, uint8_t sign_bit) {
+    // For sign_bit=1 (positive, idx 4-7): mag index = qs_2bit directly
+    // For sign_bit=0 (negative, idx 0-3): mag index = 3 - qs_2bit (reversed)
+    const uint8_t mag = sign_bit ? qs_2bit : (3 - qs_2bit);
+    const float b0 = float(mag & 1);
+    const float b1 = float((mag >> 1) & 1);
+    const float magv = TURBO_M0 + b0 * TURBO_D1 + b1 * TURBO_D2 + (b0 * b1) * TURBO_D3;
+    return sign_bit ? magv : -magv;
+}
+
 template <typename type4>
 void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
     const float norm = float(xb->norm);
@@ -651,13 +675,13 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
     const uint8_t sb = xb->signs[il >> 1];
     const int sshift = (il & 1) << 2;
 
-    float4 centroids = float4(half4(
-        turbo_centroids_3bit_h[(qb & 0x03)        | (((sb >> (sshift + 0)) & 1) << 2)],
-        turbo_centroids_3bit_h[((qb >> 2) & 0x03) | (((sb >> (sshift + 1)) & 1) << 2)],
-        turbo_centroids_3bit_h[((qb >> 4) & 0x03) | (((sb >> (sshift + 2)) & 1) << 2)],
-        turbo_centroids_3bit_h[((qb >> 6) & 0x03) | (((sb >> (sshift + 3)) & 1) << 2)]
+    // Pure arithmetic — no LUT, no memory, no spill
+    reg = type4(float4(
+        turbo_centroid_from_bits((qb      ) & 0x03, (sb >> (sshift + 0)) & 1) * norm,
+        turbo_centroid_from_bits((qb >> 2) & 0x03, (sb >> (sshift + 1)) & 1) * norm,
+        turbo_centroid_from_bits((qb >> 4) & 0x03, (sb >> (sshift + 2)) & 1) * norm,
+        turbo_centroid_from_bits((qb >> 6) & 0x03, (sb >> (sshift + 3)) & 1) * norm
     ));
-    reg = type4(centroids * norm);
 }
 
 // ----- turbo4 dequantize with per-thread block cache -----
