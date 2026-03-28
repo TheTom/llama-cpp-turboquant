@@ -41,5 +41,15 @@ void dequantize_row_turbo3_0_no_wht_cuda(const void * vx, dst_t * y, const int64
 /* Inverse WHT32 on output data (post-matmul). Tiny: only output-sized, not cache-sized. */
 void turbo3_inverse_wht32_cuda(float * data, int64_t n_elements, cudaStream_t stream);
 
+/* Fused V dequant + attention matmul: reads turbo3 V directly, no intermediate F32 tensor.
+ * Computes kqv = V_rot^T * attn per head, output in rotated space (apply inv WHT after). */
+void turbo3_fused_v_attn_cuda(
+        const void * v_data, const float * attn, float * output,
+        int64_t n_kv, int64_t head_dim, int64_t n_q, int64_t n_heads,
+        int64_t v_stride_row, int64_t v_stride_head,
+        int64_t attn_stride_row, int64_t attn_stride_head,
+        int64_t out_stride_head,
+        cudaStream_t stream);
+
 template<typename dst_t>
 void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream);

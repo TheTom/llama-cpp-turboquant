@@ -6220,7 +6220,7 @@ struct ggml_tensor * ggml_turbo_wht(
         int                   direction) {
     GGML_ASSERT(ggml_is_contiguous(a));
     GGML_ASSERT(a->type == GGML_TYPE_F32);
-    GGML_ASSERT(a->ne[0] % 128 == 0);  // ne[0] must be divisible by rotation group size
+    GGML_ASSERT(a->ne[0] % 32 == 0);  // ne[0] must be divisible by WHT32 block size
     GGML_ASSERT(direction == 0 || direction == 1);
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);

@@ -1904,9 +1904,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // TurboQuant non-FA path with WHT linearity optimization:
         // K: MMVQ fuses WHT into dot product (no K dequant needed)
-        // V: cast to rotated F32 (no WHT — cheap), matmul in rotated space,
-        //    then apply inverse WHT only to the tiny output (not the full cache).
-        //    By WHT linearity: inv_WHT(sum(attn * V_rot)) = sum(attn * inv_WHT(V_rot))
+        // V: dequant to rotated F32 (cheap: centroid*gamma, no cooperative WHT),
+        //    matmul in rotated space, inverse WHT only on tiny output.
         const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0);
         if (ggml_is_quantized(v->type)) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F32);
@@ -1914,7 +1913,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         if (!v_trans) {
-            // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
@@ -1922,11 +1920,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
 
-        // WHT linearity: apply inverse WHT32 to output instead of entire V cache.
-        // Output size = head_dim * n_heads * n_q (tiny during decode, n_q=1).
-        // Saves: n_kv * head_dim cooperative WHT invocations per layer.
         if (v_is_turbo) {
-            kqv = ggml_turbo_wht(ctx0, kqv, 1);  // inverse WHT on output
+            kqv = ggml_turbo_wht(ctx0, kqv, 1);  // inverse WHT on tiny output
             cb(kqv, "kqv_inv_wht", il);
         }
 
