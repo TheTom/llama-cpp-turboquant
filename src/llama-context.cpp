@@ -2964,14 +2964,17 @@ llama_context * llama_init_from_model(
         }
     }
 
+    // TurboQuant: auto-enable flash_attn for best performance (FA path gives f16 parity).
+    // Non-FA MMVQ path works but has slow prefill (60 t/s vs 6800 FA).
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
+        (params.type_k == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_0)) {
+        LLAMA_LOG_WARN("%s: turbo3 cache — auto-enabling flash_attn for best performance\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        if (params.type_v == GGML_TYPE_TURBO3_0) {
-            // TurboQuant: allow non-FA path — V dequant with inverse WHT happens in attention graph
-            LLAMA_LOG_WARN("%s: turbo3 V cache without flash_attn — will dequant V in attention graph\n", __func__);
-        } else {
-            LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
-            return nullptr;
-        }
+        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
+        return nullptr;
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
