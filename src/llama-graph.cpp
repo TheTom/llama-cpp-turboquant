@@ -1816,23 +1816,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // TurboQuant FA path: dequant K/V to F32 before flash attention.
-        // turbo3: CPY does centroid*gamma (no WHT), then turbo_wht applies inverse WHT32.
-        // turbo4: CPY does full dequant with inverse WHT128 + QJL (no extra step needed).
-        if (k->type == GGML_TYPE_TURBO3_0) {
+        // TurboQuant FA path: simple dequant K/V to F32 (no rotation needed).
+        if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F32);
-            k = ggml_turbo_wht(ctx0, k, 1);  // inverse WHT32
-            cb(k, "k_dequant", il);
-        } else if (k->type == GGML_TYPE_TURBO4_0) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F32);  // full dequant in CPY
             cb(k, "k_dequant", il);
         }
-        if (v->type == GGML_TYPE_TURBO3_0) {
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F32);
-            v = ggml_turbo_wht(ctx0, v, 1);  // inverse WHT32
-            cb(v, "v_dequant", il);
-        } else if (v->type == GGML_TYPE_TURBO4_0) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F32);  // full dequant in CPY
             cb(v, "v_dequant", il);
         }
 
@@ -1909,14 +1899,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
-        // TurboQuant non-FA path with WHT linearity optimization:
-        // K: MMVQ fuses WHT into dot product (no K dequant needed)
-        // V: dequant to rotated F32 (cheap: centroid*gamma, no cooperative WHT),
-        //    matmul in rotated space, inverse WHT only on tiny output.
-        const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0);
+        // TurboQuant non-FA path: dequant V to F32, standard matmul.
+        // No rotation needed — turbo3 uses simple uniform quantization.
         if (ggml_is_quantized(v->type)) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F32);
-            cb(v, "v_dequant_rot", il);
+            cb(v, "v_dequant", il);
         }
 
         if (!v_trans) {
@@ -1926,11 +1913,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
-
-        if (v_is_turbo) {
-            kqv = ggml_turbo_wht(ctx0, kqv, 1);  // inverse WHT on tiny output
-            cb(kqv, "kqv_inv_wht", il);
-        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {

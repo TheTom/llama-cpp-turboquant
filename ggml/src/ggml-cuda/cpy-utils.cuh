@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ggml-common.h"
-#include "turbo-quant.cuh"
 #include "convert.cuh"
 
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
@@ -212,61 +211,29 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
-// TurboQuant TQ3_0: WHT32 forward rotation (sign flip + butterfly + normalize)
-static __device__ __forceinline__ void turbo3_wht32_forward(float * x) {
-    const int8_t signs[32] = {
-        +1, -1, +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, -1, -1,
-        +1, -1, -1, +1, +1, -1, +1, -1, -1, +1, +1, +1, -1, -1, +1, -1
-    };
-    for (int j = 0; j < 32; j++) x[j] *= signs[j];
-    for (int step = 1; step < 32; step <<= 1) {
-        for (int i = 0; i < 32; i += step * 2) {
-            for (int j = i; j < i + step; j++) {
-                float a = x[j], b = x[j + step];
-                x[j] = a + b; x[j + step] = a - b;
-            }
-        }
-    }
-    const float s = 0.17677669529663688f;  // 1/sqrt(32)
-    for (int j = 0; j < 32; j++) x[j] *= s;
-}
-
-// TurboQuant TQ3_0: GPU quantize (WHT rotation + 8-centroid Lloyd-Max)
+// TurboQuant turbo3: 3-bit uniform quantization (Lucien approach)
+// round(x/d) clamped [-4,3], stored as [0,7], packed 8 per 3 bytes
 static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ x, block_turbo3_0 * __restrict__ y) {
-    const float centroids[8] = {
-        -2.1573f, -1.3336f, -0.7434f, -0.2428f,
-         0.2428f,  0.7434f,  1.3336f,  2.1573f
-    };
-
-    float rotated[QK_TURBO3];
-    for (int j = 0; j < QK_TURBO3; j++) rotated[j] = x[j];
-    turbo3_wht32_forward(rotated);
-
-    memset(y, 0, sizeof(block_turbo3_0));
-
     float amax = 0.0f;
-    for (int j = 0; j < QK_TURBO3; j++) {
-        float av = fabsf(rotated[j]);
+    for (int j = 0; j < 32; j++) {
+        float av = fabsf(x[j]);
         if (av > amax) amax = av;
     }
 
-    const float d = amax / 2.1573f;
+    const float d = amax / 4.0f;
     const float id = d > 0.0f ? 1.0f / d : 0.0f;
-    y->gamma = __float2half(d);
+    y->d = __float2half(d);
 
-    for (int j = 0; j < QK_TURBO3; j++) {
-        float xn = rotated[j] * id;
-        int idx;
-        if      (xn < -1.7455f) { idx = 0; }
-        else if (xn < -1.0385f) { idx = 1; }
-        else if (xn < -0.4931f) { idx = 2; }
-        else if (xn <  0.0f)    { idx = 3; }
-        else if (xn <  0.4931f) { idx = 4; }
-        else if (xn <  1.0385f) { idx = 5; }
-        else if (xn <  1.7455f) { idx = 6; }
-        else                     { idx = 7; }
-        y->qs[j / 4] |= ((idx & 3) << (2 * (j % 4)));
-        y->qr[j / 8] |= (((idx >> 2) & 1) << (j % 8));
+    for (int group = 0; group < 4; group++) {
+        uint8_t v[8];
+        for (int j = 0; j < 8; j++) {
+            const int q = __float2int_rn(x[group*8 + j] * id);
+            const int c = q < -4 ? -4 : (q > 3 ? 3 : q);
+            v[j] = (uint8_t)(c + 4);
+        }
+        y->qs[group*3 + 0] = (v[0] & 0x07) | ((v[1] & 0x07) << 3) | ((v[2] & 0x03) << 6);
+        y->qs[group*3 + 1] = ((v[2] & 0x04) >> 2) | ((v[3] & 0x07) << 1) | ((v[4] & 0x07) << 4) | ((v[5] & 0x01) << 7);
+        y->qs[group*3 + 2] = ((v[5] & 0x06) >> 1) | ((v[6] & 0x07) << 2) | ((v[7] & 0x07) << 5);
     }
 }
 
@@ -274,54 +241,7 @@ static __device__ void cpy_blck_f32_turbo3_0(const char * cxi, char * cdsti) {
     quantize_f32_turbo3_0_block((const float *)cxi, (block_turbo3_0 *)cdsti);
 }
 
-// TurboQuant turbo4: PolarQuant (3-bit angle grid + 1-bit QJL sign), no rotation
-// Matches nalditopr/ollama turboquant-support design.
-static __device__ void quantize_f32_turbo4_0_block(const float * __restrict__ x, block_turbo4_0 * __restrict__ y) {
-    constexpr float grid[8] = {
-        1.0f/16.0f, 3.0f/16.0f, 5.0f/16.0f, 7.0f/16.0f,
-        9.0f/16.0f, 11.0f/16.0f, 13.0f/16.0f, 15.0f/16.0f
-    };
-
-    // Step 1: Find absolute max
-    float amax = 0.0f;
-    for (int j = 0; j < QK_TURBO4; j++) {
-        float av = fabsf(x[j]);
-        if (av > amax) amax = av;
-    }
-    y->d = __float2half(amax);
-    float inv_d = amax > 0.0f ? 1.0f / amax : 0.0f;
-
-    memset(y->al, 0, QK_TURBO4 / 4);
-    memset(y->ah, 0, QK_TURBO4 / 8);
-    memset(y->signs, 0, QK_TURBO4 / 8);
-
-    // Step 2: For each element, find nearest grid entry in both polarities
-    for (int j = 0; j < QK_TURBO4; j++) {
-        float normalized = x[j] * inv_d;  // [-1, 1]
-
-        int best_idx = 0;
-        int best_sign = 0;
-        float best_err = 1e30f;
-
-        #pragma unroll
-        for (int g = 0; g < 8; g++) {
-            float gv = grid[g];
-            float e_pos = (normalized - gv) * (normalized - gv);
-            float e_neg = (normalized + gv) * (normalized + gv);
-            if (e_pos < best_err) { best_err = e_pos; best_idx = g; best_sign = 0; }
-            if (e_neg < best_err) { best_err = e_neg; best_idx = g; best_sign = 1; }
-        }
-
-        // Pack: 2-bit lo in al[], 1-bit hi in ah[], 1-bit sign in signs[]
-        y->al[j / 4] |= (uint8_t)((best_idx & 0x3) << ((j % 4) * 2));
-        if (best_idx & 0x4) y->ah[j / 8] |= (uint8_t)(1 << (j % 8));
-        if (best_sign)       y->signs[j / 8] |= (uint8_t)(1 << (j % 8));
-    }
-}
-
-static __device__ void cpy_blck_f32_turbo4_0(const char * cxi, char * cdsti) {
-    quantize_f32_turbo4_0_block((const float *)cxi, (block_turbo4_0 *)cdsti);
-}
+/* turbo4 quantize stub — not yet ported to Lucien approach */
 
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {

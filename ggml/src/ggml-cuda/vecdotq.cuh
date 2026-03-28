@@ -1268,62 +1268,53 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     return d * sumi;
 }
 
-// TurboQuant TQ3_0: Fused MMVQ with per-block WHT on query
-// K is stored in WHT-rotated space with 3-bit (8 centroid) quantization.
-// We apply WHT to Q inside the kernel. Since WHT is orthogonal: dot(q, k) = dot(WHT(q), WHT(k))
-#define VDR_TURBO3_0_Q8_1_MMVQ 8
-#define VDR_TURBO3_0_Q8_1_MMQ  8
+// TurboQuant turbo3: 3-bit uniform quantization with dp4a dot product.
+// Based on Lucien2468/Ollama-TurboQuant-Integration.
+// Values are [0,7] with offset -4, packed 8 per 3 bytes.
+// dp4a unpacks 4 values per int32 and dots with q8_1 in hardware.
+#define VDR_TURBO3_0_Q8_1_MMVQ 3
+#define VDR_TURBO3_0_Q8_1_MMQ  3
+
+template <int vdr> static __device__ __forceinline__ float vec_dot_turbo3_0_q8_1_impl(
+    const int * v, const int * u, const float & d_turbo, const half2 & ds8) {
+
+    int sumi = 0;
+
+    for (int i = 0; i < vdr / 3; ++i) {
+        const uint8_t * qs = (const uint8_t *)(v + 3*i);
+        const int * us = u + 8*i;
+
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            const uint8_t * g_qs = qs + g*3;
+            // Unpack 8 elements from 3 bytes into two int32s (4 bytes each)
+            // Elements 0-3
+            uint32_t vi0 =  (g_qs[0] & 7);
+            vi0 |= ((g_qs[0] >> 3) & 7) << 8;
+            vi0 |= (((g_qs[0] >> 6) & 3) | ((g_qs[1] & 1) << 2)) << 16;
+            vi0 |= ((g_qs[1] >> 1) & 7) << 24;
+
+            sumi = ggml_cuda_dp4a(vi0, us[g*2 + 0], sumi);
+
+            // Elements 4-7
+            uint32_t vi1 =  (g_qs[1] >> 4) & 7;
+            vi1 |= (((g_qs[1] >> 7) & 1) | ((g_qs[2] & 3) << 1)) << 8;
+            vi1 |= ((g_qs[2] >> 2) & 7) << 16;
+            vi1 |= ((g_qs[2] >> 5) & 7) << 24;
+
+            sumi = ggml_cuda_dp4a(vi1, us[g*2 + 1], sumi);
+        }
+    }
+
+    const float2 ds8f = __half22float2(ds8);
+    return d_turbo * (sumi * ds8f.x - 4.0f * (vdr/3.0f) * ds8f.y);
+}
 
 static __device__ __forceinline__ float vec_dot_turbo3_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
-    const float centroids[8] = {
-        -2.1573f, -1.3336f, -0.7434f, -0.2428f,
-         0.2428f,  0.7434f,  1.3336f,  2.1573f
-    };
-    const int8_t signs[32] = {
-        +1, -1, +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, -1, -1,
-        +1, -1, -1, +1, +1, -1, +1, -1, -1, +1, +1, +1, -1, -1, +1, -1
-    };
+    const block_turbo3_0 * bq = (const block_turbo3_0 *) vbq + kbx;
+    const block_q8_1  * b8 = bq8_1;
 
-    if (iqs != 0) {
-        return 0.0f;
-    }
-
-    const block_turbo3_0 * btq = (const block_turbo3_0 *) vbq + kbx;
-    const float d = __half2float(btq->gamma);
-
-    // Step 1: Apply WHT to Q8_1 int8 values (sign flip + butterfly in int32)
-    int32_t sq[32];
-    #pragma unroll
-    for (int j = 0; j < 32; j++) {
-        sq[j] = (int32_t)bq8_1[0].qs[j] * signs[j];
-    }
-
-    // 5-stage butterfly transform
-    #pragma unroll
-    for (int step = 1; step < 32; step <<= 1) {
-        #pragma unroll
-        for (int i = 0; i < 32; i += step * 2) {
-            #pragma unroll
-            for (int j = i; j < i + step; j++) {
-                int32_t a = sq[j], b = sq[j + step];
-                sq[j] = a + b; sq[j + step] = a - b;
-            }
-        }
-    }
-
-    // Step 2: Dot product in rotated space (3-bit index: low 2 bits in qs, high 1 bit in qr)
-    float sumf = 0.0f;
-    #pragma unroll
-    for (int j = 0; j < 32; j++) {
-        const int low2 = (btq->qs[j / 4] >> (2 * (j % 4))) & 3;
-        const int hi1  = (btq->qr[j / 8] >> (j % 8)) & 1;
-        const int idx  = low2 | (hi1 << 2);
-        sumf += (float)sq[j] * centroids[idx];
-    }
-
-    // Scale: d_turbo3 * d_q8 / sqrt(32)
-    const float d_q8 = __low2float(bq8_1[0].ds);
-    return sumf * d * d_q8 * 0.17677669529663688f;  // 1/sqrt(32)
+    return vec_dot_turbo3_0_q8_1_impl<3>((const int *) bq->qs, (const int *) b8->qs, __half2float(bq->d), b8->ds);
 }
