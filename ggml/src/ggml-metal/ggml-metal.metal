@@ -9712,25 +9712,38 @@ kernel void kernel_set_rows_turbo(
           device block_q * dst_row = (      device block_q *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
     const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
-    // Process in groups of 4 blocks (128 elements) for rotation
+    // Process in groups of 4 blocks (128 elements) for rotation.
+    // Use ceiling division so models with non-128-aligned head dims (e.g. GLM-4.7
+    // Flash head_dim=576, deepseek2 K head_dim=192) don't silently drop tail blocks.
     const int blocks_per_group = QK_TURBO3_GROUP / QK;  // 128/32 = 4
-    const int n_groups = args.nk0 / blocks_per_group;
+    const int n_groups = (args.nk0 + blocks_per_group - 1) / blocks_per_group;
 
     for (int grp = tiitg%tptg.x; grp < n_groups; grp += tptg.x) {
         const device float * grp_src = src_row + QK_TURBO3_GROUP * grp;
 
-        // Normalize and rotate the full 128-element group
+        // How many blocks/elements are valid in this group (< 4 blocks for tail)
+        const int grp_start_block = grp * blocks_per_group;
+        const int grp_blocks = min(blocks_per_group, (int)args.nk0 - grp_start_block);
+        const int grp_elems  = grp_blocks * QK;
+
+        // Normalize valid elements, zero-pad remainder for WHT rotation.
+        // Loop bounds use compile-time QK_TURBO3_GROUP (128) for full groups
+        // and runtime grp_elems only for tail groups.
         float norm_sq = 0.0f;
-        for (int j = 0; j < QK_TURBO3_GROUP; j++) norm_sq += grp_src[j] * grp_src[j];
+        for (int j = 0; j < QK_TURBO3_GROUP; j++) {
+            float v = (j < grp_elems) ? grp_src[j] : 0.0f;
+            norm_sq += v * v;
+        }
         float grp_norm = sqrt(norm_sq);
         float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
 
         float x[128];
-        for (int j = 0; j < 128; j++) x[j] = grp_src[j] * inv_norm;
+        for (int j = 0; j < 128; j++) {
+            x[j] = (j < grp_elems) ? grp_src[j] * inv_norm : 0.0f;
+        }
         turbo_rotate_forward(x, turbo_wht_signs1, turbo_wht_signs2);
 
-        // Split into 4 blocks of 32 elements each
-        // All blocks store the SAME group norm — centroids are in normalized space
+        // Split into blocks of QK elements each.
         // Norm correction (ported from @spiritbuun's CUDA implementation):
         // Accumulate ||centroid_vector||^2 across all 128 elements, then store
         // grp_norm / ||centroid_vector|| instead of raw grp_norm. This makes
@@ -9738,7 +9751,8 @@ kernel void kernel_set_rows_turbo(
         float recon_norm_sq = 0.0f;
 
         for (int b = 0; b < blocks_per_group; b++) {
-            device block_q & blk = dst_row[grp * blocks_per_group + b];
+            if (grp_start_block + b >= (int)args.nk0) break;  // tail guard
+            device block_q & blk = dst_row[grp_start_block + b];
             const int off = b * QK;
 
             for (int j = 0; j < QK / 4; j++) blk.qs[j] = 0;
@@ -9770,8 +9784,8 @@ kernel void kernel_set_rows_turbo(
         // Zero decode cost — dequant already multiplies by stored norm.
         float recon_norm = sqrt(recon_norm_sq);
         float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
-        for (int b = 0; b < blocks_per_group; b++) {
-            dst_row[grp * blocks_per_group + b].norm = half(corrected_norm);
+        for (int b = 0; b < grp_blocks; b++) {
+            dst_row[grp_start_block + b].norm = half(corrected_norm);
         }
     }
 }
