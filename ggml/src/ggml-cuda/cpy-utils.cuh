@@ -211,6 +211,68 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+// TurboQuant TQ3_0: WHT32 forward rotation (sign flip + butterfly + normalize)
+static __device__ __forceinline__ void turbo3_wht32_forward(float * x) {
+    const int8_t signs[32] = {
+        +1, -1, +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, -1, -1,
+        +1, -1, -1, +1, +1, -1, +1, -1, -1, +1, +1, +1, -1, -1, +1, -1
+    };
+    for (int j = 0; j < 32; j++) x[j] *= signs[j];
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step * 2) {
+            for (int j = i; j < i + step; j++) {
+                float a = x[j], b = x[j + step];
+                x[j] = a + b; x[j + step] = a - b;
+            }
+        }
+    }
+    const float s = 0.17677669529663688f;  // 1/sqrt(32)
+    for (int j = 0; j < 32; j++) x[j] *= s;
+}
+
+// TurboQuant TQ3_0: GPU quantize (WHT rotation + 8-centroid Lloyd-Max)
+static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ x, block_turbo3_0 * __restrict__ y) {
+    const float centroids[8] = {
+        -2.1573f, -1.3336f, -0.7434f, -0.2428f,
+         0.2428f,  0.7434f,  1.3336f,  2.1573f
+    };
+
+    float rotated[QK_TURBO3];
+    for (int j = 0; j < QK_TURBO3; j++) rotated[j] = x[j];
+    turbo3_wht32_forward(rotated);
+
+    memset(y, 0, sizeof(block_turbo3_0));
+
+    float amax = 0.0f;
+    for (int j = 0; j < QK_TURBO3; j++) {
+        float av = fabsf(rotated[j]);
+        if (av > amax) amax = av;
+    }
+
+    const float d = amax / 2.1573f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    y->gamma = __float2half(d);
+
+    for (int j = 0; j < QK_TURBO3; j++) {
+        float xn = rotated[j] * id;
+        int idx;
+        if      (xn < -1.7455f) { idx = 0; }
+        else if (xn < -1.0385f) { idx = 1; }
+        else if (xn < -0.4931f) { idx = 2; }
+        else if (xn <  0.0f)    { idx = 3; }
+        else if (xn <  0.4931f) { idx = 4; }
+        else if (xn <  1.0385f) { idx = 5; }
+        else if (xn <  1.7455f) { idx = 6; }
+        else                     { idx = 7; }
+        y->qs[j / 4] |= ((idx & 3) << (2 * (j % 4)));
+        y->qr[j / 8] |= (((idx >> 2) & 1) << (j % 8));
+    }
+}
+
+static __device__ void cpy_blck_f32_turbo3_0(const char * cxi, char * cdsti) {
+    quantize_f32_turbo3_0_block((const float *)cxi, (block_turbo3_0 *)cdsti);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

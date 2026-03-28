@@ -280,9 +280,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
-    // TurboQuant: always available (not gated by FA_ALL_QUANTS)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    /* TurboQuant uses MMVQ with fused WHT, not flash attention */
 
     GGML_ABORT("fatal error");
 }
@@ -378,7 +376,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             break;
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
-            break;
+            return BEST_FATTN_KERNEL_NONE;  /* Uses MMVQ with fused WHT, not FA */
         default:
             return BEST_FATTN_KERNEL_NONE;
     }
@@ -492,120 +490,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-/* Dequantize a turbo3/turbo4 KV tensor to fp16 in a temporary buffer for MMA.
- * Returns the fp16 buffer pointer. Caller must cudaFree after use. */
-static half * turbo_dequant_to_fp16(ggml_backend_cuda_context & ctx, const ggml_tensor * src) {
-    const int64_t ne = ggml_nelements(src);
-    half * buf = nullptr;
-    cudaMalloc(&buf, ne * sizeof(half));
-    if (!buf) return nullptr;
-
-    cudaStream_t stream = ctx.stream();
-    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src->type);
-    GGML_ASSERT(to_fp16 != nullptr);
-    to_fp16(src->data, buf, ne, stream);
-    return buf;
-}
-
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-
-    ggml_tensor * K = dst->src[1];
-    ggml_tensor * V = dst->src[2];
-    const bool is_turbo = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
-
-    /* For turbo types: if VEC kernel is available use it directly (best for decode).
-     * Otherwise dequantize to fp16 temp buffer and use MMA (best for prefill). */
-    if (is_turbo) {
-        const bool can_vec = (dst->src[0]->ne[0] <= 256 && dst->src[0]->ne[0] % 64 == 0 &&
-                              K->ne[1] % FATTN_KQ_STRIDE == 0);
-        if (can_vec && dst->src[0]->ne[1] <= 2) {
-            /* Decode: use VEC with native turbo dequant */
-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
-            return;
-        }
-
-        /* Prefill: dequantize to fp16 and use MMA */
-        half * K_fp16 = turbo_dequant_to_fp16(ctx, K);
-        half * V_fp16 = (V == K) ? K_fp16 : turbo_dequant_to_fp16(ctx, V);
-
-        if (K_fp16 && V_fp16) {
-            /* Temporarily patch tensor metadata to point at fp16 data */
-            void * K_data_orig = K->data;
-            void * V_data_orig = V->data;
-            ggml_type K_type_orig = K->type;
-            ggml_type V_type_orig = V->type;
-            int64_t K_nb0_orig = K->nb[0];
-            int64_t K_nb1_orig = K->nb[1];
-            int64_t K_nb2_orig = K->nb[2];
-            int64_t K_nb3_orig = K->nb[3];
-            int64_t V_nb0_orig = V->nb[0];
-            int64_t V_nb1_orig = V->nb[1];
-            int64_t V_nb2_orig = V->nb[2];
-            int64_t V_nb3_orig = V->nb[3];
-
-            K->data = K_fp16;
-            K->type = GGML_TYPE_F16;
-            K->nb[0] = sizeof(half);
-            K->nb[1] = K->ne[0] * sizeof(half);
-            K->nb[2] = K->nb[1] * K->ne[1];
-            K->nb[3] = K->nb[2] * K->ne[2];
-
-            if (V != K) {
-                V->data = V_fp16;
-                V->type = GGML_TYPE_F16;
-                V->nb[0] = sizeof(half);
-                V->nb[1] = V->ne[0] * sizeof(half);
-                V->nb[2] = V->nb[1] * V->ne[1];
-                V->nb[3] = V->nb[2] * V->ne[2];
-            }
-
-            /* Dispatch to best non-turbo kernel */
-            auto best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
-            switch (best) {
-                case BEST_FATTN_KERNEL_MMA_F16:
-                    ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
-                    break;
-                case BEST_FATTN_KERNEL_TILE:
-                    ggml_cuda_flash_attn_ext_tile(ctx, dst);
-                    break;
-                case BEST_FATTN_KERNEL_WMMA_F16:
-                    ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
-                    break;
-                case BEST_FATTN_KERNEL_VEC:
-                    ggml_cuda_flash_attn_ext_vec(ctx, dst);
-                    break;
-                default:
-                    GGML_ABORT("no FA kernel for turbo dequant path");
-            }
-
-            /* Restore original tensor metadata */
-            K->data = K_data_orig;
-            K->type = K_type_orig;
-            K->nb[0] = K_nb0_orig;
-            K->nb[1] = K_nb1_orig;
-            K->nb[2] = K_nb2_orig;
-            K->nb[3] = K_nb3_orig;
-            if (V != K) {
-                V->data = V_data_orig;
-                V->type = V_type_orig;
-                V->nb[0] = V_nb0_orig;
-                V->nb[1] = V_nb1_orig;
-                V->nb[2] = V_nb2_orig;
-                V->nb[3] = V_nb3_orig;
-            }
-
-            cudaFree(K_fp16);
-            if (V_fp16 != K_fp16) cudaFree(V_fp16);
-        } else {
-            /* Fallback: VEC if possible, else abort */
-            if (K_fp16) cudaFree(K_fp16);
-            if (V_fp16 && V_fp16 != K_fp16) cudaFree(V_fp16);
-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
-        }
-        return;
-    }
-
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

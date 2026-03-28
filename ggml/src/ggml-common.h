@@ -271,15 +271,16 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 // Transform group size = 128 (head_dim, for rotation Gaussianization)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) + 1-bit extra (4 bytes) = 14 bytes per 32 values
 // = 3.5 bits/value → 4.6× compression vs fp16
-// The 3-bit index is split: lower 2 bits in qs[], upper 1 bit in signs[]
-#define QK_TURBO3 32   // Block size 32: matches q4_0 parallelism, graph handles WHT rotation
-#define QK_TURBO3_GROUP 128  // rotation group size = head_dim
+// Per-block WHT32 rotation fused into quantize/vec_dot — no graph-level rotation ops.
+// 3-bit index split: lower 2 bits in qs[], upper 1 bit in qr[].
+// Layout matches animehacker/llama-turboquant reference.
+#define QK_TURBO3 32
 typedef struct {
-    ggml_half  norm;                    //  2 bytes: vector L2 norm (for rescaling)
     uint8_t    qs[QK_TURBO3 / 4];      //  8 bytes: lower 2-bit indices (4 per byte)
-    uint8_t    signs[QK_TURBO3 / 8];   //  4 bytes: upper 1-bit of 3-bit index (8 per byte)
+    uint8_t    qr[QK_TURBO3 / 8];      //  4 bytes: upper 1-bit of 3-bit index (8 per byte)
+    ggml_half  gamma;                   //  2 bytes: scale factor (amax / 2.1573)
 } block_turbo3_0;                       // 14 bytes total
-static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
+static_assert(sizeof(block_turbo3_0) == QK_TURBO3/4 + QK_TURBO3/8 + sizeof(ggml_half), "wrong turbo3_0 block size/padding");
 
 // TurboQuant 4-bit: 3-bit PolarQuant indices + 1-bit QJL signs
 // Per block: norm(fp16) + residual_norm(fp16) + 3-bit indices (48 bytes) + 1-bit signs (16 bytes)

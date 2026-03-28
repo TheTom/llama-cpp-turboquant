@@ -31,8 +31,8 @@ static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.13
 
 /* 3-bit: Lloyd-Max for N(0, 1/128), pre-computed */
 static const float CENTROIDS_3BIT[8] = {
-    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
-     0.021460f,  0.065717f,  0.117832f,  0.190685f
+    -2.1573f, -1.3336f, -0.7434f, -0.2428f,
+     0.2428f,  0.7434f,  1.3336f,  2.1573f
 };
 
 /* ---------- rotation matrix (lazy init) ---------- */
@@ -159,43 +159,40 @@ static int nearest_centroid_2bit(float val) {
 }
 
 static int nearest_centroid_3bit(float val) {
-    /* 8 centroids, find nearest via midpoints */
-    if (val < -0.154259f) return 0;
-    if (val < -0.091775f) return 1;
-    if (val < -0.043589f) return 2;
-    if (val <  0.000000f) return 3;
-    if (val <  0.043589f) return 4;
-    if (val <  0.091775f) return 5;
-    if (val <  0.154259f) return 6;
+    /* 8 scaled centroids, find nearest via midpoints */
+    if (val < -1.7455f) return 0;
+    if (val < -1.0385f) return 1;
+    if (val < -0.4931f) return 2;
+    if (val <  0.0000f) return 3;
+    if (val <  0.4931f) return 4;
+    if (val <  1.0385f) return 5;
+    if (val <  1.7455f) return 6;
     return 7;
 }
 
 /* ---------- TURBO3_0: 2-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
-    // Stub — Metal shader handles quantize on GPU. CPU path is simplified.
+    /* Stub — GPU handles quantize with WHT. CPU path stores zeros. */
     assert(k % QK_TURBO3 == 0);
     const int nb = k / QK_TURBO3;
     for (int i = 0; i < nb; i++) {
-        float norm = 0.0f;
-        for (int j = 0; j < QK_TURBO3; j++) norm += x[i*QK_TURBO3 + j] * x[i*QK_TURBO3 + j];
-        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
-        memset(y[i].qs, 0, QK_TURBO3 / 4);
-        memset(y[i].signs, 0, QK_TURBO3 / 8);
+        memset(&y[i], 0, sizeof(block_turbo3_0));
+        y[i].gamma = GGML_FP32_TO_FP16(0.0f);
     }
 }
 
 void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    // Stub — Metal shader handles dequant on GPU.
+    /* CPU dequant: centroid * gamma (raw rotated space, no inverse WHT). */
     assert(k % QK_TURBO3 == 0);
     const int nb = k / QK_TURBO3;
     for (int block = 0; block < nb; block++) {
-        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float d = GGML_FP16_TO_FP32(x[block].gamma);
         for (int j = 0; j < QK_TURBO3; j++) {
             uint8_t low2 = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
-            uint8_t hi1 = (x[block].signs[j/8] >> (j%8)) & 0x1;
+            uint8_t hi1 = (x[block].qr[j/8] >> (j%8)) & 0x1;
             uint8_t idx = low2 | (hi1 << 2);
-            y[block * QK_TURBO3 + j] = CENTROIDS_3BIT[idx] * norm;
+            y[block * QK_TURBO3 + j] = CENTROIDS_3BIT[idx] * d;
         }
     }
 }

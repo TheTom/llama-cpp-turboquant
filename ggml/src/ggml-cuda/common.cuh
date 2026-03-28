@@ -1046,6 +1046,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
 };
 
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TURBO3_0> {
+    static constexpr int qk = QK_TURBO3;  // 32
+    static constexpr int qr = 2;           // 2 elements per dequantize call
+    static constexpr int qi = QK_TURBO3 / 4;  // 8
+};
+
 //////////////////////
 
 struct ggml_cuda_device_info {
