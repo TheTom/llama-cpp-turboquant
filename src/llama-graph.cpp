@@ -1816,16 +1816,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // TurboQuant FA path: cast to rotated F32, then apply inverse WHT to restore original values.
-        // (CPY does centroid*gamma only — no WHT. Explicit turbo_wht completes the dequant.)
+        // TurboQuant FA path: dequant K/V to F32 before flash attention.
+        // turbo3: CPY does centroid*gamma (no WHT), then turbo_wht applies inverse WHT32.
+        // turbo4: CPY does full dequant with inverse WHT128 + QJL (no extra step needed).
         if (k->type == GGML_TYPE_TURBO3_0) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F32);
-            k = ggml_turbo_wht(ctx0, k, 1);  // inverse WHT
+            k = ggml_turbo_wht(ctx0, k, 1);  // inverse WHT32
+            cb(k, "k_dequant", il);
+        } else if (k->type == GGML_TYPE_TURBO4_0) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F32);  // full dequant in CPY
             cb(k, "k_dequant", il);
         }
         if (v->type == GGML_TYPE_TURBO3_0) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F32);
-            v = ggml_turbo_wht(ctx0, v, 1);  // inverse WHT
+            v = ggml_turbo_wht(ctx0, v, 1);  // inverse WHT32
+            cb(v, "v_dequant", il);
+        } else if (v->type == GGML_TYPE_TURBO4_0) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F32);  // full dequant in CPY
             cb(v, "v_dequant", il);
         }
 

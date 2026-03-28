@@ -60,41 +60,31 @@ static __global__ void dequantize_block_turbo3_0(const void * __restrict__ vx, d
     yy[i * QK_TURBO3 + tid] = ggml_cuda_cast<dst_t>(shmem[tid] * inv_sqrt32 * signs[tid]);
 }
 
-/* ===== turbo4 dequantize block kernel ===== */
+/* ===== turbo4 dequantize: PolarQuant (angle grid + sign), no rotation ===== */
+/* 256 elements per block. 256 threads, 1 element each. Simple and fast. */
 
 template<typename dst_t>
 static __global__ void dequantize_block_turbo4_0(
-        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
-    const int64_t i = blockIdx.x;
-    const int tid = threadIdx.x;
+        const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t k) {
+    const int64_t i = blockIdx.x;  /* block index */
+    const int tid = threadIdx.x;   /* 0..255, one element each */
 
-    if (i * QK_TURBO4 >= k) return;
+    if (i * QK_TURBO4 + tid >= k) return;
 
     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
-    const block_turbo4_0 & xb = x[i];
+    const float d = __half2float(x[i].d);
 
-    const float norm  = __half2float(xb.norm);
-    const float rnorm = __half2float(xb.rnorm);
-    const float qjl_scale = TURBO_QJL_CONST / 128.0f * rnorm;
+    /* Unpack 3-bit angle: 2-bit lo from al[], 1-bit hi from ah[] */
+    const uint8_t lo  = (x[i].al[tid / 4] >> ((tid % 4) * 2)) & 0x3;
+    const uint8_t hi  = (x[i].ah[tid / 8] >> (tid % 8)) & 0x1;
+    const uint8_t idx = lo | (hi << 2);
 
-    const int base = tid * 4;
-    dst_t * out = y + i * QK_TURBO4 + base;
+    /* Sign from QJL signs[] */
+    const uint8_t sign = (x[i].signs[tid / 8] >> (tid % 8)) & 0x1;
 
-    for (int jj = 0; jj < 4; jj++) {
-        const int j = base + jj;
-        const int bit_offset = j * 3;
-        const int byte_idx = bit_offset / 8;
-        const int bit_pos = bit_offset % 8;
-        uint16_t raw = (uint16_t)xb.qs[byte_idx];
-        if (bit_pos > 5 && byte_idx + 1 < QK_TURBO4 * 3 / 8) {
-            raw |= (uint16_t)xb.qs[byte_idx + 1] << 8;
-        }
-        const int idx = (raw >> bit_pos) & 0x7;
-        const float centroid_val = turbo_centroid_3bit(idx);
-        const int sign_bit = (xb.signs[j / 8] >> (j % 8)) & 1;
-        const float qjl_val = sign_bit ? qjl_scale : -qjl_scale;
-        out[jj] = ggml_cuda_cast<dst_t>((centroid_val + qjl_val) * norm);
-    }
+    /* Dequant: d * grid[idx] * (1 - 2*sign) */
+    const float grid_val = turbo4_polar_grid(idx);
+    yy[i * QK_TURBO4 + tid] = ggml_cuda_cast<dst_t>(d * grid_val * (1.0f - 2.0f * sign));
 }
 
 /* ===== Optimization #2: Flat no-WHT dequant — no shared memory, no syncthreads ===== */
@@ -323,7 +313,7 @@ template<typename dst_t>
 void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     GGML_ASSERT(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;
-    dequantize_block_turbo4_0<<<nb, 32, 0, stream>>>(vx, y, k);
+    dequantize_block_turbo4_0<<<nb, 256, 0, stream>>>(vx, y, k);  /* 256 threads = 1 per element */
 }
 
 /* Explicit template instantiations */

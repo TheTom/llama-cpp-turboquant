@@ -282,17 +282,18 @@ typedef struct {
 } block_turbo3_0;                       // 14 bytes total
 static_assert(sizeof(block_turbo3_0) == QK_TURBO3/4 + QK_TURBO3/8 + sizeof(ggml_half), "wrong turbo3_0 block size/padding");
 
-// TurboQuant 4-bit: 3-bit PolarQuant indices + 1-bit QJL signs
-// Per block: norm(fp16) + residual_norm(fp16) + 3-bit indices (48 bytes) + 1-bit signs (16 bytes)
-// = 68 bytes per 128 values = 4.25 bits/value → 3.8× compression vs fp16
-#define QK_TURBO4 128
+// TurboQuant 4-bit: 3-bit angle grid + 1-bit QJL sign (PolarQuant)
+// Per block: d(fp16) + 2-bit angle lo (64B) + 1-bit angle hi (32B) + 1-bit signs (32B)
+// = 130 bytes per 256 values = 4.0625 bits/value → 3.9× compression vs fp16
+// Layout matches nalditopr/ollama turboquant-support branch.
+#define QK_TURBO4 256
 typedef struct {
-    ggml_half  norm;                    //  2 bytes
-    ggml_half  rnorm;                   //  2 bytes
-    uint8_t    qs[QK_TURBO4 * 3 / 8];  // 48 bytes: 3-bit PolarQuant indices
-    uint8_t    signs[QK_TURBO4 / 8];   // 16 bytes: 1-bit QJL signs
-} block_turbo4_0;                       // 68 bytes total
-static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK_TURBO4/8, "wrong turbo4_0 block size/padding");
+    ggml_half  d;                       //   2 bytes: scale (absolute max)
+    uint8_t    al[QK_TURBO4 / 4];      //  64 bytes: 2-bit angle lo indices (4 per byte)
+    uint8_t    ah[QK_TURBO4 / 8];      //  32 bytes: 1-bit angle hi (8 per byte)
+    uint8_t    signs[QK_TURBO4 / 8];   //  32 bytes: 1-bit QJL signs (8 per byte)
+} block_turbo4_0;                       // 130 bytes total
+static_assert(sizeof(block_turbo4_0) == sizeof(ggml_half) + QK_TURBO4/4 + QK_TURBO4/8 + QK_TURBO4/8, "wrong turbo4_0 block size/padding");
 
 //
 // Super-block quantization structures

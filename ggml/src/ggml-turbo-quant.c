@@ -137,12 +137,48 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
-/* ===== turbo4 stub (not yet ported to reference approach) ===== */
+/* ===== turbo4: PolarQuant (3-bit angle grid + 1-bit QJL sign) ===== */
+
+static const float turbo4_grid[8] = {
+    1.0f/16.0f, 3.0f/16.0f, 5.0f/16.0f, 7.0f/16.0f,
+    9.0f/16.0f, 11.0f/16.0f, 13.0f/16.0f, 15.0f/16.0f
+};
 
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO4 == 0);
-    memset(y, 0, (k / QK_TURBO4) * sizeof(block_turbo4_0));
-    GGML_UNUSED(x);
+    const int64_t nb = k / QK_TURBO4;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i * QK_TURBO4;
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_TURBO4; j++) {
+            float av = fabsf(xb[j]);
+            if (av > amax) amax = av;
+        }
+        y[i].d = GGML_FP32_TO_FP16(amax);
+        float inv_d = amax > 0.0f ? 1.0f / amax : 0.0f;
+
+        memset(y[i].al, 0, QK_TURBO4 / 4);
+        memset(y[i].ah, 0, QK_TURBO4 / 8);
+        memset(y[i].signs, 0, QK_TURBO4 / 8);
+
+        for (int j = 0; j < QK_TURBO4; j++) {
+            float normalized = xb[j] * inv_d;
+            int best_idx = 0, best_sign = 0;
+            float best_err = 1e30f;
+            for (int g = 0; g < 8; g++) {
+                float gv = turbo4_grid[g];
+                float e_pos = (normalized - gv) * (normalized - gv);
+                float e_neg = (normalized + gv) * (normalized + gv);
+                if (e_pos < best_err) { best_err = e_pos; best_idx = g; best_sign = 0; }
+                if (e_neg < best_err) { best_err = e_neg; best_idx = g; best_sign = 1; }
+            }
+            y[i].al[j / 4] |= (uint8_t)((best_idx & 0x3) << ((j % 4) * 2));
+            if (best_idx & 0x4) y[i].ah[j / 8] |= (uint8_t)(1 << (j % 8));
+            if (best_sign)       y[i].signs[j / 8] |= (uint8_t)(1 << (j % 8));
+        }
+    }
 }
 
 void quantize_row_turbo4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
@@ -151,8 +187,18 @@ void quantize_row_turbo4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT v
 
 void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO4 == 0);
-    memset(y, 0, k * sizeof(float));
-    GGML_UNUSED(x);
+    const int64_t nb = k / QK_TURBO4;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK_TURBO4; j++) {
+            uint8_t lo  = (x[i].al[j / 4] >> ((j % 4) * 2)) & 0x3;
+            uint8_t hi  = (x[i].ah[j / 8] >> (j % 8)) & 0x1;
+            uint8_t idx = lo | (hi << 2);
+            uint8_t sign = (x[i].signs[j / 8] >> (j % 8)) & 0x1;
+            y[i * QK_TURBO4 + j] = d * turbo4_grid[idx] * (1.0f - 2.0f * sign);
+        }
+    }
 }
 
 size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,

@@ -2964,11 +2964,11 @@ llama_context * llama_init_from_model(
         }
     }
 
-    // TurboQuant: auto-enable flash_attn for best performance (FA path gives f16 parity).
-    // Non-FA MMVQ path works but has slow prefill (60 t/s vs 6800 FA).
+    // TurboQuant: auto-enable flash_attn for best performance.
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
-        (params.type_k == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_0)) {
-        LLAMA_LOG_WARN("%s: turbo3 cache — auto-enabling flash_attn for best performance\n", __func__);
+        (params.type_k == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_0 ||
+         params.type_k == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
+        LLAMA_LOG_WARN("%s: turbo cache — auto-enabling flash_attn for best performance\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
