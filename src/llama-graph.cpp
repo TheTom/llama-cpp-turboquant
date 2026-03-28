@@ -1817,7 +1817,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         // TurboQuant: dequant K/V with inverse WHT before flash attention.
-        // dequantize_block_turbo3_0 applies inverse WHT, restoring original values.
         if (k->type == GGML_TYPE_TURBO3_0) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F32);
             cb(k, "k_dequant", il);
@@ -1899,6 +1898,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
+
+        // TurboQuant: dequant V with inverse WHT before attention accumulation.
+        // K dot product already handled by MMVQ fused WHT (no K dequant needed).
+        if (ggml_is_quantized(v->type)) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            cb(v, "v_dequant", il);
+        }
 
         if (!v_trans) {
             // note: avoid this branch
