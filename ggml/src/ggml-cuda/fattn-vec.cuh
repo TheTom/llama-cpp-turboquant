@@ -75,7 +75,8 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr bool K_is_float_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_TURBO3_0);
+    constexpr bool K_is_float_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
+                                      type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0);
     constexpr bool V_is_float_like = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16);
     constexpr int nthreads_KQ = K_is_float_like ? 128 / cpy_nb : nthreads_KQ_q;
     constexpr int nthreads_V  = V_is_float_like ? 128 / cpy_nb : nthreads_V_q;
@@ -606,10 +607,14 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q8_0); \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_BF16); \
 
-/* TurboQuant turbo3 FA vec declarations */
+/* TurboQuant FA vec declarations */
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
 
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_F16)
 EXTERN_DECL_FATTN_VEC_CASES( 64, GGML_TYPE_Q4_0)
