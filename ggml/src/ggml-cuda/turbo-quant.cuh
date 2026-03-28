@@ -29,9 +29,17 @@ static __device__ __forceinline__ float turbo_centroid_3bit(int idx) {
 /* ===== Declarations ===== */
 
 void turbo_quant_init_cuda(cudaStream_t stream);
+void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 template<typename dst_t>
 void dequantize_row_turbo3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream);
+
+/* No-WHT dequant: centroid*gamma only (rotated space). Used for V cache optimization. */
+template<typename dst_t>
+void dequantize_row_turbo3_0_no_wht_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream);
+
+/* Inverse WHT32 on output data (post-matmul). Tiny: only output-sized, not cache-sized. */
+void turbo3_inverse_wht32_cuda(float * data, int64_t n_elements, cudaStream_t stream);
 
 template<typename dst_t>
 void dequantize_row_turbo4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream);

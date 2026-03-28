@@ -476,7 +476,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         ggml_cpy_q5_1_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_TURBO3_0 && src1->type == GGML_TYPE_F32) {
-        // TurboQuant: dequant with inverse WHT (cooperative 32-thread kernel)
+        // TurboQuant: full dequant with inverse WHT (used for K in FA path)
         GGML_ASSERT(ggml_is_contiguous(src1));
         dequantize_row_turbo3_0_cuda(src0_ddc, (float *)src1_ddc, ne, main_stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {

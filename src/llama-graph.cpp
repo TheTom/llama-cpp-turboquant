@@ -1899,7 +1899,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
-        // TurboQuant: dequant V with inverse WHT before attention accumulation.
+        // TurboQuant: dequant V with inverse WHT for attention accumulation.
         // K dot product already handled by MMVQ fused WHT (no K dequant needed).
         if (ggml_is_quantized(v->type)) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F32);

@@ -2812,7 +2812,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
             break;
-        /* TURBO_WHT no longer needed — WHT is fused into vec_dot and quantize */
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_op_turbo_wht(ctx, dst);
+            break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
@@ -5062,7 +5064,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
-        /* TURBO_WHT no longer needed — WHT fused into vec_dot/quantize */
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->type == GGML_TYPE_F32;
 
         default:
             return false;
