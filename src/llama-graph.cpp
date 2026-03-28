@@ -1816,13 +1816,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // TurboQuant: dequant K/V with inverse WHT before flash attention.
+        // TurboQuant FA path: cast to rotated F32, then apply inverse WHT to restore original values.
+        // (CPY does centroid*gamma only — no WHT. Explicit turbo_wht completes the dequant.)
         if (k->type == GGML_TYPE_TURBO3_0) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+            k = ggml_turbo_wht(ctx0, k, 1);  // inverse WHT
             cb(k, "k_dequant", il);
         }
         if (v->type == GGML_TYPE_TURBO3_0) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            v = ggml_turbo_wht(ctx0, v, 1);  // inverse WHT
             cb(v, "v_dequant", il);
         }
 
@@ -1899,11 +1902,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
-        // TurboQuant: dequant V with inverse WHT for attention accumulation.
-        // K dot product already handled by MMVQ fused WHT (no K dequant needed).
+        // TurboQuant non-FA path with WHT linearity optimization:
+        // K: MMVQ fuses WHT into dot product (no K dequant needed)
+        // V: cast to rotated F32 (no WHT — cheap), matmul in rotated space,
+        //    then apply inverse WHT only to the tiny output (not the full cache).
+        //    By WHT linearity: inv_WHT(sum(attn * V_rot)) = sum(attn * inv_WHT(V_rot))
+        const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0);
         if (ggml_is_quantized(v->type)) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F32);
-            cb(v, "v_dequant", il);
+            cb(v, "v_dequant_rot", il);
         }
 
         if (!v_trans) {
@@ -1914,6 +1921,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
+
+        // WHT linearity: apply inverse WHT32 to output instead of entire V cache.
+        // Output size = head_dim * n_heads * n_q (tiny during decode, n_q=1).
+        // Saves: n_kv * head_dim cooperative WHT invocations per layer.
+        if (v_is_turbo) {
+            kqv = ggml_turbo_wht(ctx0, kqv, 1);  // inverse WHT on output
+            cb(kqv, "kqv_inv_wht", il);
+        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
