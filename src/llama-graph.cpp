@@ -1816,6 +1816,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
+        // TurboQuant: dequant K/V with inverse WHT before flash attention.
+        // dequantize_block_turbo3_0 applies inverse WHT, restoring original values.
+        if (k->type == GGML_TYPE_TURBO3_0) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+            cb(k, "k_dequant", il);
+        }
+        if (v->type == GGML_TYPE_TURBO3_0) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            cb(v, "v_dequant", il);
+        }
+
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
