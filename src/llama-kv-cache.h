@@ -208,6 +208,15 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // TurboQuant+ temporal decay: position-aware KV quality degradation
+    struct turbo_decay_config {
+        bool enabled = false;
+        int hot_pct  = 15;   // newest tokens, full quality
+        int warm_pct = 35;   // middle tokens, base type quality
+        int cold_pct = 50;   // oldest tokens, degraded (signs zeroed)
+        bool hot_promote = false;  // phase 2: hot tier uses q8_0
+    };
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -264,6 +273,10 @@ private:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;
+
+    // TurboQuant+ temporal decay state
+    turbo_decay_config decay_cfg;
+    std::vector<llama_pos> last_cold_boundary;  // per-layer tracking
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

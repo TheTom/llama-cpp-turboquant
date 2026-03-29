@@ -32,6 +32,41 @@ static bool turbo_innerq_needs_tensor_update(void) { return false; }
 static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
 
+static llama_kv_cache::turbo_decay_config parse_turbo_decay() {
+    llama_kv_cache::turbo_decay_config cfg;
+    const char * env = getenv("TURBO_DECAY");
+    if (!env || strcmp(env, "off") == 0 || strlen(env) == 0) {
+        return cfg;  // disabled
+    }
+    cfg.enabled = true;
+
+    if (strcmp(env, "conservative") == 0) {
+        cfg.hot_pct = 25; cfg.warm_pct = 40; cfg.cold_pct = 35;
+    } else if (strcmp(env, "balanced") == 0) {
+        cfg.hot_pct = 15; cfg.warm_pct = 35; cfg.cold_pct = 50;
+    } else if (strcmp(env, "aggressive") == 0) {
+        cfg.hot_pct = 5; cfg.warm_pct = 25; cfg.cold_pct = 70;
+    } else {
+        int h = 0, w = 0, c = 0;
+        if (sscanf(env, "%d,%d,%d", &h, &w, &c) == 3 && h + w + c == 100 &&
+            h >= 0 && w >= 0 && c >= 0) {
+            cfg.hot_pct = h; cfg.warm_pct = w; cfg.cold_pct = c;
+        } else {
+            LLAMA_LOG_WARN("TURBO_DECAY: invalid value '%s', using balanced\n", env);
+            cfg.hot_pct = 15; cfg.warm_pct = 35; cfg.cold_pct = 50;
+        }
+    }
+
+    const char * promote = getenv("TURBO_DECAY_HOT_PROMOTE");
+    cfg.hot_promote = promote && atoi(promote) > 0;
+
+    LLAMA_LOG_INFO("turbo_decay: enabled (%d/%d/%d hot/warm/cold%s)\n",
+        cfg.hot_pct, cfg.warm_pct, cfg.cold_pct,
+        cfg.hot_promote ? ", hot_promote" : "");
+
+    return cfg;
+}
+
 //
 // llama_kv_cache
 //
@@ -309,6 +344,13 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
+
+    // Parse temporal decay config (once, after all layers created)
+    {
+        static const auto s_decay_cfg = parse_turbo_decay();
+        decay_cfg = s_decay_cfg;
+    }
+    last_cold_boundary.resize(layers.size(), 0);
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
