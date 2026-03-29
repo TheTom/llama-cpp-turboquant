@@ -1,6 +1,9 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#define GGML_COMMON_DECL_CPP
+#define GGML_COMMON_IMPL_CPP
+#include "ggml-common.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
@@ -10720,6 +10723,45 @@ void ggml_compute_forward_turbo_wht(
         case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
         default: GGML_ABORT("fatal error");
     }
+}
+
+// ggml_compute_forward_turbo_decay
+
+void ggml_compute_forward_turbo_decay(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) return;
+
+    const ggml_tensor * src = dst->src[0];
+    int64_t cold_start, cold_end;
+    memcpy(&cold_start, dst->op_params + 0, sizeof(int64_t));
+    memcpy(&cold_end,   dst->op_params + 2, sizeof(int64_t));
+
+    if (cold_start >= cold_end) return;
+
+    const int64_t ne0 = src->ne[0];
+
+    if (src->type == GGML_TYPE_TURBO3_0) {
+        const int64_t bpr = ne0 / QK_TURBO3;
+        block_turbo3_0 * data = (block_turbo3_0 *)src->data;
+        for (int64_t pos = cold_start; pos < cold_end; pos++) {
+            for (int64_t b = 0; b < bpr; b++) {
+                memset(data[pos * bpr + b].signs, 0, QK_TURBO3 / 8);
+            }
+        }
+    }
+#if !TURBO4_USE_4BIT
+    else if (src->type == GGML_TYPE_TURBO4_0) {
+        const int64_t bpr = ne0 / QK_TURBO4;
+        block_turbo4_0 * data = (block_turbo4_0 *)src->data;
+        for (int64_t pos = cold_start; pos < cold_end; pos++) {
+            for (int64_t b = 0; b < bpr; b++) {
+                memset(data[pos * bpr + b].signs, 0, QK_TURBO4 / 8);
+                data[pos * bpr + b].rnorm = GGML_FP32_TO_FP16(0.0f);
+            }
+        }
+    }
+#endif
 }
 
 // ggml_compute_forward_rwkv_wkv7
