@@ -1065,6 +1065,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "TURBO_WHT",
+    "TURBO_DECAY",
 
     "UNARY",
 
@@ -1082,7 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1176,6 +1177,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "turbo_wht(a)",
+    "turbo_decay(x)",
 
     "unary(x)",
 
@@ -1193,7 +1195,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6248,6 +6250,26 @@ struct ggml_tensor * ggml_turbo_wht(
     // Store direction and group_size in op_params
     memcpy(result->op_params + 0, &direction, sizeof(int));
     memcpy(result->op_params + sizeof(int), &group_size, sizeof(int));
+
+    return result;
+}
+
+// ggml_turbo_decay
+
+struct ggml_tensor * ggml_turbo_decay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int64_t               cold_start,
+        int64_t               cold_end) {
+    GGML_ASSERT(a->type == GGML_TYPE_TURBO3_0 || a->type == GGML_TYPE_TURBO4_0);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    result->op = GGML_OP_TURBO_DECAY;
+    result->src[0] = a;
+
+    memcpy(result->op_params + 0, &cold_start, sizeof(int64_t));
+    memcpy(result->op_params + 2, &cold_end,   sizeof(int64_t));
 
     return result;
 }

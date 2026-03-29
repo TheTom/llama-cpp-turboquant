@@ -563,6 +563,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_TURBO_WHT,
+        GGML_OP_TURBO_DECAY,
 
         GGML_OP_UNARY,
 
@@ -2494,6 +2495,13 @@ extern "C" {
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // TurboQuant temporal decay: zero signs field of turbo blocks in position range [cold_start, cold_end)
+    GGML_API struct ggml_tensor * ggml_turbo_decay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_cache,
+            int64_t               cold_start,
+            int64_t               cold_end);
 
     // custom operators
 
