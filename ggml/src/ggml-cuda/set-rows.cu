@@ -311,10 +311,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_TURBO3_0) {
-        set_rows_cuda_quant<idx_t, block_turbo3_0, QK_TURBO3, quantize_f32_turbo3_0_block>(
+        /* WHT128 rotation group = 4 blocks of 32. Custom kernel. */
+        turbo3_set_rows_cuda(
             src0_d, src1_d, (block_turbo3_0*)dst->data,
             ne00, ne01, ne02, ne03,
-            ne10, ne11, ne12, ne13,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,

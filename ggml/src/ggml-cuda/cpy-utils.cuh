@@ -211,8 +211,9 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
-// TurboQuant turbo3: 3-bit uniform quantization (Lucien approach)
-// round(x/d) clamped [-4,3], stored as [0,7], packed 8 per 3 bytes
+// TurboQuant turbo3: per-block quantize (no rotation — rotation is per 128-element group).
+// Called per 32-element block from set_rows. WHT128 rotation is applied by the
+// set_rows kernel across 4 consecutive blocks before calling this.
 static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ x, block_turbo3_0 * __restrict__ y) {
     float amax = 0.0f;
     for (int j = 0; j < 32; j++) {
