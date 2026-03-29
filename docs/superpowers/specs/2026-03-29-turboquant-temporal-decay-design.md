@@ -45,18 +45,41 @@ Boundaries are recomputed on every new token insertion (trivial: three integer m
 
 ### Cold Tier Demotion (Warm -> Cold)
 
-turbo3 block layout:
+**turbo3**: The `signs[]` field stores the high bit of the 3-bit centroid index (NOT QJL signs). The dequant path reconstructs indices as `idx = low2 | (hi1 << 2)`. Zeroing signs clamps all indices to the range [0-3] (4-level reconstruction) instead of [0-7] (8-level). This is a clean halving of reconstruction precision.
+
 ```
 block_turbo3_0 {
     ggml_half norm;               // 2 bytes -- keep
-    uint8_t   qs[QK_TURBO3/4];   // 8 bytes -- keep (3-bit centroid indices)
-    uint8_t   signs[QK_TURBO3/8]; // 4 bytes -- ZERO (QJL refinement bits)
+    uint8_t   qs[QK_TURBO3/4];   // 8 bytes -- keep (low 2-bit centroid indices)
+    uint8_t   signs[QK_TURBO3/8]; // 4 bytes -- ZERO (high 1-bit of 3-bit index)
 }
 ```
 
-Demotion = `memset(block.signs, 0, QK_TURBO3/8)`. The dequant path naturally handles this: with signs all zero, the QJL contribution becomes `(-1) * qjl_scale` for every element (uniform bias), which effectively reduces to centroid-only reconstruction with a systematic offset. Setting `rnorm=0` in turbo4 blocks eliminates the QJL contribution entirely since `qjl_scale = sqrt(pi/2) / 128 * rnorm`.
+Demotion = `memset(block.signs, 0, QK_TURBO3/8)`. Idempotent -- demoting an already-cold block is a no-op.
 
-For turbo3 (where signs encode the 3rd centroid bit, not QJL): the cold demotion instead clamps centroid indices to 4 levels by zeroing the high bit in signs. This reduces from 8-level to 4-level reconstruction.
+**turbo4 (legacy 3-bit+QJL, TURBO4_USE_4BIT=0)**: The `signs[]` field stores 1-bit QJL refinement signs. Setting `rnorm=0` eliminates the QJL contribution entirely since `qjl_scale = sqrt(pi/2) / 128 * rnorm`. The 3-bit centroid indices in `qs[]` are preserved.
+
+**turbo4 (4-bit PolarQuant, TURBO4_USE_4BIT=1)**: No QJL component. Cold demotion is not applicable -- no degradation possible within the format. Decay skips turbo4 in 4-bit mode (analogous to turbo2 in the layer-adaptive section).
+
+### Boundary Computation (Position Space)
+
+Boundaries are computed in **position space**, not cell index space. The KV cache is a ring buffer where cell indices are not monotonically ordered by position.
+
+```
+min_pos = seq_pos_min(seq_id)
+max_pos = seq_pos_max(seq_id)
+range   = max_pos - min_pos
+cold_boundary_pos = min_pos + range * cold_pct / 100
+warm_boundary_pos = min_pos + range * (cold_pct + warm_pct) / 100
+```
+
+Cells with `pos < cold_boundary_pos` are cold tier candidates. Demotion scans cells by position, not by contiguous index ranges.
+
+### Multi-Sequence Policy
+
+When multiple sequences share KV cells, demotion uses the **maximum position** across all sequences referencing a cell. A cell is only cold if it's cold for ALL sequences. This is conservative -- shared cells are demoted last.
+
+For simplicity, Phase 1 activates temporal decay only for single-sequence workloads (n_seq=1). Multi-sequence support deferred to Phase 2.
 
 ### Hot Tier Promotion (Optional)
 
@@ -67,15 +90,23 @@ When `TURBO_DECAY_HOT_PROMOTE=1`:
 
 This is the expensive path. Implementation deferred to phase 2.
 
-### Piggyback on SET_ROWS
+### Graph-Level Decay Op
 
-Every token generation already calls `cpy_k()` / `cpy_v()` which dispatches SET_ROWS to write the new KV entry. During the same graph evaluation, one additional operation demotes a single block that crossed a tier boundary:
+`cpy_k()` / `cpy_v()` build ggml graph nodes (they don't execute directly). The decay operation is a proper ggml op (`GGML_OP_TURBO_DECAY`) added to the graph after `ggml_set_rows`. The graph scheduler handles execution ordering.
 
-1. After writing new token at position P, compute `cold_boundary = P * cold_pct`
-2. If `cold_boundary` advanced past a block boundary since last check, schedule demotion of that block
-3. Demotion kernel: memset signs field to 0 for the target block. Single warp, negligible cost.
+1. In `cpy_k`/`cpy_v`, after the SET_ROWS node, compute the new cold boundary in position space.
+2. If the boundary advanced since the last call, append a `ggml_turbo_decay` node targeting the cells that crossed into cold tier.
+3. The decay kernel (CUDA/HIP/CPU) scans the specified position range and zeroes the signs field for each matching block.
 
-Amortized cost: one memset per token per layer. At 64 layers, that's 64 * 4-byte memsets = 256 bytes of writes per generated token. Invisible.
+Cost: one kernel launch per layer when boundaries advance. At steady-state generation, boundaries advance by ~1 position per token, so ~1 block per layer gets demoted. Total writes: 64 layers * 4 bytes = 256 bytes per token. Invisible.
+
+### Edge Cases
+
+- **Sliding window attention (ISWA)**: SWA layers already evict old tokens. Decay only applies to the base (non-SWA) cache in `llama_kv_cache_iswa`.
+- **Sequence deletion (seq_rm)**: When positions are removed, `last_cold_boundary` may exceed the new max position. Reset it to 0 on seq_rm to trigger a full rescan.
+- **Cache defragmentation**: Defrag moves cells without changing positions. Decay state (`last_cold_boundary`) is position-based, so defrag is transparent.
+- **State serialization**: Degraded blocks are saved as-is. Decay is irreversible -- restored state has the degraded quality. This is by design.
+- **Idempotency**: memset on already-zeroed signs is a no-op. Safe to re-demote.
 
 ## Configuration
 
@@ -155,7 +186,7 @@ This means the 2D compression map automatically does the right thing: quality-se
 
 ## Success Criteria
 
-- turbo3 + decay=balanced fits 2x more context than turbo3-alone in 24GB VRAM
+- turbo3 + decay=balanced maintains <5% PPL regression at 64K context (vs turbo3-alone which degrades uniformly)
 - PPL at 64K context < 10% regression vs F16
 - No measurable tg speed regression
 - NIAH retrieval accuracy > 95% for needles in hot+warm tiers
