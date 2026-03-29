@@ -276,7 +276,7 @@ private:
 
     // TurboQuant+ temporal decay state
     turbo_decay_config decay_cfg;
-    std::vector<llama_pos> last_cold_boundary;  // per-layer tracking
+    mutable std::vector<llama_pos> last_cold_boundary;  // per-layer tracking
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

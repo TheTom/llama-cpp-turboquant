@@ -1270,6 +1270,26 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         memcpy(result->op_params, &wht_group, sizeof(int32_t));
     }
 
+    // Temporal decay: demote positions that crossed into cold tier
+    if (decay_cfg.enabled &&
+        (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) &&
+        n_seq_max == 1) {
+        const llama_pos max_pos = v_cells[0].seq_pos_max(0);
+        const llama_pos min_pos = v_cells[0].seq_pos_min(0);
+        const llama_pos range = max_pos - min_pos;
+
+        if (range > 0) {
+            const llama_pos cold_boundary = min_pos + (range * decay_cfg.cold_pct) / 100;
+            const int32_t ikv_layer = map_layer_ids.at(il);
+
+            if (cold_boundary > last_cold_boundary[ikv_layer]) {
+                result = ggml_turbo_decay(ctx, result,
+                    last_cold_boundary[ikv_layer], cold_boundary);
+                last_cold_boundary[ikv_layer] = cold_boundary;
+            }
+        }
+    }
+
     return result;
 }
 
@@ -1310,6 +1330,27 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             int32_t wht_group = (n_embd_head % 128 == 0) ? 128 : 64;
             memcpy(result->op_params, &wht_group, sizeof(int32_t));
         }
+
+        // Temporal decay for V cache
+        if (decay_cfg.enabled &&
+            (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) &&
+            n_seq_max == 1) {
+            const llama_pos max_pos = v_cells[0].seq_pos_max(0);
+            const llama_pos min_pos = v_cells[0].seq_pos_min(0);
+            const llama_pos range = max_pos - min_pos;
+
+            if (range > 0) {
+                const llama_pos cold_boundary = min_pos + (range * decay_cfg.cold_pct) / 100;
+                const int32_t ikv_layer = map_layer_ids.at(il);
+
+                if (cold_boundary > last_cold_boundary[ikv_layer]) {
+                    result = ggml_turbo_decay(ctx, result,
+                        last_cold_boundary[ikv_layer], cold_boundary);
+                    last_cold_boundary[ikv_layer] = cold_boundary;
+                }
+            }
+        }
+
         return result;
     }
 
