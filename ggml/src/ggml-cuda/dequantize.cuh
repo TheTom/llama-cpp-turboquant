@@ -76,39 +76,30 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
-/* TurboQuant turbo3: Lloyd-Max centroid dequant (float2 interface, rotated space).
- * Used by generic dequantize_block_cuda. Does NOT apply inverse WHT —
- * full dequant with inverse WHT uses dequantize_row_turbo3_0_cuda. */
+/* TurboQuant turbo3: 3-bit uniform quantization dequant (float2 interface).
+ * Values stored as [0,7] with offset -4. Packed 8 per 3 bytes.
+ * QR_TURBO3=2: produces 2 float values per call, iqs ranges 0..15. */
 #define QR_TURBO3 2
 
 static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
-    const float norm = __half2float(x[ib].d);  /* group norm stored in d */
+    const float d = __half2float(x[ib].d);
 
-    const float cn[8] = {
-        -0.18165533f, -0.11483849f, -0.06487426f, -0.02106513f,
-         0.02106513f,  0.06487426f,  0.11483849f,  0.18165533f
-    };
-
-    const int group_idx = iqs / 4;
-    const int pair_idx  = iqs % 4;
+    const int group_idx = iqs / 4;  // which group of 8 (0..3)
+    const int pair_idx  = iqs % 4;  // which pair within group (0..3)
     const uint8_t * qs = x[ib].qs + group_idx * 3;
 
-    int v0, v1;
     if (pair_idx == 0) {
-        v0 = (qs[0] & 7);
-        v1 = ((qs[0] >> 3) & 7);
+        v.x = ((qs[0] & 7) - 4.0f) * d;
+        v.y = (((qs[0] >> 3) & 7) - 4.0f) * d;
     } else if (pair_idx == 1) {
-        v0 = ((qs[0] >> 6) & 3) | ((qs[1] & 1) << 2);
-        v1 = ((qs[1] >> 1) & 7);
+        v.x = ((((qs[0] >> 6) & 3) | ((qs[1] & 1) << 2)) - 4.0f) * d;
+        v.y = (((qs[1] >> 1) & 7) - 4.0f) * d;
     } else if (pair_idx == 2) {
-        v0 = ((qs[1] >> 4) & 7);
-        v1 = ((qs[1] >> 7) & 1) | ((qs[2] & 3) << 1);
+        v.x = (((qs[1] >> 4) & 7) - 4.0f) * d;
+        v.y = ((((qs[1] >> 7) & 1) | ((qs[2] & 3) << 1)) - 4.0f) * d;
     } else {
-        v0 = ((qs[2] >> 2) & 7);
-        v1 = ((qs[2] >> 5) & 7);
+        v.x = (((qs[2] >> 2) & 7) - 4.0f) * d;
+        v.y = (((qs[2] >> 5) & 7) - 4.0f) * d;
     }
-
-    v.x = cn[v0] * norm;
-    v.y = cn[v1] * norm;
 }
