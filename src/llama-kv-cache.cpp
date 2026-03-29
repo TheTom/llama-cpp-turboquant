@@ -47,11 +47,14 @@ llama_kv_cache::llama_kv_cache(
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
     // create a context for each buffer type
+    // TurboQuant types need 2 extra tensors for rotation matrices (turbo_rotation + turbo_rotation_inv)
+    const size_t n_turbo_extra = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0) ? 2 : 0;
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + n_turbo_extra)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
