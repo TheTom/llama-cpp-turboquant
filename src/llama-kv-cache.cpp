@@ -21,17 +21,13 @@
 #endif
 
 #ifdef GGML_USE_CUDA
-extern bool  g_innerq_finalized;
-extern float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
-extern bool turbo_innerq_needs_tensor_update(void);
-extern void turbo_innerq_mark_tensor_updated(void);
+#include "../ggml/src/ggml-cuda/turbo-innerq.cuh"
 #else
 static bool  g_innerq_finalized = false;
 static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
 static bool turbo_innerq_needs_tensor_update(void) { return false; }
 static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
-
 //
 // llama_kv_cache
 //
