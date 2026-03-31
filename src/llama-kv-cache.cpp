@@ -119,6 +119,41 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // TurboQuant auto-asymmetric: symmetric turbo K+V causes catastrophic PPL on
+    // some models when combined with aggressive weight quantization (Qwen 2.5 Q4_K_M:
+    // PPL 4015 symmetric vs 8.85 asymmetric q8_0-K + turbo3-V).
+    //
+    // V compression is virtually lossless across all models tested (+0.3%).
+    // K compression is model-sensitive — safe on Qwen3.5/Mixtral/Llama, catastrophic on Qwen2.5.
+    //
+    // When both K and V are turbo and the model uses quantized weights (not F16/F32),
+    // auto-downgrade K to q8_0. Override with TURBO_SYMMETRIC=1.
+    {
+        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0);
+        const bool v_is_turbo = (type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
+        const bool symmetric = k_is_turbo && v_is_turbo;
+
+        static const bool force_symmetric = []() {
+            const char * env = getenv("TURBO_SYMMETRIC");
+            return env && atoi(env) > 0;
+        }();
+
+        if (symmetric && !force_symmetric) {
+            // Check if model weights are quantized by inspecting the token embedding type.
+            // F16/F32/BF16 weights are safe for symmetric turbo. Quantized weights (Q2-Q6)
+            // risk quantization stacking on K-sensitive models.
+            const ggml_type embd_type = model.tok_embd ? model.tok_embd->type : GGML_TYPE_F16;
+            const bool weights_quantized = ggml_is_quantized(embd_type);
+            if (weights_quantized) {
+                LLAMA_LOG_WARN("%s: model has quantized weights — auto-switching K cache to q8_0 "
+                               "for safe asymmetric mode (V stays %s). "
+                               "Set TURBO_SYMMETRIC=1 to force symmetric turbo K+V.\n",
+                               __func__, ggml_type_name(type_v));
+                type_k = GGML_TYPE_Q8_0;
+            }
+        }
+    }
+
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
