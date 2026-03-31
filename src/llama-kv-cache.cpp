@@ -21,10 +21,10 @@
 #endif
 
 #ifdef GGML_USE_CUDA
-extern bool  g_innerq_finalized;
-extern float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
-extern bool turbo_innerq_needs_tensor_update(void);
-extern void turbo_innerq_mark_tensor_updated(void);
+GGML_API bool  g_innerq_finalized;
+GGML_API float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
+GGML_API bool turbo_innerq_needs_tensor_update(void);
+GGML_API void turbo_innerq_mark_tensor_updated(void);
 #else
 static bool  g_innerq_finalized = false;
 static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};

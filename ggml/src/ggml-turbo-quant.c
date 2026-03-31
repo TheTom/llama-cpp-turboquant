@@ -10,13 +10,17 @@
 #include "ggml-common.h"
 #include "ggml-impl.h"
 
+#if defined(_WIN32) && !defined(_USE_MATH_DEFINES)
+#define _USE_MATH_DEFINES
+#endif 
+
 #include <math.h>
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
 
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-int turbo3_cpu_wht_group_size = 0;
+GGML_API int turbo3_cpu_wht_group_size = 0;
 
 /* ---------- constants ---------- */
 
@@ -246,7 +250,6 @@ void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * G
 
     // Read WHT group size from global (set by CPU SET_ROWS handler before each call).
     // Fallback: 128 if row is 128-aligned, else 64.
-    extern int turbo3_cpu_wht_group_size;
     int group_size = turbo3_cpu_wht_group_size;
     if (group_size != 64 && group_size != 128) {
         group_size = (k % 128 == 0) ? 128 : 64;
@@ -341,7 +344,6 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO2 == 0);
 
-    extern int turbo3_cpu_wht_group_size;
     int group_size = turbo3_cpu_wht_group_size;
     if (group_size != 64 && group_size != 128) {
         group_size = (k % 128 == 0) ? 128 : 64;
