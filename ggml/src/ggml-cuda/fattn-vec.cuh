@@ -17,7 +17,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 3) // 3 blocks/SM for better latency hiding
 static __global__ void flash_attn_ext_vec(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -78,14 +78,14 @@ static __global__ void flash_attn_ext_vec(
     // Turbo types now use q8_1 quantized Q (cheaper integer dot product) but keep nthreads_KQ=8 for better ILP at long context
     constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16);
     constexpr bool K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
-    constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
+    constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16);
     constexpr int nthreads_KQ = K_is_unquantized ? 128 / cpy_nb : (K_is_turbo ? 128 / cpy_nb : nthreads_KQ_q);
-    constexpr int nthreads_V  = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0) ? nthreads_V_q : 128 / cpy_nb) : nthreads_V_q;
+    constexpr int nthreads_V  = V_is_unquantized ? 128 / cpy_nb : nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0) ? 4 : 2*cpy_ne) : 4;
+    constexpr int V_rows_per_thread = V_is_unquantized ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
@@ -128,15 +128,18 @@ static __global__ void flash_attn_ext_vec(
     // then the hot loop just does turbo_lut[d][idx] (shared memory read, no multiply).
     // Only used for ncols==1 (decode path). Stride = n_centroids+1 to avoid bank conflicts.
     // turbo4 excluded: 16 centroids × D exceeds shared memory budget (Dead End per Madreag).
+    // LUT for turbo3 (8 centroids) and turbo2 (4 centroids). turbo4 excluded: 16 centroids
+    // makes the LUT too large — shmem pressure kills occupancy (confirmed by Madreag + us).
     constexpr int n_centroids_lut = (D <= 256 && type_K == GGML_TYPE_TURBO3_0) ? 8 :
                                     (D <= 256 && type_K == GGML_TYPE_TURBO2_0) ? 4 : 0;
     constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
     __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
 
     // Sparse V: skip V dequant for positions with negligible attention weights.
-    // At long context, most V positions contribute < 1e-6 to the output — skipping
-    // their dequant saves significant compute (especially for quantized V types).
-    constexpr float sparse_v_threshold_f = 1e-6f;
+    // Sparse V: skip V dequant for positions with negligible attention weights.
+    // More aggressive thresholds for lower-bpv types (validated: zero PPL impact per Madreag).
+    constexpr bool V_is_low_bpv = (type_V == GGML_TYPE_TURBO2_0);
+    constexpr float sparse_v_threshold_f = V_is_low_bpv ? 1e-2f : 5e-3f;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     const     half  sparse_v_threshold_h = __float2half(sparse_v_threshold_f);
 #endif
@@ -283,8 +286,11 @@ static __global__ void flash_attn_ext_vec(
 #if __CUDA_ARCH__ >= 500
         if (k_VKQ_0 + gridDim.y*nthreads < k_VKQ_max) {
             const char * K_next = K + gridDim.y*nthreads*nb11;
+            const char * V_next = V + gridDim.y*nthreads*nb21;
             asm volatile("prefetch.global.L2 [%0];" :: "l"(K_next));
             asm volatile("prefetch.global.L2 [%0];" :: "l"(K_next + nb11));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(V_next));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(V_next + nb21));
         }
 #endif
 
