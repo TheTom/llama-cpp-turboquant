@@ -419,3 +419,35 @@ static __device__ __forceinline__ float turbo2_dequant_element(
     uint8_t idx = (x->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
     return TURBO_CENTROIDS_2BIT[idx] * norm;
 }
+
+// ============================================================================
+// Weight compression types (TQ3_1S, TQ4_1S)
+// These use N(0,1) centroids (NOT N(0,1/128) like KV cache types)
+// and require inverse WHT (RHT) after centroid lookup.
+// ============================================================================
+
+#define QR_TQ4_1S 1  // dequantize produces 2 consecutive elements
+#define QR_TQ3_1S 1
+
+// ---- Weight centroids: Lloyd-Max for N(0,1) ----
+
+static __constant__ float TQ4_CENTROIDS_WEIGHT[16] = {
+    -2.732590f, -2.069017f, -1.618046f, -1.256231f,
+    -0.942340f, -0.656759f, -0.388048f, -0.128395f,
+     0.128395f,  0.388048f,  0.656759f,  0.942340f,
+     1.256231f,  1.618046f,  2.069017f,  2.732590f
+};
+
+static __constant__ float TQ3_CENTROIDS_WEIGHT[8] = {
+    -1.996684f, -1.291398f, -0.740341f, -0.247508f,
+     0.230106f,  0.725222f,  1.277503f,  1.988943f
+};
+
+// ---- Sign array for weight WHT (golden ratio hash, 32 elements) ----
+
+static __constant__ float TQ_WEIGHT_SIGNS[32] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f
+};
