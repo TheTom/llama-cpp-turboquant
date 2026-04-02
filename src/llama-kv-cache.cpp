@@ -328,8 +328,10 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_stream, v_stream, });
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
+        // NOTE: check BOTH type_k and type_v for asymmetric configs (e.g., -ctk q8_0 -ctv turbo3)
         if (turbo_rotation == nullptr &&
-            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0)) {
+            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0 ||
+             type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
@@ -338,6 +340,10 @@ llama_kv_cache::llama_kv_cache(
             // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
             turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
+
+            LLAMA_LOG_INFO("%s: [DIAG #47] turbo rotation matrices allocated (K=%s, V=%s, asymmetric=%s)\n",
+                __func__, ggml_type_name(type_k), ggml_type_name(type_v),
+                (type_k != type_v) ? "YES" : "no");
         }
     }
 

@@ -2150,6 +2150,25 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // [DIAG #47] Log asymmetric config details on first attention layer
+    {
+        static bool diag_logged = false;
+        if (!diag_logged) {
+            const bool k_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+            const bool v_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
+            if (k_turbo || v_turbo) {
+                ggml_tensor * iq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+                LLAMA_LOG_WARN("[DIAG #47] build_attn il=%d: K=%s V=%s asymmetric=%s Q_prerot=%s innerq_scale=%s head_dim_v=%d\n",
+                    il, ggml_type_name(k->type), ggml_type_name(v->type),
+                    (k->type != v->type) ? "YES" : "no",
+                    k_turbo ? "YES" : "SKIP",
+                    iq_scale ? "allocated" : "NULL",
+                    (int)hparams.n_embd_head_v(il));
+                diag_logged = true;
+            }
+        }
+    }
+
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
@@ -2169,7 +2188,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo (#47)
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
@@ -2283,7 +2303,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
     // extract original V head_dim after inverse WHT.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo (#47)
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
         const int64_t orig_v_head = v_cur->ne[0];  // original V head_dim from model
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
@@ -2389,7 +2410,8 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo (#47)
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
