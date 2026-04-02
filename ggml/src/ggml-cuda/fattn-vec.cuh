@@ -124,6 +124,15 @@ static __global__ void flash_attn_ext_vec(
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
 
+    // Shared-memory LUT for turbo KQ scoring: precompute Q[d] * centroid[c] once,
+    // then the hot loop just does turbo_lut[d][idx] (shared memory read, no multiply).
+    // Only used for ncols==1 (decode path). Stride = n_centroids+1 to avoid bank conflicts.
+    // turbo4 excluded: 16 centroids × D exceeds shared memory budget (Dead End per Madreag).
+    constexpr int n_centroids_lut = (D <= 256 && type_K == GGML_TYPE_TURBO3_0) ? 8 :
+                                    (D <= 256 && type_K == GGML_TYPE_TURBO2_0) ? 4 : 0;
+    constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
+    __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
+
     // Sparse V: skip V dequant for positions with negligible attention weights.
     // At long context, most V positions contribute < 1e-6 to the output — skipping
     // their dequant saves significant compute (especially for quantized V types).
@@ -249,12 +258,35 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+
+    // Build shared-memory LUT: turbo_lut[d][c] = half(Q[d] * scale * centroid[c])
+    if constexpr (n_centroids_lut > 0 && ncols == 1) {
+        const float * centroids_ptr = (type_K == GGML_TYPE_TURBO3_0) ? TURBO_CENTROIDS_3BIT :
+                                      TURBO_CENTROIDS_2BIT;
+        const float * Q_f = (const float *)(Q + 0*nb01);
+        for (int d = tid; d < D; d += nthreads) {
+            const float q_val = Q_f[d] * scale;
+            for (int c = 0; c < n_centroids_lut; c++) {
+                turbo_lut[d][c] = __float2half(q_val * centroids_ptr[c]);
+            }
+        }
+        __syncthreads();
+    }
+
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+#if __CUDA_ARCH__ >= 500
+        if (k_VKQ_0 + gridDim.y*nthreads < k_VKQ_max) {
+            const char * K_next = K + gridDim.y*nthreads*nb11;
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(K_next));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(K_next + nb11));
+        }
+#endif
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -271,7 +303,61 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum;
+                if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO3_0) {
+                    // LUT scoring: 8 elements per iteration (2 qs bytes + 1 signs byte)
+                    const block_turbo3_0 * K_turbo = (const block_turbo3_0 *)(K + i_KQ*nb11);
+                    sum = 0.0f;
+#pragma unroll
+                    for (int d0 = 0; d0 < D; d0 += 8 * nthreads_KQ) {
+                        const int d_base = d0 + (threadIdx.x % nthreads_KQ) * 8;
+                        const int ib = d_base / QK_TURBO3;
+                        const int jj = d_base % QK_TURBO3;
+                        const float norm = __half2float(K_turbo[ib].norm);
+                        const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
+                        const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
+                        const uint8_t sgn = K_turbo[ib].signs[jj / 8];
+                        const uint8_t idx0 = ((qs0 >> 0) & 0x3) | (((sgn >> 0) & 0x1) << 2);
+                        const uint8_t idx1 = ((qs0 >> 2) & 0x3) | (((sgn >> 1) & 0x1) << 2);
+                        const uint8_t idx2 = ((qs0 >> 4) & 0x3) | (((sgn >> 2) & 0x1) << 2);
+                        const uint8_t idx3 = ((qs0 >> 6) & 0x3) | (((sgn >> 3) & 0x1) << 2);
+                        const uint8_t idx4 = ((qs1 >> 0) & 0x3) | (((sgn >> 4) & 0x1) << 2);
+                        const uint8_t idx5 = ((qs1 >> 2) & 0x3) | (((sgn >> 5) & 0x1) << 2);
+                        const uint8_t idx6 = ((qs1 >> 4) & 0x3) | (((sgn >> 6) & 0x1) << 2);
+                        const uint8_t idx7 = ((qs1 >> 6) & 0x3) | (((sgn >> 7) & 0x1) << 2);
+                        sum += (__half2float(turbo_lut[d_base  ][idx0]) + __half2float(turbo_lut[d_base+1][idx1]) +
+                                __half2float(turbo_lut[d_base+2][idx2]) + __half2float(turbo_lut[d_base+3][idx3]) +
+                                __half2float(turbo_lut[d_base+4][idx4]) + __half2float(turbo_lut[d_base+5][idx5]) +
+                                __half2float(turbo_lut[d_base+6][idx6]) + __half2float(turbo_lut[d_base+7][idx7])) * norm;
+                    }
+                } else if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO2_0) {
+                    // LUT scoring for turbo2: 8 elements per iteration (2 qs bytes, no signs)
+                    const block_turbo2_0 * K_turbo = (const block_turbo2_0 *)(K + i_KQ*nb11);
+                    sum = 0.0f;
+#pragma unroll
+                    for (int d0 = 0; d0 < D; d0 += 8 * nthreads_KQ) {
+                        const int d_base = d0 + (threadIdx.x % nthreads_KQ) * 8;
+                        const int ib = d_base / QK_TURBO2;
+                        const int jj = d_base % QK_TURBO2;
+                        const float norm = __half2float(K_turbo[ib].norm);
+                        const uint8_t qs0 = K_turbo[ib].qs[jj / 4];
+                        const uint8_t qs1 = K_turbo[ib].qs[jj / 4 + 1];
+                        const uint8_t idx0 = (qs0 >> 0) & 0x3;
+                        const uint8_t idx1 = (qs0 >> 2) & 0x3;
+                        const uint8_t idx2 = (qs0 >> 4) & 0x3;
+                        const uint8_t idx3 = (qs0 >> 6) & 0x3;
+                        const uint8_t idx4 = (qs1 >> 0) & 0x3;
+                        const uint8_t idx5 = (qs1 >> 2) & 0x3;
+                        const uint8_t idx6 = (qs1 >> 4) & 0x3;
+                        const uint8_t idx7 = (qs1 >> 6) & 0x3;
+                        sum += (__half2float(turbo_lut[d_base  ][idx0]) + __half2float(turbo_lut[d_base+1][idx1]) +
+                                __half2float(turbo_lut[d_base+2][idx2]) + __half2float(turbo_lut[d_base+3][idx3]) +
+                                __half2float(turbo_lut[d_base+4][idx4]) + __half2float(turbo_lut[d_base+5][idx5]) +
+                                __half2float(turbo_lut[d_base+6][idx6]) + __half2float(turbo_lut[d_base+7][idx7])) * norm;
+                    }
+                } else {
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                }
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
