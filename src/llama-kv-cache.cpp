@@ -431,10 +431,15 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
+    // TurboQuant: disable upstream graph-level activation rotation by default.
+    // Our fork uses kernel-level WHT rotation (simd_shuffle_xor in Metal/CUDA)
+    // which is independent and more efficient. The upstream rotation adds extra
+    // graph nodes that cause hash table overflow on some models (e.g. Phi-4).
+    // Users can re-enable with LLAMA_ATTN_ROT_DISABLE=0 if needed.
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
+    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : true;
     if (attn_rot_disable) {
-        LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+        LLAMA_LOG_INFO("%s: upstream attention rotation disabled (TurboQuant uses kernel-level WHT)\n", __func__);
     }
 
     attn_rot_k =
