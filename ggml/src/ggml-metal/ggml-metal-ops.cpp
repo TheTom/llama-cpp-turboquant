@@ -172,6 +172,26 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+static bool ggml_metal_op_mutates_tq_src1(const ggml_tensor * node) {
+    if (node == nullptr || node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+
+    const bool is_tq_weight = node->src[0]->type == GGML_TYPE_TQ3_1S ||
+                              node->src[0]->type == GGML_TYPE_TQ4_1S;
+    if (!is_tq_weight) {
+        return false;
+    }
+
+    switch (node->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
 
@@ -208,6 +228,15 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     int n_fuse = 1;
+
+    // Rotated TQ weight kernels temporarily rotate src1 in-place before the
+    // matmul and restore it afterwards. The generic range tracker only sees a
+    // read dependency on src1, so sibling projections can be scheduled as
+    // concurrent even though they race on the shared activation buffer.
+    // Gemma4 GEGLU / MoE fan-out is especially sensitive to this hazard.
+    if (ggml_metal_op_mutates_tq_src1(node)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     // check if the current node can run concurrently with other nodes before it
     // the condition is that:
@@ -2099,8 +2128,6 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q8_0 ||
            op->src[0]->type == GGML_TYPE_MXFP4 ||
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           op->src[0]->type == GGML_TYPE_TQ3_1S ||
-           op->src[0]->type == GGML_TYPE_TQ4_1S ||
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
@@ -2191,8 +2218,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
         props_dev->has_simdgroup_mm && ne00 >= 64 &&
-        (ne11 > ne11_mm_min || ((op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S) && ne11 > 1))) {
-        // TQ3_1S/TQ4_1S with ne11=1 uses specialized V2.1 fused mul_mv kernel
+        (ne11 > ne11_mm_min || op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S)) {
+        // Route all TQ weights through the rotated mul_mm path.
+        // Gemma4 decode still degrades on the fused mul_mv kernel even after the broader
+        // TQ backend fixes, while the rotated mul_mm path matches CPU behavior.
 
         const bool is_tq_weight = (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S);
 
@@ -2390,12 +2419,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
+    const bool is_tq_weight = (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S);
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
     // ne20 = n_used_experts
     // ne21 = n_rows (batch size)
-    const int ne21_mm_id_min = 32;
+    const int ne21_mm_id_min = is_tq_weight ? 1 : 32;
 
     if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
         // some Metal matrix data types require aligned pointers
@@ -2449,8 +2479,6 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
 
         {
-            const bool is_tq_weight = (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S);
-
             // TQ weight MoE: pre-rotate activations for rotated dispatch
             if (is_tq_weight && ne00 % 32 == 0) {
                 const int64_t n_act = (int64_t)ne10 * ne11 * ne12 * ne13;
