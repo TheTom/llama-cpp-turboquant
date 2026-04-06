@@ -6,14 +6,18 @@
 
 #define INNERQ_MAX_CHANNELS 128
 
-#if defined(_WIN32) && !defined(__MINGW32__)
-#  ifdef GGML_BACKEND_BUILD
-#    define TURBO_IQ_API __declspec(dllexport)
+#ifdef GGML_BACKEND_SHARED
+#  if defined(_WIN32) && !defined(__MINGW32__)
+#    ifdef GGML_BACKEND_BUILD
+#      define TURBO_IQ_API __declspec(dllexport)
+#    else
+#      define TURBO_IQ_API __declspec(dllimport)
+#    endif
 #  else
-#    define TURBO_IQ_API __declspec(dllimport)
+#    define TURBO_IQ_API __attribute__((visibility("default")))
 #  endif
 #else
-#  define TURBO_IQ_API __attribute__((visibility("default")))
+#  define TURBO_IQ_API
 #endif
 
 // Host-side shared state (defined in turbo-innerq.cu)
