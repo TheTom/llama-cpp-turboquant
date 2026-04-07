@@ -262,8 +262,66 @@ static __global__ void mul_mat_tq3_1s_multi(
 }
 
 // ============================================================================
-// Dispatch: ne[1]=1 (decode), ne[1]≤8 (multi-token dp4a)
+// TQ4_1S scalar/half kernel (AMD fallback — no dp4a)
+// Same pattern as TQ3_1S: pre-rotated half activations, scalar centroid lookup.
+// On RDNA4, sudot4 throughput differs from NVIDIA dp4a — this path is faster.
+// ============================================================================
+
+template <int ncols_dst>
+static __global__ void mul_mat_tq4_1s_scalar_multi(
+        const void  * __restrict__ vx,
+        const half  * __restrict__ vy_rot,
+        float       * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int stride_col_y,
+        const int stride_col_dst) {
+
+    __shared__ float s_lut[16];
+    if (threadIdx.y == 0 && threadIdx.x < 16) {
+        s_lut[threadIdx.x] = TQ4_CENTROIDS_WEIGHT[threadIdx.x];
+    }
+    __syncthreads();
+
+    const int row  = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
+    if (row >= nrows_x) return;
+
+    const int lane = threadIdx.x;
+    const int blocks_per_row = ncols_x / QK_TQ4_1S;
+    const block_tq4_1s * x_row = ((const block_tq4_1s *) vx) + (int64_t)row * blocks_per_row;
+
+    float sumf[ncols_dst] = {};
+
+    for (int ib = 0; ib < blocks_per_row; ib++) {
+        const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
+        const uint8_t idx = (x_row[ib].qs[lane / 2] >> ((lane & 1) * 4)) & 0xF;
+        const float w = s_lut[idx] * d;
+
+        #pragma unroll
+        for (int j = 0; j < ncols_dst; j++) {
+            const float act = __half2float(vy_rot[j * stride_col_y + ib * QK_TQ4_1S + lane]);
+            sumf[j] += act * w;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int j = 0; j < ncols_dst; j++)
+            sumf[j] += __shfl_xor_sync(0xffffffff, sumf[j], offset);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < ncols_dst; j++)
+            dst[j * stride_col_dst + row] = sumf[j];
+    }
+}
+
+// ============================================================================
+// Dispatch: ne[1]=1 (decode), ne[1]≤8 (multi-token dp4a / scalar)
 // ne[1]>8 handled by ggml_cuda_mul_mat_tq4_1s_cublas (runtime dequant + cuBLAS)
+// AMD: uses scalar half path for TQ4_1S (dp4a regresses on RDNA4)
 // ============================================================================
 
 template <int ncols_dst>
@@ -275,6 +333,17 @@ static void launch_tq4_1s_multi(
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
     mul_mat_tq4_1s_dp4a_multi<ncols_dst><<<grid, block, 0, stream>>>(
         src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
+}
+
+template <int ncols_dst>
+static void launch_tq4_1s_scalar_multi(
+        const void * src0_d, const half * act_buf,
+        float * dst_d, int ncols_x, int nrows_x,
+        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+    const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
+    const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
+    mul_mat_tq4_1s_scalar_multi<ncols_dst><<<grid, block, 0, stream>>>(
+        src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
 template <int ncols_dst>
@@ -307,10 +376,12 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
     cudaStream_t stream = ctx.stream();
 
     const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
     const int n_total_elements = ncols_x * ncols_dst;
+    const bool use_dp4a = !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_TQ4_1S;
 
-    if (src0->type == GGML_TYPE_TQ4_1S) {
-        // Per-device pool-allocated q8_1 buffer for pre-rotated activations
+    if (use_dp4a) {
+        // NVIDIA TQ4_1S: dp4a int8 path (optimized for Turing+ dp4a throughput)
         const int n_total_blocks = n_total_elements / 32;
         ggml_cuda_pool_alloc<block_q8_1> q8_1_buf(ctx.pool(id), n_total_blocks);
 
@@ -337,7 +408,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
             case 8: launch_tq4_1s_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
         }
     } else {
-        // TQ3_1S: per-device pool-allocated half buffer for pre-rotated activations
+        // Scalar half path: TQ3_1S (all vendors) + TQ4_1S on AMD (dp4a regresses on RDNA4)
         ggml_cuda_pool_alloc<half> act_buf(ctx.pool(id), n_total_elements);
 
         {
@@ -350,17 +421,23 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
 
         const int stride_col_y   = ncols_x;  // half elements per column
         const int stride_col_dst = nrows_x;
+        const bool is_tq4 = (src0->type == GGML_TYPE_TQ4_1S);
+
+        // Macro to dispatch to the right kernel based on quant type
+        #define LAUNCH_SCALAR(N, src0_ptr, act_ptr, dst_ptr) \
+            if (is_tq4) { launch_tq4_1s_scalar_multi<N>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); } \
+            else        { launch_tq3_1s_multi<N>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); }
 
         if (ncols_dst <= 8) {
             switch (ncols_dst) {
-                case 1: launch_tq3_1s_multi<1>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 2: launch_tq3_1s_multi<2>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 3: launch_tq3_1s_multi<3>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 4: launch_tq3_1s_multi<4>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 5: launch_tq3_1s_multi<5>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 6: launch_tq3_1s_multi<6>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 7: launch_tq3_1s_multi<7>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 8: launch_tq3_1s_multi<8>(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 1: LAUNCH_SCALAR(1, src0_d, act_buf.get(), dst_d); break;
+                case 2: LAUNCH_SCALAR(2, src0_d, act_buf.get(), dst_d); break;
+                case 3: LAUNCH_SCALAR(3, src0_d, act_buf.get(), dst_d); break;
+                case 4: LAUNCH_SCALAR(4, src0_d, act_buf.get(), dst_d); break;
+                case 5: LAUNCH_SCALAR(5, src0_d, act_buf.get(), dst_d); break;
+                case 6: LAUNCH_SCALAR(6, src0_d, act_buf.get(), dst_d); break;
+                case 7: LAUNCH_SCALAR(7, src0_d, act_buf.get(), dst_d); break;
+                case 8: LAUNCH_SCALAR(8, src0_d, act_buf.get(), dst_d); break;
             }
         } else {
             // Large prefill: batch in groups of 8
@@ -369,17 +446,18 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                 const half * act_j = act_buf.get() + j * ncols_x;
                 float * dst_j = dst_d + j * nrows_x;
                 switch (batch) {
-                    case 1: launch_tq3_1s_multi<1>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 2: launch_tq3_1s_multi<2>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 3: launch_tq3_1s_multi<3>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 4: launch_tq3_1s_multi<4>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 5: launch_tq3_1s_multi<5>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 6: launch_tq3_1s_multi<6>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 7: launch_tq3_1s_multi<7>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 8: launch_tq3_1s_multi<8>(src0_d, act_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 1: LAUNCH_SCALAR(1, src0_d, act_j, dst_j); break;
+                    case 2: LAUNCH_SCALAR(2, src0_d, act_j, dst_j); break;
+                    case 3: LAUNCH_SCALAR(3, src0_d, act_j, dst_j); break;
+                    case 4: LAUNCH_SCALAR(4, src0_d, act_j, dst_j); break;
+                    case 5: LAUNCH_SCALAR(5, src0_d, act_j, dst_j); break;
+                    case 6: LAUNCH_SCALAR(6, src0_d, act_j, dst_j); break;
+                    case 7: LAUNCH_SCALAR(7, src0_d, act_j, dst_j); break;
+                    case 8: LAUNCH_SCALAR(8, src0_d, act_j, dst_j); break;
                 }
             }
         }
+        #undef LAUNCH_SCALAR
     }
 }
 
