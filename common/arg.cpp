@@ -2085,11 +2085,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--triatt-boundary-skip"}, "N",
         string_format(
-            "TriAttention: skip the first N attention layers from scoring.\n"
-            "Boundary layers act as input transducers rather than coupled\n"
-            "oscillators (Sharpe 2026) and mirror the boundary protection\n"
-            "already used on the weight-quant side of the stack.\n"
-            "Default: %d. Set to 0 to disable.",
+            "TriAttention: skip the first N attention layers from scoring\n"
+            "(experimental, default %d = off). Empirically regresses PPL\n"
+            "on pure transformers and does not fix NIAH failures on\n"
+            "hybrid Mamba+Attention models. Kept as an opt-in research\n"
+            "knob. See docs/papers/triattention-v3.md Section 4.8.",
             params.triatt_boundary_skip
         ),
         [](common_params & params, int value) {

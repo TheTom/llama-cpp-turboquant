@@ -1,0 +1,33 @@
+============================================
+============================================
+17:34:16 
+17:34:16 ========== boundary_skip=4 (skips first attention layer il=3) ==========
+17:34:16 >>> 27B V3 prefix=128 boundary_skip=4 @400
+17:37:31   PASS (runtime=195s, evictions=7)
+17:37:31   tail:     *   Does the output meet the constraint? Yes, just the word and number. 7.  **Construct Final Response:**     *   PURPLE ELEPHANT 7742 </think> PURPLE ELEPHANT 7742 [end of text] 
+
+17:37:31 >>> 27B V3 prefix=128 boundary_skip=4 @65000
+17:41:58   FAIL (runtime=267s, evictions=9)
+17:41:58   tail:             *   ...             *   Ah, I found it. In the "Ise-class battleships" section, under the subsection "Design and description", there is no code.             *   Under "Ships"? No.             *   Under "Service"? No.             *   Under "Second Battle of Naktong Bulge"? 
+
+17:41:58 >>> 27B V3 prefix=128 boundary_skip=4 @120000
+17:45:34   FAIL (runtime=216s, evictions=9)
+17:45:34   tail:         *   Scanning for "code".         *   Scanning for "word".         *   Scanning for "number".         *   There is no explicit "Code Word" label in the text.         *   However, 
+
+17:45:34 
+17:45:34 ========== boundary_skip=8 (skips first two attention layers il=3,7) ==========
+17:45:34 >>> 27B V3 prefix=128 boundary_skip=8 @400
+17:49:11   PASS (runtime=217s, evictions=9)
+17:49:11   tail:     *   Okay, looking at the actual prompt text provided:         *   "The secret code word is PURPLE ELEPHANT 7742." is embedded in the first paragraph.         *   The instruction at the very end is: "Answer with just the code word and nothing else: nothing else" -> Wait, I am simulating the thoug
+
+17:49:11 >>> 27B V3 prefix=128 boundary_skip=8 @65000
+17:52:46   FAIL (runtime=215s, evictions=9)
+17:52:46   tail:     *   Scanning for "word".     *   Scanning for "secret".     *   Scanning for "key".     *   Nothing found.     * 
+
+17:52:46 >>> 27B V3 prefix=128 boundary_skip=8 @120000
+17:56:21   FAIL (runtime=215s, evictions=9)
+17:56:21   tail:         *   Is there anything else?         *   Maybe the question refers to something specific in the Naktong Bulge text since it's the last major section before the end of the input.         *   Let's search for "code word" explicitly in the text.         *   Text search: "code word".         *   
+
+============================================
+Done: Thu Apr  9 17:56:21 CDT 2026
+============================================

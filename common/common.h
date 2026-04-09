@@ -560,11 +560,13 @@ struct common_params {
     // Not validated on hybrid Mamba+Attention architectures, use with care.
     int32_t triatt_hybrid       = 0;
     int32_t triatt_prefix       = 128;   // V3 only: first N tokens never evicted
-    // Boundary protection: skip the first N attention layers from the scoring
-    // sum. These layers act as input transducers rather than coupled
-    // oscillators and contribute noise when left in. Default 2 matches the
-    // boundary protection already used on the weight-quant side of the stack.
-    int32_t triatt_boundary_skip = 2;
+    // Boundary layer skip for V3 scoring (experimental, default OFF).
+    // Skips the first N attention layers from the per-cell scoring sum.
+    // Empirically hurts PPL on pure transformers (~1% regression on 7B)
+    // and does not fix the retrieval failures on hybrid Mamba+Attention
+    // models that motivated the test. Kept as an opt-in research knob.
+    // See docs/papers/triattention-v3.md Section 4.8 for the full data.
+    int32_t triatt_boundary_skip = 0;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

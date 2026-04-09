@@ -99,14 +99,29 @@ struct llama_triattention {
     int32_t prefix_protect         = 128;   // keep first N tokens (V3 only). override via --triatt-prefix
     int32_t hybrid_mode_cli        = -1;    // from CLI/API, -1 = fall back to env
 
-    // Boundary layer skip for scoring. The first N attention layers act as
-    // input transducers rather than coupled oscillators, so their contribution
-    // to the per-cell scoring sum is noise. Skipping them mirrors the same
-    // protection we already apply on the weight-quant side of TurboQuant+ and
-    // is motivated theoretically by the coupled-oscillator framework (Sharpe
-    // 2026, "Coherence-Guided Dead-Head Identification"). Default: 2.
-    // Override via --triatt-boundary-skip N or TRIATT_BOUNDARY_SKIP env var.
-    int32_t boundary_skip          = 2;
+    // Boundary layer skip for scoring (experimental, default OFF).
+    //
+    // The hypothesis was that the first N attention layers act as input
+    // transducers rather than coupled oscillators, and excluding them from
+    // V3's per-cell scoring sum would clean up the signal. This mirrors the
+    // boundary protection pattern already used on the weight-quant side of
+    // TurboQuant+ and is motivated theoretically by Sharpe 2026's
+    // "Coherence-Guided Dead-Head Identification" framework.
+    //
+    // Empirically this did not pan out. On Qwen2.5-7B it regresses PPL by
+    // roughly 1% at both 32K and 64K context (6.8508 -> 6.9166 at 32K,
+    // 6.2530 -> 6.2940 at 64K). On Qwen3.5-27B it improves PPL marginally
+    // (7.4853 -> 7.4779 with skip=4, which is the first skip value that
+    // actually catches an attention layer on qwen35), but it does NOT fix
+    // the NIAH middle/end retrieval failures that were the motivating
+    // problem. See docs/papers/triattention-v3.md Section 4.8 for the full
+    // data.
+    //
+    // The flag is kept as an opt-in knob for future research (e.g. in
+    // combination with a coupling-based replacement for the trig scoring).
+    // Default is 0 so nobody accidentally regresses their PPL on a pure
+    // transformer. Set via --triatt-boundary-skip N or TRIATT_BOUNDARY_SKIP.
+    int32_t boundary_skip          = 0;
 
     // Initialize RoPE constants
     // n_rot: number of rotated dimensions (<= head_dim). Defaults to head_dim (full RoPE).
