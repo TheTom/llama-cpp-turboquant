@@ -17,6 +17,7 @@
 #include <vector>
 
 class llama_kv_cache;
+class llama_context;
 
 // Main TriAttention engine — self-calibrating scoring + eviction
 struct llama_triattention {
@@ -64,6 +65,18 @@ struct llama_triattention {
     int32_t warmup_tokens          = 1024; // accumulate this many Q samples before first eviction
     float   ema_alpha              = 0.1f; // EMA blending factor (0.1 = stable, 0.5 = reactive)
     int32_t first_attn_layer       = -1;   // smallest attention-layer index ever observed (used to count tokens once per pass)
+
+    // Back-pointer to the owning context. Used once to disable the scheduler
+    // cb_eval hook after calibration completes. Set by llama_context::set_triattention().
+    llama_context * ctx = nullptr;
+
+    // Deferred uninstall flag. The callback cannot safely call
+    // ggml_backend_sched_set_eval_callback(nullptr) from inside a cb_eval
+    // invocation — the scheduler is actively iterating its callback field.
+    // We set this flag from eval_callback / update_calibration, and
+    // llama_context::decode() clears the callback from a safe point after the
+    // forward pass completes.
+    bool pending_uninstall = false;
 
     // Hybrid memory policy: per-segment quota + optional prefix protection.
     //

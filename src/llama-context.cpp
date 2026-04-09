@@ -1068,7 +1068,20 @@ void llama_context::set_triattention(std::unique_ptr<llama_triattention> triatt)
     cparams.cb_eval           = llama_triattention::eval_callback;
     cparams.cb_eval_user_data = triatt.get();
 
+    // Give the triattention instance a back-reference so it can disable its own
+    // callback once calibration is complete (the scheduler takes a much slower
+    // path when any eval_callback is installed — removing it is a big win).
+    triatt->ctx = this;
+
     triattention = std::move(triatt);
+}
+
+void llama_context::disable_triatt_callback() {
+    if (sched) {
+        ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
+    }
+    cparams.cb_eval           = nullptr;
+    cparams.cb_eval_user_data = nullptr;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1904,6 +1917,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // TriAttention: deferred cb_eval uninstall. Must happen AFTER the forward
+    // pass finishes (not from inside cb_eval itself) because the scheduler
+    // iterates its callback field during dispatch — mutating it mid-flight is
+    // racy. See llama-triattention.cpp for the rationale.
+    if (triattention && triattention->pending_uninstall) {
+        disable_triatt_callback();
+        triattention->pending_uninstall = false;
+    }
 
     return 0;
 }

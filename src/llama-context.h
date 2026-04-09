@@ -110,6 +110,13 @@ struct llama_context {
     // TriAttention: enable self-calibrating KV cache eviction
     void set_triattention(std::unique_ptr<llama_triattention> triatt);
 
+    // TriAttention: permanently remove the cb_eval hook once calibration is
+    // complete. This matters because the ggml scheduler takes a *dramatically*
+    // slower per-node path when any eval_callback is installed (loses graph
+    // fusion + forces per-range synchronization). After warmup, the callback
+    // is no longer needed, so we clear it from both the scheduler and cparams.
+    void disable_triatt_callback();
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

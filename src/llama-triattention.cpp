@@ -8,6 +8,7 @@
 // during prefill — no external calibration files or Python dependencies needed.
 
 #include "llama-triattention.h"
+#include "llama-context.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cells.h"
 #include "llama-impl.h"
@@ -145,6 +146,25 @@ void llama_triattention::update_calibration() {
         calibrated = true;
         LLAMA_LOG_INFO("%s: initial calibration from %d tokens (%u layers, %u kv_heads)\n",
             __func__, q_samples, n_layers, n_kv_heads);
+
+        // Non-adaptive mode: request the cb_eval scheduler hook be removed as
+        // soon as it's safe. The ggml scheduler takes a much slower per-node
+        // path when any eval_callback is installed (loses graph fusion +
+        // forces per-range synchronization), and this cost runs for EVERY
+        // batch until we uninstall. We set a pending flag here; the actual
+        // call to set_eval_callback happens in llama_context::decode() after
+        // the forward pass returns — doing it from inside cb_eval itself is
+        // unsafe because the scheduler is actively iterating its callback
+        // field.
+        static int adaptive_mode_cached = -1;
+        if (adaptive_mode_cached < 0) {
+            const char * env = getenv("TRIATT_ADAPTIVE");
+            adaptive_mode_cached = env ? atoi(env) : 0;
+        }
+        if (adaptive_mode_cached == 0) {
+            pending_uninstall = true;
+            LLAMA_LOG_INFO("%s: scheduling cb_eval uninstall (non-adaptive mode)\n", __func__);
+        }
     } else {
         // Adaptive update: EMA blend of existing centers with new batch stats
         // alpha controls how fast we adapt (0.1 = slow/stable, 0.5 = fast/reactive)
@@ -283,6 +303,16 @@ bool llama_triattention::eval_callback(ggml_tensor * t, bool ask, void * user_da
     }
     if (layer_idx == self->first_attn_layer) {
         self->q_samples += n_tokens;
+
+        // If we just crossed the warmup threshold, run calibration NOW rather
+        // than waiting for evict() to be called. This matters because evict()
+        // only runs when the cache exceeds budget — at large contexts that
+        // can be many batches after calibration is technically ready. Every
+        // batch in that window runs the ggml scheduler's slow per-node
+        // callback dispatch path, which is the dominant V3 overhead.
+        if (!self->calibrated && self->q_samples >= self->warmup_tokens) {
+            self->update_calibration();
+        }
     }
 
     return true;
@@ -372,7 +402,21 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
     };
 
     if (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_0) {
-        LLAMA_LOG_WARN("%s: unsupported K type %d, skipping\n", __func__, type_k);
+        // Unsupported K type (e.g. TQ turbo formats). We can't score on this
+        // cache, BUT we still need to uninstall the cb_eval scheduler hook —
+        // otherwise on stacked runs (TQ + V3) the callback leaks and the slow
+        // scheduler path runs for the entire prefill. Finish calibration if
+        // we've crossed the warmup threshold and request the uninstall.
+        if (!calibrated && q_samples >= warmup_tokens) {
+            update_calibration();
+        }
+        static bool warned_once = false;
+        if (!warned_once) {
+            LLAMA_LOG_WARN("%s: unsupported K type %d — TriAttention cannot evict on this K, "
+                           "but calibration + cb_eval uninstall still happen\n",
+                           __func__, type_k);
+            warned_once = true;
+        }
         return 0;
     }
 
