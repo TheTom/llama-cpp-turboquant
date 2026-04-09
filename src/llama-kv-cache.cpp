@@ -119,6 +119,32 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
+    // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
+    // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
+    // Turbo K quantization error gets amplified by the GQA broadcast factor.
+    // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
+    // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
+    // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
+    {
+        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+        if (k_is_turbo) {
+            const uint32_t n_head    = hparams.n_head(0);
+            const uint32_t n_head_kv = hparams.n_head_kv(0);
+            const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
+
+            const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
+            const bool disabled = (env && env[0] == '0');
+
+            if (!disabled && gqa_ratio >= 6 && type_k == type_v) {
+                LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
+                               "upgrading K from %s to q8_0 to prevent quality degradation. "
+                               "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
+                               __func__, gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
+                type_k = GGML_TYPE_Q8_0;
+            }
+        }
+    }
+
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
