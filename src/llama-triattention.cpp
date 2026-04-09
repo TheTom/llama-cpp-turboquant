@@ -430,7 +430,40 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
             cell.score = (cell.pos >= window_threshold) ? 1e10f : (float)cell.pos;
         }
     } else {
-        // Trig scoring (default)
+        // Trig scoring (default) — inlined hot-path version.
+        //
+        // Algebraic identity we exploit:
+        //   score_per_cell = (1/n_off) * sum_o sum_f [A_f cos(t_o w_f) - B_f sin(t_o w_f)] + extra
+        // Since t_o = max_pos + offset_o and omega_f don't depend on the cell,
+        // we precompute:
+        //   cos_sum[f] = (1/n_off) * sum_o cos((max_pos + offset_o) * omega_f)
+        //   sin_sum[f] = (1/n_off) * sum_o sin((max_pos + offset_o) * omega_f)
+        // ONCE per evict() call, then each cell becomes a dot product over f only.
+        //
+        // Per-cell work drops from n_off*freq_count cos+sin calls (~2176 transcendentals
+        // at 32K with 17 offsets * 64 freqs) to freq_count pure muladds (~64). c_mag is
+        // also lifted out of the cell loop to once per (layer, head). The transformation
+        // is bit-exact vs the original score_tokens() path modulo float associativity.
+
+        const uint32_t fc = freq_count;
+        const int n_off   = (int)offsets.size();
+        const float inv_n_off = 1.0f / (float)n_off;
+
+        // Precompute cos_sum / sin_sum ONCE — constant across all cells and all
+        // (layer, head) blocks for this eviction round.
+        std::vector<float> cos_sum(fc);
+        std::vector<float> sin_sum(fc);
+        for (uint32_t f = 0; f < fc; ++f) {
+            float cs = 0.0f, ss = 0.0f;
+            for (int o = 0; o < n_off; ++o) {
+                const float phase = ((float)max_pos + offsets[o]) * omega[f];
+                cs += cosf(phase);
+                ss += sinf(phase);
+            }
+            cos_sum[f] = cs * inv_n_off;
+            sin_sum[f] = ss * inv_n_off;
+        }
+
         const auto * type_traits = ggml_get_type_traits(type_k);
         const auto   to_float    = type_traits->to_float;
         const size_t type_size   = ggml_type_size(type_k);
@@ -438,6 +471,15 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
 
         std::vector<float> k_f32(head_dim);
         const uint32_t n_layers_kv = cache->get_n_layers_kv();
+
+        // Pre-mark protected cells once so we can skip them cheaply in the hot loop.
+        for (auto & cell : active_cells) {
+            if (cell.pos >= window_threshold) {
+                cell.score = 1e10f;
+            } else {
+                cell.score = 0.0f;
+            }
+        }
 
         for (uint32_t ikv = 0; ikv < n_layers_kv; ++ikv) {
             const int32_t il = cache->get_layer_il(ikv);
@@ -449,19 +491,48 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
 
             for (uint32_t h = 0; h < n_kv_heads; ++h) {
                 const size_t head_offset = ((size_t)h * head_dim / blk_size) * type_size;
+                const uint32_t head_block = (uint32_t)il * n_kv_heads + h;
 
+                if (head_block >= center_real.size()) continue;
+
+                const float * c_r   = center_real[head_block].data();
+                const float * c_i   = center_imag[head_block].data();
+                const float * c_abs = center_abs[head_block].data();
+
+                // Lift c_mag and cb_delta (c_abs - c_mag) out of the cell loop.
+                // Both depend only on the (layer, head) centers, not on any cell.
+                std::vector<float> cb_delta(fc);
+                for (uint32_t f = 0; f < fc; ++f) {
+                    const float mag = sqrtf(c_r[f] * c_r[f] + c_i[f] * c_i[f] + 1e-8f);
+                    cb_delta[f] = c_abs[f] - mag;
+                }
+
+                // Inner: score every non-protected cell for this (layer, head).
                 for (size_t ci = 0; ci < active_cells.size(); ++ci) {
                     auto & cell = active_cells[ci];
-
-                    if (cell.pos >= window_threshold) {
-                        cell.score = 1e10f;
-                        continue;
-                    }
+                    if (cell.pos >= window_threshold) continue;
 
                     const uint8_t * k_ptr = k_base + (size_t)cell.idx * cell_stride + head_offset;
                     to_float(k_ptr, k_f32.data(), head_dim);
 
-                    score_tokens(k_f32.data(), 1, (int32_t)max_pos, il, h, &cell.score);
+                    const float * k = k_f32.data();
+                    float acc = 0.0f;
+                    float extra = 0.0f;
+                    for (uint32_t f = 0; f < fc; ++f) {
+                        const float k_r = k[f];
+                        const float k_i = k[fc + f];
+
+                        // Complex product: center * conj(K_rot)
+                        const float A = c_r[f] * k_r + c_i[f] * k_i;
+                        const float B = c_i[f] * k_r - c_r[f] * k_i;
+
+                        acc += A * cos_sum[f] - B * sin_sum[f];
+
+                        const float k_abs = sqrtf(k_r * k_r + k_i * k_i + 1e-8f);
+                        extra += cb_delta[f] * k_abs;
+                    }
+
+                    cell.score += acc + extra;
                 }
             }
         }
