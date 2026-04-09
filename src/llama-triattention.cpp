@@ -539,6 +539,30 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
 
         // Flatten (layer, head) blocks into a single index space for round-robin
         // thread assignment.
+        //
+        // Boundary protection: skip the first `boundary_skip` attention layers.
+        // These act as input transducers rather than coupled oscillators and
+        // contribute noise to the per-cell score sum when left in. This mirrors
+        // the weight-quant side of TurboQuant+ (which already carves out
+        // boundary layers) and is motivated theoretically by Sharpe 2026.
+        //
+        // Note: we count "attention layers" by absolute layer index `il`. On
+        // hybrid Mamba+Attention architectures (qwen35) the first attention
+        // layer may be at index 3 or higher, so `il < boundary_skip` for
+        // small `boundary_skip` on a hybrid model is a no-op. That is the
+        // correct behavior: the hybrid architecture already has non-attention
+        // "transducer" layers between the input and the first attention layer.
+        static int boundary_skip_cached = -2;
+        if (boundary_skip_cached == -2) {
+            const char * env = getenv("TRIATT_BOUNDARY_SKIP");
+            if (env) boundary_skip = atoi(env);
+            boundary_skip_cached = boundary_skip;
+            if (boundary_skip > 0) {
+                LLAMA_LOG_INFO("%s: boundary protection — skipping first %d attention layer(s) from scoring\n",
+                    __func__, boundary_skip);
+            }
+        }
+
         struct block_info {
             int32_t il;
             uint32_t h;
@@ -549,9 +573,29 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
         std::vector<block_info> blocks;
         blocks.reserve(n_layers_kv * n_kv_heads);
 
+        // Two-pass approach: first determine how many attention layers actually
+        // exist in the cache, so we can clamp boundary_skip without degenerating
+        // to zero scored blocks on models with very few attention layers.
+        int32_t max_attn_il = -1;
         for (uint32_t ikv = 0; ikv < n_layers_kv; ++ikv) {
             const int32_t il = cache->get_layer_il(ikv);
             if ((uint32_t)il >= n_layers) continue;
+            if (il > max_attn_il) max_attn_il = il;
+        }
+        // Clamp: leave at least one scored layer. If boundary_skip would
+        // eliminate everything, drop it to zero and warn.
+        int32_t effective_skip = boundary_skip;
+        if (max_attn_il >= 0 && effective_skip > max_attn_il) {
+            LLAMA_LOG_WARN("%s: boundary_skip=%d would eliminate all attention layers "
+                           "(max attn layer index = %d); falling back to 0\n",
+                           __func__, (int)boundary_skip, (int)max_attn_il);
+            effective_skip = 0;
+        }
+
+        for (uint32_t ikv = 0; ikv < n_layers_kv; ++ikv) {
+            const int32_t il = cache->get_layer_il(ikv);
+            if ((uint32_t)il >= n_layers) continue;
+            if (il < effective_skip) continue; // boundary protection
 
             const uint8_t * k_base = (const uint8_t *)cache->get_k_data(ikv);
             const uint64_t  ne0    = cache->get_k_ne0(ikv);
@@ -688,7 +732,15 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
         }
 
         // Merge per-thread scores into active_cells, then normalize.
-        const float score_norm = 1.0f / (float)(n_layers_kv * n_kv_heads);
+        // Normalize by the actual number of blocks we scored (post-boundary-skip)
+        // rather than the full n_layers_kv * n_kv_heads count, so absolute score
+        // magnitudes are stable across different boundary_skip settings. The
+        // ranking would be preserved either way since the scale is uniform, but
+        // this keeps the score values interpretable if we add thresholding later.
+        const size_t n_blocks_scored = blocks.size();
+        const float score_norm = (n_blocks_scored > 0)
+            ? (1.0f / (float)n_blocks_scored)
+            : 0.0f;
         for (size_t ci = 0; ci < n_cells; ++ci) {
             auto & cell = active_cells[ci];
             if (cell.pos >= window_threshold) continue;

@@ -557,9 +557,14 @@ struct common_params {
     // quota only, 2 = V3 prefix-protect + per-segment quota (experimental).
     // V3 is the recommended non-default: passes NIAH start/middle/end on
     // standard transformers at up to 64K with PPL bit-identical to baseline.
-    // Not validated on hybrid Mamba+Attention architectures — use with care.
+    // Not validated on hybrid Mamba+Attention architectures, use with care.
     int32_t triatt_hybrid       = 0;
     int32_t triatt_prefix       = 128;   // V3 only: first N tokens never evicted
+    // Boundary protection: skip the first N attention layers from the scoring
+    // sum. These layers act as input transducers rather than coupled
+    // oscillators and contribute noise when left in. Default 2 matches the
+    // boundary protection already used on the weight-quant side of the stack.
+    int32_t triatt_boundary_skip = 2;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

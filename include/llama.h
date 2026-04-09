@@ -986,7 +986,7 @@ extern "C" {
 
     // TriAttention: self-calibrating trigonometric KV cache token eviction
     // Inspired by arXiv:2604.04921 (Mao et al.)
-    // Automatically calibrates from the KV cache during inference — no external files needed.
+    // Automatically calibrates from the KV cache during inference, no external files needed.
     // rope_theta and head_dim are auto-detected if set to 0.
     //
     // hybrid_mode selects the eviction policy:
@@ -997,15 +997,21 @@ extern "C" {
     //
     // prefix_protect only applies when hybrid_mode == 2; it's the number of
     // tokens at the start of the context that are never evicted.
+    //
+    // boundary_skip: skip the first N attention layers from per-cell scoring.
+    // Matches the boundary protection pattern on the weight-quant side of the
+    // stack and is motivated theoretically by Sharpe 2026. Pass -1 to keep
+    // the struct default (currently 2).
     LLAMA_API void llama_triattention_enable(
             struct llama_context * ctx,
             int32_t                budget,          // max tokens to retain (e.g. 2048)
-            int32_t                divide_length,    // eviction interval (e.g. 128)
-            int32_t                window_size,      // protected recent tokens (e.g. 128)
-            float                  rope_theta,       // RoPE theta (0 = auto from model)
-            int32_t                head_dim,         // head dimension (0 = auto from model)
-            int32_t                hybrid_mode,      // 0 = V1 (default), 1 = V2, 2 = V3
-            int32_t                prefix_protect);  // V3: first N tokens never evicted (e.g. 128)
+            int32_t                divide_length,   // eviction interval (e.g. 128)
+            int32_t                window_size,     // protected recent tokens (e.g. 128)
+            float                  rope_theta,      // RoPE theta (0 = auto from model)
+            int32_t                head_dim,        // head dimension (0 = auto from model)
+            int32_t                hybrid_mode,     // 0 = V1 (default), 1 = V2, 2 = V3
+            int32_t                prefix_protect,  // V3: first N tokens never evicted (e.g. 128)
+            int32_t                boundary_skip);  // skip first N attention layers (-1 = default)
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

@@ -3150,7 +3150,8 @@ void llama_triattention_enable(
         float           rope_theta,
         int32_t         head_dim,
         int32_t         hybrid_mode,
-        int32_t         prefix_protect) {
+        int32_t         prefix_protect,
+        int32_t         boundary_skip) {
     auto triatt = std::make_unique<llama_triattention>();
     triatt->budget         = budget;
     triatt->divide_length  = divide_length;
@@ -3160,6 +3161,11 @@ void llama_triattention_enable(
     // semantics and the validated workload envelope.
     triatt->hybrid_mode_cli = hybrid_mode;
     triatt->prefix_protect  = (prefix_protect > 0) ? prefix_protect : triatt->prefix_protect;
+    // Boundary protection: honor the CLI-specified value unless it's -1, in
+    // which case keep the struct default.
+    if (boundary_skip >= 0) {
+        triatt->boundary_skip = boundary_skip;
+    }
 
     // Get model info. For hybrid/partial-RoPE models (qwen35, qwen35moe, etc.)
     // head_dim comes from hparams.n_embd_head_k() (not n_embd / n_head, which

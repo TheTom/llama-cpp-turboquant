@@ -99,6 +99,15 @@ struct llama_triattention {
     int32_t prefix_protect         = 128;   // keep first N tokens (V3 only). override via --triatt-prefix
     int32_t hybrid_mode_cli        = -1;    // from CLI/API, -1 = fall back to env
 
+    // Boundary layer skip for scoring. The first N attention layers act as
+    // input transducers rather than coupled oscillators, so their contribution
+    // to the per-cell scoring sum is noise. Skipping them mirrors the same
+    // protection we already apply on the weight-quant side of TurboQuant+ and
+    // is motivated theoretically by the coupled-oscillator framework (Sharpe
+    // 2026, "Coherence-Guided Dead-Head Identification"). Default: 2.
+    // Override via --triatt-boundary-skip N or TRIATT_BOUNDARY_SKIP env var.
+    int32_t boundary_skip          = 2;
+
     // Initialize RoPE constants
     // n_rot: number of rotated dimensions (<= head_dim). Defaults to head_dim (full RoPE).
     void init_constants(float rope_theta, uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads, uint32_t n_layers, uint32_t n_rot = 0);

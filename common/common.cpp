@@ -1306,14 +1306,15 @@ common_init_result_ptr common_init_from_params(common_params & params) {
             /* rope_theta     */ 0.0f,
             /* head_dim       */ 0,
             /* hybrid_mode    */ params.triatt_hybrid,
-            /* prefix_protect */ params.triatt_prefix);
+            /* prefix_protect */ params.triatt_prefix,
+            /* boundary_skip  */ params.triatt_boundary_skip);
 
         const char * mode_name = "V1 paper-faithful";
         if (params.triatt_hybrid == 1) mode_name = "V2 per-segment quota";
         else if (params.triatt_hybrid == 2) mode_name = "V3 prefix-protect + quota";
-        LOG_INF("%s: TriAttention enabled (budget=%d, divide=%d, window=%d, mode=%s, prefix=%d)\n",
+        LOG_INF("%s: TriAttention enabled (budget=%d, divide=%d, window=%d, mode=%s, prefix=%d, boundary_skip=%d)\n",
             __func__, params.triatt_budget, params.triatt_divide, params.triatt_window,
-            mode_name, params.triatt_prefix);
+            mode_name, params.triatt_prefix, params.triatt_boundary_skip);
     }
 
     if (!params.control_vectors.empty()) {
