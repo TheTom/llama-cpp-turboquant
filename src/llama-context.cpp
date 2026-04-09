@@ -3148,11 +3148,18 @@ void llama_triattention_enable(
         int32_t         divide_length,
         int32_t         window_size,
         float           rope_theta,
-        int32_t         head_dim) {
+        int32_t         head_dim,
+        int32_t         hybrid_mode,
+        int32_t         prefix_protect) {
     auto triatt = std::make_unique<llama_triattention>();
-    triatt->budget        = budget;
-    triatt->divide_length = divide_length;
-    triatt->window_size   = window_size;
+    triatt->budget         = budget;
+    triatt->divide_length  = divide_length;
+    triatt->window_size    = window_size;
+    // Hybrid policy is opt-in. V1 (paper-faithful) is the default. See
+    // llama-triattention.h and docs/papers/triattention-v3.md for the
+    // semantics and the validated workload envelope.
+    triatt->hybrid_mode_cli = hybrid_mode;
+    triatt->prefix_protect  = (prefix_protect > 0) ? prefix_protect : triatt->prefix_protect;
 
     // Get model info. For hybrid/partial-RoPE models (qwen35, qwen35moe, etc.)
     // head_dim comes from hparams.n_embd_head_k() (not n_embd / n_head, which

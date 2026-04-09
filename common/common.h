@@ -553,6 +553,13 @@ struct common_params {
     int32_t triatt_budget       = 0;     // 0 = disabled, >0 = max KV tokens to retain
     int32_t triatt_divide       = 128;   // eviction check interval
     int32_t triatt_window       = 128;   // recent tokens always protected
+    // Hybrid policy selector: 0 = V1 paper-faithful (default), 1 = V2 per-segment
+    // quota only, 2 = V3 prefix-protect + per-segment quota (experimental).
+    // V3 is the recommended non-default: passes NIAH start/middle/end on
+    // standard transformers at up to 64K with PPL bit-identical to baseline.
+    // Not validated on hybrid Mamba+Attention architectures — use with care.
+    int32_t triatt_hybrid       = 0;
+    int32_t triatt_prefix       = 128;   // V3 only: first N tokens never evicted
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

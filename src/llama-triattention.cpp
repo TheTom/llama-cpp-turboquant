@@ -14,7 +14,6 @@
 #include "llama-impl.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -395,12 +394,6 @@ void llama_triattention::score_tokens(
 }
 
 int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
-    using clk = std::chrono::high_resolution_clock;
-    const auto t_start = clk::now();
-    auto us = [](clk::time_point a, clk::time_point b) {
-        return (int)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-    };
-
     if (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_0) {
         // Unsupported K type (e.g. TQ turbo formats). We can't score on this
         // cache, BUT we still need to uninstall the cb_eval scheduler hook —
@@ -471,7 +464,6 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
         max_pos = std::max(max_pos, c.pos);
     }
     const llama_pos window_threshold = max_pos - window_size + 1;
-    const auto t_collect = clk::now();
 
     // Scoring mode: TRIATT_MODE env var
     // 0 = trig scoring (default), 1 = random, 2 = recency (keep newest)
@@ -707,16 +699,27 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
             cell.score = s * score_norm;
         }
     }
-    const auto t_score = clk::now();
 
     // ----- Eviction selection -----
-    // V1 (default, TRIATT_HYBRID=0): global sort by score, evict highest-score cells.
-    // V2 (TRIATT_HYBRID=1): per-segment quota only.
-    // V3 (TRIATT_HYBRID=2): per-segment quota + prefix protection (first N tokens).
-    static int hybrid_mode = -1;
-    if (hybrid_mode < 0) {
-        const char * env = getenv("TRIATT_HYBRID");
-        hybrid_mode = env ? atoi(env) : 0;
+    //
+    // The eviction policy is selected in priority order:
+    //   1. CLI flag / API parameter (hybrid_mode_cli, set via --triatt-hybrid or
+    //      llama_triattention_enable's hybrid_mode argument).
+    //   2. TRIATT_HYBRID environment variable (fallback for scripting).
+    //   3. Default: 0 (V1 paper-faithful, global sort by score).
+    //
+    // 0 = V1 paper-faithful: global sort, evict the highest-score cells.
+    // 1 = V2 per-segment quota only (experimental).
+    // 2 = V3 prefix-protect + per-segment quota (recommended for standard
+    //     transformers at up to 64K context).
+    static int hybrid_mode = -2;
+    if (hybrid_mode == -2) {
+        if (hybrid_mode_cli >= 0) {
+            hybrid_mode = hybrid_mode_cli;
+        } else {
+            const char * env = getenv("TRIATT_HYBRID");
+            hybrid_mode = env ? atoi(env) : 0;
+        }
         const char * p_env = getenv("TRIATT_PREFIX");
         if (p_env) {
             prefix_protect = atoi(p_env);
@@ -725,7 +728,7 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
             LLAMA_LOG_INFO("%s: V2 hybrid policy enabled (per-segment quota, n_segments=%d)\n",
                 __func__, (int)n_segments);
         } else if (hybrid_mode == 2) {
-            LLAMA_LOG_INFO("%s: V3 hybrid policy enabled (prefix_protect=%d + per-segment quota n_segments=%d)\n",
+            LLAMA_LOG_INFO("%s: V3 hybrid policy enabled (prefix_protect=%d, n_segments=%d)\n",
                 __func__, (int)prefix_protect, (int)n_segments);
         }
     }
@@ -845,15 +848,12 @@ int32_t llama_triattention::evict(llama_kv_cache * cache, ggml_type type_k) {
         }
     }
 
-    const auto t_end = clk::now();
-
     const char * mode_str =
         (hybrid_mode == 0) ? "v1" :
         (hybrid_mode == 1) ? "v2" :
         (hybrid_mode == 2) ? "v3" : "unknown";
-    LLAMA_LOG_INFO("%s: evicted %d/%d (budget=%d, used=%d, mode=%s) [collect=%dus score=%dus selectEvict=%dus total=%dus]\n",
-        __func__, n_evicted, n_used, budget, n_used - n_evicted, mode_str,
-        us(t_start, t_collect), us(t_collect, t_score), us(t_score, t_end), us(t_start, t_end));
+    LLAMA_LOG_INFO("%s: evicted %d/%d tokens (budget=%d, used=%d, max_pos=%d, mode=%s)\n",
+        __func__, n_evicted, n_used, budget, n_used - n_evicted, (int)max_pos, mode_str);
 
     return n_evicted;
 }

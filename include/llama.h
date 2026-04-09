@@ -988,13 +988,24 @@ extern "C" {
     // Inspired by arXiv:2604.04921 (Mao et al.)
     // Automatically calibrates from the KV cache during inference — no external files needed.
     // rope_theta and head_dim are auto-detected if set to 0.
+    //
+    // hybrid_mode selects the eviction policy:
+    //   0 = V1 paper-faithful (default, global trig-score sort)
+    //   1 = V2 per-segment quota only (experimental)
+    //   2 = V3 prefix-protect + per-segment quota (experimental, recommended
+    //       for standard transformers at up to 64K context)
+    //
+    // prefix_protect only applies when hybrid_mode == 2; it's the number of
+    // tokens at the start of the context that are never evicted.
     LLAMA_API void llama_triattention_enable(
             struct llama_context * ctx,
-            int32_t                budget,        // max tokens to retain (e.g. 2048)
-            int32_t                divide_length,  // eviction interval (e.g. 128)
-            int32_t                window_size,    // protected recent tokens (e.g. 128)
-            float                  rope_theta,     // RoPE theta (0 = auto from model)
-            int32_t                head_dim);       // head dimension (0 = auto from model)
+            int32_t                budget,          // max tokens to retain (e.g. 2048)
+            int32_t                divide_length,    // eviction interval (e.g. 128)
+            int32_t                window_size,      // protected recent tokens (e.g. 128)
+            float                  rope_theta,       // RoPE theta (0 = auto from model)
+            int32_t                head_dim,         // head dimension (0 = auto from model)
+            int32_t                hybrid_mode,      // 0 = V1 (default), 1 = V2, 2 = V3
+            int32_t                prefix_protect);  // V3: first N tokens never evicted (e.g. 128)
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

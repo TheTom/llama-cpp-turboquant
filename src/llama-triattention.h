@@ -80,20 +80,24 @@ struct llama_triattention {
 
     // Hybrid memory policy: per-segment quota + optional prefix protection.
     //
-    // V2 (TRIATT_HYBRID=1): per-segment quota only.
+    // V2 (hybrid_mode=1): per-segment quota only.
     //   Divide non-protected cells into n_segments buckets by position and
     //   evict proportionally from each bucket. Rescues NIAH end-position but
     //   breaks NIAH start-position (observed 2026-04-09).
     //
-    // V3 (TRIATT_HYBRID=2): per-segment quota + prefix protection.
+    // V3 (hybrid_mode=2): per-segment quota + prefix protection.
     //   Always keep the first prefix_protect tokens (like the recent-window
     //   protection, but at the start of context), then apply per-segment
-    //   quota to the cells between prefix and window. Designed to preserve
-    //   both ends of the context.
+    //   quota to the cells between prefix and window. Validated on standard
+    //   transformers (qwen2.5-7b) up to 64K context. Not validated on hybrid
+    //   Mamba+Attention architectures (qwen3.5-27b/35b-a3b NIAH fails at
+    //   middle/end positions even though PPL is clean). See
+    //   docs/papers/triattention-v3.md for the full validation envelope.
     //
-    // Toggle via TRIATT_HYBRID env var (0=V1, 1=V2, 2=V3).
+    // Toggle via --triatt-hybrid CLI flag, or TRIATT_HYBRID env var fallback.
     int32_t n_segments             = 8;     // number of position buckets
-    int32_t prefix_protect         = 256;   // keep first N tokens (V3 only). override via TRIATT_PREFIX env.
+    int32_t prefix_protect         = 128;   // keep first N tokens (V3 only). override via --triatt-prefix
+    int32_t hybrid_mode_cli        = -1;    // from CLI/API, -1 = fall back to env
 
     // Initialize RoPE constants
     // n_rot: number of rotated dimensions (<= head_dim). Defaults to head_dim (full RoPE).

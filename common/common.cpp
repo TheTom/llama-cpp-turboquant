@@ -1292,21 +1292,28 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         params.ctx_shift = false;
     }
 
-    // TriAttention: self-calibrating KV cache eviction
+    // TriAttention: self-calibrating KV cache eviction.
+    //
+    // The engine reads rope_theta and head_dim from the model's hparams, so
+    // this code passes zero for both. Computing n_embd / n_head locally would
+    // be incorrect for fused-QKV models such as qwen35, where n_embd_head_k
+    // does not equal n_embd / n_head.
     if (params.triatt_budget > 0) {
-        // Pass 0 for both rope_theta and head_dim — the engine reads them from
-        // the model's hparams (n_embd_head_k() for head_dim, rope_freq_base_train
-        // for theta). Computing n_embd / n_head here is wrong for fused-QKV
-        // models like qwen35 where n_embd_head_k != n_embd / n_head.
         llama_triattention_enable(lctx,
             params.triatt_budget,
             params.triatt_divide,
             params.triatt_window,
-            /* rope_theta */ 0.0f,
-            /* head_dim   */ 0);
+            /* rope_theta     */ 0.0f,
+            /* head_dim       */ 0,
+            /* hybrid_mode    */ params.triatt_hybrid,
+            /* prefix_protect */ params.triatt_prefix);
 
-        LOG_INF("%s: TriAttention enabled (budget=%d, divide=%d, window=%d, auto-detected head_dim/n_rot/theta from model)\n",
-            __func__, params.triatt_budget, params.triatt_divide, params.triatt_window);
+        const char * mode_name = "V1 paper-faithful";
+        if (params.triatt_hybrid == 1) mode_name = "V2 per-segment quota";
+        else if (params.triatt_hybrid == 2) mode_name = "V3 prefix-protect + quota";
+        LOG_INF("%s: TriAttention enabled (budget=%d, divide=%d, window=%d, mode=%s, prefix=%d)\n",
+            __func__, params.triatt_budget, params.triatt_divide, params.triatt_window,
+            mode_name, params.triatt_prefix);
     }
 
     if (!params.control_vectors.empty()) {

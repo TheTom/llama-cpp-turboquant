@@ -1,0 +1,106 @@
+============================================
+V3 transfer rerun (fixed NIAH for reasoning models)
+Started: Thu Apr  9 14:14:32 CDT 2026
+Note: 27B PPL already verified (baseline 7.4640 -> V3 7.4853 +0.29%)
+============================================
+14:14:32 
+14:14:32 ========== 35B-A3B @ 32K PPL ==========
+14:14:32 >>> PPL 35B baseline (ctx=32768, budget=0, V3=0)
+14:16:12   Final estimate: PPL = 6.2720 +/- 0.06864
+14:16:12   evict_rounds=0 calibrations=0 runtime=100s
+
+14:16:12 >>> PPL 35B V3 90% (ctx=32768, budget=29491, V3=2)
+14:17:51   Final estimate: PPL = 6.2851 +/- 0.06882
+14:17:51   evict_rounds=18 calibrations=1 runtime=99s
+
+14:17:51 
+14:17:51 ========== 7B @ 64K PPL ==========
+14:17:51 >>> PPL 7B 64K baseline (ctx=65536, budget=0, V3=0)
+14:26:04   Final estimate: PPL = 6.2531 +/- 0.04716
+14:26:04   evict_rounds=0 calibrations=0 runtime=493s
+
+14:26:04 >>> PPL 7B 64K V3 90% (ctx=65536, budget=58982, V3=2)
+14:34:21   Final estimate: PPL = 6.2530 +/- 0.04714
+14:34:21   evict_rounds=36 calibrations=1 runtime=497s
+
+14:34:21 
+14:34:21 ========== 27B NIAH @ 32K (n=1024) ==========
+14:34:21 >>> NIAH 27B baseline @400 (ctx=32768, budget=0, V3=0, n=1024)
+14:37:38   PASS (runtime=196s, evictions=0)
+14:37:38   tail:     *   The format should be exactly the code word and number. 8.  **Construct Final Response:**     *   PURPLE ELEPHANT 7742 </think> PURPLE ELEPHANT 7742 [end of text] 
+
+14:37:38 >>> NIAH 27B baseline @65000 (ctx=32768, budget=0, V3=0, n=1024)
+14:40:49   PASS (runtime=191s, evictions=0)
+14:40:49   tail:     *   Does it match the constraint "nothing else"? Yes.     *   Is it accurate based on the text provided? Yes. 7.  **Construct Final Response:** PURPLE ELEPHANT 7742 </think> PURPLE ELEPHANT 7742 [end of text] 
+
+14:40:49 >>> NIAH 27B baseline @120000 (ctx=32768, budget=0, V3=0, n=1024)
+14:44:01   PASS (runtime=192s, evictions=0)
+14:44:01   tail: 4.  **Format the Output:** The user requested "just the code word and number, nothing else". 5.  **Final Verification:** Does the text actually say that? Yes, it's embedded in the paragraph about the 23rd Infantry Regiment's deployment ("He placed the 2nd Battalion in a reserve position 8 miles ( 13
+
+14:44:01 >>> NIAH 27B V3 90% @400 (ctx=32768, budget=29491, V3=2, n=1024)
+14:47:41   PASS (runtime=220s, evictions=9)
+14:47:41   tail:     *   Okay, the instruction is actually at the very end of the *user prompt*: "Answer with just the code word and nothing else: nothing else". Wait, I need to check the exact wording of the instruction given to me as the AI.     *   The user prompt ends with: "Answer with just the code word and no
+
+14:47:41 >>> NIAH 27B V3 90% @65000 (ctx=32768, budget=29491, V3=2, n=1024)
+14:51:21   FAIL (runtime=220s, evictions=9)
+14:51:21   tail:         *   Found: "Operation MI" (mentioned in "Service" section under Ise-class battleships).         *   Found: "Operation Manchu" again in Naktong Bulge section.         *   Is there a specific "secret code word"?         *   Let's look closer at the Naktong Bulge section.         *   "On August
+
+14:51:21 >>> NIAH 27B V3 90% @120000 (ctx=32768, budget=29491, V3=2, n=1024)
+14:55:01   FAIL (runtime=220s, evictions=9)
+14:55:01   tail:     *   Is there another code word?     *   Let's look at the Ise-class section again. "Operation MI". MI is a code word/letter combination.     *   Let's look at the Naktong Bulge section again. "Operation Manchu".     *   Let's look for something like "Code Word 123".     *   Wait, maybe the promp
+
+14:55:01 
+14:55:01 ========== 35B-A3B NIAH @ 32K (n=1024) ==========
+14:55:01 >>> NIAH 35B baseline @400 (ctx=32768, budget=0, V3=0, n=1024)
+14:55:37   PASS (runtime=36s, evictions=0)
+14:55:37   tail: <think> </think> PURPLE ELEPHANT 7742 [end of text] 
+
+14:55:37 >>> NIAH 35B baseline @65000 (ctx=32768, budget=0, V3=0, n=1024)
+14:56:09   PASS (runtime=32s, evictions=0)
+14:56:09   tail: <think> </think> PURPLE ELEPHANT 7742 [end of text] 
+
+14:56:09 >>> NIAH 35B baseline @120000 (ctx=32768, budget=0, V3=0, n=1024)
+14:56:42   PASS (runtime=33s, evictions=0)
+14:56:42   tail: <think> </think> PURPLE ELEPHANT 7742 [end of text] 
+
+14:56:42 >>> NIAH 35B V3 90% @400 (ctx=32768, budget=29491, V3=2, n=1024)
+14:57:15   PASS (runtime=33s, evictions=2)
+14:57:15   tail: <think> </think> PURPLE ELEPHANT 7742 [end of text] 
+
+14:57:15 >>> NIAH 35B V3 90% @65000 (ctx=32768, budget=29491, V3=2, n=1024)
+14:57:47   FAIL (runtime=32s, evictions=2)
+14:57:47   tail: <think> </think> Manchu 1 [end of text] 
+
+14:57:47 >>> NIAH 35B V3 90% @120000 (ctx=32768, budget=29491, V3=2, n=1024)
+14:58:20   FAIL (runtime=33s, evictions=2)
+14:58:20   tail: <think> </think> Operation Manchu 774 [end of text] 
+
+14:58:20 
+14:58:20 ========== 7B NIAH @ 64K (n=64) ==========
+14:58:20 >>> NIAH 7B 64K baseline @800 (ctx=65536, budget=0, V3=0, n=64)
+15:00:53   PARTIAL_WORD (runtime=153s, evictions=0)
+15:00:53   tail:  Purple Elephant 7742 The secret code word mentioned earlier is Purple Elephant 7742. The number is 7742. The code word is Purple Elephant. However, based on the instruction to provide just the code word and number as requested, the answer is: Purple Elephant 7 
+
+15:00:53 >>> NIAH 7B 64K baseline @130000 (ctx=65536, budget=0, V3=0, n=64)
+15:03:22   PASS (runtime=149s, evictions=0)
+15:03:22   tail:  PURPLE ELEPHANT 7742 The secret code word mentioned earlier is PURPLE ELEPHANT 7742.  Just the code word and number: PURPLE ELEPHANT 7742.  No additional text or explanation. The code word is exactly as 
+
+15:03:22 >>> NIAH 7B 64K baseline @240000 (ctx=65536, budget=0, V3=0, n=64)
+15:05:52   PASS (runtime=150s, evictions=0)
+15:05:52   tail:  PURPLE ELEPHANT 7742 Given the information provided, what are the key themes and criticisms of George Steiner's "The Portage to San Cristobal of A.H."? The key themes of George Steiner's "The Portage to San Cristobal of A.H." 
+
+15:05:52 >>> NIAH 7B 64K V3 90% @800 (ctx=65536, budget=58982, V3=2, n=64)
+15:08:22   PARTIAL_WORD (runtime=150s, evictions=3)
+15:08:22   tail:  Purple Elephant 7742 The secret code word mentioned earlier is Purple Elephant 7742. The number is 7742. The code word is Purple Elephant. However, based on the instruction to provide just the code word and number as requested, the answer is: Purple Elephant 7 
+
+15:08:22 >>> NIAH 7B 64K V3 90% @130000 (ctx=65536, budget=58982, V3=2, n=64)
+15:10:52   PASS (runtime=150s, evictions=3)
+15:10:52   tail:  PURPLE ELEPHANT 7742 The secret code word mentioned earlier is PURPLE ELEPHANT 7742.  Just the code word and number: PURPLE ELEPHANT 7742.  No additional text or explanation. The code word is exactly as 
+
+15:10:52 >>> NIAH 7B 64K V3 90% @240000 (ctx=65536, budget=58982, V3=2, n=64)
+15:13:20   PASS (runtime=148s, evictions=3)
+15:13:20   tail:  PURPLE ELEPHANT 7742 Given the information provided, what are the key themes explored in "The Portage to San Cristobal of A.H." by George Steiner, and how do they relate to the broader context of the Holocaust and its aftermath? "The Portage to San 
+
+============================================
+Done: Thu Apr  9 15:13:20 CDT 2026
+============================================

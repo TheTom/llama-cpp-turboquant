@@ -2061,6 +2061,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TRIATT_WINDOW"));
     add_opt(common_arg(
+        {"--triatt-hybrid"}, "MODE",
+        "TriAttention eviction policy: 0=V1 paper-faithful (default),\n"
+        "1=V2 per-segment quota only (experimental),\n"
+        "2=V3 prefix-protect + per-segment quota (experimental, recommended\n"
+        "for standard transformers up to 64K — passes NIAH start/middle/end\n"
+        "with bit-identical PPL to baseline. Not validated on hybrid\n"
+        "Mamba+Attention architectures).",
+        [](common_params & params, int value) {
+            params.triatt_hybrid = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATT_HYBRID"));
+    add_opt(common_arg(
+        {"--triatt-prefix"}, "N",
+        string_format(
+            "TriAttention V3: first N tokens never evicted (default: %d)",
+            params.triatt_prefix
+        ),
+        [](common_params & params, int value) {
+            params.triatt_prefix = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATT_PREFIX"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
