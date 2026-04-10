@@ -4155,6 +4155,30 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
     const uint32_t force_subgroup_size16 = use_subgroups16 ? subgroup_size16 : 0;
+
+    // TQ4_1S uses a dedicated pipeline whose workgroup size is always 32 and
+    // whose reduction path is always the shared-memory variant.
+    //
+    // The Walsh-Hadamard butterfly inside the shader operates on 32-element
+    // blocks with one element per thread, so the workgroup contract is fixed
+    // regardless of what the rest of the mul_mat_vec family picks for the
+    // current DMMV_WG_SIZE bucket.  We always use 32 threads per workgroup.
+    //
+    // Reduction choice: the shader uses the SHMEM tree reduction even when
+    // subgroup arithmetic is available.  A subgroup-shuffle butterfly + pure
+    // subgroupAdd reduction variant was tried and measured ~70 %% slower on
+    // Intel Arc (Mesa Xe HPG), where subgroup shuffles and subgroup adds are
+    // emulated over LDS and end up doing the same amount of LDS traffic as
+    // the explicit shared-memory path but with extra driver overhead.  Going
+    // through SHMEM directly is always correct and is fastest on the devices
+    // we can actually measure.  Future vendor-specific heuristics can switch
+    // to the hybrid reduction variant on NVIDIA / AMD RDNA if hardware
+    // subgroup shuffles beat the LDS roundtrip there.
+    const uint32_t tq4_1s_wg_size            = 32u;
+    const uint32_t tq4_1s_force_sg_size      = 0u;
+    const bool     tq4_1s_use_subgroups      = false;
+    const shader_reduction_mode tq4_1s_reduc = SHADER_REDUCTION_MODE_SHMEM;
+
     static constexpr uint32_t mul_mat_vec_num_bindings = 5;
     static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
 
@@ -4196,6 +4220,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f32_f32",  arr_dmmv_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f32_f32",   arr_dmmv_mxfp4_f32_f32_len[reduc16],   arr_dmmv_mxfp4_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f32_f32",   arr_dmmv_nvfp4_f32_f32_len[reduc16],   arr_dmmv_nvfp4_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            // TQ4_1S: fixed 32-thread workgroup, shared-memory WHT butterfly,
+            // shared-memory reduction.  NUM_ROWS=8 amortises the butterfly cost
+            // across 8 output rows per workgroup.
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f32_f32",  arr_dmmv_tq4_1s_f32_f32_len[tq4_1s_reduc],  arr_dmmv_tq4_1s_f32_f32_data[tq4_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_wg_size, 8, i+1}, 1, true, tq4_1s_use_subgroups, tq4_1s_force_sg_size);
 
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f16_f32",  arr_dmmv_f32_f16_f32_len[reduc],  arr_dmmv_f32_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -4222,6 +4250,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f16_f32",  arr_dmmv_iq4_nl_f16_f32_len[reduc16],  arr_dmmv_iq4_nl_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f16_f32",   arr_dmmv_mxfp4_f16_f32_len[reduc16],   arr_dmmv_mxfp4_f16_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f16_f32",   arr_dmmv_nvfp4_f16_f32_len[reduc16],   arr_dmmv_nvfp4_f16_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ4_1S][i],  "mul_mat_vec_tq4_1s_f16_f32",  arr_dmmv_tq4_1s_f16_f32_len[tq4_1s_reduc],  arr_dmmv_tq4_1s_f16_f32_data[tq4_1s_reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {8, 1, 1}, {tq4_1s_wg_size, 8, i+1}, 1, true, tq4_1s_use_subgroups, tq4_1s_force_sg_size);
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->integer_dot_product) {
@@ -6285,6 +6314,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_TQ4_1S:
             break;
         default:
             return nullptr;
@@ -6300,6 +6330,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             if (m < 4096 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
+        } else if (a_type == GGML_TYPE_TQ4_1S) {
+            // TQ4_1S needs exactly 32 threads (one subgroup) to cooperate on the
+            // 32-element WHT butterfly in shared memory. Force SUBGROUP-sized wg.
+            dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         } else {
             if (m <= 8192 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
@@ -8316,8 +8350,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
-               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
-               src0->type != GGML_TYPE_TQ4_1S) {  // TQ4_1S uses dequant + generic matmul fallback
+               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);

@@ -2376,10 +2376,9 @@ struct test_set_rows : public test_case {
             return err_estimate;
         }
         if (type == GGML_TYPE_TQ4_1S) {
-            // GPU and CPU quantization diverge due to floating-point reduction
-            // order (subgroupAdd vs serial) in the 6-iteration scale refinement.
-            // Both are valid quantizations of comparable quality.
-            return 2.0;
+            // Reduction order matters; TQ4_1S has 32-element WHT inside the
+            // dot product which amplifies fp reduction differences slightly.
+            return 0.01;
         }
         return 1e-7;
     }
@@ -8152,6 +8151,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        }
+    }
+
+    // TQ4_1S: Gemma-4 E2B dimensions. The fused mul_mat_vec kernel has a
+    // shared-memory WHT on the activation and dequantizes centroid*scale per
+    // thread; bugs in the butterfly or reduction only surface at production sizes.
+    for (int k : { 1536, 2048, 2304, 3072, 4096 }) {
+        for (int m : { 256, 1152, 1536, 2048, 5120, 6144 }) {
+            for (int n : { 1, 2, 4, 8 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // TQ4_1S: large-batch MUL_MAT exercises the dequant + f16 matmul path used
+    // during prompt processing (n > mul_mat_vec_max_cols = 8 forces this path).
+    // The fused mul_mat_vec kernel is NOT used for these cases; instead the weights
+    // are dequantized via pipeline_dequant[TQ4_1S] into a temporary f16 buffer and
+    // then the generic f16 matmul runs on them.
+    for (int k : { 1536, 2048 }) {
+        for (int m : { 256, 1536, 2048 }) {
+            for (int n : { 16, 64, 256 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
         }
     }
 
