@@ -1,0 +1,58 @@
+name: llama-cpp-dev
+
+x-llama-dev-base: &llama-dev-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: local/llama.cpp:dev
+  init: true
+  working_dir: /workspace
+  environment:
+    CMAKE_BUILD_PARALLEL_LEVEL: ${CMAKE_BUILD_PARALLEL_LEVEL:-2}
+
+services:
+  dev:
+    <<: *llama-dev-base
+    stdin_open: true
+    tty: true
+    volumes:
+      - .:/workspace
+      - llama-cpp-ccache:/ccache
+    command: /bin/bash
+
+  test:
+    <<: *llama-dev-base
+    profiles: ["test"]
+    volumes:
+      - .:/workspace:ro
+      - llama-cpp-ccache:/ccache
+      - llama-cpp-test-build:/build
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        cmake -S /workspace -B /build -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-RelWithDebInfo} -DLLAMA_BUILD_TESTS=ON
+        cmake --build /build --parallel
+        ctest --test-dir /build --output-on-failure
+
+  bench:
+    <<: *llama-dev-base
+    profiles: ["bench"]
+    volumes:
+      - .:/workspace:ro
+      - llama-cpp-ccache:/ccache
+      - llama-cpp-bench-build:/build
+    environment:
+      CMAKE_BUILD_PARALLEL_LEVEL: ${CMAKE_BUILD_PARALLEL_LEVEL:-2}
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        cmake -S /workspace -B /build -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-RelWithDebInfo}
+        cmake --build /build --target llama-bench --parallel
+        /build/bin/llama-bench $${LLAMA_BENCH_ARGS:---help}
+
+volumes:
+  llama-cpp-ccache:
+  llama-cpp-test-build:
+  llama-cpp-bench-build:

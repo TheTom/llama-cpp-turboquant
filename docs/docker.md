@@ -112,6 +112,32 @@ ctest --test-dir build --output-on-failure
 ./build/bin/llama-bench --help
 ```
 
+For repeatable runs, the repository also includes a `docker-compose.yml` with dedicated services for an interactive shell, tests, and benchmarks.
+
+Open a shell in the developer container:
+
+```bash
+docker compose run --rm dev
+```
+
+Run the test workflow in an isolated build volume:
+
+```bash
+docker compose run --rm test
+```
+
+Run `llama-bench` with the default help output:
+
+```bash
+docker compose run --rm bench
+```
+
+Override benchmark arguments without editing the compose file:
+
+```bash
+LLAMA_BENCH_ARGS="-m /models/model.gguf -p 256 -n 128" docker compose run --rm bench
+```
+
 You may want to pass in some different `ARGS`, depending on the CUDA environment supported by your container host, as well as the GPU architecture.
 
 The defaults are:
