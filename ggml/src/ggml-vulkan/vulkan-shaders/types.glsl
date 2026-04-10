@@ -1747,6 +1747,23 @@ struct block_turbo3_0
 #define A_TYPE block_turbo3_0
 #endif
 
+#define QUANT_K_TQ4_1S 32
+#define QUANT_R_TQ4_1S 1
+
+struct block_tq4_1s
+{
+    float16_t d0;      // scale for elements 0-15
+    float16_t d1;      // scale for elements 16-31
+    uint8_t qs[16];    // 4-bit nibble-packed centroid indices (2 per byte)
+};
+
+#if defined(DATA_A_TQ4_1S)
+#define QUANT_K QUANT_K_TQ4_1S
+#define QUANT_R QUANT_R_TQ4_1S
+#define QUANT_AUXF 1
+#define A_TYPE block_tq4_1s
+#endif
+
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
 const int8_t kvalues_iq4nl_const[16] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
