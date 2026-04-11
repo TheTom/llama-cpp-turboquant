@@ -577,6 +577,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+            cublas_handles[i] = nullptr;
+        }
+        // Free the fixed cuBLAS/hipBLAS workspace installed in cublas_handle()
+        // above. Must happen after cublasDestroy so the BLAS library doesn't
+        // touch the buffer during its own cleanup.
+        if (cublas_workspaces[i] != nullptr) {
+            CUDA_CHECK(cudaFree(cublas_workspaces[i]));
+            cublas_workspaces[i] = nullptr;
         }
     }
 }

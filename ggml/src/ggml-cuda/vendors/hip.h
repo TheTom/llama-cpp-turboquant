@@ -62,6 +62,12 @@
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 #define cublasHandle_t hipblasHandle_t
 #define cublasSetMathMode(handle, mode) CUBLAS_STATUS_SUCCESS
+// hipblasSetWorkspace is available in hipBLAS 2.0+ (ROCm 6.0+). We call this
+// on handle creation with a fixed-size buffer to prevent rocBLAS from lazily
+// growing its own untracked workspace across varying GEMM shapes during long
+// prompt processing. Upstream issue:
+//     https://github.com/ggml-org/llama.cpp/issues/19979
+#define cublasSetWorkspace hipblasSetWorkspace
 #define cublasSetStream hipblasSetStream
 #define cublasSgemm hipblasSgemm
 #define cublasStatus_t hipblasStatus_t
