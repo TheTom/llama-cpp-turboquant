@@ -1336,14 +1336,15 @@ void launch_fattn(
             const int  * kv_max_ptr,
             float      * dst_out,
             float2     * meta_out,
-            dim3         blk_num) {
+            dim3         blk_num,
+            const char * sinks_ptr = nullptr) {
         GGML_ASSERT(block_dim.x % warp_size == 0);
         fattn_kernel<<<blk_num, block_dim, nbytes_shared, main_stream>>>(
             (const char *) Q->data,
             kd,
             vd,
             mask_ptr,
-            sinks ? ((const char *) sinks->data) : nullptr,
+            sinks_ptr,
             kv_max_ptr,
             dst_out, meta_out,
             scale, max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -1521,7 +1522,8 @@ void launch_fattn(
             KV_max.ptr,
             !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data,
             dst_tmp_meta.ptr,
-            blocks_num
+            blocks_num,
+            sinks ? ((const char *) sinks->data) : nullptr
         );
 
         if (stream_k) {
@@ -1635,7 +1637,8 @@ void launch_fattn(
                 knb11, knb12, knb13, vnb21, vnb22, vnb23,
                 mask_ptr, nullptr,  // KV_max not used in batched path
                 dst_out, meta_out,
-                batch_blocks
+                batch_blocks,
+                b == 0 ? (sinks ? (const char *) sinks->data : nullptr) : nullptr  // sinks only on first batch
             );
         };
 
