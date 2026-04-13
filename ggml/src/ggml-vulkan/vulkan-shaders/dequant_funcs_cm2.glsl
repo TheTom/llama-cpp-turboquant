@@ -685,6 +685,33 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 }
 #endif
 
+#if defined(DATA_A_TURBO3_0)
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTURBO3_0 {
+   block_turbo3_0 block;
+};
+
+float16_t dequantFuncTURBO3_0(const in decodeBufTURBO3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[8] = float[8](
+        -0.190685, -0.117832, -0.065717, -0.021460,
+         0.021460,  0.065717,  0.117832,  0.190685
+    );
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+
+    // Extract 2-bit low index from qs (4 per byte)
+    const uint low2 = (uint(bl.block.qs[j / 4]) >> ((j % 4) * 2)) & 0x3;
+
+    // Extract 1-bit high from signs (8 per byte)
+    const uint hi1 = (uint(bl.block.signs[j / 8]) >> (j % 8)) & 0x1;
+
+    // Combine to 3-bit index
+    const uint idx = low2 | (hi1 << 2);
+
+    return float16_t(centroids[idx] * norm);
+}
+#endif
+
 #if defined(DATA_A_Q4_0)
 #define dequantFuncA dequantFuncQ4_0
 #elif defined(DATA_A_Q4_1)
@@ -729,6 +756,8 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncIQ4_NL
 #elif defined(DATA_A_MXFP4)
 #define dequantFuncA dequantFuncMXFP4
+#elif defined(DATA_A_TURBO3_0)
+#define dequantFuncA dequantFuncTURBO3_0
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif

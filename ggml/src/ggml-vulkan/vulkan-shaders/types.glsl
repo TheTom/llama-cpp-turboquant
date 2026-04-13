@@ -6,6 +6,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
 
 #if defined(DATA_A_F32)
 #define QUANT_K 1
@@ -1694,6 +1695,23 @@ struct block_mxfp4
 #define QUANT_R QUANT_R_MXFP4
 #define QUANT_AUXF 1
 #define A_TYPE block_mxfp4
+#endif
+
+#define QUANT_K_TURBO3_0 128
+#define QUANT_R_TURBO3_0 1
+
+struct block_turbo3_0
+{
+    float16_t norm;
+    uint8_t qs[32];     // 2-bit centroid indices (4 per byte), 128/4 = 32 bytes
+    uint8_t signs[16]; // 1-bit high bit of 3-bit index (8 per byte), 128/8 = 16 bytes
+};
+
+#if defined(DATA_A_TURBO3_0)
+#define QUANT_K QUANT_K_TURBO3_0
+#define QUANT_R QUANT_R_TURBO3_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo3_0
 #endif
 
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)

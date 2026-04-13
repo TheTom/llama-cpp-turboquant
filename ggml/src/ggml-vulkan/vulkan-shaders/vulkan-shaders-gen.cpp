@@ -66,6 +66,7 @@ const std::vector<std::string> type_names = {
     "iq4_nl",
     "mxfp4",
     "bf16",
+    "turbo3_0",
 };
 
 enum MatMulIdType {
@@ -655,7 +656,7 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32" || tname == "turbo3_0") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
@@ -666,7 +667,7 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32" || tname == "turbo3_0") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
@@ -762,13 +763,18 @@ void process_shaders() {
         string_to_spv("cpy_f32_" + t + "_rte", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
+    // turbo3_0 copy-from-quant only; copy-to-quant (cpy_f32_turbo3_0) omitted because the non-SET_ROWS quantize() path lacks the WHT transform
+    string_to_spv("cpy_turbo3_0_f32", "copy_from_quant.comp", {{"DATA_A_TURBO3_0", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
-    for (std::string t : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
+    for (std::string t : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "turbo3_0"}) {
         string_to_spv("set_rows_" + t + "_i32",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i32_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
         string_to_spv("set_rows_" + t + "_i64",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i64_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
     }
+
+    // TurboQuant WHT operation
+    string_to_spv("turbo_wht", "turbo_wht.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

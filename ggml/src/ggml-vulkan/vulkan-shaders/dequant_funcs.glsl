@@ -602,3 +602,39 @@ vec2 get_dm(uint ib, uint a_offset) {
     return vec2(1, 0);
 }
 #endif
+
+#if defined(DATA_A_TURBO3_0)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    // PolarQuant 3-bit centroids (Lloyd-Max for Gaussian)
+    const float centroids[8] = float[8](
+        -0.190685, -0.117832, -0.065717, -0.021460,
+         0.021460,  0.065717,  0.117832,  0.190685
+    );
+
+    // iqs is the element index within the block (0..31), we decode 2 consecutive elements
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+
+    // Extract 2-bit low indices from qs (4 per byte)
+    const uint low2_0 = (uint(data_a[a_offset + ib].qs[j0 / 4]) >> ((j0 % 4) * 2)) & 0x3;
+    const uint low2_1 = (uint(data_a[a_offset + ib].qs[j1 / 4]) >> ((j1 % 4) * 2)) & 0x3;
+
+    // Extract 1-bit high from signs (8 per byte)
+    const uint hi1_0 = (uint(data_a[a_offset + ib].signs[j0 / 8]) >> (j0 % 8)) & 0x1;
+    const uint hi1_1 = (uint(data_a[a_offset + ib].signs[j1 / 8]) >> (j1 % 8)) & 0x1;
+
+    // Combine to 3-bit index
+    const uint idx0 = low2_0 | (hi1_0 << 2);
+    const uint idx1 = low2_1 | (hi1_1 << 2);
+
+    return vec2(centroids[idx0], centroids[idx1]);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].norm), 0);
+}
+#endif

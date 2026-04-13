@@ -1,9 +1,15 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #include "rte.glsl"
 #include "types.glsl"
 
-#if defined(SET_ROWS) && QUANT_K == 1
+#if defined(SET_ROWS) && defined(DATA_A_TURBO3_0)
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+const uint BLOCK_SIZE = 128;
+#elif defined(SET_ROWS) && QUANT_K == 1
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 const uint BLOCK_SIZE = 512;
 #else
@@ -184,6 +190,69 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_TURBO3_0)
+const float TS1[128] = float[128](
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
+    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
+     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
+    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
+     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
+     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
+);
+
+const float TS2[128] = float[128](
+     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
+     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
+     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
+);
+
+const float TINV = 0.08838834764831845;  // 1 / sqrt(128)
+
+const float TC[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+);
+
+const float TM[7] = float[7](
+    -0.154259, -0.091775, -0.043589,
+     0.0,
+     0.043589,  0.091775,  0.154259
+);
+
+#if defined(SET_ROWS)
+
+shared float wht[128];
+shared float sg_acc[16];
+shared float gnrm;
+
+void quantize_block(uint b, uint o) {
+    [[unroll]] for (int j = 0; j < 32; ++j) data_q[b].qs[j]    = uint8_t(0);
+    [[unroll]] for (int j = 0; j < 16; ++j) data_q[b].signs[j] = uint8_t(0);
+    float rs = 0.0;
+    [[unroll]] for (int j = 0; j < 128; ++j) {
+        float v  = wht[o + j];
+        uint  i  = v < TM[0] ? 0 : v < TM[1] ? 1 : v < TM[2] ? 2 : v < TM[3] ? 3 :
+                   v < TM[4] ? 4 : v < TM[5] ? 5 : v < TM[6] ? 6 : 7;
+        rs += TC[i] * TC[i];
+        uint low2 = i & 0x3;
+        uint hi1  = (i >> 2) & 0x1;
+        data_q[b].qs[j / 4]    |= uint8_t(low2 << ((j % 4) * 2));
+        data_q[b].signs[j / 8] |= uint8_t(hi1  << (j % 8));
+    }
+    float rn = sqrt(rs);
+    data_q[b].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
+}
+
+#endif // defined(SET_ROWS)
+#endif // defined(DATA_A_TURBO3_0)
+
 #if defined(DATA_A_IQ4_NL)
 uint best_index(float x) {
     if (x <= kvalues_iq4nl[0]) return 0;
@@ -246,7 +315,97 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
-#if defined(SET_ROWS)
+#if defined(SET_ROWS) && defined(DATA_A_TURBO3_0)
+void main() {
+    const uint t   = gl_LocalInvocationID.x;
+    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint gpr = p.ne00 / 128;
+
+    if (gpr == 0) return;
+    if (g >= p.ne / 128) return;
+
+    uint tmp = g;
+    const uint ig  = tmp % gpr; tmp /= gpr;
+    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
+    const uint i02 = tmp % p.ne12;
+    const uint i03 = tmp / p.ne12;
+
+    const uint sb  = src0_idx(ig * 128, i01, i02, i03) + get_aoffset();
+    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
+    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
+
+    // Step 1: load into shared memory
+    wht[t] = data_s[sb + t];
+    barrier();
+
+    // Step 2: L2 norm via subgroup reduction
+    float v2 = wht[t] * wht[t];
+    v2 = subgroupAdd(v2);
+    if (gl_SubgroupInvocationID == 0) sg_acc[gl_SubgroupID] = v2;
+    barrier();
+    if (t == 0) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc[w];
+        gnrm = sqrt(total);
+    }
+    barrier();
+
+    // Step 3: normalize, then apply forward WHT: signs1 -> butterfly -> signs2
+    wht[t] *= (gnrm > 1e-10) ? (1.0 / gnrm) : 0.0;
+    barrier();
+
+    wht[t] *= TS1[t];
+    barrier();
+
+    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
+        if ((t % (2 * h)) < h) {
+            float a    = wht[t];
+            float b    = wht[t + h];
+            wht[t]     = a + b;
+            wht[t + h] = a - b;
+        }
+        barrier();
+    }
+
+    // Step 5: apply signs2 + scaling
+    float rv = wht[t] * TINV * TS2[t];
+
+    // Step 6: quantize -- all 128 threads participate
+    uint idx = rv < TM[0] ? 0u : rv < TM[1] ? 1u : rv < TM[2] ? 2u : rv < TM[3] ? 3u :
+              rv < TM[4] ? 4u : rv < TM[5] ? 5u : rv < TM[6] ? 6u : 7u;
+
+    // Pack qs: 4 elements per byte via subgroup shuffle
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint my_low2 = idx & 0x3u;
+    uint qs_byte = 0u;
+    [[unroll]] for (uint k = 0; k < 4; k++) {
+        uint contrib = subgroupShuffle(my_low2, (sg_lane & ~3u) + k);
+        qs_byte |= contrib << (k * 2u);
+    }
+    if (sg_lane % 4u == 0u) {
+        data_q[db].qs[t / 4u] = uint8_t(qs_byte);
+    }
+
+    // Pack signs: 8 elements per byte via subgroup ballot
+    uvec4 ballot = subgroupBallot(((idx >> 2u) & 1u) != 0u);
+    if (sg_lane % 8u == 0u) {
+        uint local_byte = sg_lane / 8u;
+        data_q[db].signs[t / 8u] = uint8_t((ballot.x >> (local_byte * 8u)) & 0xFFu);
+    }
+
+    // Step 7: reconstruction norm via subgroup reduction
+    float rc = TC[idx] * TC[idx];
+    rc = subgroupAdd(rc);
+    if (sg_lane == 0u) sg_acc[gl_SubgroupID] = rc;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc[w];
+        float rn = sqrt(total);
+        data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
+    }
+}
+#elif defined(SET_ROWS)
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
