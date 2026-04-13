@@ -1026,6 +1026,7 @@ namespace ggml_cuda_mma {
         const floatx2_t& b_frag = reinterpret_cast<const floatx2_t&>(B.x[0]);
         acc_frag = __builtin_amdgcn_mfma_f32_16x16x8_xf32(a_frag, b_frag, acc_frag, 0, 0, 0);
 #elif defined(CDNA4) || defined(CDNA2) || defined(CDNA1)
+        // CDNA4 (gfx950) does not support xf32 MFMA, use f32 path like CDNA2/CDNA1
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             acc_frag = __builtin_amdgcn_mfma_f32_16x16x4f32(A.x[i], B.x[i], acc_frag, 0, 0, 0);
@@ -1230,7 +1231,7 @@ namespace ggml_cuda_mma {
                                                       B.x[1],
                                                       acc[0],
                                                       0, 0, 0);
-#endif // defined(CDNA3)
+#endif // defined(CDNA4) || defined(CDNA3)
 
 #elif defined(AMD_WMMA_AVAILABLE)
 
@@ -1309,7 +1310,7 @@ namespace ggml_cuda_mma {
                                                      B.x[1],
                                                      acc[0],
                                                      0, 0, 0);
-#endif // defined(CDNA3)
+#endif // defined(CDNA4) || defined(CDNA3)
 
 #else
         GGML_UNUSED_VARS(D, A, B);
