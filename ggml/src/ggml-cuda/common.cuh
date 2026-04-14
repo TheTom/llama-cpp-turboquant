@@ -1354,6 +1354,18 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Fixed cuBLAS / hipBLAS workspace size. Setting this explicitly via
+// cublasSetWorkspace() on handle creation prevents the underlying BLAS
+// library (particularly rocBLAS on GFX11/RDNA3/3.5) from lazily growing
+// its own untracked workspace as it encounters new GEMM shapes during
+// long prompt processing. Without this, VRAM creeps up until OOM.
+//
+// 32 MiB is large enough for the Tensile kernels rocBLAS ships and matches
+// the NVIDIA cuBLAS recommended default for most workloads. Bump if you
+// see rocBLAS falling back to smaller kernels in traces.
+// Upstream bug: https://github.com/ggml-org/llama.cpp/issues/19979
+#define GGML_CUDA_CUBLAS_WORKSPACE_SIZE (size_t(32) * 1024 * 1024)
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1361,6 +1373,7 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
 
@@ -1426,6 +1439,16 @@ struct ggml_backend_cuda_context {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+
+            // Allocate and install a fixed cuBLAS/hipBLAS workspace.
+            // Without this call, rocBLAS lazily allocates its own workspace
+            // and grows it as it encounters new GEMM shapes, producing
+            // untracked VRAM creep on GFX11/RDNA3/3.5. See the workspace
+            // size constant definition above and upstream issue #19979.
+            CUDA_CHECK(cudaMalloc(&cublas_workspaces[device], GGML_CUDA_CUBLAS_WORKSPACE_SIZE));
+            CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device],
+                                            cublas_workspaces[device],
+                                            GGML_CUDA_CUBLAS_WORKSPACE_SIZE));
         }
         return cublas_handles[device];
     }

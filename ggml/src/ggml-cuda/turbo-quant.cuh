@@ -173,7 +173,10 @@ static void turbo_innerq_init(void) {
     if (env_str) innerq_strength = atof(env_str);
     if (innerq_strength <= 0.0f || innerq_strength > 1.0f) innerq_strength = 0.5f;
 
-    // Zero accumulators and set calibrating flag on device
+    // Zero accumulators and set calibrating flag on device.
+    // CUDA_CHECK wrappers are critical on HIP/ROCm: unchecked errors from
+    // hipMemcpyToSymbol are sticky and poison the runtime, causing subsequent
+    // API calls to fail with "no ROCm-capable device is detected".
     float zeros[INNERQ_MAX_CHANNELS] = {0};
     int zero = 0, one = 1;
     CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_sq_accum, zeros, sizeof(zeros)));

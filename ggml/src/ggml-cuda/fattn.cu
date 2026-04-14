@@ -139,6 +139,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
             break;
+#ifndef GGML_USE_HIP
+        // D>=576 MMA kernels use shared memory that exceeds HIP's 65536-byte LDS
+        // limit on RDNA3/3.5/4. The matching template instances are excluded
+        // from the HIP build in ggml-hip/CMakeLists.txt, so guard the dispatch too.
         case 576: {
             // For Deepseek, go straight to the ncols1 switch to avoid compiling unnecessary kernels.
             GGML_ASSERT(V->ne[0] == 512);
@@ -206,6 +210,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 ggml_cuda_flash_attn_ext_mma_f16_case<640, 512, 2, 16>(ctx, dst);
             }
         } break;
+#endif // !GGML_USE_HIP
         default:
             GGML_ABORT("fatal error");
             break;
@@ -396,6 +401,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
+#ifndef GGML_USE_HIP
+        // D>=576 is not supported on HIP — shared memory exceeds LDS limits
         case 576:
         case 640:
             if (V->ne[0] != 512) {
@@ -405,6 +412,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
+#endif
         default:
             return BEST_FATTN_KERNEL_NONE;
     }
