@@ -2838,10 +2838,12 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
         res += ggml_type_size(GGML_TYPE_F32)*(ne01_max*ne02*ne03*nwg*(ne20 + 2));
     }
 
-    // TurboFlash two-pass: always reserve partial result buffer to avoid graph reallocations
-    // partial_out: float[n_bh * n_blocks * dv]
-    // partial_ms:  float[n_bh * n_blocks * 2]  (max + sum per block)
-    {
+    // TurboFlash two-pass temp is only needed when the TurboFlash path is eligible.
+    // Reserving it unconditionally can massively inflate graph scratch usage for
+    // large-context models even when the normal FA path is selected.
+    if (ggml_metal_op_flash_attn_ext_use_turbo_flash(op)) {
+        // partial_out: float[n_bh * n_blocks * dv]
+        // partial_ms:  float[n_bh * n_blocks * 2]  (max + sum per block)
         const int64_t n_bh = ne01 * ne02 * ne03;
         const int64_t ne11 = op->src[1]->ne[1];  // T_kv
         const int64_t n_blocks = (ne11 + 63) / 64;  // ceil(T_kv / 64)
