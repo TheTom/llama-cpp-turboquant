@@ -16,6 +16,14 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+static pthread_once_t turbo_rotation_once = PTHREAD_ONCE_INIT;
+static pthread_once_t turbo_qjl_once      = PTHREAD_ONCE_INIT;
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -44,9 +52,9 @@ static const float CENTROIDS_3BIT[8] = {
 
 static float turbo_rotation[TURBO_D * TURBO_D];
 static float turbo_rotation_t[TURBO_D * TURBO_D]; /* transpose */
-static int   turbo_rotation_initialized = 0;
 
-/* Simple LCG PRNG for deterministic rotation generation */
+/* Simple LCG PRNG for deterministic rotation generation.
+ * Only used during one-time init (protected by pthread_once), so not thread-safe by itself. */
 static uint64_t turbo_prng_state;
 
 static void turbo_prng_seed(uint64_t seed) {
@@ -63,81 +71,86 @@ static double turbo_prng_normal(void) {
     return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
 
-static void turbo_init_rotation(void) {
-    if (turbo_rotation_initialized) return;
-
+/* Generate orthogonal matrix via QR (Gram-Schmidt) with given PRNG seed */
+static void turbo_generate_orthogonal(float * mat, float * mat_t, uint64_t seed) {
     const int d = TURBO_D;
 
-    /* Generate random Gaussian matrix */
-    turbo_prng_seed(TURBO_SEED_ROTATION);
+    turbo_prng_seed(seed);
     float G[TURBO_D * TURBO_D];
     for (int i = 0; i < d * d; i++) {
         G[i] = (float)turbo_prng_normal();
     }
 
-    /* QR decomposition via modified Gram-Schmidt */
-    /* Q stored column-major in turbo_rotation */
-    memcpy(turbo_rotation, G, d * d * sizeof(float));
+    memcpy(mat, G, d * d * sizeof(float));
 
     for (int j = 0; j < d; j++) {
-        /* Normalize column j */
         float norm = 0.0f;
         for (int i = 0; i < d; i++) {
-            norm += turbo_rotation[i * d + j] * turbo_rotation[i * d + j];
+            norm += mat[i * d + j] * mat[i * d + j];
         }
         norm = sqrtf(norm);
         if (norm > 1e-10f) {
             for (int i = 0; i < d; i++) {
-                turbo_rotation[i * d + j] /= norm;
+                mat[i * d + j] /= norm;
             }
         }
-
-        /* Orthogonalize remaining columns against j */
         for (int k = j + 1; k < d; k++) {
             float dot = 0.0f;
             for (int i = 0; i < d; i++) {
-                dot += turbo_rotation[i * d + j] * turbo_rotation[i * d + k];
+                dot += mat[i * d + j] * mat[i * d + k];
             }
             for (int i = 0; i < d; i++) {
-                turbo_rotation[i * d + k] -= dot * turbo_rotation[i * d + j];
+                mat[i * d + k] -= dot * mat[i * d + j];
             }
         }
     }
 
-    /* Compute transpose */
     for (int i = 0; i < d; i++) {
         for (int j = 0; j < d; j++) {
-            turbo_rotation_t[i * d + j] = turbo_rotation[j * d + i];
+            mat_t[i * d + j] = mat[j * d + i];
         }
     }
+}
 
-    turbo_rotation_initialized = 1;
+static void turbo_init_rotation_impl(void) {
+    turbo_generate_orthogonal(turbo_rotation, turbo_rotation_t, TURBO_SEED_ROTATION);
+}
+
+static void turbo_init_rotation(void) {
+#ifdef _WIN32
+    static volatile long turbo_rotation_init_flag = 0;
+    if (InterlockedCompareExchange(&turbo_rotation_init_flag, 1, 0) == 0) {
+        turbo_init_rotation_impl();
+        InterlockedExchange(&turbo_rotation_init_flag, 2);
+    } else {
+        while (InterlockedCompareExchange(&turbo_rotation_init_flag, 2, 2) != 2) { /* spin */ }
+    }
+#else
+    pthread_once(&turbo_rotation_once, turbo_init_rotation_impl);
+#endif
 }
 
 /* ---------- QJL projection matrix (lazy init, seed-based) ---------- */
 
 static float turbo_qjl_matrix[TURBO_D * TURBO_D];
 static float turbo_qjl_matrix_t[TURBO_D * TURBO_D];
-static int   turbo_qjl_initialized = 0;
+
+static void turbo_init_qjl_impl(void) {
+    turbo_generate_orthogonal(turbo_qjl_matrix, turbo_qjl_matrix_t, TURBO_SEED_QJL);
+}
 
 static void turbo_init_qjl(void) {
-    if (turbo_qjl_initialized) return;
-
-    const int d = TURBO_D;
-    turbo_prng_seed(TURBO_SEED_QJL);
-
-    for (int i = 0; i < d * d; i++) {
-        turbo_qjl_matrix[i] = (float)turbo_prng_normal();
+#ifdef _WIN32
+    static volatile long turbo_qjl_init_flag = 0;
+    if (InterlockedCompareExchange(&turbo_qjl_init_flag, 1, 0) == 0) {
+        turbo_init_qjl_impl();
+        InterlockedExchange(&turbo_qjl_init_flag, 2);
+    } else {
+        while (InterlockedCompareExchange(&turbo_qjl_init_flag, 2, 2) != 2) { /* spin */ }
     }
-
-    /* Transpose */
-    for (int i = 0; i < d; i++) {
-        for (int j = 0; j < d; j++) {
-            turbo_qjl_matrix_t[i * d + j] = turbo_qjl_matrix[j * d + i];
-        }
-    }
-
-    turbo_qjl_initialized = 1;
+#else
+    pthread_once(&turbo_qjl_once, turbo_init_qjl_impl);
+#endif
 }
 
 /* ---------- helper: matrix-vector multiply ---------- */
@@ -449,9 +462,11 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         }
 
         /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
+        float rotated_tmp[TURBO_D];
+        memcpy(rotated_tmp, normalized, d * sizeof(float));
+        // turbo_cpu_fwht(rotated, d);
         float rotated[TURBO_D];
-        memcpy(rotated, normalized, d * sizeof(float));
-        turbo_cpu_fwht(rotated, d);
+        matvec(turbo_rotation, rotated_tmp, rotated, d);
 
 #if TURBO4_USE_4BIT
         /* Step 3: 4-bit quantization (16 centroids) */
@@ -494,6 +509,12 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
             residual[i] = normalized[i] - mse_recon[i];
         }
 
+          /* Step 1: Extract norm */
+        float norm_rs = 0.0f;
+        for (int i = 0; i < d; i++) norm_rs += residual[i] * residual[i];
+        norm_rs = sqrtf(norm_rs);
+
+
         /* Step 5: QJL */
         float projected[TURBO_D];
         matvec(turbo_qjl_matrix, residual, projected, d);
@@ -502,6 +523,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         /* Pack */
 #if !TURBO4_USE_4BIT
         y[block].norm  = GGML_FP32_TO_FP16(norm);
+        y[block].rnorm = GGML_FP32_TO_FP16(norm_rs);
 #endif
 
 #if TURBO4_USE_4BIT
@@ -586,7 +608,7 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
         }
 
         float rnorm = GGML_FP16_TO_FP32(x[block].rnorm);
-        const float qjl_scale = TURBO_QJL_CONST / (float)d * rnorm;
+        const float qjl_scale = TURBO_QJL_CONST / sqrtf((float)d) * rnorm;
 
         float rotated_recon[TURBO_D];
         for (int i = 0; i < d; i++) {
