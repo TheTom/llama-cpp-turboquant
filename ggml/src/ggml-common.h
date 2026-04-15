@@ -272,23 +272,38 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 // Per block: norm(fp16) + 2-bit indices (8 bytes) + 1-bit extra (4 bytes) = 14 bytes per 32 values
 // = 3.5 bits/value → 4.6× compression vs fp16
 // The 3-bit index is split: lower 2 bits in qs[], upper 1 bit in signs[]
+#ifndef TURBO3_USE_QJL
+#  define TURBO3_USE_QJL 1
+#endif
 #define QK_TURBO3 128   // Block size 128: one block per rotation group, eliminates redundant norms
 #define QK_TURBO3_GROUP 128  // rotation group size = head_dim
 // Derived: FA template nl parameters (auto-scale with block size)
 #define NL_TURBO3     (QK_TURBO3 / 16)   // non-vec FA iterations per block
 #define NL_TURBO3_VEC (QK_TURBO3 / 4)    // vec FA iterations per block
+#if TURBO3_USE_QJL
 typedef struct {
-    ggml_half  norm;                    //  2 bytes: vector L2 norm (for rescaling)
-    uint8_t    qs[QK_TURBO3 / 4];      //  8 bytes: lower 2-bit indices (4 per byte)
-    uint8_t    signs[QK_TURBO3 / 8];   //  4 bytes: upper 1-bit of 3-bit index (8 per byte)
-} block_turbo3_0;                       // 14 bytes total
-static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
+    ggml_half  norm;                    //  2 bytes: original vector L2 norm
+    ggml_half  rnorm;                   //  2 bytes: residual norm for QJL scale
+    uint8_t    qs[QK_TURBO3 / 4];      // 32 bytes: 2-bit PolarQuant indices
+    uint8_t    signs[QK_TURBO3 / 8];   // 16 bytes: 1-bit QJL sign bits
+} block_turbo3_0;                       // 52 bytes total
+static_assert(sizeof(block_turbo3_0) == 2*sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8,
+              "wrong turbo3_0 block size");
+#else
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected norm
+    uint8_t    qs[QK_TURBO3 / 4];      // 32 bytes: lower 2-bit of 3-bit index
+    uint8_t    signs[QK_TURBO3 / 8];   // 16 bytes: upper 1-bit of 3-bit index
+} block_turbo3_0;                       // 50 bytes total
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8,
+              "wrong turbo3_0 block size");
+#endif
 
 // TurboQuant 4-bit: 3-bit PolarQuant indices + 1-bit QJL signs
 // TURBO4_USE_4BIT: switch between 4-bit PolarQuant (new) and 3-bit+QJL (legacy)
 // Default: 4-bit on all backends (Metal + CUDA validated)
 #ifndef TURBO4_USE_4BIT
-#  define TURBO4_USE_4BIT 1
+#  define TURBO4_USE_4BIT 0
 #endif
 
 #define QK_TURBO4 128
