@@ -419,11 +419,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        // Allow mixed turbo KV types (any combination of turbo2, turbo3, q8_0)
-        auto is_turbo = [](ggml_type t) {
-            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_Q8_0;
+        // Allow mixed KV types for combinations that have FA template instances compiled in:
+        // - turbo2/3/4 + q8_0 (turbo cache work)
+        // - f16/bf16 + q8_0 (common K=f16, V=q8_0 setup)
+        auto is_kv_compat = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
+                || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
         };
-        if (!is_turbo(K->type) || !is_turbo(V->type)) {
+        if (!is_kv_compat(K->type) || !is_kv_compat(V->type)) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
