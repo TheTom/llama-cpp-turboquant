@@ -3,7 +3,6 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
-#include "rte.glsl"
 #include "types.glsl"
 
 #if defined(SET_ROWS) && defined(DATA_A_TURBO3_0)
