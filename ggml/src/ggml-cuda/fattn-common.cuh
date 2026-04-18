@@ -1299,14 +1299,19 @@ void launch_fattn(
 
 #ifdef GGML_USE_HIP
     // HIP/ROCm: bypass the memory pool for f16 temp buffers.
-    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently.
-    // For quantized KV dequant, this means the f16 temp buffer stays allocated,
-    // consuming more VRAM than the quantized KV compression saves — causing OOM.
-    // Using raw alloc+free ensures the memory is released after the kernel completes.
+    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently
+    // because free() stores buffers for reuse rather than releasing them.
+    // On HIP without VMM support (RDNA 3/4), this means the f16 dequant temp buffers
+    // for quantized KV stay allocated after use, consuming more VRAM than the KV
+    // compression saves — causing OOM before f16 at equivalent context lengths.
+    // Using raw cudaMalloc/cudaFree ensures memory is released after the kernel completes.
+    // Ref: https://github.com/ggml-org/llama.cpp/issues/22107
     struct hip_f16_alloc {
         half * ptr = nullptr;
         cudaStream_t stream;
         hip_f16_alloc(cudaStream_t s) : stream(s) {}
+        hip_f16_alloc(const hip_f16_alloc &) = delete;
+        hip_f16_alloc & operator=(const hip_f16_alloc &) = delete;
         ~hip_f16_alloc() {
             if (ptr) {
                 cudaStreamSynchronize(stream);
