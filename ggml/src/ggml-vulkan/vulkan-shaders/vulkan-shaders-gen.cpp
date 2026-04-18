@@ -684,6 +684,15 @@ void process_shaders() {
 #endif
                 }
             }
+
+            // Narrow mixed-KV support for Vulkan FA scalar path:
+            // K=q8_0,V=turbo3_0 and K=turbo3_0,V=q8_0.
+            string_to_spv("flash_attn_f32_f16_kq8_0_vturbo3_0", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"DATA_A_MIXED_K_Q8_0_V_TURBO3_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}),
+                fp16, false, false, f16acc);
+            string_to_spv("flash_attn_f32_f16_kturbo3_0_vq8_0", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"DATA_A_MIXED_K_TURBO3_0_V_Q8_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}),
+                fp16, false, false, f16acc);
         }
     }
 

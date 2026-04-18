@@ -81,6 +81,23 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
+
+#if defined(DATA_A_MIXED_K_Q8_0_V_TURBO3_0)
+layout (binding = 1) readonly buffer K_Q8 {block_q8_0_packed16 data_k_q8[];};
+layout (binding = 2) readonly buffer V_T3 {block_turbo3_0 data_v_t3[];};
+#define BLOCK_SIZE_K QUANT_K_Q8_0
+#define BLOCK_SIZE_V QUANT_K_TURBO3_0
+#define BLOCK_BYTE_SIZE_K 34
+#define BLOCK_BYTE_SIZE_V 50
+#elif defined(DATA_A_MIXED_K_TURBO3_0_V_Q8_0)
+layout (binding = 1) readonly buffer K_T3 {block_turbo3_0 data_k_t3[];};
+layout (binding = 2) readonly buffer V_Q8 {block_q8_0_packed16 data_v_q8[];};
+#define BLOCK_SIZE_K QUANT_K_TURBO3_0
+#define BLOCK_SIZE_V QUANT_K_Q8_0
+#define BLOCK_BYTE_SIZE_K 50
+#define BLOCK_BYTE_SIZE_V 34
+#endif
+
 #if defined(DATA_A_F32)
 layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
@@ -97,13 +114,76 @@ layout (binding = 1) readonly buffer K_PACKED32 {A_TYPE_PACKED32 k_data_packed32
 layout (binding = 2) readonly buffer V_PACKED32 {A_TYPE_PACKED32 v_data_packed32[];} v_packed32;
 #endif
 
+#ifndef BLOCK_SIZE_K
+#ifdef BLOCK_SIZE
+#define BLOCK_SIZE_K BLOCK_SIZE
+#else
+#define BLOCK_SIZE_K 1
+#endif
+#endif
+
+#ifndef BLOCK_SIZE_V
+#ifdef BLOCK_SIZE
+#define BLOCK_SIZE_V BLOCK_SIZE
+#else
+#define BLOCK_SIZE_V BLOCK_SIZE_K
+#endif
+#endif
+
 #ifndef BLOCK_SIZE
-#define BLOCK_SIZE 1
+#define BLOCK_SIZE BLOCK_SIZE_K
 #endif
 
 // turbo3: define BLOCK_BYTE_SIZE early (before first use in FA offset computation)
 #if defined(DATA_A_TURBO3_0) && !defined(BLOCK_BYTE_SIZE)
 #define BLOCK_BYTE_SIZE 50 // block_turbo3_0: 2 (norm) + 32 (qs) + 16 (signs) = 50 bytes
+#endif
+
+#if defined(DATA_A_MIXED_K_Q8_0_V_TURBO3_0) || defined(DATA_A_MIXED_K_TURBO3_0_V_Q8_0)
+const float T3C[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+);
+
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+#if defined(DATA_A_MIXED_K_Q8_0_V_TURBO3_0)
+        const i8vec2 v0 = unpack8(int32_t(data_k_q8[a_offset + ib].qs[iqs / 2])).xy;
+        const i8vec2 v1 = unpack8(int32_t(data_k_q8[a_offset + ib].qs[iqs / 2 + 1])).xy;
+        return FLOAT_TYPE(data_k_q8[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+#else
+        FLOAT_TYPEV4 r;
+        for (int k = 0; k < 4; k++) {
+            uint j = iqs + uint(k);
+            const float nm = float(data_k_t3[a_offset + ib].norm);
+            const uint qb = uint(data_k_t3[a_offset + ib].qs[j / 4]);
+            const uint sb = uint(data_k_t3[a_offset + ib].signs[j / 8]);
+            const uint lo = (qb >> ((j % 4) * 2)) & 0x3;
+            const uint hi = (sb >> (j % 8)) & 0x1;
+            r[k] = FLOAT_TYPE(T3C[lo | (hi << 2)] * nm);
+        }
+        return r;
+#endif
+    } else {
+#if defined(DATA_A_MIXED_K_Q8_0_V_TURBO3_0)
+        FLOAT_TYPEV4 r;
+        for (int k = 0; k < 4; k++) {
+            uint j = iqs + uint(k);
+            const float nm = float(data_v_t3[a_offset + ib].norm);
+            const uint qb = uint(data_v_t3[a_offset + ib].qs[j / 4]);
+            const uint sb = uint(data_v_t3[a_offset + ib].signs[j / 8]);
+            const uint lo = (qb >> ((j % 4) * 2)) & 0x3;
+            const uint hi = (sb >> (j % 8)) & 0x1;
+            r[k] = FLOAT_TYPE(T3C[lo | (hi << 2)] * nm);
+        }
+        return r;
+#else
+        const i8vec2 v0 = unpack8(int32_t(data_v_q8[a_offset + ib].qs[iqs / 2])).xy;
+        const i8vec2 v1 = unpack8(int32_t(data_v_q8[a_offset + ib].qs[iqs / 2 + 1])).xy;
+        return FLOAT_TYPE(data_v_q8[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+#endif
+    }
+}
 #endif
 
 #if defined(DATA_A_F32)
@@ -287,6 +367,18 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     }
     return r;
 }
+#endif
+
+#ifndef BLOCK_BYTE_SIZE_K
+#ifdef BLOCK_BYTE_SIZE
+#define BLOCK_BYTE_SIZE_K BLOCK_BYTE_SIZE
+#endif
+#endif
+
+#ifndef BLOCK_BYTE_SIZE_V
+#ifdef BLOCK_BYTE_SIZE
+#define BLOCK_BYTE_SIZE_V BLOCK_BYTE_SIZE
+#endif
 #endif
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))

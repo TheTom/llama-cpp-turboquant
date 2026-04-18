@@ -414,7 +414,18 @@ void main() {
     uvec4 ballot = subgroupBallot(((idx >> 2u) & 1u) != 0u);
     if (sg_lane % 8u == 0u) {
         uint local_byte = sg_lane / 8u;
-        data_q[db].signs[t / 8u] = uint8_t((ballot.x >> (local_byte * 8u)) & 0xFFu);
+        uint bit = local_byte * 8u;
+        uint packed = 0u;
+        if (bit < 32u) {
+            packed = (ballot.x >> bit) & 0xFFu;
+        } else if (bit < 64u) {
+            packed = (ballot.y >> (bit - 32u)) & 0xFFu;
+        } else if (bit < 96u) {
+            packed = (ballot.z >> (bit - 64u)) & 0xFFu;
+        } else {
+            packed = (ballot.w >> (bit - 96u)) & 0xFFu;
+        }
+        data_q[db].signs[t / 8u] = uint8_t(packed);
     }
 
     // Step 7: reconstruction norm via subgroup reduction
