@@ -687,3 +687,42 @@ vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].norm), 0);
 }
 #endif
+
+#if defined(DATA_A_TQ4_1S)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    // TQ4_1S: 16-level Lloyd-Max centroids for N(0,1)
+    const float centroids[16] = float[16](
+        -2.732590, -2.069017, -1.618046, -1.256231,
+        -0.942340, -0.656759, -0.388048, -0.128395,
+         0.128395,  0.388048,  0.656759,  0.942340,
+         1.256231,  1.618046,  2.069017,  2.732590
+    );
+
+    // iqs is the element pair index within the block (0..15)
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+
+    // Extract 4-bit nibble indices from qs (2 per byte)
+    const uint idx0 = (uint(data_a[a_offset + ib].qs[j0 / 2]) >> ((j0 & 1) * 4)) & 0xF;
+    const uint idx1 = (uint(data_a[a_offset + ib].qs[j1 / 2]) >> ((j1 & 1) * 4)) & 0xF;
+
+    // Scale by d0 (elements 0-15) or d1 (elements 16-31)
+    const float d0 = float(data_a[a_offset + ib].d0);
+    const float d1 = float(data_a[a_offset + ib].d1);
+    const float s0 = (j0 < 16) ? d0 : d1;
+    const float s1 = (j1 < 16) ? d0 : d1;
+
+    // Returns centroid * scale WITHOUT RHT inverse
+    // (caller must handle pre-rotation for correctness)
+    return vec2(centroids[idx0] * s0, centroids[idx1] * s1);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    // No global scale/min — scales are applied per-element in dequantize()
+    return vec2(1, 0);
+}
+#endif
