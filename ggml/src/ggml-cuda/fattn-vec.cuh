@@ -75,17 +75,20 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
-    constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
+    // Turbo3 uses the float Q path (like f16/bf16), not q8_1 integer path
+    constexpr bool K_is_unquantized = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
+    constexpr bool V_is_unquantized = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
+    constexpr int nthreads_KQ = K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q;
+    constexpr int nthreads_V  = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0) ? nthreads_V_q : 128 / cpy_nb) : nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
+    constexpr int V_rows_per_thread = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0) ? 4 : 2*cpy_ne) : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = !K_is_unquantized;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -119,6 +122,14 @@ static __global__ void flash_attn_ext_vec(
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
+
+    // Sparse V: skip V dequant for positions with negligible attention weights.
+    // At long context, most V positions contribute < 1e-6 to the output — skipping
+    // their dequant saves significant compute (especially for quantized V types).
+    constexpr float sparse_v_threshold_f = 1e-6f;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    const     half  sparse_v_threshold_h = __float2half(sparse_v_threshold_f);
+#endif
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -320,6 +331,17 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
             }
+
+            // Sparse V: skip V dequant if all attention weights for this position are negligible
+            {
+                bool dominated = true;
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    if (__hgt(__low2half(KQ_k[j]), sparse_v_threshold_h)) { dominated = false; break; }
+                }
+                if (dominated) { continue; }
+            }
+
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
@@ -349,6 +371,17 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = KQ[j*nthreads + k];
             }
+
+            // Sparse V: skip V dequant if all attention weights for this position are negligible
+            {
+                bool dominated = true;
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    if (KQ_k[j] >= sparse_v_threshold_f) { dominated = false; break; }
+                }
+                if (dominated) { continue; }
+            }
+
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
@@ -598,3 +631,72 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// TurboQuant3 — turbo3 K + turbo3 V (KV cache uses same type)
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+
+// Mixed turbo3/q8_0 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+
+// TurboQuant2 -- turbo2 K + turbo2 V
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+
+// Mixed turbo2/q8_0 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
+
+// Mixed turbo3/turbo2 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0);
+
+// TurboQuant4 — turbo4 K + turbo4 V (KV cache uses same type)
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+
+// Mixed turbo4/q8_0 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+
+// Mixed turbo4/turbo3 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0);
+
+// Mixed turbo4/turbo2 KV cache types
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);

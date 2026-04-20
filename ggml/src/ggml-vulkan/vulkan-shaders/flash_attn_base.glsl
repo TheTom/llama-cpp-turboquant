@@ -84,13 +84,26 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #if defined(DATA_A_F32)
 layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
+#elif defined(DATA_A_TURBO3_0)
+layout (binding = 1) readonly buffer K_T3 {block_turbo3_0 data_k_t3[];};
+layout (binding = 2) readonly buffer V_T3 {block_turbo3_0 data_v_t3[];};
 #elif defined(A_TYPE_PACKED16)
 layout (binding = 1) readonly buffer K_PACKED16 {A_TYPE_PACKED16 k_data_packed16[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16[];} v_packed;
 #endif
 
+#if defined(A_TYPE_PACKED32)
+layout (binding = 1) readonly buffer K_PACKED32 {A_TYPE_PACKED32 k_data_packed32[];} k_packed32;
+layout (binding = 2) readonly buffer V_PACKED32 {A_TYPE_PACKED32 v_data_packed32[];} v_packed32;
+#endif
+
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 1
+#endif
+
+// turbo3: define BLOCK_BYTE_SIZE early (before first use in FA offset computation)
+#if defined(DATA_A_TURBO3_0) && !defined(BLOCK_BYTE_SIZE)
+#define BLOCK_BYTE_SIZE 50 // block_turbo3_0: 2 (norm) + 32 (qs) + 16 (signs) = 50 bytes
 #endif
 
 #if defined(DATA_A_F32)
@@ -110,6 +123,97 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 
 #if defined(DATA_A_Q4_0)
 #define BLOCK_BYTE_SIZE 18
+#elif defined(DATA_A_Q4_1)
+#define BLOCK_BYTE_SIZE 20
+#endif
+
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+        uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+        uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+        uint shift = (iqs & 0x10) >> 2;
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+#ifdef DATA_A_Q4_1
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * nibbles + FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].m);
+#else
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+#endif
+    } else {
+        uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+        uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+        uint shift = (iqs & 0x10) >> 2;
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+#ifdef DATA_A_Q4_1
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * nibbles + FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].m);
+#else
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+#endif
+    }
+}
+#endif
+
+#if defined(DATA_A_Q5_0)
+#define BLOCK_BYTE_SIZE 22
+#elif defined(DATA_A_Q5_1)
+#define BLOCK_BYTE_SIZE 24
+#endif
+
+#if defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+        uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+        uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+        uint shift = (iqs & 0x10) >> 2;
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+#ifdef DATA_A_Q5_1
+        uint qh = k_packed.k_data_packed16[a_offset + ib].qh;
+#else
+        uint qh = uint(k_packed.k_data_packed16[a_offset + ib].qh[0]) | (uint(k_packed.k_data_packed16[a_offset + ib].qh[1]) << 16);
+#endif
+        FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs) & 1, (qh >> (iqs + 1)) & 1, (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1) * FLOAT_TYPE(16.0f);
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+#ifdef DATA_A_Q5_1
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles + hb) + FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].m);
+#else
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles + hb - FLOAT_TYPE(16.0f));
+#endif
+    } else {
+        uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+        uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+        uint shift = (iqs & 0x10) >> 2;
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+#ifdef DATA_A_Q5_1
+        uint qh = v_packed.v_data_packed16[a_offset + ib].qh;
+#else
+        uint qh = uint(v_packed.v_data_packed16[a_offset + ib].qh[0]) | (uint(v_packed.v_data_packed16[a_offset + ib].qh[1]) << 16);
+#endif
+        FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs) & 1, (qh >> (iqs + 1)) & 1, (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1) * FLOAT_TYPE(16.0f);
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+#ifdef DATA_A_Q5_1
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles + hb) + FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].m);
+#else
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles + hb - FLOAT_TYPE(16.0f));
+#endif
+    }
+}
+#endif
+
+
+#if defined(DATA_A_IQ4_NL)
+#define BLOCK_BYTE_SIZE 18
 
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
@@ -119,7 +223,11 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         vui_lo >>= shift;
         vui_hi >>= shift;
 
-        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF) - FLOAT_TYPE(8.0f));
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(
+            kvalues_iq4nl[vui_lo & 0xF],
+            kvalues_iq4nl[(vui_lo >> 8) & 0xF],
+            kvalues_iq4nl[vui_hi & 0xF],
+            kvalues_iq4nl[(vui_hi >> 8) & 0xF]);
     } else {
         uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
         uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
@@ -127,11 +235,14 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         vui_lo >>= shift;
         vui_hi >>= shift;
 
-        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF) - FLOAT_TYPE(8.0f));
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(
+            kvalues_iq4nl[vui_lo & 0xF],
+            kvalues_iq4nl[(vui_lo >> 8) & 0xF],
+            kvalues_iq4nl[vui_hi & 0xF],
+            kvalues_iq4nl[(vui_hi >> 8) & 0xF]);
     }
 }
 #endif
-
 #if defined(DATA_A_Q8_0)
 #define BLOCK_BYTE_SIZE 34
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
@@ -146,6 +257,35 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 
         return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
     }
+}
+#endif
+
+#if defined(DATA_A_TURBO3_0)
+const float T3C[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+);
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    FLOAT_TYPEV4 r;
+    for (int k = 0; k < 4; k++) {
+        uint  j  = iqs + uint(k);
+        float nm;
+        uint  qb;
+        uint  sb;
+        if (binding_idx == BINDING_IDX_K) {
+            nm = float(data_k_t3[a_offset + ib].norm);
+            qb = uint(data_k_t3[a_offset + ib].qs[j / 4]);
+            sb = uint(data_k_t3[a_offset + ib].signs[j / 8]);
+        } else {
+            nm = float(data_v_t3[a_offset + ib].norm);
+            qb = uint(data_v_t3[a_offset + ib].qs[j / 4]);
+            sb = uint(data_v_t3[a_offset + ib].signs[j / 8]);
+        }
+        uint lo = (qb >> ((j % 4) * 2)) & 0x3;
+        uint hi = (sb >> (j % 8)) & 0x1;
+        r[k] = FLOAT_TYPE(T3C[lo | (hi << 2)] * nm);
+    }
+    return r;
 }
 #endif
 

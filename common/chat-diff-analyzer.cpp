@@ -95,34 +95,6 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               LOG_DBG(ANSI_ORANGE "[Patch: Functionary 3.1]\n" ANSI_RESET);
           }
       },
-      // Gemma4 - custom dict format: <|tool_call>call:name{key:<|"|>val<|"|>}<tool_call|>
-      [](const common_chat_template & tmpl, autoparser & analysis) -> void {
-          if (tmpl.src.find("'<|tool_call>call:'") != std::string::npos) {
-              analysis.tools.format.mode           = tool_format::TAG_WITH_GEMMA4_DICT;
-              analysis.tools.format.per_call_start = "<|tool_call>";
-              analysis.tools.format.per_call_end   = "<tool_call|>";
-              analysis.tools.format.section_start  = "";
-              analysis.tools.format.section_end    = "";
-              analysis.tools.function.name_prefix  = "call:";
-              analysis.tools.function.name_suffix  = "";
-              analysis.tools.arguments.start       = "{";
-              analysis.tools.arguments.end         = "}";
-              analysis.tools.arguments.name_prefix = "";
-              analysis.tools.arguments.name_suffix = ":";
-              analysis.tools.arguments.separator   = ",";
-              analysis.reasoning.mode              = reasoning_mode::TAG_BASED;
-              analysis.reasoning.start             = "<|channel>thought";
-              analysis.reasoning.end               = "<channel|>";
-              analysis.preserved_tokens.clear();
-              analysis.preserved_tokens.push_back("<|tool_call>");
-              analysis.preserved_tokens.push_back("<tool_call|>");
-              analysis.preserved_tokens.push_back("<|tool_response>");
-              analysis.preserved_tokens.push_back("<tool_response|>");
-              analysis.preserved_tokens.push_back("<|\"|>");
-              analysis.preserved_tokens.push_back("<|turn>");
-              LOG_DBG(ANSI_ORANGE "[Patch: Gemma4]\n" ANSI_RESET);
-          }
-      },
       // DeepSeek-R1-Distill-Qwen
       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
           if (tmpl.src.find(
@@ -586,7 +558,7 @@ analyze_tools::analyze_tools(const common_chat_template & tmpl,
     : analyze_base(tmpl) {
     LOG_DBG(ANSI_ORANGE "Phase 3: Tool call analysis\n" ANSI_RESET);
 
-    analyze_tool_calls(reasoning);
+    analyze_tool_calls(reasoning, caps.supports_parallel_tool_calls);
 
     if (format.mode != tool_format::NONE && format.mode != tool_format::JSON_NATIVE) {
         if (caps.supports_parallel_tool_calls) {
@@ -605,7 +577,7 @@ analyze_tools::analyze_tools(const common_chat_template & tmpl,
     }
 }
 
-void analyze_tools::analyze_tool_calls(const analyze_reasoning & reasoning) {
+void analyze_tools::analyze_tool_calls(const analyze_reasoning & reasoning, bool supports_parallel_tool_calls) {
     json assistant_no_tools = json{
         { "role",    "assistant"   },
         { "content", ASSISTANT_MSG }
@@ -639,13 +611,14 @@ void analyze_tools::analyze_tool_calls(const analyze_reasoning & reasoning) {
         return;
     }
 
-    analyze_tool_call_format(tool_section, FUN_FIRST, ARG_FIRST, reasoning);
+    analyze_tool_call_format(tool_section, FUN_FIRST, ARG_FIRST, reasoning, supports_parallel_tool_calls);
 }
 
 void analyze_tools::analyze_tool_call_format(const std::string &       haystack,
                                              const std::string &       fun_name_needle,
                                              const std::string &       arg_name_needle,
-                                             const analyze_reasoning & reasoning) {
+                                             const analyze_reasoning & reasoning,
+                                             bool                      supports_parallel_tool_calls) {
     if (fun_name_needle.empty() || arg_name_needle.empty() || haystack.empty()) {
         return;
     }
@@ -688,12 +661,51 @@ void analyze_tools::analyze_tool_call_format(const std::string &       haystack,
 
     if (format.mode == tool_format::JSON_NATIVE) {
         analyze_tool_call_format_json_native(clean_haystack, fun_name_needle, arg_name_needle);
+        if (supports_parallel_tool_calls) {
+            analyze_json_native_parallel_calls();
+        }
     } else {
         analyze_tool_call_format_non_json(clean_haystack, fun_name_needle);
     }
     // always relax whitespace requirements on ending markers since they don't influence content
     format.section_end  = trim_whitespace(format.section_end);
     format.per_call_end = trim_whitespace(format.per_call_end);
+}
+
+void analyze_tools::analyze_json_native_parallel_calls() {
+    json assistant_one_tool = json{
+        { "role",       "assistant" },
+        { "content",    ""          },
+        { "tool_calls", json::array({ first_tool_call }) }
+    };
+
+    json assistant_two_tools = json{
+        { "role",       "assistant" },
+        { "content",    ""          },
+        { "tool_calls", json::array({ first_tool_call, second_tool_call }) }
+    };
+
+    template_params params;
+    params.messages              = json::array({ user_msg, assistant_one_tool });
+    params.tools                 = tools;
+    params.add_generation_prompt = false;
+    params.enable_thinking       = true;
+
+    auto comparison = compare_variants(
+        *tmpl, params, [&](template_params & p) { p.messages = json::array({ user_msg, assistant_two_tools }); });
+
+    if (!comparison) {
+        LOG_DBG(ANSI_ORANGE "%s: Template application failed\n" ANSI_RESET, __func__);
+        return;
+    }
+
+    std::string & second_call = comparison->diff.right;
+    if (!format.section_start.empty() && second_call.find(format.section_start) != std::string::npos) {
+        format.per_call_start = format.section_start;
+        format.per_call_end = format.section_end;
+        format.section_start.clear();
+        format.section_end.clear();
+    }
 }
 
 void analyze_tools::analyze_tool_call_format_json_native(const std::string & clean_haystack,

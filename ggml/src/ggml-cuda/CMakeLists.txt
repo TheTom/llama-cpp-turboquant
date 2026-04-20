@@ -120,7 +120,22 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-f16-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu)
+            template-instances/fattn-vec-instance-bf16-bf16.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
     endif()
 
     ggml_add_backend_library(ggml-cuda
@@ -179,6 +194,16 @@ if (CUDAToolkit_FOUND)
         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
     else()
         target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+    endif()
+
+    if (GGML_CUDA_NCCL)
+        find_package(NCCL)
+        if (NCCL_FOUND)
+            add_compile_definitions(GGML_USE_NCCL)
+            target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)
+        else()
+            message(STATUS "Warning: NCCL not found, performance for multiple CUDA GPUs will be suboptimal")
+        endif()
     endif()
 
     set(CUDA_CXX_FLAGS "")

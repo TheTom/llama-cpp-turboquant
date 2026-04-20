@@ -200,11 +200,13 @@ add_library(ggml-base
             ggml.cpp
             ggml-alloc.c
             ggml-backend.cpp
+            ggml-backend-meta.cpp
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-turbo-quant.c
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
