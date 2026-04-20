@@ -7939,6 +7939,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
+    test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 1, 1));
+    test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 32, 1));
+    test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 128, 32, 4));
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
