@@ -1153,6 +1153,38 @@ struct ggml_cuda_pool_alloc {
     ggml_cuda_pool_alloc& operator=(ggml_cuda_pool_alloc &&) = delete;
 };
 
+#ifdef GGML_USE_HIP
+// Direct alloc/free, avoids legacy pool retention on HIP without VMM
+template<typename T>
+struct ggml_cuda_direct_alloc {
+    T * ptr = nullptr;
+    cudaStream_t stream;
+
+    ggml_cuda_direct_alloc() = default;
+    explicit ggml_cuda_direct_alloc(cudaStream_t s) : stream(s) {}
+
+    ~ggml_cuda_direct_alloc() {
+        if (ptr) {
+            cudaStreamSynchronize(stream);
+            cudaFree(ptr);
+        }
+    }
+
+    T * alloc(size_t size) {
+        GGML_ASSERT(ptr == nullptr);
+        CUDA_CHECK(cudaMalloc(&ptr, size * sizeof(T)));
+        return ptr;
+    }
+
+    T * get() { return ptr; }
+
+    ggml_cuda_direct_alloc(const ggml_cuda_direct_alloc &) = delete;
+    ggml_cuda_direct_alloc(ggml_cuda_direct_alloc &&) = delete;
+    ggml_cuda_direct_alloc& operator=(const ggml_cuda_direct_alloc &) = delete;
+    ggml_cuda_direct_alloc& operator=(ggml_cuda_direct_alloc &&) = delete;
+};
+#endif
+
 
 // backend interface
 
