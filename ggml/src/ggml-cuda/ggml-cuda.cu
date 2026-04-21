@@ -358,10 +358,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     struct ggml_cuda_buffer {
         void * ptr = nullptr;
         size_t size = 0;
+        uint64_t last_use = 0;
     };
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    uint64_t usage_counter = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
@@ -385,7 +387,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc(size_t size, size_t * actual_size, float lookahead = 1.05f) override {
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -424,20 +426,48 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             return ptr;
         }
         void * ptr;
-        size_t look_ahead_size = (size_t) (1.05 * size);
+        size_t look_ahead_size = (size_t) (lookahead * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
-            const size_t cached_bytes = pool_size;
-            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
-                           device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
+            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, evicting LRU from %.2f MiB cached\n",
+                           device, look_ahead_size/1024.0/1024.0, pool_size/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
-            clear_pool();
+            // evict LRU buffers up to 3x the requested size
+            size_t freed = 0;
+            size_t evict_target = 3 * look_ahead_size;
+            while (freed < evict_target) {
+                int oldest = -1;
+                uint64_t oldest_use = UINT64_MAX;
+                for (int i = 0; i < MAX_BUFFERS; ++i) {
+                    if (buffer_pool[i].ptr != nullptr && buffer_pool[i].last_use < oldest_use) {
+                        oldest_use = buffer_pool[i].last_use;
+                        oldest = i;
+                    }
+                }
+                if (oldest < 0) {
+                    break;
+                }
+                ggml_cuda_buffer & b = buffer_pool[oldest];
+                CUDA_CHECK(cudaFree(b.ptr));
+                freed += b.size;
+                pool_size -= b.size;
+                b.ptr = nullptr;
+                b.size = 0;
+            }
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            if (err == cudaErrorMemoryAllocation) {
+                // LRU eviction wasn't enough, flush everything
+                (void)cudaGetLastError();
+                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: LRU freed %.2f MiB, still OOM, flushing all\n",
+                               device, freed/1024.0/1024.0);
+                clear_pool();
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            }
             if (err == cudaSuccess) {
-                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded after eviction\n", device);
             }
         }
         CUDA_CHECK(err);
@@ -456,6 +486,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                b.last_use = ++usage_counter;
                 return;
             }
         }
@@ -499,7 +530,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc(size_t size, size_t * actual_size, float lookahead = 1.05f) override {
+        GGML_UNUSED(lookahead);
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
