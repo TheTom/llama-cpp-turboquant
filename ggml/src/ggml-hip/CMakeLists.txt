@@ -72,6 +72,12 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
+set(GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA_DEFAULT OFF)
+if (CMAKE_HIP_ARCHITECTURES MATCHES "(^|;)(gfx900|gfx906)($|;)")
+    set(GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA_DEFAULT ON)
+endif()
+option(GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA "ggml: disable mixed TurboQuant vec flash-attention on HIP (recommended for gfx900/gfx906)" ${GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA_DEFAULT})
+
 if (GGML_CUDA_FA_ALL_QUANTS)
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
     list(APPEND GGML_SOURCES_ROCM ${SRCS})
@@ -83,20 +89,27 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu)
+
+    if (NOT GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA)
+        list(APPEND GGML_SOURCES_ROCM
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo3_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo2_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo4_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
+    endif()
 endif()
 
 ggml_add_backend_library(ggml-hip
@@ -125,6 +138,10 @@ endif()
 
 if (GGML_HIP_GRAPHS)
     add_compile_definitions(GGML_HIP_GRAPHS)
+endif()
+
+if (GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA)
+    add_compile_definitions(GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA)
 endif()
 
 if (GGML_HIP_NO_VMM)

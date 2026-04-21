@@ -306,15 +306,19 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // TurboQuant3 KV cache types (always enabled)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
 
+    // TurboQuant2 KV cache types (always enabled)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+
+    // TurboQuant4 KV cache types (always enabled)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+
+#ifndef GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA
     // Mixed turbo3/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
 
     // Mixed f16/turbo3 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO3_0)
-
-    // TurboQuant2 KV cache types (always enabled)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
 
     // Mixed turbo2/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
@@ -326,9 +330,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // Mixed turbo3/turbo2 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
-
-    // TurboQuant4 KV cache types (always enabled)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
 
     // Mixed turbo4/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
@@ -344,6 +345,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // Mixed turbo4/turbo2 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
+#endif // GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA
 
     GGML_ABORT("fatal error");
 }
@@ -482,16 +484,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
-    // HIP/ROCm: the TILE/MMA/WMMA FA paths allocate unbounded f16 temp buffers
-    // for quantized KV types (K_f16, V_f16 in launch_fattn). The pool retains
-    // peak allocation size, so the temp buffer VRAM exceeds KV compression savings.
-    // This causes quantized KV to OOM before f16 on the same context length.
-    // Force VEC path which does inline dequant with zero temp buffer overhead.
-    // Trade-off: prefill is slower (sequential query processing).
-    // Limitation: head_dim > 256 cannot use VEC (falls through to TILE).
+    // HIP/ROCm can optionally disable mixed TurboQuant vec FA. This is useful
+    // on gfx900/gfx906 where the mixed turbo vec path is not reliable, while
+    // preserving same-type turbo vec FA and the full mixed-turbo path on newer
+    // HIP targets.
+    const bool k_is_turbo = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0;
+    const bool v_is_turbo = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    const bool turbo_mixed_kv = (k_is_turbo || v_is_turbo) && K->type != V->type;
+#ifdef GGML_HIP_DISABLE_MIXED_TURBO_VEC_FA
+    if (turbo_mixed_kv) {
+        can_use_vector_kernel = false;
+    }
+#endif
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
         return BEST_FATTN_KERNEL_VEC;
     }
