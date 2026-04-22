@@ -19,6 +19,7 @@
   spirv-headers,
   openssl,
   shaderc,
+  spirv-headers,
   useBlas ?
     builtins.all (x: !x) [
       useCuda
@@ -147,6 +148,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       ninja
       pkg-config
       git
+      spirv-headers
     ]
     ++ optionals useCuda [
       cudaPackages.cuda_nvcc
