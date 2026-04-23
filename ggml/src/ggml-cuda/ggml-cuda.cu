@@ -435,39 +435,55 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, evicting LRU from %.2f MiB cached\n",
                            device, look_ahead_size/1024.0/1024.0, pool_size/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
-            // evict LRU buffers up to 3x the requested size
-            size_t freed = 0;
-            size_t evict_target = 3 * look_ahead_size;
-            while (freed < evict_target) {
-                int oldest = -1;
-                uint64_t oldest_use = UINT64_MAX;
-                for (int i = 0; i < MAX_BUFFERS; ++i) {
-                    if (buffer_pool[i].ptr != nullptr && buffer_pool[i].last_use < oldest_use) {
-                        oldest_use = buffer_pool[i].last_use;
-                        oldest = i;
-                    }
-                }
-                if (oldest < 0) {
-                    break;
-                }
-                ggml_cuda_buffer & b = buffer_pool[oldest];
-                CUDA_CHECK(cudaFree(b.ptr));
-                freed += b.size;
-                pool_size -= b.size;
-                b.ptr = nullptr;
-                b.size = 0;
-            }
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            if (err == cudaErrorMemoryAllocation) {
-                // LRU eviction wasn't enough, flush everything
-                (void)cudaGetLastError();
-                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: LRU freed %.2f MiB, still OOM, flushing all\n",
-                               device, freed/1024.0/1024.0);
+#if defined(GGML_USE_HIP)
+            // ROCm/rocm-systems#4817: LRU free/realloc cycles amplify a
+            // hipMemcpyAsync host-mapping race on multi-GPU.  Fall back to
+            // the original clear_pool() path to avoid the timing change.
+            if (ggml_backend_cuda_get_device_count() > 1) {
+                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: HIP multi-GPU, flushing %.2f MiB cached\n",
+                               device, pool_size/1024.0/1024.0);
                 clear_pool();
                 err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            }
-            if (err == cudaSuccess) {
-                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded after eviction\n", device);
+                if (err == cudaSuccess) {
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+                }
+            } else
+#endif
+            {
+                // evict LRU buffers up to 3x the requested size
+                size_t freed = 0;
+                size_t evict_target = 3 * look_ahead_size;
+                while (freed < evict_target) {
+                    int oldest = -1;
+                    uint64_t oldest_use = UINT64_MAX;
+                    for (int i = 0; i < MAX_BUFFERS; ++i) {
+                        if (buffer_pool[i].ptr != nullptr && buffer_pool[i].last_use < oldest_use) {
+                            oldest_use = buffer_pool[i].last_use;
+                            oldest = i;
+                        }
+                    }
+                    if (oldest < 0) {
+                        break;
+                    }
+                    ggml_cuda_buffer & b = buffer_pool[oldest];
+                    CUDA_CHECK(cudaFree(b.ptr));
+                    freed += b.size;
+                    pool_size -= b.size;
+                    b.ptr = nullptr;
+                    b.size = 0;
+                }
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                if (err == cudaErrorMemoryAllocation) {
+                    // LRU eviction wasn't enough, flush everything
+                    (void)cudaGetLastError();
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: LRU freed %.2f MiB, still OOM, flushing all\n",
+                                   device, freed/1024.0/1024.0);
+                    clear_pool();
+                    err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                }
+                if (err == cudaSuccess) {
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded after eviction\n", device);
+                }
             }
         }
         CUDA_CHECK(err);
