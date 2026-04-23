@@ -212,6 +212,21 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
+    // EAGLE3 draft model - layer indices to extract from target model
+    // e.g., for 32-layer target: [2, 16, 29] (low, middle, high)
+    std::array<int, 3> eagle3_extract_layers = {0, 0, 0};
+
+    // EAGLE3 draft model - target model hidden size
+    uint32_t eagle3_target_hidden_size = 0;
+
+    // EAGLE3 draft model - apply hidden_norm before storing residual
+    bool eagle3_norm_before_residual = false;
+
+    // DFlash draft model
+    std::array<int, 5> dflash_target_layer_ids = {};
+    uint32_t dflash_block_size     = 16;
+    uint32_t dflash_mask_token_id  = 0;
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;

@@ -377,6 +377,10 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        // EAGLE3 extraction configuration
+        const struct llama_model * target_model; // reference to target model
+                                                 // only used to share embedding layer with eagle3 model
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
@@ -577,6 +581,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
 
+    // DFlash draft model: block size used as number of draft tokens
+    LLAMA_API int32_t llama_model_dflash_block_size(const struct llama_model * model);
+
+    // DFlash draft model: mask token id used as filler in the noise block
+    LLAMA_API int32_t llama_model_dflash_mask_token_id(const struct llama_model * model);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
@@ -708,6 +718,14 @@ extern "C" {
                          int32_t   n_embd,
                          int32_t   il_start,
                          int32_t   il_end);
+
+    //
+    // eagle3 (tmp)
+    //
+
+    LLAMA_API void llama_set_eagle3(
+            struct llama_context * ctx,
+            const struct llama_model * model);
 
     //
     // Memory
@@ -907,6 +925,41 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    //
+    // EAGLE3 draft model support
+    //
+
+    // Get pointer to target model features extracted for EAGLE3 encoder
+    // Returns NULL if no features are available
+    // Format: [3*n_embd, n_tokens] - use model.hparams.n_embd and batch.n_tokens for dimensions
+    LLAMA_API const float * llama_get_eagle3_target_features(struct llama_context * ctx);
+
+    // Set g_embeddings from EAGLE3 encoder output for decoder input
+    // g_embd: pointer to encoder output embeddings
+    LLAMA_API void llama_set_eagle3_g_embeddings(
+            struct llama_context * ctx,
+                   const float * g_embd,
+                       int32_t   n_embd,
+                       int32_t   n_tokens);
+
+    //
+    // DFlash draft model support (similar to EAGLE3)
+    //
+
+    // Enable DFlash target feature extraction on the target context
+    LLAMA_API void llama_set_dflash(
+            struct llama_context * ctx,
+            const struct llama_model * model);
+
+    LLAMA_API const float * llama_get_dflash_target_features(struct llama_context * ctx);
+
+    // Set accumulated target_ctx for DFlash decoder
+    LLAMA_API void llama_set_dflash_accumulated_target_ctx(
+            struct llama_context * ctx,
+                   const float * data,
+                       int32_t   n_embd,
+                       int32_t   n_tokens);
 
     //
     // Decoding

@@ -171,6 +171,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // dflash draft model
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -333,9 +334,13 @@ struct common_params_speculative {
 
     struct common_params_model mparams_dft;
 
+    llama_model * model_tgt = nullptr; // the target model
     llama_model * model_dft = nullptr; // a llama_model that can be shared by multiple speculative contexts
 
     llama_context_params cparams_dft; // these are the parameters for the draft llama_context
+
+    bool    eagle3       = false; // use EAGLE3 speculative decoding
+    bool    dflash       = false; // use DFlash speculative decoding
 
     int32_t n_ctx        = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
