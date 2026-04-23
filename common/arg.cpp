@@ -1,5 +1,6 @@
 #include "arg.h"
 
+#include "build-info.h"
 #include "chat.h"
 #include "common.h"
 #include "download.h"
@@ -1047,8 +1048,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--version"},
         "show version and build info",
         [](common_params &) {
-            fprintf(stderr, "version: %d (%s)\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT);
-            fprintf(stderr, "built with %s for %s\n", LLAMA_COMPILER, LLAMA_BUILD_TARGET);
+            fprintf(stderr, "version: %d (%s)\n", llama_build_number(), llama_commit());
+            fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
             exit(0);
         }
     ));
@@ -1318,13 +1319,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
-        {"--clear-idle"},
-        {"--no-clear-idle"},
+        {"--cache-idle-slots"},
+        {"--no-cache-idle-slots"},
         "save and clear idle slots on new task (default: enabled, requires unified KV and cache-ram)",
         [](common_params & params, bool value) {
-            params.clear_idle = value;
+            params.cache_idle_slots = value;
         }
-    ).set_env("LLAMA_ARG_CLEAR_IDLE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
@@ -2428,6 +2429,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_FIT"));
+    add_opt(common_arg(
+        { "-fitp", "--fit-print" }, "[on|off]",
+        string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_params_print = true;
+            } else if (is_falsey(value)) {
+                params.fit_params_print = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-print: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "

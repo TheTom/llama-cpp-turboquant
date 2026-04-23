@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 
+#include "build-info.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
@@ -813,6 +814,7 @@ private:
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
+            mparams.media_marker     = get_media_marker();
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
             if (mctx == nullptr) {
@@ -984,13 +986,13 @@ private:
 
         metrics.init();
 
-        if (params_base.clear_idle) {
+        if (params_base.cache_idle_slots) {
             if (!params_base.kv_unified) {
-                SRV_WRN("%s: --clear-idle requires --kv-unified, disabling\n", __func__);
-                params_base.clear_idle = false;
+                SRV_WRN("%s: --cache-idle-slots requires --kv-unified, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
             } else if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s: --clear-idle requires --cache-ram, disabling\n", __func__);
-                params_base.clear_idle = false;
+                SRV_WRN("%s: --cache-idle-slots requires --cache-ram, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
             } else {
                 SRV_INF("%s: idle slots will be saved to prompt cache and cleared upon starting a new task\n", __func__);
                 SRV_DBG("%s", "__TEST_TAG_CLEAR_IDLE_ENABLED__\n");
@@ -1883,7 +1885,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.clear_idle) {
+                    if (params_base.cache_idle_slots) {
                         for (auto & s : slots) {
                             if (!s.is_processing()) {
                                 slot_save_and_clear(s);
@@ -3091,7 +3093,7 @@ server_context_meta server_context::get_meta() const {
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx, eos_id, true) : "";
 
     return server_context_meta {
-        /* build_info             */ build_info,
+        /* build_info             */ std::string(llama_build_info()),
         /* model_name             */ impl->model_name,
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
@@ -3617,6 +3619,7 @@ void server_routes::init_routes() {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
             } },
+            { "media_marker",                get_media_marker() },
             { "endpoint_slots",              params.endpoint_slots },
             { "endpoint_props",              params.endpoint_props },
             { "endpoint_metrics",            params.endpoint_metrics },
@@ -3647,34 +3650,6 @@ void server_routes::init_routes() {
         // update any props here
 
         res->ok({{ "success", true }});
-        return res;
-    };
-
-    this->get_api_show = [this](const server_http_req &) {
-        auto res = create_response();
-        std::string tmpl_default = common_chat_templates_source(meta->chat_params.tmpls.get(), "");
-        json data = {
-            {
-                "model_info", {
-                    { "llama.context_length", meta->slot_n_ctx },
-                }
-            },
-            {"modelfile", ""},
-            {"parameters", ""},
-            {"template", tmpl_default},
-            {"details", {
-                {"parent_model", ""},
-                {"format", "gguf"},
-                {"family", ""},
-                {"families", {""}},
-                {"parameter_size", ""},
-                {"quantization_level", ""}
-            }},
-            {"model_info", ""},
-            {"capabilities", meta->has_mtmd ? json({"completion","multimodal"}) : json({"completion"})}
-        };
-
-        res->ok(data);
         return res;
     };
 

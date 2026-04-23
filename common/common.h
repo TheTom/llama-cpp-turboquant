@@ -2,9 +2,10 @@
 
 #pragma once
 
+#include "llama-cpp.h"
+
 #include "ggml-opt.h"
 #include "ggml.h"
-#include "llama-cpp.h"
 
 #include <set>
 #include <sstream>
@@ -26,11 +27,6 @@
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
-#define print_build_info() do {                                                                     \
-    fprintf(stderr, "%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);      \
-    fprintf(stderr, "%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);    \
-} while(0)
-
 struct common_time_meas {
     common_time_meas(int64_t & t_acc, bool disable = false);
     ~common_time_meas();
@@ -51,14 +47,6 @@ struct common_adapter_lora_info {
 };
 
 using llama_tokens = std::vector<llama_token>;
-
-// build info
-extern int LLAMA_BUILD_NUMBER;
-extern const char * LLAMA_COMMIT;
-extern const char * LLAMA_COMPILER;
-extern const char * LLAMA_BUILD_TARGET;
-
-const static std::string build_info("b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT);
 
 struct common_control_vector_load_info;
 
@@ -432,11 +420,12 @@ struct common_params {
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
-    int32_t n_gpu_layers       = -1;   // number of layers to store in VRAM, -1 is auto, <= -2 is all
-    int32_t main_gpu           = 0;    // the GPU that is used for scratch and small tensors
-    float   tensor_split[128]  = {0};  // how split tensors should be distributed across GPUs
-    bool    fit_params         = true; // whether to fit unset model/context parameters to free device memory
-    int32_t fit_params_min_ctx = 4096; // minimum context size to set when trying to reduce memory use
+    int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+    int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
+    float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
+    bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    bool    fit_params_print   = false; // print the estimated required memory to run the model
+    int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
@@ -578,7 +567,7 @@ struct common_params {
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
-    bool    clear_idle          = true;  // save and clear idle slots upon starting a new task
+    bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
