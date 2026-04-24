@@ -333,6 +333,10 @@ static __global__ void flash_attn_ext_vec(
             }
 
             // Sparse V: skip V dequant if all attention weights for this position are negligible
+            // Disabled — per-lane branching causes warp divergence that costs more than the
+            // skipped dequants save (-0.3% to -2.8% on RTX 3090/4090).
+            // TODO: revisit with warp-level ballot skip.
+#if 0
             {
                 bool dominated = true;
 #pragma unroll
@@ -341,6 +345,7 @@ static __global__ void flash_attn_ext_vec(
                 }
                 if (dominated) { continue; }
             }
+#endif
 
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -373,6 +378,10 @@ static __global__ void flash_attn_ext_vec(
             }
 
             // Sparse V: skip V dequant if all attention weights for this position are negligible
+            // Disabled — per-lane branching causes warp divergence that costs more than the
+            // skipped dequants save (-0.3% to -2.8% on RTX 3090/4090).
+            // TODO: revisit with warp-level ballot skip.
+#if 0
             {
                 bool dominated = true;
 #pragma unroll
@@ -381,6 +390,7 @@ static __global__ void flash_attn_ext_vec(
                 }
                 if (dominated) { continue; }
             }
+#endif
 
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
