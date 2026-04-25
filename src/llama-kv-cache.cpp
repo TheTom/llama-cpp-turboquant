@@ -8,10 +8,140 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
+#include "../vendor/nlohmann/json.hpp"
+
+namespace {
+
+using json = nlohmann::ordered_json;
+
+static bool llama_kv_is_turbo_pca_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0;
+}
+
+static const char * llama_kv_getenv_any(const char * a, const char * b, const char * c) {
+    const char * v = a ? getenv(a) : nullptr;
+    if (v && *v) {
+        return v;
+    }
+    v = b ? getenv(b) : nullptr;
+    if (v && *v) {
+        return v;
+    }
+    v = c ? getenv(c) : nullptr;
+    return (v && *v) ? v : nullptr;
+}
+
+static void llama_kv_load_pca_groups(
+        const json & root,
+        const char * side_name,
+        std::vector<float> & rotation,
+        std::vector<float> & rotation_t) {
+    auto side_it = root.find(side_name);
+    if (side_it == root.end() || !side_it->is_object()) {
+        throw std::runtime_error(std::string("turbo3_pca calibration JSON missing side: ") + side_name);
+    }
+
+    auto groups_it = side_it->find("groups");
+    if (groups_it == side_it->end() || !groups_it->is_array() || groups_it->empty()) {
+        throw std::runtime_error(std::string("turbo3_pca calibration JSON side has no groups: ") + side_name);
+    }
+
+    rotation.clear();
+    rotation_t.clear();
+    for (const auto & group : *groups_it) {
+        auto rot_it = group.find("rotation");
+        auto rt_it  = group.find("rotation_t");
+        if (rot_it == group.end() || rt_it == group.end() || !rot_it->is_array() || !rt_it->is_array()) {
+            throw std::runtime_error(std::string("turbo3_pca group missing rotation/rotation_t for side: ") + side_name);
+        }
+        if (rot_it->size() != 128u*128u || rt_it->size() != 128u*128u) {
+            throw std::runtime_error(std::string("turbo3_pca rotations must be 128x128 for side: ") + side_name);
+        }
+        for (const auto & v : *rot_it) {
+            rotation.push_back(v.get<float>());
+        }
+        for (const auto & v : *rt_it) {
+            rotation_t.push_back(v.get<float>());
+        }
+    }
+}
+
+static bool llama_kv_load_turbo3_pca_json(
+        std::vector<float> & k_rotation_t,
+        std::vector<float> & v_rotation_t,
+        std::vector<float> & v_rotation,
+        uint32_t expected_k_head_dim,
+        uint32_t expected_v_head_dim) {
+    const char * path = llama_kv_getenv_any(
+            "GGML_TURBO_PCA_JSON_FILE",
+            "GGML_METAL_TURBO_PCA_JSON_FILE",
+            "GGML_METAL_TURBO_EMPVAR_JSON_FILE");
+    if (path == nullptr) {
+        return false;
+    }
+
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error(std::string("failed to open turbo3_pca calibration JSON: ") + path);
+    }
+
+    json root = json::parse(in);
+    const std::string mode = root.value("mode", std::string());
+    if (mode.empty()) {
+        throw std::runtime_error(
+                "turbo*_pca calibration JSON has no mode field: " + std::string(path));
+    }
+
+    const uint32_t json_k_head_dim = root.at("keys").value("head_dim", 0u);
+    const uint32_t json_v_head_dim = root.at("values").value("head_dim", 0u);
+    if (json_k_head_dim != expected_k_head_dim || json_v_head_dim != expected_v_head_dim) {
+        throw std::runtime_error(
+                "turbo3_pca calibration JSON is incompatible with this model: " +
+                std::string(path) +
+                " has K/V head_dim " + std::to_string(json_k_head_dim) + "/" + std::to_string(json_v_head_dim) +
+                ", expected " + std::to_string(expected_k_head_dim) + "/" + std::to_string(expected_v_head_dim));
+    }
+    const std::string json_model_hash = root.value("model_hash", std::string());
+    if (json_model_hash.empty()) {
+        throw std::runtime_error(
+                "turbo3_pca calibration JSON has no model_hash; regenerate calibration JSON with this build: " +
+                std::string(path));
+    }
+    const char * expected_model_hash_env = std::getenv("LLAMA_KV_CALIBRATION_MODEL_HASH");
+    if (expected_model_hash_env == nullptr || expected_model_hash_env[0] == '\0') {
+        throw std::runtime_error(
+                "turbo3_pca cannot verify calibration JSON model_hash because current model hash is unavailable");
+    }
+    const std::string expected_model_hash = expected_model_hash_env;
+    if (json_model_hash != expected_model_hash) {
+        throw std::runtime_error(
+                "turbo3_pca calibration JSON is for a different model: " +
+                std::string(path) +
+                " has model_hash " + json_model_hash +
+                ", expected " + expected_model_hash);
+    }
+
+    std::vector<float> k_rotation;
+    llama_kv_load_pca_groups(root, "keys",   k_rotation, k_rotation_t);
+    llama_kv_load_pca_groups(root, "values", v_rotation, v_rotation_t);
+    GGML_UNUSED(k_rotation);
+
+    if (k_rotation_t.empty() || v_rotation_t.empty() || v_rotation.empty()) {
+        throw std::runtime_error(std::string("turbo3_pca calibration JSON has empty rotations: ") + path);
+    }
+    LLAMA_LOG_INFO("%s: loaded turbo3_pca rotations from %s (%zu K groups, %zu V groups)\n",
+            __func__, path, k_rotation_t.size()/(128u*128u), v_rotation_t.size()/(128u*128u));
+    return true;
+}
+
+}
 
 // InnerQ: cross-TU shared state for CUDA per-channel equalization.
 // These are defined in ggml-cuda/turbo-innerq.cu (when CUDA is enabled).
@@ -31,6 +161,15 @@ static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
 static bool turbo_innerq_needs_tensor_update(void) { return false; }
 static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
+
+static void llama_kv_cache_set_turbo_meta(ggml_tensor * t, int32_t kv_kind) {
+    if (t == nullptr) {
+        return;
+    }
+    const int32_t wht_group = 128;
+    memcpy(t->op_params, &wht_group, sizeof(int32_t));
+    memcpy((char *) t->op_params + sizeof(int32_t), &kv_kind, sizeof(int32_t));
+}
 
 //
 // llama_kv_cache
@@ -56,6 +195,20 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
+    const bool needs_turbo3_pca = llama_kv_is_turbo_pca_type(type_k) || llama_kv_is_turbo_pca_type(type_v);
+    if (needs_turbo3_pca &&
+            !llama_kv_load_turbo3_pca_json(
+                    turbo_pca_k_rotation_t_data,
+                    turbo_pca_v_rotation_t_data,
+                    turbo_pca_v_rotation_data,
+                    ((hparams.n_embd_head_k() + 127u) / 128u) * 128u,
+                    ((hparams.n_embd_head_v() + 127u) / 128u) * 128u)) {
+          throw std::runtime_error(
+      "turbo*_pca cache type requires a precomputed calibration JSON. "
+      "Set GGML_TURBO_PCA_JSON_FILE or GGML_METAL_TURBO_PCA_JSON_FILE "
+      "to a PCA calibration JSON generated for this model.");
+
+    }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -70,8 +223,9 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 3)*ggml_tensor_overhead()),
+                // +6 for optional turbo rotation tensors:
+                // WHT forward/inverse/innerq plus PCA K U^T, V U^T, V U.
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 6)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -189,8 +343,8 @@ llama_kv_cache::llama_kv_cache(
                 }
                 return 0;
             }();
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-            const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO3_EMPVAR_0 || type_k == GGML_TYPE_TURBO3_PCA_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO4_PCA_0 || type_k == GGML_TYPE_TURBO4333_PCA_0 || type_k == GGML_TYPE_TURBO4322_PCA_0 || type_k == GGML_TYPE_TURBO2_0);
+            const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO3_EMPVAR_0 || type_v == GGML_TYPE_TURBO3_PCA_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO4_PCA_0 || type_v == GGML_TYPE_TURBO4333_PCA_0 || type_v == GGML_TYPE_TURBO4322_PCA_0 || type_v == GGML_TYPE_TURBO2_0);
             const uint32_t n_layer = hparams.n_layer;
             if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
                 if (il < 4 || il >= n_layer - 4) {
@@ -226,7 +380,7 @@ llama_kv_cache::llama_kv_cache(
         }
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
-        const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO2_0);
+        const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO3_EMPVAR_0 || layer_type_k == GGML_TYPE_TURBO3_PCA_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO4_PCA_0 || layer_type_k == GGML_TYPE_TURBO4333_PCA_0 || layer_type_k == GGML_TYPE_TURBO4322_PCA_0 || layer_type_k == GGML_TYPE_TURBO2_0);
         if (k_is_turbo && n_embd_head_k % 128 != 0) {
             const uint32_t padded_head_k = ((n_embd_head_k + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_k_gqa / n_embd_head_k;
@@ -240,7 +394,7 @@ llama_kv_cache::llama_kv_cache(
         // For turbo types, pad V head_dim to next multiple of 128 if needed
         const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
         uint32_t n_embd_v_gqa_eff = n_embd_v_gqa;
-        const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO4_0 || layer_type_v == GGML_TYPE_TURBO2_0);
+        const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO3_EMPVAR_0 || layer_type_v == GGML_TYPE_TURBO3_PCA_0 || layer_type_v == GGML_TYPE_TURBO4_0 || layer_type_v == GGML_TYPE_TURBO4_PCA_0 || layer_type_v == GGML_TYPE_TURBO4333_PCA_0 || layer_type_v == GGML_TYPE_TURBO4322_PCA_0 || layer_type_v == GGML_TYPE_TURBO2_0);
         if (v_is_turbo && !is_mla && n_embd_head_v % 128 != 0) {
             const uint32_t padded_head_v = ((n_embd_head_v + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_v_gqa / n_embd_head_v;
@@ -251,8 +405,17 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        // Create a tensor for the K cache of shape [n_embd_k_gqa_eff, kv_size, n_stream]
+        // and a tensor for the V cache of shape [n_embd_v_gqa_eff, kv_size, n_stream]
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
+
+        if (k_is_turbo) {
+            llama_kv_cache_set_turbo_meta(k, 1);
+        }
+        if (v_is_turbo) {
+            llama_kv_cache_set_turbo_meta(v, 2);
+        }
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -271,7 +434,7 @@ llama_kv_cache::llama_kv_cache(
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
-            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0)) {
+            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO3_EMPVAR_0 || type_k == GGML_TYPE_TURBO3_PCA_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO4_PCA_0 || type_k == GGML_TYPE_TURBO4333_PCA_0 || type_k == GGML_TYPE_TURBO4322_PCA_0 || type_k == GGML_TYPE_TURBO2_0)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
@@ -280,6 +443,17 @@ llama_kv_cache::llama_kv_cache(
             // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
             turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
+        }
+
+        if (needs_turbo3_pca && turbo_pca_k_rotation_t == nullptr) {
+            const int64_t n_k_groups = (int64_t) turbo_pca_k_rotation_t_data.size() / (128*128);
+            const int64_t n_v_groups = (int64_t) turbo_pca_v_rotation_t_data.size() / (128*128);
+            turbo_pca_k_rotation_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_k_groups);
+            ggml_format_name(turbo_pca_k_rotation_t, "turbo_pca_k_rotation_t");
+            turbo_pca_v_rotation_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_v_groups);
+            ggml_format_name(turbo_pca_v_rotation_t, "turbo_pca_v_rotation_t");
+            turbo_pca_v_rotation = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 128, n_v_groups);
+            ggml_format_name(turbo_pca_v_rotation, "turbo_pca_v_rotation");
         }
     }
 
@@ -347,6 +521,12 @@ llama_kv_cache::llama_kv_cache(
 
             LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
         }
+        if (turbo_pca_k_rotation_t != nullptr && turbo_pca_k_rotation_t->buffer != nullptr && !model.hparams.no_alloc) {
+            ggml_backend_tensor_set(turbo_pca_k_rotation_t, turbo_pca_k_rotation_t_data.data(), 0, turbo_pca_k_rotation_t_data.size()*sizeof(float));
+            ggml_backend_tensor_set(turbo_pca_v_rotation_t, turbo_pca_v_rotation_t_data.data(), 0, turbo_pca_v_rotation_t_data.size()*sizeof(float));
+            ggml_backend_tensor_set(turbo_pca_v_rotation,   turbo_pca_v_rotation_data.data(),   0, turbo_pca_v_rotation_data.size()*sizeof(float));
+            LLAMA_LOG_INFO("%s: Turbo3 PCA rotation tensors initialized\n", __func__);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -387,6 +567,11 @@ void llama_kv_cache::clear(bool data) {
                 for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
                 ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
             }
+        }
+        if (turbo_pca_k_rotation_t != nullptr && turbo_pca_k_rotation_t->buffer != nullptr) {
+            ggml_backend_tensor_set(turbo_pca_k_rotation_t, turbo_pca_k_rotation_t_data.data(), 0, turbo_pca_k_rotation_t_data.size()*sizeof(float));
+            ggml_backend_tensor_set(turbo_pca_v_rotation_t, turbo_pca_v_rotation_t_data.data(), 0, turbo_pca_v_rotation_t_data.size()*sizeof(float));
+            ggml_backend_tensor_set(turbo_pca_v_rotation,   turbo_pca_v_rotation_data.data(),   0, turbo_pca_v_rotation_data.size()*sizeof(float));
         }
     }
 }
@@ -1194,7 +1379,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO3_EMPVAR_0 || k->type == GGML_TYPE_TURBO3_PCA_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO4_PCA_0 || k->type == GGML_TYPE_TURBO4333_PCA_0 || k->type == GGML_TYPE_TURBO4322_PCA_0 || k->type == GGML_TYPE_TURBO2_0);
     if (k_is_turbo) {
         assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
     } else {
@@ -1228,7 +1413,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     // Use padded head_dim for turbo types
-    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
+    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO3_EMPVAR_0 || v->type == GGML_TYPE_TURBO3_PCA_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_PCA_0 || v->type == GGML_TYPE_TURBO4333_PCA_0 || v->type == GGML_TYPE_TURBO4322_PCA_0 || v->type == GGML_TYPE_TURBO2_0);
     const uint32_t head_v = hparams.n_embd_head_v(il);
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
@@ -1268,7 +1453,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // Turbo zero-padding: pad each head to next multiple of 128 before merging dims.
     // k_cur shape here is (n_embd_head, n_head, n_tokens).
     // ggml_pad pads ne[0] with zeros — exactly what we need per-head.
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO3_EMPVAR_0 || k->type == GGML_TYPE_TURBO3_PCA_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO4_PCA_0 || k->type == GGML_TYPE_TURBO4333_PCA_0 || k->type == GGML_TYPE_TURBO4322_PCA_0 || k->type == GGML_TYPE_TURBO2_0);
     const bool k_needs_pad = k_is_turbo && (n_embd_head % 128 != 0);
     if (k_needs_pad) {
         const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
@@ -1299,11 +1484,10 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // store the current K values into the cache
     ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
 
-    // For turbo: store WHT group size in op_params so the CUDA kernel knows.
+    // For turbo: store WHT group size in op_params so the Metal kernel knows.
     // With zero-padding, all groups are always full 128-element WHT groups.
     if (k_is_turbo) {
-        int32_t wht_group = 128;  // always 128 with padding
-        memcpy(result->op_params, &wht_group, sizeof(int32_t));
+        llama_kv_cache_set_turbo_meta(result, 1);
     }
 
     return result;
@@ -1321,7 +1505,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_tokens    = v_cur->ne[2];
 
     // Turbo zero-padding: pad V head_dim to next multiple of 128
-    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
+    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO3_EMPVAR_0 || v->type == GGML_TYPE_TURBO3_PCA_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_PCA_0 || v->type == GGML_TYPE_TURBO4333_PCA_0 || v->type == GGML_TYPE_TURBO4322_PCA_0 || v->type == GGML_TYPE_TURBO2_0);
     const bool v_needs_pad = v_is_turbo && (n_embd_head % 128 != 0);
     if (v_needs_pad) {
         const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
@@ -1353,8 +1537,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
         // With zero-padding, all groups are always full 128-element WHT groups
         if (v_is_turbo) {
-            int32_t wht_group = 128;  // always 128 with padding
-            memcpy(result->op_params, &wht_group, sizeof(int32_t));
+            llama_kv_cache_set_turbo_meta(result, 2);
         }
         return result;
     }
@@ -1467,6 +1650,70 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
             data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
     }
+}
+
+void llama_kv_cache::observe_empvar_calibration(const slot_info & sinfo, llama_kv_empvar_calibration & calibration) const {
+    if (layers.empty() || sinfo.empty()) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t((2u * layers.size() + 1u) * ggml_tensor_overhead()),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        throw std::runtime_error("failed to init ggml context for empvar calibration observation");
+    }
+
+    const uint32_t n_kv = get_n_kv(sinfo);
+    std::vector<float> row;
+
+    for (const auto & layer : layers) {
+        const int32_t il = layer.il;
+
+        ggml_tensor * k_view = get_k(ctx, il, n_kv, sinfo);
+        ggml_tensor * v_view = layer.v != nullptr ? get_v(ctx, il, n_kv, sinfo) : nullptr;
+
+        GGML_ASSERT(k_view != nullptr);
+        GGML_ASSERT(k_view->type == GGML_TYPE_F32);
+        GGML_ASSERT(v_view == nullptr || v_view->type == GGML_TYPE_F32);
+
+        const int head_k = (int) hparams.n_embd_head_k(il);
+        const int head_v = (int) hparams.n_embd_head_v(il);
+        const int n_head = (int) hparams.n_head_kv(il);
+
+        row.resize(std::max(head_k, head_v));
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const uint32_t stream_id = (uint32_t) sinfo.strm[s];
+            GGML_ASSERT(stream_id >= sinfo.s0 && stream_id <= sinfo.s1);
+            const size_t view_stream = size_t(stream_id - sinfo.s0);
+            for (uint32_t idx : sinfo.idxs[s]) {
+                for (int h = 0; h < n_head; ++h) {
+                    const size_t k_off = view_stream*k_view->nb[3] + size_t(idx)*k_view->nb[2] + size_t(h)*k_view->nb[1];
+                    ggml_backend_tensor_get(k_view, row.data(), k_off, size_t(head_k) * sizeof(float));
+                    calibration.observe_key_row(row.data(), head_k);
+
+                    if (v_view == nullptr) {
+                        continue;
+                    } else if (!v_trans) {
+                        const size_t v_off = view_stream*v_view->nb[3] + size_t(idx)*v_view->nb[2] + size_t(h)*v_view->nb[1];
+                        ggml_backend_tensor_get(v_view, row.data(), v_off, size_t(head_v) * sizeof(float));
+                    } else {
+                        for (int d = 0; d < head_v; ++d) {
+                            const size_t v_off = view_stream*v_view->nb[3] + size_t(d)*v_view->nb[2] + size_t(h)*v_view->nb[1] + size_t(idx)*v_view->nb[0];
+                            ggml_backend_tensor_get(v_view, row.data() + d, v_off, sizeof(float));
+                        }
+                    }
+                    calibration.observe_value_row(row.data(), head_v);
+                }
+            }
+        }
+    }
+
+    ggml_free(ctx);
 }
 
 struct args_set_input_kq_mask {
@@ -2486,12 +2733,36 @@ ggml_tensor * llama_kv_cache_context::get_turbo_rotation_inv() const {
     return kv->get_turbo_rotation_inv();
 }
 
+ggml_tensor * llama_kv_cache_context::get_turbo_pca_k_rotation_t() const {
+    return kv->get_turbo_pca_k_rotation_t();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_pca_v_rotation_t() const {
+    return kv->get_turbo_pca_v_rotation_t();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_pca_v_rotation() const {
+    return kv->get_turbo_pca_v_rotation();
+}
+
 ggml_tensor * llama_kv_cache_context::get_turbo_rot_forward() const {
     return kv->get_turbo_rotation();
 }
 
 ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
     return kv->get_turbo_rotation_inv();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_pca_k_rot_t() const {
+    return kv->get_turbo_pca_k_rotation_t();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_pca_v_rot_t() const {
+    return kv->get_turbo_pca_v_rotation_t();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_pca_v_rot() const {
+    return kv->get_turbo_pca_v_rotation();
 }
 
 ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
@@ -2532,4 +2803,8 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+void llama_kv_cache_context::observe_empvar_calibration(llama_kv_empvar_calibration & calibration) const {
+    kv->observe_empvar_calibration(sinfos[i_cur], calibration);
 }

@@ -17,8 +17,10 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <cstdlib>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -55,6 +57,44 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+static void common_set_env(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void common_unset_env(const char * name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+static std::string common_file_hash_fnv1a64(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return "";
+    }
+
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    char buf[1 << 20];
+    while (in) {
+        in.read(buf, sizeof(buf));
+        const std::streamsize n = in.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            hash ^= (uint8_t) buf[i];
+            hash *= 0x100000001b3ULL;
+        }
+    }
+
+    std::ostringstream ss;
+    ss << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return ss.str();
+}
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1134,7 +1174,72 @@ common_init_result::common_init_result(common_params & params) :
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    const char * prev_kv_empvar_calibrate = std::getenv("LLAMA_KV_EMPVAR_CALIBRATE");
+    const char * prev_kv_empvar_out = std::getenv("LLAMA_KV_EMPVAR_CALIBRATE_OUT");
+    const char * prev_kv_empvar_mode = std::getenv("LLAMA_KV_EMPVAR_CALIBRATE_MODE");
+    const char * prev_kv_model_hash = std::getenv("LLAMA_KV_CALIBRATION_MODEL_HASH");
+    std::string prev_kv_empvar_calibrate_str = prev_kv_empvar_calibrate ? prev_kv_empvar_calibrate : "";
+    std::string prev_kv_empvar_out_str = prev_kv_empvar_out ? prev_kv_empvar_out : "";
+    std::string prev_kv_empvar_mode_str = prev_kv_empvar_mode ? prev_kv_empvar_mode : "";
+    std::string prev_kv_model_hash_str = prev_kv_model_hash ? prev_kv_model_hash : "";
+
+    const bool needs_kv_model_hash =
+        params.kv_empvar_calibrate ||
+        params.cache_type_k == GGML_TYPE_TURBO3_PCA_0 ||
+        params.cache_type_v == GGML_TYPE_TURBO3_PCA_0 ||
+        params.cache_type_k == GGML_TYPE_TURBO4_PCA_0 ||
+        params.cache_type_v == GGML_TYPE_TURBO4_PCA_0 ||
+        params.cache_type_k == GGML_TYPE_TURBO4333_PCA_0 ||
+        params.cache_type_v == GGML_TYPE_TURBO4333_PCA_0 ||
+        params.cache_type_k == GGML_TYPE_TURBO4322_PCA_0 ||
+        params.cache_type_v == GGML_TYPE_TURBO4322_PCA_0;
+    if (needs_kv_model_hash) {
+        const std::string model_hash = common_file_hash_fnv1a64(params.model.path);
+        if (!model_hash.empty()) {
+            common_set_env("LLAMA_KV_CALIBRATION_MODEL_HASH", model_hash.c_str());
+        } else {
+            common_unset_env("LLAMA_KV_CALIBRATION_MODEL_HASH");
+        }
+    }
+
+    if (params.kv_empvar_calibrate) {
+        common_set_env("LLAMA_KV_EMPVAR_CALIBRATE", "1");
+        if (!params.kv_empvar_calibration_out.empty()) {
+            common_set_env("LLAMA_KV_EMPVAR_CALIBRATE_OUT", params.kv_empvar_calibration_out.c_str());
+        } else {
+            common_unset_env("LLAMA_KV_EMPVAR_CALIBRATE_OUT");
+        }
+        common_set_env("LLAMA_KV_EMPVAR_CALIBRATE_MODE", params.kv_calibration_mode.c_str());
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
+
+    if (params.kv_empvar_calibrate || needs_kv_model_hash) {
+        if (prev_kv_empvar_calibrate) {
+            common_set_env("LLAMA_KV_EMPVAR_CALIBRATE", prev_kv_empvar_calibrate_str.c_str());
+        } else {
+            common_unset_env("LLAMA_KV_EMPVAR_CALIBRATE");
+        }
+
+        if (prev_kv_empvar_out) {
+            common_set_env("LLAMA_KV_EMPVAR_CALIBRATE_OUT", prev_kv_empvar_out_str.c_str());
+        } else {
+            common_unset_env("LLAMA_KV_EMPVAR_CALIBRATE_OUT");
+        }
+
+        if (prev_kv_empvar_mode) {
+            common_set_env("LLAMA_KV_EMPVAR_CALIBRATE_MODE", prev_kv_empvar_mode_str.c_str());
+        } else {
+            common_unset_env("LLAMA_KV_EMPVAR_CALIBRATE_MODE");
+        }
+
+        if (prev_kv_model_hash) {
+            common_set_env("LLAMA_KV_CALIBRATION_MODEL_HASH", prev_kv_model_hash_str.c_str());
+        } else {
+            common_unset_env("LLAMA_KV_CALIBRATION_MODEL_HASH");
+        }
+    }
+
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;

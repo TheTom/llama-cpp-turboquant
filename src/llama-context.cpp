@@ -4,7 +4,11 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-kv-empvar-calibration.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -12,8 +16,23 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+
+struct llama_context::kv_empvar_calibration_runtime {
+    std::string output_path;
+    std::string model_hash;
+    llama_kv_empvar_calibration calibration;
+    uint64_t n_decode_calls = 0;
+
+    explicit kv_empvar_calibration_runtime(
+            std::string output_path,
+            std::string model_hash,
+            llama_kv_empvar_calibration::mode_t mode)
+        : output_path(std::move(output_path)), model_hash(std::move(model_hash)), calibration(128, mode) {
+    }
+};
 
 //
 // llama_context
@@ -62,6 +81,29 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    const char * empvar_calibration_env = std::getenv("LLAMA_KV_EMPVAR_CALIBRATE");
+    const bool empvar_calibration_enabled = empvar_calibration_env != nullptr &&
+        std::strcmp(empvar_calibration_env, "0") != 0 &&
+        std::strcmp(empvar_calibration_env, "false") != 0;
+    if (empvar_calibration_enabled) {
+        const char * output_path = std::getenv("LLAMA_KV_EMPVAR_CALIBRATE_OUT");
+        const char * mode_env = std::getenv("LLAMA_KV_EMPVAR_CALIBRATE_MODE");
+        const char * model_hash = std::getenv("LLAMA_KV_CALIBRATION_MODEL_HASH");
+        const auto mode = llama_kv_empvar_calibration::mode_from_string(mode_env != nullptr ? mode_env : "");
+        kv_empvar_calibration = std::make_unique<kv_empvar_calibration_runtime>(
+                output_path && *output_path ? output_path : "kv-empvar-calibration.json",
+                model_hash && *model_hash ? model_hash : "",
+                mode);
+
+        // Calibration should observe the raw KV tensors, not compressed cache states.
+        params.type_k = GGML_TYPE_F32;
+        params.type_v = GGML_TYPE_F32;
+        LLAMA_LOG_INFO("%s: KV empvar calibration enabled (mode=%s), forcing KV cache types to f32 and writing to '%s'\n",
+                __func__,
+                llama_kv_empvar_calibration::mode_to_string(kv_empvar_calibration->calibration.mode()),
+                kv_empvar_calibration->output_path.c_str());
+    }
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -365,6 +407,28 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (kv_empvar_calibration) {
+        try {
+            synchronize();
+            const auto keys = kv_empvar_calibration->calibration.finalize_keys();
+            const auto values = kv_empvar_calibration->calibration.finalize_values();
+            llama_kv_empvar_write_json(
+                    kv_empvar_calibration->output_path,
+                    kv_empvar_calibration->calibration.mode(),
+                    kv_empvar_calibration->model_hash,
+                    keys,
+                    values);
+            LLAMA_LOG_INFO("%s: wrote KV empvar calibration to '%s' (mode=%s, K rows=%" PRIu64 ", V rows=%" PRIu64 ")\n",
+                    __func__,
+                    kv_empvar_calibration->output_path.c_str(),
+                    llama_kv_empvar_calibration::mode_to_string(kv_empvar_calibration->calibration.mode()),
+                    keys.n_rows,
+                    values.n_rows);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to write KV empvar calibration: %s\n", __func__, err.what());
+        }
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -382,6 +446,29 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+void llama_context::maybe_observe_empvar_calibration(const llama_memory_context_i * mctx) {
+    if (!kv_empvar_calibration || mctx == nullptr) {
+        return;
+    }
+
+    synchronize();
+
+    if (auto * kv_ctx = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        kv_ctx->observe_empvar_calibration(kv_empvar_calibration->calibration);
+    } else if (auto * kv_iswa_ctx = dynamic_cast<const llama_kv_cache_iswa_context *>(mctx)) {
+        kv_iswa_ctx->get_base()->observe_empvar_calibration(kv_empvar_calibration->calibration);
+        kv_iswa_ctx->get_swa()->observe_empvar_calibration(kv_empvar_calibration->calibration);
+    } else if (auto * hybrid_ctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        hybrid_ctx->get_attn()->observe_empvar_calibration(kv_empvar_calibration->calibration);
+    } else if (auto * hybrid_iswa_ctx = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        const auto * attn = hybrid_iswa_ctx->get_attn();
+        attn->get_base()->observe_empvar_calibration(kv_empvar_calibration->calibration);
+        attn->get_swa()->observe_empvar_calibration(kv_empvar_calibration->calibration);
+    }
+
+    kv_empvar_calibration->n_decode_calls++;
 }
 
 void llama_context::sched_reserve() {
@@ -1818,6 +1905,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        maybe_observe_empvar_calibration(mctx.get());
+
         n_outputs_prev += n_outputs;
     } while (mctx->next());
 
@@ -2946,6 +3035,11 @@ llama_context * llama_init_from_model(
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
                                  params.type_k == GGML_TYPE_TURBO3_0 ||
+                                 params.type_k == GGML_TYPE_TURBO3_EMPVAR_0 ||
+                                 params.type_k == GGML_TYPE_TURBO3_PCA_0 ||
+                                 params.type_k == GGML_TYPE_TURBO4_PCA_0 ||
+                                 params.type_k == GGML_TYPE_TURBO4333_PCA_0 ||
+                                 params.type_k == GGML_TYPE_TURBO4322_PCA_0 ||
                                  params.type_k == GGML_TYPE_TURBO4_0);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
@@ -2965,6 +3059,11 @@ llama_context * llama_init_from_model(
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
                                  params.type_v == GGML_TYPE_TURBO3_0 ||
+                                 params.type_v == GGML_TYPE_TURBO3_EMPVAR_0 ||
+                                 params.type_v == GGML_TYPE_TURBO3_PCA_0 ||
+                                 params.type_v == GGML_TYPE_TURBO4_PCA_0 ||
+                                 params.type_v == GGML_TYPE_TURBO4333_PCA_0 ||
+                                 params.type_v == GGML_TYPE_TURBO4322_PCA_0 ||
                                  params.type_v == GGML_TYPE_TURBO4_0);
         const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
@@ -2983,8 +3082,8 @@ llama_context * llama_init_from_model(
 
     // TurboQuant cache types require flash attention — auto-enable if disabled
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
-        (params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 ||
-         params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
+        (params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO3_EMPVAR_0 || params.type_k == GGML_TYPE_TURBO3_PCA_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4_PCA_0 || params.type_k == GGML_TYPE_TURBO4333_PCA_0 || params.type_k == GGML_TYPE_TURBO4322_PCA_0 ||
+         params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_EMPVAR_0 || params.type_v == GGML_TYPE_TURBO3_PCA_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO4_PCA_0 || params.type_v == GGML_TYPE_TURBO4333_PCA_0 || params.type_v == GGML_TYPE_TURBO4322_PCA_0)) {
         LLAMA_LOG_WARN("%s: turbo cache types require flash_attn — enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }

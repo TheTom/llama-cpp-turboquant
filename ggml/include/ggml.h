@@ -428,10 +428,15 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_TURBO3_0 = 41, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO4_0 = 42, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_TURBO3_0        = 41, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO4_0        = 42, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO2_0        = 43, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
+        GGML_TYPE_TURBO3_EMPVAR_0 = 44, // TurboQuant 3-bit KV cache with empirical per-coordinate variance tables
+        GGML_TYPE_TURBO3_PCA_0    = 45, // TurboQuant 3-bit KV cache with calibration-derived PCA basis
+        GGML_TYPE_TURBO4_PCA_0    = 46, // TurboQuant 4-bit KV cache with calibration-derived PCA basis
+        GGML_TYPE_TURBO4333_PCA_0 = 47, // TurboQuant mixed 4-3-3-3 KV cache with calibration-derived PCA basis
+        GGML_TYPE_TURBO4322_PCA_0 = 48, // TurboQuant mixed 4-3-2-2 KV cache with calibration-derived PCA basis
+        GGML_TYPE_COUNT           = 49,
     };
 
     // precision

@@ -389,7 +389,12 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO3_EMPVAR_0,
+    GGML_TYPE_TURBO3_PCA_0,
     GGML_TYPE_TURBO4_0,
+    GGML_TYPE_TURBO4_PCA_0,
+    GGML_TYPE_TURBO4333_PCA_0,
+    GGML_TYPE_TURBO4322_PCA_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2021,6 +2026,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-empvar-calibrate"},
+        "run KV empvar calibration on raw f32 KV cache writes and dump a JSON artifact",
+        [](common_params & params) {
+            params.kv_empvar_calibrate = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_KV_EMPVAR_CALIBRATE"));
+    add_opt(common_arg(
+        {"--kv-empvar-calibrate-out"}, "FILE",
+        "output JSON file for KV empvar calibration",
+        [](common_params & params, const std::string & value) {
+            params.kv_empvar_calibration_out = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_KV_EMPVAR_CALIBRATE_OUT"));
+    add_opt(common_arg(
+        {"--kv-calibration-mode"}, "MODE",
+        "KV calibration mode: wht_only_empvar | turbo3_pca | turbo4_pca | turbo4333_pca | turbo4322_pca",
+        [](common_params & params, const std::string & value) {
+            params.kv_calibration_mode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_KV_CALIBRATION_MODE"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

@@ -328,3 +328,15 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa()  const {
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
 }
+
+ggml_tensor * llama_kv_cache_iswa_context::get_turbo_pca_k_rot_t() const {
+    return ctx_base ? ctx_base->get_turbo_pca_k_rot_t() : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_iswa_context::get_turbo_pca_v_rot_t() const {
+    return ctx_base ? ctx_base->get_turbo_pca_v_rot_t() : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_iswa_context::get_turbo_pca_v_rot() const {
+    return ctx_base ? ctx_base->get_turbo_pca_v_rot() : nullptr;
+}

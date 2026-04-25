@@ -318,6 +318,31 @@ static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK
 
 static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 
+#define QK_TURBO4333_PCA 128
+#define NL_TURBO4333_PCA     (QK_TURBO4333_PCA / 16)
+#define NL_TURBO4333_PCA_VEC (QK_TURBO4333_PCA / 4)
+typedef struct {
+    ggml_half norm;                 // 2 bytes: one corrected norm for the full 128-dim group
+    ggml_half pad;                  // 2 bytes: reserved/alignment
+    uint8_t   qs4[16];              // 16 bytes: first 32 dims, 4-bit
+    uint8_t   qs3[3][8];            // 24 bytes: remaining 96 dims, 3-bit low 2 bits
+    uint8_t   signs3[3][4];         // 12 bytes: remaining 96 dims, high sign bit
+} block_turbo4333_pca_0;            // 56 bytes total
+static_assert(sizeof(block_turbo4333_pca_0) == 2*sizeof(ggml_half) + 16 + 24 + 12, "wrong turbo4333_pca_0 block size");
+
+#define QK_TURBO4322_PCA 128
+#define NL_TURBO4322_PCA     (QK_TURBO4322_PCA / 16)
+#define NL_TURBO4322_PCA_VEC (QK_TURBO4322_PCA / 4)
+typedef struct {
+    ggml_half norm;                 // 2 bytes: one corrected norm for the full 128-dim group
+    ggml_half pad;                  // 2 bytes: reserved/alignment
+    uint8_t   qs4[16];              // 16 bytes: first 32 dims, 4-bit
+    uint8_t   qs3[8];               // 8 bytes: second 32 dims, 3-bit low 2 bits
+    uint8_t   signs3[4];            // 4 bytes: second 32 dims, high sign bit
+    uint8_t   qs2[2][8];            // 16 bytes: last 64 dims, 2-bit
+} block_turbo4322_pca_0;            // 44 bytes total
+static_assert(sizeof(block_turbo4322_pca_0) == 2*sizeof(ggml_half) + 16 + 8 + 4 + 16, "wrong turbo4322_pca_0 block size");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
 // = 2.5 bits/value → 6.4× compression vs fp16

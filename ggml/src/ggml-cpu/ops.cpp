@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "../ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -4924,14 +4925,47 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
-    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    ggml_from_float_t from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
-    // For turbo types: communicate WHT group size to the quantize function via global
-    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO2_0) {
-        extern int turbo3_cpu_wht_group_size;
+    // For turbo types: communicate WHT group size to the quantize function.
+    // Empvar uses explicit K/V quantizers so dequant does not depend on stale global side.
+    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO3_EMPVAR_0 || dst->type == GGML_TYPE_TURBO3_PCA_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO4_PCA_0 || dst->type == GGML_TYPE_TURBO4333_PCA_0 || dst->type == GGML_TYPE_TURBO4322_PCA_0 || dst->type == GGML_TYPE_TURBO2_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
-        turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
+        int kv_kind = 0;
+        memcpy(&kv_kind, (const char *) dst->op_params + sizeof(int32_t), sizeof(int32_t));
+        ggml_turbo_quant_set_context((gs == 64 || gs == 128) ? gs : 0, kv_kind);
+        if (dst->type == GGML_TYPE_TURBO3_EMPVAR_0) {
+            if (kv_kind == 1) {
+                from_float = (ggml_from_float_t) quantize_row_turbo3_empvar_k_ref;
+            } else if (kv_kind == 2) {
+                from_float = (ggml_from_float_t) quantize_row_turbo3_empvar_v_ref;
+            }
+        } else if (dst->type == GGML_TYPE_TURBO3_PCA_0) {
+            if (kv_kind == 1) {
+                from_float = (ggml_from_float_t) quantize_row_turbo3_pca_k_ref;
+            } else if (kv_kind == 2) {
+                from_float = (ggml_from_float_t) quantize_row_turbo3_pca_v_ref;
+            }
+        } else if (dst->type == GGML_TYPE_TURBO4_PCA_0) {
+            if (kv_kind == 1) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4_pca_k_ref;
+            } else if (kv_kind == 2) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4_pca_v_ref;
+            }
+        } else if (dst->type == GGML_TYPE_TURBO4333_PCA_0) {
+            if (kv_kind == 1) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4333_pca_k_ref;
+            } else if (kv_kind == 2) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4333_pca_v_ref;
+            }
+        } else if (dst->type == GGML_TYPE_TURBO4322_PCA_0) {
+            if (kv_kind == 1) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4322_pca_k_ref;
+            } else if (kv_kind == 2) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4322_pca_v_ref;
+            }
+        }
     }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {

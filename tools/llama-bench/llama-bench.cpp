@@ -489,6 +489,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "turbo3") {
         return GGML_TYPE_TURBO3_0;
     }
+    if (s == "turbo3_empvar") {
+        return GGML_TYPE_TURBO3_EMPVAR_0;
+    }
     if (s == "turbo4") {
         return GGML_TYPE_TURBO4_0;
     }

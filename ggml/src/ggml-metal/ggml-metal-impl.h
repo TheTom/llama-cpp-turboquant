@@ -1,6 +1,11 @@
 #ifndef GGML_METAL_IMPL
 #define GGML_METAL_IMPL
 
+// File used to define argument structs used in ggml-metal-ops.cpp.
+// They are used to add the parameter to the kernel launches.
+// example usage:
+//
+
 // kernel parameters for mat-vec threadgroups
 //
 // N_R0: number of src0 rows to process per simdgroup
@@ -934,6 +939,8 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  wht_group;
+    int32_t  kv_kind;
 } ggml_metal_kargs_set_rows;
 
 typedef struct {

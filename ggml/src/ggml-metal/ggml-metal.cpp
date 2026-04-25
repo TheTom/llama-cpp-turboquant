@@ -17,6 +17,29 @@
 // note: can be overridden with GGML_METAL_DEVICES env to simulate virtual devices
 static int g_devices = 1;
 
+static ggml_metal_device_t ggml_backend_metal_device_resolve_ctx(ggml_backend_dev_t dev) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) dev->context;
+
+    const bool needs_rebind = ctx_dev == nullptr ||
+        ggml_metal_device_get_obj(ctx_dev) == nullptr ||
+        ggml_metal_device_get_queue(ctx_dev) == nullptr ||
+        ggml_metal_device_get_props(ctx_dev)->name[0] == '\0';
+
+    if (!needs_rebind) {
+        return ctx_dev;
+    }
+
+    int device_index = 0;
+    if (ctx_dev != nullptr) {
+        device_index = ggml_metal_device_get_props(ctx_dev)->device;
+    }
+
+    ctx_dev = ggml_metal_device_get(device_index);
+    dev->context = ctx_dev;
+
+    return ctx_dev;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // backend interface
 ////////////////////////////////////////////////////////////////////////////////
@@ -635,7 +658,7 @@ void ggml_backend_metal_capture_next_compute(ggml_backend_t backend) {
 // backend device
 
 static const char * ggml_backend_metal_device_get_name(ggml_backend_dev_t dev) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
@@ -643,13 +666,13 @@ static const char * ggml_backend_metal_device_get_name(ggml_backend_dev_t dev) {
 }
 
 static const char * ggml_backend_metal_device_get_description(ggml_backend_dev_t dev) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     return ggml_metal_device_get_props(ctx_dev)->desc;
 }
 
 static void ggml_backend_metal_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     ggml_metal_device_get_memory(ctx_dev, free, total);
 }
@@ -676,7 +699,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
 }
 
 static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     ggml_metal_t ctx = ggml_metal_init(ctx_dev);
     if (ctx == NULL) {
@@ -701,7 +724,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
 }
 
 static ggml_backend_buffer_type_t ggml_backend_metal_device_get_buffer_type(ggml_backend_dev_t dev) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
@@ -709,7 +732,7 @@ static ggml_backend_buffer_type_t ggml_backend_metal_device_get_buffer_type(ggml
 }
 
 static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
 
@@ -719,7 +742,7 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 }
 
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     return ggml_metal_device_supports_op(ctx_dev, op);
 }
@@ -746,7 +769,7 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 }
 
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     return (op->op == GGML_OP_MUL_MAT ||
             op->op == GGML_OP_MUL_MAT_ID) &&
@@ -754,7 +777,7 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
 }
 
 static ggml_backend_event_t ggml_backend_metal_device_event_new(ggml_backend_dev_t dev) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     ggml_metal_event_t event = ggml_metal_device_event_init(ctx_dev);
     GGML_ASSERT(event);
@@ -768,7 +791,7 @@ static ggml_backend_event_t ggml_backend_metal_device_event_new(ggml_backend_dev
 }
 
 static void ggml_backend_metal_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     ggml_metal_event_t ev = (ggml_metal_event_t)event->context;
 
@@ -778,7 +801,7 @@ static void ggml_backend_metal_device_event_free(ggml_backend_dev_t dev, ggml_ba
 }
 
 static void ggml_backend_metal_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_device_t ctx_dev = ggml_backend_metal_device_resolve_ctx(dev);
 
     ggml_metal_event_t evt = (ggml_metal_event_t)event->context;
 

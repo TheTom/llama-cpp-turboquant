@@ -122,6 +122,10 @@ public:
     const llama_kv_cache_context * get_base() const;
     const llama_kv_cache_context * get_swa()  const;
 
+    ggml_tensor * get_turbo_pca_k_rot_t() const override;
+    ggml_tensor * get_turbo_pca_v_rot_t() const override;
+    ggml_tensor * get_turbo_pca_v_rot() const override;
+
 private:
     //llama_kv_cache_iswa * kv;
 

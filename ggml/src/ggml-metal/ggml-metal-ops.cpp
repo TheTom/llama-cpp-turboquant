@@ -1,5 +1,13 @@
 #include "ggml-metal-ops.h"
 
+// This file implements the higher level "ops" that are used to encode ggml graphs into Metal command buffers.
+// Example usage of an op is as follows:
+// ggml_metal_op_t op = ggml_metal_op_init(dev, cmd_buf, gf, idx_start, idx_end, use_fusion, use_concurrency, use_capture, debug_graph, debug_fusion);
+// for (int i = 0; i < ggml_metal_op_n_nodes(op); i++) {
+//     // encode the i-th node in order to execute it on the GPU
+//     ggml_metal_op_encode(op, i);
+// }
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -12,6 +20,452 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <string>
+#include "../../../vendor/nlohmann/json.hpp"
+
+namespace {
+
+using json = nlohmann::ordered_json;
+
+enum {
+    GGML_METAL_TURBO_EMPVAR_DISABLED = 0,
+    GGML_METAL_TURBO_EMPVAR_WHT_ONLY = 1,
+    GGML_METAL_TURBO_EMPVAR_MAX_DIM  = 1024,
+};
+
+struct ggml_metal_turbo_empvar_state {
+    bool  initialized = false;
+    int32_t mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
+    int32_t k_dim = 0;
+    int32_t v_dim = 0;
+    float k[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
+    float v[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
+};
+
+static const char * ggml_metal_turbo_getenv_any(const char * a, const char * b = nullptr, const char * c = nullptr) {
+    const char * value = a ? std::getenv(a) : nullptr;
+    if (value != nullptr && *value != '\0') {
+        return value;
+    }
+    value = b ? std::getenv(b) : nullptr;
+    if (value != nullptr && *value != '\0') {
+        return value;
+    }
+    value = c ? std::getenv(c) : nullptr;
+    if (value != nullptr && *value != '\0') {
+        return value;
+    }
+    return nullptr;
+}
+
+static int ggml_metal_turbo_parse_float_list(const char * text, float * out, int max_n) {
+    if (text == nullptr || *text == '\0') {
+        return 0;
+    }
+    int n = 0;
+    const char * p = text;
+    while (*p != '\0' && n < max_n) {
+        char * end = nullptr;
+        const float v = strtof(p, &end);
+        if (end == p) {
+            while (*p != '\0' && *p != ',' && *p != ';') {
+                ++p;
+            }
+        } else {
+            out[n++] = v;
+            p = end;
+        }
+        while (*p == ',' || *p == ';' || *p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') {
+            ++p;
+        }
+    }
+    return n;
+}
+
+static int ggml_metal_turbo_parse_float_file(const char * path, float * out, int max_n) {
+    if (path == nullptr || *path == '\0') {
+        return 0;
+    }
+
+    FILE * fp = std::fopen(path, "rb");
+    if (fp == nullptr) {
+        GGML_LOG_ERROR("%s: failed to open empvar file '%s'\n", __func__, path);
+        return 0;
+    }
+
+    if (std::fseek(fp, 0, SEEK_END) != 0) {
+        GGML_LOG_ERROR("%s: failed to seek empvar file '%s'\n", __func__, path);
+        std::fclose(fp);
+        return 0;
+    }
+
+    const long size = std::ftell(fp);
+    if (size < 0) {
+        GGML_LOG_ERROR("%s: failed to size empvar file '%s'\n", __func__, path);
+        std::fclose(fp);
+        return 0;
+    }
+
+    if (std::fseek(fp, 0, SEEK_SET) != 0) {
+        GGML_LOG_ERROR("%s: failed to rewind empvar file '%s'\n", __func__, path);
+        std::fclose(fp);
+        return 0;
+    }
+
+    std::string text;
+    text.resize((size_t) size);
+    if (!text.empty()) {
+        const size_t n_read = std::fread(text.data(), 1, text.size(), fp);
+        if (n_read != text.size()) {
+            GGML_LOG_ERROR("%s: short read for empvar file '%s' (%zu / %zu bytes)\n", __func__, path, n_read, text.size());
+            std::fclose(fp);
+            return 0;
+        }
+    }
+
+    std::fclose(fp);
+    return ggml_metal_turbo_parse_float_list(text.c_str(), out, max_n);
+}
+
+static bool ggml_metal_turbo_read_text_file(const char * path, std::string & text) {
+    if (path == nullptr || *path == '\0') {
+        return false;
+    }
+
+    FILE * fp = std::fopen(path, "rb");
+    if (fp == nullptr) {
+        GGML_LOG_ERROR("%s: failed to open empvar file '%s'\n", __func__, path);
+        return false;
+    }
+
+    if (std::fseek(fp, 0, SEEK_END) != 0) {
+        GGML_LOG_ERROR("%s: failed to seek empvar file '%s'\n", __func__, path);
+        std::fclose(fp);
+        return false;
+    }
+
+    const long size = std::ftell(fp);
+    if (size < 0) {
+        GGML_LOG_ERROR("%s: failed to size empvar file '%s'\n", __func__, path);
+        std::fclose(fp);
+        return false;
+    }
+
+    if (std::fseek(fp, 0, SEEK_SET) != 0) {
+        GGML_LOG_ERROR("%s: failed to rewind empvar file '%s'\n", __func__, path);
+        std::fclose(fp);
+        return false;
+    }
+
+    text.resize((size_t) size);
+    if (!text.empty()) {
+        const size_t n_read = std::fread(text.data(), 1, text.size(), fp);
+        if (n_read != text.size()) {
+            GGML_LOG_ERROR("%s: short read for empvar file '%s' (%zu / %zu bytes)\n", __func__, path, n_read, text.size());
+            std::fclose(fp);
+            return false;
+        }
+    }
+
+    std::fclose(fp);
+    return true;
+}
+
+static const json * ggml_metal_turbo_find_empvar_side(const json & root, const char * side_name) {
+    if (root.is_object()) {
+        auto it = root.find(side_name);
+        if (it != root.end() && it->is_object()) {
+            return &(*it);
+        }
+
+        auto rit = root.find("results");
+        if (rit != root.end() && rit->is_array() && !rit->empty() && (*rit)[0].is_object()) {
+            auto sit = (*rit)[0].find(side_name);
+            if (sit != (*rit)[0].end() && sit->is_object()) {
+                return &(*sit);
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+static int ggml_metal_turbo_parse_float_json_side(
+        const json & root,
+        const char * side_name,
+        float * out,
+        int max_n) {
+    const json * side = ggml_metal_turbo_find_empvar_side(root, side_name);
+    if (side == nullptr) {
+        return 0;
+    }
+
+    int n = 0;
+    auto groups_it = side->find("groups");
+    if (groups_it != side->end() && groups_it->is_array()) {
+        for (const auto & group : *groups_it) {
+            auto vit = group.find("variances");
+            if (vit == group.end() || !vit->is_array()) {
+                return 0;
+            }
+            for (const auto & item : *vit) {
+                if (n >= max_n) {
+                    break;
+                }
+                if (!item.is_number()) {
+                    return 0;
+                }
+                out[n++] = item.get<float>();
+            }
+        }
+        return n;
+    }
+
+    auto vit = side->find("variances");
+    if (vit == side->end() || !vit->is_array()) {
+        return 0;
+    }
+
+    for (const auto & item : *vit) {
+        if (n >= max_n) {
+            break;
+        }
+        if (!item.is_number()) {
+            return 0;
+        }
+        out[n++] = item.get<float>();
+    }
+
+    return n;
+}
+
+static bool ggml_metal_turbo_parse_empvar_json_file(
+        const char * path,
+        float * k_out,
+        int * k_dim,
+        float * v_out,
+        int * v_dim,
+        int max_n) {
+    std::string text;
+    if (!ggml_metal_turbo_read_text_file(path, text)) {
+        return false;
+    }
+
+    json root;
+    try {
+        root = json::parse(text);
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: failed to parse empvar json '%s': %s\n", __func__, path, e.what());
+        return false;
+    }
+
+    const int local_k_dim = ggml_metal_turbo_parse_float_json_side(root, "keys", k_out, max_n);
+    const int local_v_dim = ggml_metal_turbo_parse_float_json_side(root, "values", v_out, max_n);
+
+    if (local_k_dim <= 0 || local_v_dim <= 0) {
+        GGML_LOG_ERROR("%s: empvar json '%s' does not contain usable keys/values variance arrays\n", __func__, path);
+        return false;
+    }
+
+    if (k_dim) {
+        *k_dim = local_k_dim;
+    }
+    if (v_dim) {
+        *v_dim = local_v_dim;
+    }
+
+    return true;
+}
+
+static int32_t ggml_metal_turbo_validate_empvar_table(
+        const char * label,
+        const char * source,
+        int32_t dim,
+        const float * table) {
+    if (dim <= 0) {
+        return 0;
+    }
+
+    for (int32_t i = 0; i < dim; ++i) {
+        if (!std::isfinite(table[i]) || table[i] < 0.0f) {
+            GGML_LOG_ERROR("%s: invalid %s empvar value at %d from '%s'\n", __func__, label, (int) i, source ? source : "<null>");
+            return 0;
+        }
+    }
+
+    return dim;
+}
+
+static const ggml_metal_turbo_empvar_state & ggml_metal_turbo_empvar_get_state() {
+    static ggml_metal_turbo_empvar_state state;
+    if (state.initialized) {
+        return state;
+    }
+
+    const char * mode = ggml_metal_turbo_getenv_any(
+        "GGML_METAL_TURBO_EXPERIMENTAL_MODE",
+        "TURBO_METAL_EXPERIMENTAL_MODE");
+    if (mode != nullptr) {
+        while (*mode == ' ' || *mode == '\t' || *mode == '\n' || *mode == '\r') {
+            ++mode;
+        }
+        if (strncmp(mode, "wht_only_empvar", strlen("wht_only_empvar")) != 0 &&
+                strncmp(mode, "turbo3_pca", strlen("turbo3_pca")) != 0 &&
+                strncmp(mode, "turbo4_pca", strlen("turbo4_pca")) != 0 &&
+                strncmp(mode, "turbo4333_pca", strlen("turbo4333_pca")) != 0 &&
+                strncmp(mode, "turbo4322_pca", strlen("turbo4322_pca")) != 0) {
+            state.initialized = true;
+            return state;
+        }
+    }
+
+    const char * json_file = ggml_metal_turbo_getenv_any(
+        "GGML_TURBO_PCA_JSON_FILE",
+        "GGML_METAL_TURBO_PCA_JSON_FILE",
+        "GGML_METAL_TURBO_EMPVAR_JSON_FILE");
+    if (json_file == nullptr) {
+        json_file = ggml_metal_turbo_getenv_any(
+            "TURBO_METAL_EMPVAR_JSON_FILE",
+            "TURBO_METAL_PCA_JSON_FILE");
+    }
+    const char * k_file = ggml_metal_turbo_getenv_any(
+        "GGML_METAL_TURBO_EMPVAR_K_FILE",
+        "TURBO_METAL_EMPVAR_K_FILE");
+    const char * v_file = ggml_metal_turbo_getenv_any(
+        "GGML_METAL_TURBO_EMPVAR_V_FILE",
+        "TURBO_METAL_EMPVAR_V_FILE");
+    const char * k_inline = ggml_metal_turbo_getenv_any(
+        "GGML_METAL_TURBO_EMPVAR_K",
+        "TURBO_METAL_EMPVAR_K");
+    const char * v_inline = ggml_metal_turbo_getenv_any(
+        "GGML_METAL_TURBO_EMPVAR_V",
+        "TURBO_METAL_EMPVAR_V");
+
+    if (json_file && *json_file) {
+        int k_dim = 0;
+        int v_dim = 0;
+        if (ggml_metal_turbo_parse_empvar_json_file(
+                json_file,
+                state.k, &k_dim,
+                state.v, &v_dim,
+                GGML_METAL_TURBO_EMPVAR_MAX_DIM)) {
+            state.k_dim = k_dim;
+            state.v_dim = v_dim;
+        }
+    }
+
+    if (state.k_dim <= 0) {
+        state.k_dim = k_file && *k_file
+            ? ggml_metal_turbo_parse_float_file(k_file, state.k, GGML_METAL_TURBO_EMPVAR_MAX_DIM)
+            : ggml_metal_turbo_parse_float_list(k_inline, state.k, GGML_METAL_TURBO_EMPVAR_MAX_DIM);
+    }
+    if (state.v_dim <= 0) {
+        state.v_dim = v_file && *v_file
+            ? ggml_metal_turbo_parse_float_file(v_file, state.v, GGML_METAL_TURBO_EMPVAR_MAX_DIM)
+            : ggml_metal_turbo_parse_float_list(v_inline, state.v, GGML_METAL_TURBO_EMPVAR_MAX_DIM);
+    }
+
+    state.k_dim = ggml_metal_turbo_validate_empvar_table(
+        "K",
+        json_file && *json_file ? json_file : (k_file && *k_file ? k_file : "GGML_METAL_TURBO_EMPVAR_K"),
+        state.k_dim,
+        state.k);
+    state.v_dim = ggml_metal_turbo_validate_empvar_table(
+        "V",
+        json_file && *json_file ? json_file : (v_file && *v_file ? v_file : "GGML_METAL_TURBO_EMPVAR_V"),
+        state.v_dim,
+        state.v);
+
+    if (state.k_dim > 0 || state.v_dim > 0) {
+        state.mode = GGML_METAL_TURBO_EMPVAR_WHT_ONLY;
+    }
+
+    state.initialized = true;
+    return state;
+}
+
+static void ggml_metal_turbo_read_meta(const ggml_tensor * t, int32_t & wht_group, int32_t & kv_kind) {
+    wht_group = 0;
+    kv_kind = 0;
+    if (t == nullptr) {
+        return;
+    }
+    const ggml_tensor * meta_src = t->view_src ? t->view_src : t;
+    memcpy(&wht_group, meta_src->op_params, sizeof(int32_t));
+    memcpy(&kv_kind, (const char *) meta_src->op_params + sizeof(int32_t), sizeof(int32_t));
+}
+
+static bool ggml_metal_is_turbo_type(const ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 ||
+           type == GGML_TYPE_TURBO3_0 ||
+           type == GGML_TYPE_TURBO3_EMPVAR_0 ||
+           type == GGML_TYPE_TURBO3_PCA_0 ||
+           type == GGML_TYPE_TURBO4_0 ||
+           type == GGML_TYPE_TURBO4_PCA_0 ||
+           type == GGML_TYPE_TURBO4333_PCA_0 ||
+           type == GGML_TYPE_TURBO4322_PCA_0;
+}
+
+static bool ggml_metal_is_turbo3_empvar_type(const ggml_type type) {
+    return type == GGML_TYPE_TURBO3_EMPVAR_0 || type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0;
+}
+
+static void ggml_metal_turbo_empvar_select(
+        const ggml_tensor * t,
+        const float ** table,
+        int32_t * dim,
+        int32_t * mode,
+        int32_t * wht_group,
+        int32_t * kv_kind) {
+    static const float empvar_dummy[1] = { 0.0f };
+
+    int32_t local_wht_group = 0;
+    int32_t local_kv_kind = 0;
+    ggml_metal_turbo_read_meta(t, local_wht_group, local_kv_kind);
+
+    const float * local_table = nullptr;
+    int32_t local_dim = 0;
+    int32_t local_mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
+
+    if (t != nullptr && ggml_metal_is_turbo3_empvar_type(t->type)) {
+        const auto & empvar = ggml_metal_turbo_empvar_get_state();
+        if (empvar.mode == GGML_METAL_TURBO_EMPVAR_WHT_ONLY) {
+            if (local_kv_kind == 1) {
+                local_table = empvar.k;
+                local_dim = empvar.k_dim;
+            } else if (local_kv_kind == 2) {
+                local_table = empvar.v;
+                local_dim = empvar.v_dim;
+            }
+            local_mode = empvar.mode;
+        }
+    }
+
+    if (local_table == nullptr) {
+        local_table = empvar_dummy;
+    }
+
+    if (table) {
+        *table = local_table;
+    }
+    if (dim) {
+        *dim = local_dim;
+    }
+    if (mode) {
+        *mode = local_mode;
+    }
+    if (wht_group) {
+        *wht_group = local_wht_group;
+    }
+    if (kv_kind) {
+        *kv_kind = local_kv_kind;
+    }
+}
+
+} // namespace
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -171,6 +625,12 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
 
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
+
+// Encodes the node at the given index and returns the number of nodes encoded
+// (1 if the node was encoded, 0 if it was skipped).
+// Example usage:
+// Switch on the node's op type and encode it using the appropriate Metal pipeline.
+// Note that the encoding may be skipped for certain nodes, such as no-ops or nodes that can be fused with others.
 
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
@@ -621,6 +1081,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
+    // Serve a estrarre le dimensioni e gli stride di un tensore GGML in variabili locali
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1174,12 +1635,29 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
+    // Serve a estrarre le dimensioni e gli stride di un tensore GGML in variabili locali
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    int32_t wht_group = 0;
+    int32_t kv_kind = 0;
+    ggml_metal_turbo_read_meta(op, wht_group, kv_kind);
+    const bool use_empvar = ggml_metal_is_turbo3_empvar_type(op->type);
+    const float * empvar = nullptr;
+    int32_t empvar_dim = 0;
+    int32_t empvar_mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
+    int32_t empvar_wht_group = 0;
+    if (use_empvar) {
+        ggml_metal_turbo_empvar_select(op, &empvar, &empvar_dim, &empvar_mode, &empvar_wht_group, nullptr);
+        if (empvar_dim <= 0 || ne0 % empvar_dim != 0) {
+            GGML_ABORT("%s: turbo3_empvar SET_ROWS requires an explicit per-head variance table that divides row width %d, got %d",
+                    __func__, (int) ne0, (int) empvar_dim);
+        }
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_set_rows(lib, op->src[1]->type, op->type);
 
@@ -1217,6 +1695,8 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.wht_group =*/ wht_group,
+        /*.kv_kind =*/ kv_kind,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -1224,6 +1704,10 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    if (use_empvar) {
+        ggml_metal_encoder_set_bytes(enc, (void *) empvar, empvar_dim*sizeof(float), 4);
+        ggml_metal_encoder_set_bytes(enc, &empvar_dim, sizeof(empvar_dim), 5);
+    }
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
 
@@ -2536,7 +3020,7 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     // loop iterations than the non-vec nl=2 path. On M2 Pro, this loop overhead
     // dominates — the non-vec path may be faster even for batch=1.
     const ggml_type ktype = op->src[1]->type;
-    if (ktype == GGML_TYPE_TURBO2_0 || ktype == GGML_TYPE_TURBO3_0 || ktype == GGML_TYPE_TURBO4_0) {
+    if (ggml_metal_is_turbo_type(ktype)) {
         const char * force_nonvec = getenv("TURBO_FORCE_NONVEC");
         if (force_nonvec && force_nonvec[0] == '1') {
             return false;  // force non-vec path
@@ -2666,6 +3150,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_t enc = ctx->enc;
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const bool uses_empvar_k = ggml_metal_is_turbo3_empvar_type(op->src[1]->type);
+    const bool uses_empvar_v = ggml_metal_is_turbo3_empvar_type(op->src[2]->type);
+    const bool uses_empvar = uses_empvar_k || uses_empvar_v;
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -2678,6 +3165,23 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS( int32_t, nb,  op,         nb);
 
+    const float * empvar_k = nullptr;
+    const float * empvar_v = nullptr;
+    int32_t empvar_k_dim = 0;
+    int32_t empvar_v_dim = 0;
+    if (uses_empvar) {
+        ggml_metal_turbo_empvar_select(op->src[1], &empvar_k, &empvar_k_dim, nullptr, nullptr, nullptr);
+        ggml_metal_turbo_empvar_select(op->src[2], &empvar_v, &empvar_v_dim, nullptr, nullptr, nullptr);
+        if (uses_empvar_k && empvar_k_dim < ne10) {
+            GGML_ABORT("%s: turbo3_empvar K requires a K variance table with at least %d values, got %d",
+                    __func__, (int) ne10, (int) empvar_k_dim);
+        }
+        if (uses_empvar_v && empvar_v_dim < ne20) {
+            GGML_ABORT("%s: turbo3_empvar V requires a V variance table with at least %d values, got %d",
+                    __func__, (int) ne20, (int) empvar_v_dim);
+        }
+    }
+
     GGML_ASSERT(ne00 % 4 == 0);
 
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
@@ -2687,14 +3191,18 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         const ggml_type type_k = op->src[1]->type;
         const ggml_type type_v = op->src[2]->type;
         if (type_k != type_v) {
-            const bool k_is_turbo = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0);
-            const bool v_is_turbo = (type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
+            const bool k_is_turbo = ggml_metal_is_turbo_type(type_k);
+            const bool v_is_turbo = ggml_metal_is_turbo_type(type_v);
             const bool k_is_q8 = (type_k == GGML_TYPE_Q8_0);
             const bool v_is_q8 = (type_v == GGML_TYPE_Q8_0);
+            const bool k_is_q4_0 = (type_k == GGML_TYPE_Q4_0);
+            const bool v_is_q4_0 = (type_v == GGML_TYPE_Q4_0);
             const bool supported = (k_is_turbo && v_is_turbo) ||
                                    (k_is_q8 && v_is_turbo) ||
-                                   (k_is_turbo && v_is_q8);
-            GGML_ASSERT(supported && "asymmetric K/V types only supported for turbo and q8_0 mixed pairs");
+                                   (k_is_turbo && v_is_q8) ||
+                                   (k_is_q8 && v_is_q4_0) ||
+                                   (k_is_q4_0 && v_is_q8);
+            GGML_ASSERT(supported && "asymmetric K/V types only supported for turbo/q8_0 mixed pairs and q8_0/q4_0");
         }
     }
 
@@ -2910,6 +3418,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  8);
+        if (uses_empvar) {
+            ggml_metal_encoder_set_bytes(enc, (void *) empvar_k, empvar_k_dim > 0 ? empvar_k_dim*sizeof(float) : sizeof(float), 9);
+            ggml_metal_encoder_set_bytes(enc, (void *) empvar_v, empvar_v_dim > 0 ? empvar_v_dim*sizeof(float) : sizeof(float), 10);
+            ggml_metal_encoder_set_bytes(enc, &empvar_k_dim, sizeof(empvar_k_dim), 11);
+            ggml_metal_encoder_set_bytes(enc, &empvar_v_dim, sizeof(empvar_v_dim), 12);
+        }
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -3048,6 +3562,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+        if (uses_empvar) {
+            ggml_metal_encoder_set_bytes(enc, (void *) empvar_k, empvar_k_dim > 0 ? empvar_k_dim*sizeof(float) : sizeof(float), 8);
+            ggml_metal_encoder_set_bytes(enc, (void *) empvar_v, empvar_v_dim > 0 ? empvar_v_dim*sizeof(float) : sizeof(float), 9);
+            ggml_metal_encoder_set_bytes(enc, &empvar_k_dim, sizeof(empvar_k_dim), 10);
+            ggml_metal_encoder_set_bytes(enc, &empvar_v_dim, sizeof(empvar_v_dim), 11);
+        }
 
         const size_t smem = FATTN_SMEM(nsg);
 

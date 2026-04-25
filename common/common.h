@@ -549,6 +549,10 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    bool kv_empvar_calibrate = false;          // enable KV empvar calibration run
+    std::string kv_empvar_calibration_out;     // JSON output path for KV empvar calibration
+    std::string kv_calibration_mode = "wht_only_empvar"; // wht_only_empvar | turbo3_pca | turbo4_pca | turbo4333_pca | turbo4322_pca
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

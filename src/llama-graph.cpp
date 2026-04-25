@@ -19,6 +19,85 @@
 
 // dedup helpers
 
+static bool llm_graph_is_turbo_wht_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 ||
+           type == GGML_TYPE_TURBO3_0 ||
+           type == GGML_TYPE_TURBO3_EMPVAR_0 ||
+           type == GGML_TYPE_TURBO4_0;
+}
+
+static bool llm_graph_is_turbo_pca_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0;
+}
+
+static ggml_tensor * llm_graph_pca_rot_group(ggml_context * ctx, ggml_tensor * rotations, int64_t group) {
+    GGML_ASSERT(rotations != nullptr);
+    GGML_ASSERT(rotations->ne[0] == 128 && rotations->ne[1] == 128);
+    const int64_t n_groups = rotations->ne[2];
+    GGML_ASSERT(n_groups > 0);
+    const int64_t g = n_groups > 1 ? group % n_groups : 0;
+    // Return a view of the rotations for this group. The rotations are stored as [128, 128, n_groups], 
+    // but we want to return them as [128, 128] for the matrix multiplication, so we need to transpose the first two dimensions.
+    return ggml_view_2d(ctx, rotations, 128, 128, rotations->nb[1], g*rotations->nb[2]);
+}
+
+static ggml_tensor * llm_graph_apply_turbo_pca(
+        ggml_context * ctx,
+        ggml_tensor * x,
+        ggml_tensor * rotations) {
+    GGML_ASSERT(rotations != nullptr);
+    if (x->ne[0] % 128 != 0) {
+        const int64_t pad = ((x->ne[0] + 127) / 128) * 128 - x->ne[0];
+        x = ggml_pad(ctx, x, pad, 0, 0, 0);
+    }
+    if (!ggml_is_contiguous(x)) {
+        x = ggml_cont(ctx, x);
+    }
+
+    // n_groups is the number of 128-dim groups of one head.
+    const int64_t n_groups = x->ne[0] / 128;
+    ggml_tensor * result = nullptr;
+    // For every group of 128 dimensions in the input, apply the corresponding PCA rotation and concatenate the results
+    for (int64_t g = 0; g < n_groups; ++g) {
+        ggml_tensor * xg = ggml_view_4d(ctx, x,
+                128, x->ne[1], x->ne[2], x->ne[3],
+                x->nb[1], x->nb[2], x->nb[3], g*128*x->nb[0]);
+        // Get the PCA rotation for this group. that is transposed compared to the original input, so we need to transpose it back before multiplying
+        ggml_tensor * rg = llm_graph_pca_rot_group(ctx, rotations, g);
+        // Do the matrix multiplication for this group. The PCA rotations are transposed compared to the original input, so we need to transpose them back before multiplying
+        ggml_tensor * yg = ggml_mul_mat(ctx, rg, xg);
+        result = result == nullptr ? yg : ggml_concat(ctx, result, yg, 0);
+    }
+    return result;
+}
+
+static ggml_tensor * llm_graph_apply_turbo_pca_from_t(
+        ggml_context * ctx,
+        ggml_tensor * x,
+        ggml_tensor * rotations_t) {
+    GGML_ASSERT(rotations_t != nullptr);
+    if (x->ne[0] % 128 != 0) {
+        const int64_t pad = ((x->ne[0] + 127) / 128) * 128 - x->ne[0];
+        x = ggml_pad(ctx, x, pad, 0, 0, 0);
+    }
+    if (!ggml_is_contiguous(x)) {
+        x = ggml_cont(ctx, x);
+    }
+
+    const int64_t n_groups = x->ne[0] / 128;
+    ggml_tensor * result = nullptr;
+    for (int64_t g = 0; g < n_groups; ++g) {
+        ggml_tensor * xg = ggml_view_4d(ctx, x,
+                128, x->ne[1], x->ne[2], x->ne[3],
+                x->nb[1], x->nb[2], x->nb[3], g*128*x->nb[0]);
+        ggml_tensor * rg_t = llm_graph_pca_rot_group(ctx, rotations_t, g);
+        ggml_tensor * rg = ggml_transpose(ctx, rg_t);
+        ggml_tensor * yg = ggml_mul_mat(ctx, rg, xg);
+        result = result == nullptr ? yg : ggml_concat(ctx, result, yg, 0);
+    }
+    return result;
+}
+
 static ggml_tensor * build_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -1833,8 +1912,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (llm_graph_is_turbo_pca_type(v->type)) {
+            if (v_mla) {
+                cur = llm_graph_apply_turbo_pca_from_t(ctx0, cur, mctx ? mctx->get_turbo_pca_k_rot_t() : nullptr);
+            } else {
+                cur = llm_graph_apply_turbo_pca(ctx0, cur, mctx ? mctx->get_turbo_pca_v_rot() : nullptr);
+            }
+        } else if (llm_graph_is_turbo_wht_type(v->type)) {
+            const bool k_is_turbo = llm_graph_is_turbo_wht_type(k->type);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (cur->ne[0] % turbo_group == 0) {
@@ -1911,8 +1996,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kqv, "kqv", il);
 
         // TurboQuant: inverse WHT on attention output (non-FA path)
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (llm_graph_is_turbo_pca_type(v->type)) {
+            if (v_mla) {
+                kqv = llm_graph_apply_turbo_pca_from_t(ctx0, kqv, mctx ? mctx->get_turbo_pca_k_rot_t() : nullptr);
+            } else {
+                kqv = llm_graph_apply_turbo_pca(ctx0, kqv, mctx ? mctx->get_turbo_pca_v_rot() : nullptr);
+            }
+        } else if (llm_graph_is_turbo_wht_type(v->type)) {
+            const bool k_is_turbo = llm_graph_is_turbo_wht_type(k->type);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (kqv->ne[0] % turbo_group == 0) {
@@ -1968,6 +2059,7 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     return (llm_graph_input_attn_no_cache *) res->add_input(std::move(inp));
 }
 
+// Attention builder for models without KV cache, e.g. an embedding model with non-causal attention
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_no_cache * inp,
         ggml_tensor * wo,
@@ -2051,7 +2143,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
-
+// Attention builder for models with KV cache, e.g. a decoder-only model with causal attention
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -2075,10 +2167,21 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    // Why doing the get before copying the rows 
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
+        // Apply Spectral PCA here, not when setting rows, in set_rows (done in cpy_k and cpy_v)
+        if (llm_graph_is_turbo_pca_type(k->type)) {
+            k_cur = llm_graph_apply_turbo_pca(ctx0, k_cur, mctx_cur->get_turbo_pca_k_rot_t());
+        }
+        if (llm_graph_is_turbo_pca_type(v->type)) {
+            v_cur = llm_graph_apply_turbo_pca(ctx0, v_cur, mctx_cur->get_turbo_pca_v_rot_t());
+        }
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
@@ -2087,13 +2190,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // TurboQuant and SpectralQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llm_graph_is_turbo_pca_type(k->type)) {
+        q = llm_graph_apply_turbo_pca(ctx0, q, mctx_cur->get_turbo_pca_k_rot_t());
+    } else if (llm_graph_is_turbo_wht_type(k->type)) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -2109,13 +2212,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llm_graph_is_turbo_pca_type(v->type) || llm_graph_is_turbo_wht_type(v->type)) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
             // Reshape to 4D, extract original head_dim, reshape back to 2D
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             // ggml_view_3d to extract first orig_v_head elements per head
@@ -2171,7 +2274,7 @@ llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
 
     return (llm_graph_input_attn_k *) res->add_input(std::move(inp));
 }
-
+// Attention builder for models with KV cache with multi latent attention (MLA)
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_k * inp,
         ggml_tensor * wo,
@@ -2192,23 +2295,28 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
 
+        if (llm_graph_is_turbo_pca_type(k->type)) {
+            k_cur = llm_graph_apply_turbo_pca(ctx0, k_cur, mctx_cur->get_turbo_pca_k_rot_t());
+        }
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     // TurboQuant: pre-rotate Q for K-only (MLA) attention
     // For zero-padded models, pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llm_graph_is_turbo_pca_type(k->type)) {
+        q = llm_graph_apply_turbo_pca(ctx0, q, mctx_cur->get_turbo_pca_k_rot_t());
+    } else if (llm_graph_is_turbo_wht_type(k->type)) {
         // Pad Q per-head to next multiple of 128 if needed
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -2224,12 +2332,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
     // extract original V head_dim after inverse WHT.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llm_graph_is_turbo_pca_type(v->type) || llm_graph_is_turbo_wht_type(v->type)) {
         const int64_t orig_v_head = v_cur->ne[0];  // original V head_dim from model
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
             // cur is 2D: (padded_v_head * n_head, n_tokens) after build_attn_mha
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
@@ -2254,6 +2362,7 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+// Attention builder for models with KV cache with sliding window attention (SWA)
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv_iswa * inp,
         ggml_tensor * wo,
@@ -2283,28 +2392,36 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool is_swa = hparams.is_swa(il);
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
+        if (llm_graph_is_turbo_pca_type(k->type)) {
+            k_cur = llm_graph_apply_turbo_pca(ctx0, k_cur, mctx_cur->get_turbo_pca_k_rot_t());
+        }
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
     if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
+        if (llm_graph_is_turbo_pca_type(v->type)) {
+            v_cur = llm_graph_apply_turbo_pca(ctx0, v_cur, mctx_cur->get_turbo_pca_v_rot_t());
+        }
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llm_graph_is_turbo_pca_type(k->type)) {
+        q = llm_graph_apply_turbo_pca(ctx0, q, mctx_cur->get_turbo_pca_k_rot_t());
+    } else if (llm_graph_is_turbo_wht_type(k->type)) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
@@ -2318,11 +2435,11 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llm_graph_is_turbo_pca_type(v->type) || llm_graph_is_turbo_wht_type(v->type)) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,

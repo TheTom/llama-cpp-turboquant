@@ -250,6 +250,8 @@ private:
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
+    void maybe_observe_empvar_calibration(const llama_memory_context_i * mctx);
+
     //
     // members
     //
@@ -257,6 +259,9 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    struct kv_empvar_calibration_runtime;
+    std::unique_ptr<kv_empvar_calibration_runtime> kv_empvar_calibration;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

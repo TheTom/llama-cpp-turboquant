@@ -734,6 +734,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_0_ref,
     },
+    [GGML_TYPE_TURBO3_EMPVAR_0] = {
+        .type_name                = "turbo3_empvar",
+        .blck_size                = QK_TURBO3,
+        .type_size                = sizeof(block_turbo3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_empvar_v,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_empvar_k_ref,
+    },
+    [GGML_TYPE_TURBO3_PCA_0] = {
+        .type_name                = "turbo3_pca",
+        .blck_size                = QK_TURBO3,
+        .type_size                = sizeof(block_turbo3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_empvar_v,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_pca_k_ref,
+    },
     [GGML_TYPE_TURBO4_0] = {
         .type_name                = "turbo4",
         .blck_size                = QK_TURBO4,
@@ -741,6 +757,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+    },
+    [GGML_TYPE_TURBO4_PCA_0] = {
+        .type_name                = "turbo4_pca",
+        .blck_size                = QK_TURBO4,
+        .type_size                = sizeof(block_turbo4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_pca_k_ref,
+    },
+    [GGML_TYPE_TURBO4333_PCA_0] = {
+        .type_name                = "turbo4333_pca",
+        .blck_size                = QK_TURBO4333_PCA,
+        .type_size                = sizeof(block_turbo4333_pca_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4333_pca,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4333_pca_k_ref,
+    },
+    [GGML_TYPE_TURBO4322_PCA_0] = {
+        .type_name                = "turbo4322_pca",
+        .blck_size                = QK_TURBO4322_PCA,
+        .type_size                = sizeof(block_turbo4322_pca_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4322_pca,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4322_pca_k_ref,
     },
     [GGML_TYPE_TURBO2_0] = {
         .type_name                = "turbo2",
@@ -7733,9 +7773,14 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
-        case GGML_TYPE_TURBO2_0: result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_0:        result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_EMPVAR_0: result = quantize_turbo3_empvar_k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_PCA_0:    result = quantize_turbo3_pca_k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4_0:        result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4_PCA_0:    result = quantize_turbo4_pca_k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4333_PCA_0: result = quantize_turbo4333_pca_k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4322_PCA_0: result = quantize_turbo4322_pca_k(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO2_0:        result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

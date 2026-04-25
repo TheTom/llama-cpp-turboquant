@@ -1194,20 +1194,26 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
+                if (op->src[1]->type == GGML_TYPE_TURBO4_PCA_0 || op->src[2]->type == GGML_TYPE_TURBO4_PCA_0 ||
+                    op->src[1]->type == GGML_TYPE_TURBO4333_PCA_0 || op->src[2]->type == GGML_TYPE_TURBO4333_PCA_0 ||
+                    op->src[1]->type == GGML_TYPE_TURBO4322_PCA_0 || op->src[2]->type == GGML_TYPE_TURBO4322_PCA_0) {
+                    return false;
+                }
                 // Allow asymmetric K/V for supported mixed pairs:
                 // - turbo x turbo (any combination)
                 // - q8_0 x turbo (either direction)
-                const bool k_is_turbo = (op->src[1]->type == GGML_TYPE_TURBO2_0 ||
-                                         op->src[1]->type == GGML_TYPE_TURBO3_0 ||
-                                         op->src[1]->type == GGML_TYPE_TURBO4_0);
-                const bool v_is_turbo = (op->src[2]->type == GGML_TYPE_TURBO2_0 ||
-                                         op->src[2]->type == GGML_TYPE_TURBO3_0 ||
-                                         op->src[2]->type == GGML_TYPE_TURBO4_0);
+                const bool k_is_turbo = (op->src[1]->type == GGML_TYPE_TURBO2_0 || op->src[1]->type == GGML_TYPE_TURBO3_0 || op->src[1]->type == GGML_TYPE_TURBO3_EMPVAR_0 || op->src[1]->type == GGML_TYPE_TURBO3_PCA_0 || op->src[1]->type == GGML_TYPE_TURBO4_0 || op->src[1]->type == GGML_TYPE_TURBO4_PCA_0 || op->src[1]->type == GGML_TYPE_TURBO4333_PCA_0 || op->src[1]->type == GGML_TYPE_TURBO4322_PCA_0);
+                const bool v_is_turbo = (op->src[2]->type == GGML_TYPE_TURBO2_0 || op->src[2]->type == GGML_TYPE_TURBO3_0 || op->src[2]->type == GGML_TYPE_TURBO3_EMPVAR_0 || op->src[2]->type == GGML_TYPE_TURBO3_PCA_0 || op->src[2]->type == GGML_TYPE_TURBO4_0 || op->src[2]->type == GGML_TYPE_TURBO4_PCA_0 || op->src[2]->type == GGML_TYPE_TURBO4333_PCA_0 || op->src[2]->type == GGML_TYPE_TURBO4322_PCA_0);
                 const bool k_is_q8 = (op->src[1]->type == GGML_TYPE_Q8_0);
                 const bool v_is_q8 = (op->src[2]->type == GGML_TYPE_Q8_0);
+                const bool k_is_q4_0 = (op->src[1]->type == GGML_TYPE_Q4_0);
+                const bool v_is_q4_0 = (op->src[2]->type == GGML_TYPE_Q4_0);
                 const bool supported = (k_is_turbo && v_is_turbo) ||
-                                       (k_is_q8 && v_is_turbo) ||
-                                       (k_is_turbo && v_is_q8);
+                                    (k_is_q8 && v_is_turbo) ||
+                                    (k_is_turbo && v_is_q8) ||
+                                    (k_is_q8 && v_is_q4_0) ||
+                                    (k_is_q4_0 && v_is_q8);
+
                 if (!supported) {
                     return false;
                 }
@@ -1242,10 +1248,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_Q4_0:
                            case GGML_TYPE_Q4_1:
                            case GGML_TYPE_Q5_0:
-                           case GGML_TYPE_Q5_1:
-                           case GGML_TYPE_IQ4_NL:
-                           case GGML_TYPE_I32:
-                                return true;
+	                           case GGML_TYPE_Q5_1:
+	                           case GGML_TYPE_IQ4_NL:
+	                           case GGML_TYPE_I32:
+	                           case GGML_TYPE_TURBO2_0:
+	                           case GGML_TYPE_TURBO3_0:
+	                           case GGML_TYPE_TURBO3_EMPVAR_0:
+	                           case GGML_TYPE_TURBO3_PCA_0:
+	                           case GGML_TYPE_TURBO4_0:
+	                           case GGML_TYPE_TURBO4_PCA_0:
+	                           case GGML_TYPE_TURBO4333_PCA_0:
+	                           case GGML_TYPE_TURBO4322_PCA_0:
+	                                return true;
                            default:
                                 return false;
                         }
@@ -1303,7 +1317,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TURBO2_0:
                     case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO3_EMPVAR_0:
+                    case GGML_TYPE_TURBO3_PCA_0:
                     case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO4_PCA_0:
+                    case GGML_TYPE_TURBO4333_PCA_0:
+                    case GGML_TYPE_TURBO4322_PCA_0:
                         return true;
                     default:
                         return false;

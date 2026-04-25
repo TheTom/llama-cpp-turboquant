@@ -122,6 +122,9 @@ public:
     // TurboQuant: delegate to the KV cache context
     ggml_tensor * get_turbo_rot_forward() const override;
     ggml_tensor * get_turbo_rot_inverse() const override;
+    ggml_tensor * get_turbo_pca_k_rot_t() const override;
+    ggml_tensor * get_turbo_pca_v_rot_t() const override;
+    ggml_tensor * get_turbo_pca_v_rot() const override;
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
 
     //

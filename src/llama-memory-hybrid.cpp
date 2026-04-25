@@ -271,6 +271,18 @@ ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
     return ctx_attn ? ctx_attn->get_turbo_rot_inverse() : nullptr;
 }
 
+ggml_tensor * llama_memory_hybrid_context::get_turbo_pca_k_rot_t() const {
+    return ctx_attn ? ctx_attn->get_turbo_pca_k_rot_t() : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_turbo_pca_v_rot_t() const {
+    return ctx_attn ? ctx_attn->get_turbo_pca_v_rot_t() : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_turbo_pca_v_rot() const {
+    return ctx_attn ? ctx_attn->get_turbo_pca_v_rot() : nullptr;
+}
+
 ggml_tensor * llama_memory_hybrid_context::get_turbo_innerq_scale_inv() const {
     return ctx_attn ? ctx_attn->get_turbo_innerq_scale_inv() : nullptr;
 }

@@ -253,6 +253,15 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
+    llama_build_and_test(test-wht-empvar.cpp)
+    llama_build(test-wht-empvar-dump.cpp)
+    llama_test_cmd(
+        python3
+        NAME test-wht-empvar-python-parity
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-wht-empvar-python-parity.py
+    )
+    llama_build(bench-wht-empvar.cpp)
     llama_build_and_test(test-rope.cpp)
 endif()
 

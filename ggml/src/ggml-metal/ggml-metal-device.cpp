@@ -18,11 +18,14 @@ struct ggml_metal_device_deleter {
 typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal_device_ptr;
 
 ggml_metal_device_t ggml_metal_device_get(int device) {
-    static std::vector<ggml_metal_device_ptr> devs;
+    static std::unordered_map<int, ggml_metal_device_ptr> devs;
 
-    devs.emplace_back(ggml_metal_device_init(device));
+    auto it = devs.find(device);
+    if (it == devs.end()) {
+        it = devs.emplace(device, ggml_metal_device_ptr(ggml_metal_device_init(device))).first;
+    }
 
-    return devs.back().get();
+    return it->second.get();
 }
 
 struct ggml_metal_pipelines {
@@ -1341,8 +1344,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     // Asymmetric K/V: always encode both K and V types in the pipeline name.
     // Symmetric case: ktype == vtype, so the name just has the type twice.
     // This avoids ambiguity if a type name contains underscores (e.g. q4_0).
+    const bool uses_empvar =
+        op->src[1]->type == GGML_TYPE_TURBO3_EMPVAR_0 ||
+        op->src[1]->type == GGML_TYPE_TURBO3_PCA_0 ||
+        op->src[1]->type == GGML_TYPE_TURBO4_PCA_0 ||
+        op->src[1]->type == GGML_TYPE_TURBO4333_PCA_0 ||
+        op->src[1]->type == GGML_TYPE_TURBO4322_PCA_0 ||
+        op->src[2]->type == GGML_TYPE_TURBO3_EMPVAR_0 ||
+        op->src[2]->type == GGML_TYPE_TURBO3_PCA_0 ||
+        op->src[2]->type == GGML_TYPE_TURBO4_PCA_0 ||
+        op->src[2]->type == GGML_TYPE_TURBO4333_PCA_0 ||
+        op->src[2]->type == GGML_TYPE_TURBO4322_PCA_0;
+
     snprintf(base, 256, "kernel_%s_k%s_v%s_dk%d_dv%d",
-            "flash_attn_ext",
+            uses_empvar ? "flash_attn_ext_empvar" : "flash_attn_ext",
             ggml_type_name(op->src[1]->type),
             ggml_type_name(op->src[2]->type),
             dk,
@@ -1415,7 +1430,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             dk,
             dv);
 
-
     snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
             base,
             has_mask,
@@ -1426,7 +1440,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             ns10,
             ns20,
             nsg, nwg);
-
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();

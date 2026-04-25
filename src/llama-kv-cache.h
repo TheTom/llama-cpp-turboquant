@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama-kv-empvar-calibration.h"
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
@@ -167,6 +168,9 @@ public:
     // turbo_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)
     ggml_tensor * get_turbo_rotation() const { return turbo_rotation; }
     ggml_tensor * get_turbo_rotation_inv() const { return turbo_rotation_inv; }
+    ggml_tensor * get_turbo_pca_k_rotation_t() const { return turbo_pca_k_rotation_t; }
+    ggml_tensor * get_turbo_pca_v_rotation_t() const { return turbo_pca_v_rotation_t; }
+    ggml_tensor * get_turbo_pca_v_rotation()   const { return turbo_pca_v_rotation; }
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
@@ -204,6 +208,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+    void observe_empvar_calibration(const slot_info & sinfo, llama_kv_empvar_calibration & calibration) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -261,6 +266,14 @@ private:
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)
     ggml_tensor * turbo_rotation_inv = nullptr;   // R^T = R^{-1} (inverse rotation)
+
+    // Turbo3 PCA calibration tensors. Shape: [128, 128, n_groups].
+    ggml_tensor * turbo_pca_k_rotation_t = nullptr; // U_k^T
+    ggml_tensor * turbo_pca_v_rotation_t = nullptr; // U_v^T
+    ggml_tensor * turbo_pca_v_rotation   = nullptr; // U_v
+    std::vector<float> turbo_pca_k_rotation_t_data;
+    std::vector<float> turbo_pca_v_rotation_t_data;
+    std::vector<float> turbo_pca_v_rotation_data;
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;
@@ -351,10 +364,16 @@ public:
     // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;
     ggml_tensor * get_turbo_rotation_inv() const;
+    ggml_tensor * get_turbo_pca_k_rotation_t() const;
+    ggml_tensor * get_turbo_pca_v_rotation_t() const;
+    ggml_tensor * get_turbo_pca_v_rotation() const;
 
     // Override virtual methods from llama_memory_context_i
     ggml_tensor * get_turbo_rot_forward() const override;
     ggml_tensor * get_turbo_rot_inverse() const override;
+    ggml_tensor * get_turbo_pca_k_rot_t() const override;
+    ggml_tensor * get_turbo_pca_v_rot_t() const override;
+    ggml_tensor * get_turbo_pca_v_rot() const override;
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
@@ -380,6 +399,7 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void observe_empvar_calibration(llama_kv_empvar_calibration & calibration) const;
 
 private:
     llama_memory_status status;

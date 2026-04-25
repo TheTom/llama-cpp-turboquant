@@ -65,6 +65,12 @@ struct llama_memory_context_i {
     virtual ggml_tensor * get_turbo_rot_forward() const { return nullptr; }
     virtual ggml_tensor * get_turbo_rot_inverse() const { return nullptr; }
 
+    // Turbo3 PCA: calibration-derived per-128-group bases.
+    // K/Q use U_k^T before attention; V uses U_v^T before cache write and U_v after attention.
+    virtual ggml_tensor * get_turbo_pca_k_rot_t() const { return nullptr; }
+    virtual ggml_tensor * get_turbo_pca_v_rot_t() const { return nullptr; }
+    virtual ggml_tensor * get_turbo_pca_v_rot()   const { return nullptr; }
+
     // TurboQuant InnerQ: get per-channel scale_inv tensor for Q/V equalization
     // Returns nullptr when InnerQ is not active. Override in KV cache contexts.
     virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
