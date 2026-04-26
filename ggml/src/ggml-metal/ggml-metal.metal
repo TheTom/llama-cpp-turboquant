@@ -458,43 +458,43 @@ constant float turbo_empvar_v_table_256[256] = {
 0.00871698185801506,0.0073377820663154125,0.01049073226749897,0.007217869162559509,0.006839060690253973,0.005502468440681696,0.007389398757368326,0.00969752948731184,0.007850296795368195,0.0062703159637749195,0.005590564571321011,0.008467615582048893,0.007132012862712145,0.0074696955271065235,0.005746373441070318,0.007013767957687378,0.0039024509023875,0.005417239386588335,0.006209450773894787,0.005973513238132,0.006909978110343218,0.007497308310121298,0.006146911531686783,0.007228810805827379,0.005739663727581501,0.010089781135320663,0.007305148523300886,0.005294654984027147,0.005330583546310663,0.0072373864240944386,0.0067184255458414555,0.010496127419173717,0.006385937798768282,0.006932007148861885,0.007567636203020811,0.010871334932744503,0.006175810471177101,0.006116662640124559,0.007744410540908575,0.00943625345826149,0.007930553518235683,0.006440452765673399,0.0046163443475961685,0.006736657116562128,0.007853456772863865,0.005624102894216776,0.007289557252079248,0.008013454265892506,0.00783699844032526,0.006069866940379143,0.00978025421500206,0.00927415769547224,0.010647212155163288,0.006039726547896862,0.008765065111219883,0.007276657037436962,0.014599321410059929,0.008550201542675495,0.006688180845230818,0.005538195837289095,0.008076382800936699,0.009943912737071514,0.009454316459596157,0.010347731411457062,0.007640110328793526,0.005979310721158981,0.007042487617582083,0.007975184358656406,0.009856319054961205,0.005737673956900835,0.007189128547906876,0.004136284813284874,0.009819716215133667,0.007731580641120672,0.008247077465057373,0.006582616828382015,0.007876435294747353,0.006760170683264732,0.007524449378252029,0.01145295798778534,0.009802059270441532,0.00600927509367466,0.005576280876994133,0.00954480841755867,0.010554726235568523,0.007883952930569649,0.009965437464416027,0.007672428619116545,0.004818307235836983,0.013514705002307892,0.009254271164536476,0.006119186989963055,0.008411888964474201,0.008025665767490864,0.009113353677093983,0.00908022839576006,0.009108280763030052,0.008126555010676384,0.010009192861616611,0.011903156526386738,0.006431762129068375,0.008059917017817497,0.008867794647812843,0.007253732997924089,0.009198482148349285,0.009627440012991428,0.005076725501567125,0.00927818100899458,0.0127787496894598,0.006703689228743315,0.008114971220493317,0.011243335902690887,0.009787721559405327,0.009476521983742714,0.00737989554181695,0.008635182864964008,0.006675873417407274,0.007857603952288628,0.004797475412487984,0.007743766065686941,0.007879151031374931,0.010627114214003086,0.009075646288692951,0.005702953785657883,0.004321668762713671,0.006714925169944763,0.0063813659362494946,0.0074103339575231075,0.003904217155650258,0.012199006043374538,0.007913421839475632,0.0047663738951087,0.003260919824242592,0.0110554751008749,0.011288660578429699,0.0051551624201238155,0.004547246731817722,0.0065508377738296986,0.009328770451247692,0.003766197245568037,0.003466756083071232,0.011999626643955708,0.01283497828990221,0.003532201051712036,0.00565767427906394,0.00983564555644989,0.011583467945456505,0.004887771792709827,0.004222974181175232,0.007580865640193224,0.005761404521763325,0.0063641369342803955,0.004408176057040691,0.011212497018277645,0.006823776289820671,0.006096037104725838,0.003210852388292551,0.005984610412269831,0.012054874561727047,0.0036773602478206158,0.008912408724427223,0.004028956405818462,0.0035052094608545303,0.009903841651976109,0.013037117198109627,0.005389384925365448,0.004562537185847759,0.010254677385091782,0.009482460096478462,0.006513639353215694,0.004503099713474512,0.0048697758466005325,0.0098946001380682,0.00648795859888196,0.004010455217212439,0.01284361444413662,0.010810955427587032,0.0038708895444869995,0.004755929112434387,0.0076025002636015415,0.008294902741909027,0.0036793455947190523,0.007576155476272106,0.012879228219389915,0.009471229277551174,0.005043992307037115,0.005642210599035025,0.011646803468465805,0.011136661283671856,0.0043056258000433445,0.0040505630895495415,0.007281670346856117,0.006001931615173817,0.011449027806520462,0.009403742849826813,0.007265882566571236,0.004488273989409208,0.009004988707602024,0.014173218980431557,0.004334637895226479,0.0045686583034694195,0.011493006721138954,0.011134146712720394,0.007406627759337425,0.007692629937082529,0.012385839596390724,0.012248528189957142,0.007954061962664127,0.0031470207031816244,0.011692142114043236,0.01367104984819889,0.0050974139012396336,0.005781134590506554,0.013828849419951439,0.007544383872300386,0.004513322841376066,0.004373027011752129,0.021068749949336052,0.009886104613542557,0.005597755312919617,0.004139905329793692,0.0072309840470552444,0.00871863029897213,0.004072852898389101,0.008216364309191704,0.00434202840551734,0.005677347537130117,0.009523945860564709,0.01254087220877409,0.0023183792363852262,0.0061892615631222725,0.013747291639447212,0.013524740934371948,0.004006148781627417,0.004050877410918474,0.007984308525919914,0.010154043324291706,0.004202752374112606,0.007232241332530975,0.012735115364193916,0.00888135377317667,0.0055436743423342705,0.002893265802413225,0.010394874028861523,0.011060226708650589,0.004756328649818897,0.00647321529686451,0.011330571956932545,0.013520804233849049,0.005430213175714016,0.007847013883292675,0.016746025532484055,0.010797355324029922,0.004716335795819759,0.006240224000066519,0.014373869635164738
 };
 
-constant float turbo_empvar_sigma_ref_128 = 0.08838834764831845f; // 1 / sqrt(128)
+constant float turbo_calib_sigma_ref_128 = 0.08838834764831845f; // 1 / sqrt(128)
 
-static inline float turbo_empvar_sigma_scale(
-        constant float * empvar,
-        int empvar_dim,
+static inline float turbo_calib_sigma_scale(
+        constant float * calib,
+        int calib_dim,
         int coord) {
-    if (coord < 0 || coord >= empvar_dim) {
+    if (coord < 0 || coord >= calib_dim) {
         return 1.0f;
     }
-    const float sigma = sqrt(max(empvar[coord], 1e-6f));
-    return sigma / turbo_empvar_sigma_ref_128;
+    const float sigma = sqrt(max(calib[coord], 1e-6f));
+    return sigma / turbo_calib_sigma_ref_128;
 }
 
 template <typename type4x4>
-static inline void turbo_apply_empvar_scale_4x4(
+static inline void turbo_apply_calib_scale_4x4(
         thread type4x4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     float4x4 scaled = (float4x4) reg;
     for (int g = 0; g < 4; ++g) {
         for (int k = 0; k < 4; ++k) {
-            scaled[g][k] *= turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+            scaled[g][k] *= turbo_calib_sigma_scale(calib, calib_dim, base_coord + g*4 + k);
         }
     }
     reg = (type4x4) scaled;
 }
 
 template <typename type4>
-static inline void turbo_apply_empvar_scale_4(
+static inline void turbo_apply_calib_scale_4(
         thread type4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     float4 scaled = (float4) reg;
     for (int k = 0; k < 4; ++k) {
-        scaled[k] *= turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + k);
+        scaled[k] *= turbo_calib_sigma_scale(calib, calib_dim, base_coord + k);
     }
     reg = (type4) scaled;
 }
@@ -787,20 +787,21 @@ void dequantize_turbo3_0(device const block_turbo3_0 * xb, short il, thread type
     reg = (type4x4) reg_f;
 }
 
-// FALL BACK, with gemma 256 inline constant table lookup for empirical variance scaling (empvar).
+// FALL BACK, with gemma 256 inline constant table lookup for calibration scaling.
 template <typename type4x4>
 void dequantize_turbo3_empvar_k_0(device const block_turbo3_0 * xb, short il, thread type4x4 & reg) {
     dequantize_turbo3_0(xb, il, reg);
-    turbo_apply_empvar_scale_4x4(reg, turbo_empvar_k_table_256, 256, il*16);
+    turbo_apply_calib_scale_4x4(reg, turbo_empvar_k_table_256, 256, il*16);
 }
-// FALL BACK, with gemma 256 inline constant table lookup for empirical variance scaling (empvar).
+// FALL BACK, with gemma 256 inline constant table lookup for calibration scaling.
 template <typename type4x4>
 void dequantize_turbo3_empvar_v_0(device const block_turbo3_0 * xb, short il, thread type4x4 & reg) {
     dequantize_turbo3_0(xb, il, reg);
-    turbo_apply_empvar_scale_4x4(reg, turbo_empvar_v_table_256, 256, il*16);
+    turbo_apply_calib_scale_4x4(reg, turbo_empvar_v_table_256, 256, il*16);
 }
 
-// Dequant functions used in empvar-aware attention kernels where empvar is dynamic and can't be baked into a constant table.
+// Dequant functions used in calibrated attention kernels where the scaling
+// table is dynamic and can't be baked into a constant table.
 template <typename type4x4>
 void dequantize_q8_0_ctx(
         device const block_q8_0 * xb,
@@ -850,11 +851,11 @@ void dequantize_turbo4_pca_0_ctx(
         device const block_turbo4_0 * xb,
         short il,
         thread type4x4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     dequantize_turbo4_0(xb, il, reg);
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4x4(reg, calib, calib_dim, base_coord);
 }
 
 template <typename type4x4>
@@ -862,8 +863,8 @@ void dequantize_turbo4333_pca_0_ctx(
         device const block_turbo4333_pca_0 * xb,
         short il,
         thread type4x4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     const int region = il >> 1;
     const int local_il = il & 1;
@@ -886,7 +887,7 @@ void dequantize_turbo4333_pca_0_ctx(
     }
 
     reg = (type4x4) reg_f;
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4x4(reg, calib, calib_dim, base_coord);
 }
 
 template <typename type4x4>
@@ -894,8 +895,8 @@ void dequantize_turbo4322_pca_0_ctx(
         device const block_turbo4322_pca_0 * xb,
         short il,
         thread type4x4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     const int region = il >> 1;
     const int local_il = il & 1;
@@ -921,7 +922,7 @@ void dequantize_turbo4322_pca_0_ctx(
     }
 
     reg = (type4x4) reg_f;
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4x4(reg, calib, calib_dim, base_coord);
 }
 
 template <typename type4x4>
@@ -929,11 +930,11 @@ void dequantize_turbo3_empvar_0_ctx(
         device const block_turbo3_0 * xb,
         short il,
         thread type4x4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     dequantize_turbo3_0(xb, il, reg);
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4x4(reg, calib, calib_dim, base_coord);
 }
 
 template <typename type4x4>
@@ -941,10 +942,10 @@ void dequantize_turbo3_pca_0_ctx(
         device const block_turbo3_0 * xb,
         short il,
         thread type4x4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
-    dequantize_turbo3_empvar_0_ctx(xb, il, reg, empvar, empvar_dim, base_coord);
+    dequantize_turbo3_empvar_0_ctx(xb, il, reg, calib, calib_dim, base_coord);
 }
 
 // Half-precision centroid LUT for vec path — reduces constant cache pressure at long context.
@@ -1069,20 +1070,21 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
 #endif
 }
 
-// FALL BACK, with gemma 256 inline constant table lookup for empirical variance scaling (empvar).
+// FALL BACK, with gemma 256 inline constant table lookup for calibration scaling.
 template <typename type4>
 void dequantize_turbo3_empvar_k_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
     dequantize_turbo3_0_t4(xb, il, reg);
-    turbo_apply_empvar_scale_4(reg, turbo_empvar_k_table_256, 256, il*4);
+    turbo_apply_calib_scale_4(reg, turbo_empvar_k_table_256, 256, il*4);
 }
 
 template <typename type4>
 void dequantize_turbo3_empvar_v_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
     dequantize_turbo3_0_t4(xb, il, reg);
-    turbo_apply_empvar_scale_4(reg, turbo_empvar_v_table_256, 256, il*4);
+    turbo_apply_calib_scale_4(reg, turbo_empvar_v_table_256, 256, il*4);
 }
 
-// Dequant functions used in empvar-aware attention kernels where empvar is dynamic and can't be baked into a constant table.
+// Dequant functions used in calibrated attention kernels where the scaling
+// table is dynamic and can't be baked into a constant table.
 template <typename type4>
 void dequantize_q8_0_t4_ctx(
         device const block_q8_0 * xb,
@@ -1132,11 +1134,11 @@ void dequantize_turbo4_pca_0_t4_ctx(
         device const block_turbo4_0 * xb,
         short il,
         thread type4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     dequantize_turbo4_0_t4(xb, il, reg);
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4(reg, calib, calib_dim, base_coord);
 }
 
 template <typename type4>
@@ -1144,8 +1146,8 @@ void dequantize_turbo4333_pca_0_t4_ctx(
         device const block_turbo4333_pca_0 * xb,
         short il,
         thread type4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     const int region = il >> 3;
     const int local_il = il & 7;
@@ -1182,7 +1184,7 @@ void dequantize_turbo4333_pca_0_t4_ctx(
             float(turbo_centroids_3bit_h[q3 | (s3 << 2)]) * norm
         ));
     }
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4(reg, calib, calib_dim, base_coord);
 }
 
 template <typename type4>
@@ -1190,8 +1192,8 @@ void dequantize_turbo4322_pca_0_t4_ctx(
         device const block_turbo4322_pca_0 * xb,
         short il,
         thread type4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     const int region = il >> 3;
     const int local_il = il & 7;
@@ -1234,7 +1236,7 @@ void dequantize_turbo4322_pca_0_t4_ctx(
             float(turbo_centroids_2bit_h[(qb >> 6)       ]) * norm
         ));
     }
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4(reg, calib, calib_dim, base_coord);
 }
 
 template <typename type4>
@@ -1242,24 +1244,24 @@ void dequantize_turbo3_empvar_0_t4_ctx(
         device const block_turbo3_0 * xb,
         short il,
         thread type4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
     dequantize_turbo3_0_t4(xb, il, reg);
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    turbo_apply_calib_scale_4(reg, calib, calib_dim, base_coord);
 }
 
 
-// Added for compiling the template, same logic as dequantize_turbo3_empvar_0_t4_ctx.
+// Same scaling path as dequantize_turbo3_empvar_0_t4_ctx; name kept for template dispatch.
 template <typename type4>
 void dequantize_turbo3_pca_0_t4_ctx(
         device const block_turbo3_0 * xb,
         short il,
         thread type4 & reg,
-        constant float * empvar,
-        int empvar_dim,
+        constant float * calib,
+        int calib_dim,
         int base_coord) {
-    dequantize_turbo3_empvar_0_t4_ctx(xb, il, reg, empvar, empvar_dim, base_coord);
+    dequantize_turbo3_empvar_0_t4_ctx(xb, il, reg, calib, calib_dim, base_coord);
 }
 
 // ----- turbo4 dequantize with per-thread block cache -----
@@ -12149,8 +12151,8 @@ kernel void kernel_set_rows_turbo_empvar(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
-        constant float * empvar [[buffer(4)]],
-        constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * calib [[buffer(4)]],
+        constant int32_t & calib_dim [[buffer(5)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12205,8 +12207,8 @@ kernel void kernel_set_rows_turbo_empvar(
             for (int j = 0; j < QK; j++) {
                 float rv = x[off + j];  // rotated, normalized value
                 const int coord = grp * (args.wht_group > 0 ? args.wht_group : QK_TURBO3_GROUP) + off + j;
-                const int table_coord = coord % empvar_dim;
-                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+                const int table_coord = coord % calib_dim;
+                const float scale = turbo_calib_sigma_scale(calib, calib_dim, table_coord);
                 uint8_t idx = turbo_nearest_centroid_3bit_scaled(rv, scale);
 
                 blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
@@ -12393,8 +12395,8 @@ kernel void kernel_set_rows_turbo4_pca(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
-        constant float * empvar [[buffer(4)]],
-        constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * calib [[buffer(4)]],
+        constant int32_t & calib_dim [[buffer(5)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12427,8 +12429,8 @@ kernel void kernel_set_rows_turbo4_pca(
         for (int j = 0; j < QK_TURBO4; j++) {
             const float val = blk_src[j] * inv_norm;
             const int coord = blk_idx * (args.wht_group > 0 ? args.wht_group : QK_TURBO4) + j;
-            const int table_coord = coord % empvar_dim;
-            const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+            const int table_coord = coord % calib_dim;
+            const float scale = turbo_calib_sigma_scale(calib, calib_dim, table_coord);
             const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
             blk.qs[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
 
@@ -12448,8 +12450,8 @@ kernel void kernel_set_rows_turbo4333_pca(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
-        constant float * empvar [[buffer(4)]],
-        constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * calib [[buffer(4)]],
+        constant int32_t & calib_dim [[buffer(5)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12488,8 +12490,8 @@ kernel void kernel_set_rows_turbo4333_pca(
 
         for (int j = 0; j < 32; ++j) {
             const float val = blk_src[j] * inv_norm;
-            const int table_coord = (blk_idx * QK_TURBO4333_PCA + j) % empvar_dim;
-            const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+            const int table_coord = (blk_idx * QK_TURBO4333_PCA + j) % calib_dim;
+            const float scale = turbo_calib_sigma_scale(calib, calib_dim, table_coord);
             const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
             blk.qs4[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
             const float c = turbo_centroids_4bit[idx] * scale;
@@ -12500,8 +12502,8 @@ kernel void kernel_set_rows_turbo4333_pca(
             const int base = 32 + region * 32;
             for (int j = 0; j < 32; ++j) {
                 const float val = blk_src[base + j] * inv_norm;
-                const int table_coord = (blk_idx * QK_TURBO4333_PCA + base + j) % empvar_dim;
-                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+                const int table_coord = (blk_idx * QK_TURBO4333_PCA + base + j) % calib_dim;
+                const float scale = turbo_calib_sigma_scale(calib, calib_dim, table_coord);
 
                 float best_dist = fabs(val - turbo_centroids_3bit[0] * scale);
                 uint8_t idx = 0;
@@ -12535,8 +12537,8 @@ kernel void kernel_set_rows_turbo4322_pca(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
-        constant float * empvar [[buffer(4)]],
-        constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * calib [[buffer(4)]],
+        constant int32_t & calib_dim [[buffer(5)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12575,8 +12577,8 @@ kernel void kernel_set_rows_turbo4322_pca(
 
         for (int j = 0; j < 32; ++j) {
             const float val = blk_src[j] * inv_norm;
-            const int table_coord = (blk_idx * QK_TURBO4322_PCA + j) % empvar_dim;
-            const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+            const int table_coord = (blk_idx * QK_TURBO4322_PCA + j) % calib_dim;
+            const float scale = turbo_calib_sigma_scale(calib, calib_dim, table_coord);
             const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
             blk.qs4[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
             const float c = turbo_centroids_4bit[idx] * scale;
@@ -12586,8 +12588,8 @@ kernel void kernel_set_rows_turbo4322_pca(
         for (int j = 0; j < 32; ++j) {
             const int coord = 32 + j;
             const float val = blk_src[coord] * inv_norm;
-            const int table_coord = (blk_idx * QK_TURBO4322_PCA + coord) % empvar_dim;
-            const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+            const int table_coord = (blk_idx * QK_TURBO4322_PCA + coord) % calib_dim;
+            const float scale = turbo_calib_sigma_scale(calib, calib_dim, table_coord);
 
             float best_dist = fabs(val - turbo_centroids_3bit[0] * scale);
             uint8_t idx = 0;
@@ -12610,8 +12612,8 @@ kernel void kernel_set_rows_turbo4322_pca(
             const int base = 64 + r * 32;
             for (int j = 0; j < 32; ++j) {
                 const float val = blk_src[base + j] * inv_norm;
-                const int table_coord = (blk_idx * QK_TURBO4322_PCA + base + j) % empvar_dim;
-                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+                const int table_coord = (blk_idx * QK_TURBO4322_PCA + base + j) % calib_dim;
+                const float scale = turbo_calib_sigma_scale(calib, calib_dim, table_coord);
 
                 float best_dist = fabs(val - turbo_centroids_2bit[0] * scale);
                 uint8_t idx = 0;

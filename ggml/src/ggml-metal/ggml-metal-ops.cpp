@@ -31,18 +31,20 @@ namespace {
 using json = nlohmann::ordered_json;
 
 enum {
-    GGML_METAL_TURBO_EMPVAR_DISABLED = 0,
-    GGML_METAL_TURBO_EMPVAR_WHT_ONLY = 1,
-    GGML_METAL_TURBO_EMPVAR_MAX_DIM  = 1024,
+    GGML_METAL_TURBO_CALIB_TABLE_DISABLED = 0,
+    GGML_METAL_TURBO_CALIB_TABLE_ACTIVE   = 1,
+    GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM  = 1024,
 };
 
-struct ggml_metal_turbo_empvar_state {
+// Metal-side calibration tables can come either from WHT-only empirical
+// variance profiles or from PCA-group eigenvalue spectra.
+struct ggml_metal_turbo_calib_table_state {
     bool  initialized = false;
-    int32_t mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
+    int32_t mode = GGML_METAL_TURBO_CALIB_TABLE_DISABLED;
     int32_t k_dim = 0;
     int32_t v_dim = 0;
-    float k[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
-    float v[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
+    float k[GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM] = {};
+    float v[GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM] = {};
 };
 
 static const char * ggml_metal_turbo_getenv_any(const char * a, const char * b = nullptr, const char * c = nullptr) {
@@ -174,7 +176,7 @@ static bool ggml_metal_turbo_read_text_file(const char * path, std::string & tex
     return true;
 }
 
-static const json * ggml_metal_turbo_find_empvar_side(const json & root, const char * side_name) {
+static const json * ggml_metal_turbo_find_calib_side(const json & root, const char * side_name) {
     if (root.is_object()) {
         auto it = root.find(side_name);
         if (it != root.end() && it->is_object()) {
@@ -198,7 +200,7 @@ static int ggml_metal_turbo_parse_float_json_side(
         const char * side_name,
         float * out,
         int max_n) {
-    const json * side = ggml_metal_turbo_find_empvar_side(root, side_name);
+    const json * side = ggml_metal_turbo_find_calib_side(root, side_name);
     if (side == nullptr) {
         return 0;
     }
@@ -242,7 +244,7 @@ static int ggml_metal_turbo_parse_float_json_side(
     return n;
 }
 
-static bool ggml_metal_turbo_parse_empvar_json_file(
+static bool ggml_metal_turbo_parse_calib_json_file(
         const char * path,
         float * k_out,
         int * k_dim,
@@ -258,7 +260,7 @@ static bool ggml_metal_turbo_parse_empvar_json_file(
     try {
         root = json::parse(text);
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("%s: failed to parse empvar json '%s': %s\n", __func__, path, e.what());
+        GGML_LOG_ERROR("%s: failed to parse turbo calibration json '%s': %s\n", __func__, path, e.what());
         return false;
     }
 
@@ -266,7 +268,7 @@ static bool ggml_metal_turbo_parse_empvar_json_file(
     const int local_v_dim = ggml_metal_turbo_parse_float_json_side(root, "values", v_out, max_n);
 
     if (local_k_dim <= 0 || local_v_dim <= 0) {
-        GGML_LOG_ERROR("%s: empvar json '%s' does not contain usable keys/values variance arrays\n", __func__, path);
+        GGML_LOG_ERROR("%s: turbo calibration json '%s' does not contain usable keys/values variance arrays\n", __func__, path);
         return false;
     }
 
@@ -280,7 +282,7 @@ static bool ggml_metal_turbo_parse_empvar_json_file(
     return true;
 }
 
-static int32_t ggml_metal_turbo_validate_empvar_table(
+static int32_t ggml_metal_turbo_validate_calib_table(
         const char * label,
         const char * source,
         int32_t dim,
@@ -291,7 +293,7 @@ static int32_t ggml_metal_turbo_validate_empvar_table(
 
     for (int32_t i = 0; i < dim; ++i) {
         if (!std::isfinite(table[i]) || table[i] < 0.0f) {
-            GGML_LOG_ERROR("%s: invalid %s empvar value at %d from '%s'\n", __func__, label, (int) i, source ? source : "<null>");
+            GGML_LOG_ERROR("%s: invalid %s calibration value at %d from '%s'\n", __func__, label, (int) i, source ? source : "<null>");
             return 0;
         }
     }
@@ -299,8 +301,8 @@ static int32_t ggml_metal_turbo_validate_empvar_table(
     return dim;
 }
 
-static const ggml_metal_turbo_empvar_state & ggml_metal_turbo_empvar_get_state() {
-    static ggml_metal_turbo_empvar_state state;
+static const ggml_metal_turbo_calib_table_state & ggml_metal_turbo_calib_table_get_state() {
+    static ggml_metal_turbo_calib_table_state state;
     if (state.initialized) {
         return state;
     }
@@ -347,11 +349,11 @@ static const ggml_metal_turbo_empvar_state & ggml_metal_turbo_empvar_get_state()
     if (json_file && *json_file) {
         int k_dim = 0;
         int v_dim = 0;
-        if (ggml_metal_turbo_parse_empvar_json_file(
+        if (ggml_metal_turbo_parse_calib_json_file(
                 json_file,
                 state.k, &k_dim,
                 state.v, &v_dim,
-                GGML_METAL_TURBO_EMPVAR_MAX_DIM)) {
+                GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM)) {
             state.k_dim = k_dim;
             state.v_dim = v_dim;
         }
@@ -359,28 +361,28 @@ static const ggml_metal_turbo_empvar_state & ggml_metal_turbo_empvar_get_state()
 
     if (state.k_dim <= 0) {
         state.k_dim = k_file && *k_file
-            ? ggml_metal_turbo_parse_float_file(k_file, state.k, GGML_METAL_TURBO_EMPVAR_MAX_DIM)
-            : ggml_metal_turbo_parse_float_list(k_inline, state.k, GGML_METAL_TURBO_EMPVAR_MAX_DIM);
+            ? ggml_metal_turbo_parse_float_file(k_file, state.k, GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM)
+            : ggml_metal_turbo_parse_float_list(k_inline, state.k, GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM);
     }
     if (state.v_dim <= 0) {
         state.v_dim = v_file && *v_file
-            ? ggml_metal_turbo_parse_float_file(v_file, state.v, GGML_METAL_TURBO_EMPVAR_MAX_DIM)
-            : ggml_metal_turbo_parse_float_list(v_inline, state.v, GGML_METAL_TURBO_EMPVAR_MAX_DIM);
+            ? ggml_metal_turbo_parse_float_file(v_file, state.v, GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM)
+            : ggml_metal_turbo_parse_float_list(v_inline, state.v, GGML_METAL_TURBO_CALIB_TABLE_MAX_DIM);
     }
 
-    state.k_dim = ggml_metal_turbo_validate_empvar_table(
+    state.k_dim = ggml_metal_turbo_validate_calib_table(
         "K",
         json_file && *json_file ? json_file : (k_file && *k_file ? k_file : "GGML_METAL_TURBO_EMPVAR_K"),
         state.k_dim,
         state.k);
-    state.v_dim = ggml_metal_turbo_validate_empvar_table(
+    state.v_dim = ggml_metal_turbo_validate_calib_table(
         "V",
         json_file && *json_file ? json_file : (v_file && *v_file ? v_file : "GGML_METAL_TURBO_EMPVAR_V"),
         state.v_dim,
         state.v);
 
     if (state.k_dim > 0 || state.v_dim > 0) {
-        state.mode = GGML_METAL_TURBO_EMPVAR_WHT_ONLY;
+        state.mode = GGML_METAL_TURBO_CALIB_TABLE_ACTIVE;
     }
 
     state.initialized = true;
@@ -409,18 +411,18 @@ static bool ggml_metal_is_turbo_type(const ggml_type type) {
            type == GGML_TYPE_TURBO4322_PCA_0;
 }
 
-static bool ggml_metal_is_turbo3_empvar_type(const ggml_type type) {
+static bool ggml_metal_is_turbo_calibrated_type(const ggml_type type) {
     return type == GGML_TYPE_TURBO3_EMPVAR_0 || type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0;
 }
 
-static void ggml_metal_turbo_empvar_select(
+static void ggml_metal_turbo_calib_table_select(
         const ggml_tensor * t,
         const float ** table,
         int32_t * dim,
         int32_t * mode,
         int32_t * wht_group,
         int32_t * kv_kind) {
-    static const float empvar_dummy[1] = { 0.0f };
+    static const float calib_table_dummy[1] = { 0.0f };
 
     int32_t local_wht_group = 0;
     int32_t local_kv_kind = 0;
@@ -428,24 +430,24 @@ static void ggml_metal_turbo_empvar_select(
 
     const float * local_table = nullptr;
     int32_t local_dim = 0;
-    int32_t local_mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
+    int32_t local_mode = GGML_METAL_TURBO_CALIB_TABLE_DISABLED;
 
-    if (t != nullptr && ggml_metal_is_turbo3_empvar_type(t->type)) {
-        const auto & empvar = ggml_metal_turbo_empvar_get_state();
-        if (empvar.mode == GGML_METAL_TURBO_EMPVAR_WHT_ONLY) {
+    if (t != nullptr && ggml_metal_is_turbo_calibrated_type(t->type)) {
+        const auto & calib = ggml_metal_turbo_calib_table_get_state();
+        if (calib.mode == GGML_METAL_TURBO_CALIB_TABLE_ACTIVE) {
             if (local_kv_kind == 1) {
-                local_table = empvar.k;
-                local_dim = empvar.k_dim;
+                local_table = calib.k;
+                local_dim = calib.k_dim;
             } else if (local_kv_kind == 2) {
-                local_table = empvar.v;
-                local_dim = empvar.v_dim;
+                local_table = calib.v;
+                local_dim = calib.v_dim;
             }
-            local_mode = empvar.mode;
+            local_mode = calib.mode;
         }
     }
 
     if (local_table == nullptr) {
-        local_table = empvar_dummy;
+        local_table = calib_table_dummy;
     }
 
     if (table) {
@@ -1646,16 +1648,16 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     int32_t wht_group = 0;
     int32_t kv_kind = 0;
     ggml_metal_turbo_read_meta(op, wht_group, kv_kind);
-    const bool use_empvar = ggml_metal_is_turbo3_empvar_type(op->type);
-    const float * empvar = nullptr;
-    int32_t empvar_dim = 0;
-    int32_t empvar_mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
-    int32_t empvar_wht_group = 0;
-    if (use_empvar) {
-        ggml_metal_turbo_empvar_select(op, &empvar, &empvar_dim, &empvar_mode, &empvar_wht_group, nullptr);
-        if (empvar_dim <= 0 || ne0 % empvar_dim != 0) {
-            GGML_ABORT("%s: turbo3_empvar SET_ROWS requires an explicit per-head variance table that divides row width %d, got %d",
-                    __func__, (int) ne0, (int) empvar_dim);
+    const bool use_calib_table = ggml_metal_is_turbo_calibrated_type(op->type);
+    const float * calib_table = nullptr;
+    int32_t calib_dim = 0;
+    int32_t calib_mode = GGML_METAL_TURBO_CALIB_TABLE_DISABLED;
+    int32_t calib_wht_group = 0;
+    if (use_calib_table) {
+        ggml_metal_turbo_calib_table_select(op, &calib_table, &calib_dim, &calib_mode, &calib_wht_group, nullptr);
+        if (calib_dim <= 0 || ne0 % calib_dim != 0) {
+            GGML_ABORT("%s: calibrated turbo SET_ROWS requires an explicit per-head calibration table that divides row width %d, got %d",
+                    __func__, (int) ne0, (int) calib_dim);
         }
     }
 
@@ -1704,9 +1706,9 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
-    if (use_empvar) {
-        ggml_metal_encoder_set_bytes(enc, (void *) empvar, empvar_dim*sizeof(float), 4);
-        ggml_metal_encoder_set_bytes(enc, &empvar_dim, sizeof(empvar_dim), 5);
+    if (use_calib_table) {
+        ggml_metal_encoder_set_bytes(enc, (void *) calib_table, calib_dim*sizeof(float), 4);
+        ggml_metal_encoder_set_bytes(enc, &calib_dim, sizeof(calib_dim), 5);
     }
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
@@ -3150,9 +3152,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_t enc = ctx->enc;
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
-    const bool uses_empvar_k = ggml_metal_is_turbo3_empvar_type(op->src[1]->type);
-    const bool uses_empvar_v = ggml_metal_is_turbo3_empvar_type(op->src[2]->type);
-    const bool uses_empvar = uses_empvar_k || uses_empvar_v;
+    const bool uses_calib_k = ggml_metal_is_turbo_calibrated_type(op->src[1]->type);
+    const bool uses_calib_v = ggml_metal_is_turbo_calibrated_type(op->src[2]->type);
+    const bool uses_calib = uses_calib_k || uses_calib_v;
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -3165,20 +3167,20 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS( int32_t, nb,  op,         nb);
 
-    const float * empvar_k = nullptr;
-    const float * empvar_v = nullptr;
-    int32_t empvar_k_dim = 0;
-    int32_t empvar_v_dim = 0;
-    if (uses_empvar) {
-        ggml_metal_turbo_empvar_select(op->src[1], &empvar_k, &empvar_k_dim, nullptr, nullptr, nullptr);
-        ggml_metal_turbo_empvar_select(op->src[2], &empvar_v, &empvar_v_dim, nullptr, nullptr, nullptr);
-        if (uses_empvar_k && empvar_k_dim < ne10) {
-            GGML_ABORT("%s: turbo3_empvar K requires a K variance table with at least %d values, got %d",
-                    __func__, (int) ne10, (int) empvar_k_dim);
+    const float * calib_k = nullptr;
+    const float * calib_v = nullptr;
+    int32_t calib_k_dim = 0;
+    int32_t calib_v_dim = 0;
+    if (uses_calib) {
+        ggml_metal_turbo_calib_table_select(op->src[1], &calib_k, &calib_k_dim, nullptr, nullptr, nullptr);
+        ggml_metal_turbo_calib_table_select(op->src[2], &calib_v, &calib_v_dim, nullptr, nullptr, nullptr);
+        if (uses_calib_k && calib_k_dim < ne10) {
+            GGML_ABORT("%s: calibrated turbo K path requires a K calibration table with at least %d values, got %d",
+                    __func__, (int) ne10, (int) calib_k_dim);
         }
-        if (uses_empvar_v && empvar_v_dim < ne20) {
-            GGML_ABORT("%s: turbo3_empvar V requires a V variance table with at least %d values, got %d",
-                    __func__, (int) ne20, (int) empvar_v_dim);
+        if (uses_calib_v && calib_v_dim < ne20) {
+            GGML_ABORT("%s: calibrated turbo V path requires a V calibration table with at least %d values, got %d",
+                    __func__, (int) ne20, (int) calib_v_dim);
         }
     }
 
@@ -3418,11 +3420,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  8);
-        if (uses_empvar) {
-            ggml_metal_encoder_set_bytes(enc, (void *) empvar_k, empvar_k_dim > 0 ? empvar_k_dim*sizeof(float) : sizeof(float), 9);
-            ggml_metal_encoder_set_bytes(enc, (void *) empvar_v, empvar_v_dim > 0 ? empvar_v_dim*sizeof(float) : sizeof(float), 10);
-            ggml_metal_encoder_set_bytes(enc, &empvar_k_dim, sizeof(empvar_k_dim), 11);
-            ggml_metal_encoder_set_bytes(enc, &empvar_v_dim, sizeof(empvar_v_dim), 12);
+        if (uses_calib) {
+            ggml_metal_encoder_set_bytes(enc, (void *) calib_k, calib_k_dim > 0 ? calib_k_dim*sizeof(float) : sizeof(float), 9);
+            ggml_metal_encoder_set_bytes(enc, (void *) calib_v, calib_v_dim > 0 ? calib_v_dim*sizeof(float) : sizeof(float), 10);
+            ggml_metal_encoder_set_bytes(enc, &calib_k_dim, sizeof(calib_k_dim), 11);
+            ggml_metal_encoder_set_bytes(enc, &calib_v_dim, sizeof(calib_v_dim), 12);
         }
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
@@ -3562,11 +3564,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
-        if (uses_empvar) {
-            ggml_metal_encoder_set_bytes(enc, (void *) empvar_k, empvar_k_dim > 0 ? empvar_k_dim*sizeof(float) : sizeof(float), 8);
-            ggml_metal_encoder_set_bytes(enc, (void *) empvar_v, empvar_v_dim > 0 ? empvar_v_dim*sizeof(float) : sizeof(float), 9);
-            ggml_metal_encoder_set_bytes(enc, &empvar_k_dim, sizeof(empvar_k_dim), 10);
-            ggml_metal_encoder_set_bytes(enc, &empvar_v_dim, sizeof(empvar_v_dim), 11);
+        if (uses_calib) {
+            ggml_metal_encoder_set_bytes(enc, (void *) calib_k, calib_k_dim > 0 ? calib_k_dim*sizeof(float) : sizeof(float), 8);
+            ggml_metal_encoder_set_bytes(enc, (void *) calib_v, calib_v_dim > 0 ? calib_v_dim*sizeof(float) : sizeof(float), 9);
+            ggml_metal_encoder_set_bytes(enc, &calib_k_dim, sizeof(calib_k_dim), 10);
+            ggml_metal_encoder_set_bytes(enc, &calib_v_dim, sizeof(calib_v_dim), 11);
         }
 
         const size_t smem = FATTN_SMEM(nsg);
