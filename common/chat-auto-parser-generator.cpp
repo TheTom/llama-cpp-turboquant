@@ -8,6 +8,7 @@
 #include "nlohmann/json.hpp"
 #include "peg-parser.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -61,8 +62,17 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             ((inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && !trigger_marker.empty()) ||
               inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
 
+    // FSM structured CoT: when LLAMA_FSM_THINK=1, force the grammar to apply
+    // from the start of generation (not lazily on tool-call trigger). This is
+    // what makes the structured GOAL/APPROACH/EDGE pattern actually constrain
+    // sampling — without this, the model can freely emit anything inside
+    // <think>...</think> because the grammar only kicks in at tool-call
+    // markers.
+    const char * fsm_force = std::getenv("LLAMA_FSM_THINK");
+    bool fsm_force_eager = (fsm_force && fsm_force[0] == '1');
+
     if (include_grammar) {
-        data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar_lazy = !has_response_format && !fsm_force_eager && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
             foreach_function(inputs.tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
@@ -134,6 +144,23 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
         if (!end.empty()) {
+            // Env-gated structured CoT: forces GOAL/APPROACH/EDGE inside the
+            // reasoning block. Compresses thinking ~20× on single-turn code
+            // gen (andthattoo/structured-cot). For lil agentic flows, applied
+            // through autoparser's peg-native so it composes with tool calls.
+            const char * fsm = std::getenv("LLAMA_FSM_THINK");
+            if (fsm && fsm[0] == '1') {
+                // Required (not optional): grammar will force this pattern
+                // since we also flip grammar_lazy=false in generate_parser.
+                auto structured =
+                    p.literal("GOAL: ") + p.until("\n") + p.literal("\n") +
+                    p.literal("APPROACH: ") + p.until("\n") + p.literal("\n") +
+                    p.literal("EDGE: ") + p.until("\n") + p.literal("\n");
+                if (!start.empty()) {
+                    return start + p.literal("\n") + p.reasoning(structured) + end + p.space();
+                }
+                return p.reasoning(structured) + end + p.space();
+            }
             if (!start.empty()) {
                 // Standard tag-based: optional(<think>reasoning</think>)
                 return p.optional(start + p.reasoning(p.until(end)) + end + p.space());
