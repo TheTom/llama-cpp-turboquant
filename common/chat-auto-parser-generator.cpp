@@ -31,6 +31,32 @@ parser_build_context::parser_build_context(common_chat_peg_builder & p, const ge
     inputs(inputs),
     reasoning_parser(p.eps()) {}
 
+// Resolve effective FSM-think mode for this request. Precedence:
+//   1. extra_context["think_mode"] — per-request override from chat_template_kwargs
+//      ("structured" → force on; "free" → force off; "auto" → fall through to env)
+//   2. LLAMA_FSM_THINK env var — server-startup default ("1" → on, anything else → off)
+//
+// Returns true if structured CoT should be applied for this request.
+//
+// 2026-04-27: previously this was a one-line getenv check. Now per-request because
+// research-style prompts (multi-file ports, investigations) are structurally
+// incompatible with a fixed 3-line GOAL/APPROACH/EDGE shape — the model has nothing
+// to put in the slots until it has read files, so it loops or gives up. The caller
+// (lil/pi/etc.) is in a better position to decide than the server.
+static bool fsm_think_active(const generation_params & inputs) {
+    if (inputs.extra_context.is_object()) {
+        auto it = inputs.extra_context.find("think_mode");
+        if (it != inputs.extra_context.end() && it->is_string()) {
+            const std::string & mode = it->get_ref<const std::string &>();
+            if (mode == "structured") return true;
+            if (mode == "free") return false;
+            // "auto" or unrecognized → fall through to env
+        }
+    }
+    const char * fsm = std::getenv("LLAMA_FSM_THINK");
+    return (fsm && fsm[0] == '1');
+}
+
 common_chat_params peg_generator::generate_parser(const common_chat_template &    tmpl,
                                                   const struct generation_params & inputs) {
     // Run differential analysis to extract template structure
@@ -62,14 +88,13 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
             ((inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO && !trigger_marker.empty()) ||
               inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
 
-    // FSM structured CoT: when LLAMA_FSM_THINK=1, force the grammar to apply
-    // from the start of generation (not lazily on tool-call trigger). This is
-    // what makes the structured GOAL/APPROACH/EDGE pattern actually constrain
-    // sampling — without this, the model can freely emit anything inside
-    // <think>...</think> because the grammar only kicks in at tool-call
-    // markers.
-    const char * fsm_force = std::getenv("LLAMA_FSM_THINK");
-    bool fsm_force_eager = (fsm_force && fsm_force[0] == '1');
+    // FSM structured CoT: when active for this request, force the grammar to
+    // apply from the start of generation (not lazily on tool-call trigger).
+    // This is what makes the structured GOAL/APPROACH/EDGE pattern actually
+    // constrain sampling — without this, the model can freely emit anything
+    // inside <think>...</think> because the grammar only kicks in at tool-
+    // call markers.
+    bool fsm_force_eager = fsm_think_active(inputs);
 
     if (include_grammar) {
         data.grammar_lazy = !has_response_format && !fsm_force_eager && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
@@ -144,18 +169,40 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
         if (!end.empty()) {
-            // Env-gated structured CoT: forces GOAL/APPROACH/EDGE inside the
+            // Per-request structured CoT: forces GOAL/APPROACH/EDGE inside the
             // reasoning block. Compresses thinking ~20× on single-turn code
             // gen (andthattoo/structured-cot). For lil agentic flows, applied
             // through autoparser's peg-native so it composes with tool calls.
-            const char * fsm = std::getenv("LLAMA_FSM_THINK");
-            if (fsm && fsm[0] == '1') {
+            if (fsm_think_active(ctx.inputs)) {
                 // Required (not optional): grammar will force this pattern
                 // since we also flip grammar_lazy=false in generate_parser.
-                auto structured =
+                //
+                // 2026-04-27: relaxed from "exactly 1 triplet" to "1-5
+                // triplets". The fixed-1 cap was too tight for multi-file
+                // research prompts — the model would close </think> after
+                // 3 lines, then re-emit fake <think> blocks as raw content
+                // (the post-</think> tools-grammar accepts arbitrary text),
+                // looping forever. Allowing up to 5 triplets per block gives
+                // enough thinking budget for complex tasks while keeping the
+                // upper bound that motivates the FSM in the first place.
+                // Repro: blud Hand-port stretch task, 30k tokens of pure
+                // GOAL/APPROACH/EDGE repetition before agent harness gave up.
+                //
+                // 2026-04-27 (later): added optional READ-FIRST 4th slot.
+                // When the model's actual plan is "read N files first, then
+                // form a real plan", it has nothing useful to put in
+                // GOAL/APPROACH/EDGE — the structure was actively blocking
+                // research-style prompts. READ-FIRST is the model's structural
+                // way to say "I'm done thinking for this turn; let me read
+                // and re-think next turn". Combined with the post-</think>
+                // hole closure in analyze_tools (require tool calls when FSM
+                // is on), this makes the loop architecturally impossible.
+                auto triplet =
                     p.literal("GOAL: ") + p.until("\n") + p.literal("\n") +
                     p.literal("APPROACH: ") + p.until("\n") + p.literal("\n") +
                     p.literal("EDGE: ") + p.until("\n") + p.literal("\n");
+                auto read_first = p.literal("READ-FIRST\n");
+                auto structured = p.repeat(triplet, 1, 5) + p.optional(read_first);
                 if (!start.empty()) {
                     return start + p.literal("\n") + p.reasoning(structured) + end + p.space();
                 }
@@ -213,7 +260,16 @@ common_peg_parser analyze_tools::build_parser(parser_build_context & ctx) const 
 common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
-    bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    // 2026-04-27: when FSM-think is active, force tools after </think>. This
+    // closes the "fake <think> as content" loop hole — without it, the model
+    // could emit </think>, then re-emit a <think>...</think> block as raw
+    // content (matched by p.optional(p.content(p.until(tool_start)))), and
+    // loop forever. Forcing tool calls means post-</think> content must end
+    // at the tool-call marker, with no detour through more thinking. Final-
+    // message paths (where the model declines to call any tool) still work
+    // through the non-FSM grammar branch, so this only constrains FSM=on.
+    bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ||
+                               fsm_think_active(inputs);
 
     // Build effective field names with dot notation if function_field is set
     std::string name_field = format.name_field;
@@ -297,7 +353,9 @@ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, 
 common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
-    bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    // See note in build_tool_parser_json_native re: FSM-think hole closure.
+    bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ||
+                               fsm_think_active(inputs);
 
     common_peg_parser tool_choice = p.choice();
 
@@ -370,7 +428,9 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
-    bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    // See note in build_tool_parser_json_native re: FSM-think hole closure.
+    bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ||
+                               fsm_think_active(inputs);
 
     auto until_suffix = p.rule("until-suffix", p.until(arguments.value_suffix));
 
