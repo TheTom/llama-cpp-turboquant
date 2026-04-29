@@ -436,28 +436,58 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
-    // TurboQuant: disable upstream graph-level activation rotation by default.
-    // Our fork uses kernel-level WHT rotation (simd_shuffle_xor in Metal/CUDA)
-    // which is independent and more efficient. The upstream rotation adds extra
-    // graph nodes that cause hash table overflow on some models (e.g. Phi-4).
-    // Users can re-enable with LLAMA_ATTN_ROT_DISABLE=0 if needed.
+    // TurboQuant: master's #21038 attention rotation is OFF by default on this
+    // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
+    // LLAMA_ATTN_ROT_V_OVERRIDE=1 if your specific model+KV combo benefits.
+    //
+    // Why default OFF: empirical PPL+KLD testing on 7 model families
+    // (gemma-4 26B-A4B/31B/E2B, Qwen2.5-7B, Qwen3.5-2B, Mistral-Small-24B,
+    // phi-4, on q8/turbo4 KV) showed the optimal rotation policy is highly
+    // model-and-quant specific:
+    //
+    //   • gemma-4 31B Q8 q8/turbo4: V-only rotation gives -43% PPL (huge win).
+    //   • gemma-4 26B-A4B Q8 q8/turbo4: V-only gives -3.9%.
+    //   • gemma-4 E2B Q4_K_L q8/turbo4: V-only HURTS by +6.7%.
+    //   • phi-4 Q8 q8/turbo4: V-side rotation crashes (graph hash overflow).
+    //   • Qwen2.5/3.5/Mistral: rotation effect is within standard error.
+    //
+    // No single default is correct everywhere, including within the same
+    // architecture family (gemma-4 above shows three distinct optima across
+    // three sizes). Per-arch heuristics in code would silently regress users
+    // on variants we haven't tested. Default OFF + per-side env knobs lets
+    // each user tune for their specific config; documented findings in the
+    // README guide the choice.
+    //
+    // Reported by @erazortt (TheTom/turboquant_plus#88).
+    //
+    // LLAMA_ATTN_ROT_DISABLE retained as a no-op alias (default OFF makes it
+    // redundant but historical scripts may set it).
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
     const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : true;
-    if (attn_rot_disable) {
-        LLAMA_LOG_INFO("%s: upstream attention rotation disabled (TurboQuant uses kernel-level WHT)\n", __func__);
+
+    // Default: rotation OFF on both sides (safe across all tested model families).
+    // Override per side via env vars below.
+    attn_rot_k = false;
+    attn_rot_v = false;
+
+    // Per-side overrides. Set LLAMA_ATTN_ROT_K_OVERRIDE=1 / LLAMA_ATTN_ROT_V_OVERRIDE=1
+    // to enable rotation. The cache type and head-dim alignment guards below
+    // still apply: rotation only takes effect on quantized types with
+    // head_dim % 64 == 0 (master's #21038 requirements).
+    const char * ROT_K_OV = getenv("LLAMA_ATTN_ROT_K_OVERRIDE");
+    if (ROT_K_OV && atoi(ROT_K_OV) != 0 && !attn_rot_disable) {
+        attn_rot_k =
+            n_embd_head_k_all > 0 &&
+            ggml_is_quantized(type_k) &&
+            hparams.n_embd_head_k() % 64 == 0;
     }
-
-    attn_rot_k =
-        !attn_rot_disable &&
-        n_embd_head_k_all > 0 &&
-        ggml_is_quantized(type_k) &&
-        hparams.n_embd_head_k() % 64 == 0;
-
-    attn_rot_v =
-        !attn_rot_disable &&
-        n_embd_head_v_all > 0 &&
-        ggml_is_quantized(type_v) &&
-        hparams.n_embd_head_v() % 64 == 0;
+    const char * ROT_V_OV = getenv("LLAMA_ATTN_ROT_V_OVERRIDE");
+    if (ROT_V_OV && atoi(ROT_V_OV) != 0 && !attn_rot_disable) {
+        attn_rot_v =
+            n_embd_head_v_all > 0 &&
+            ggml_is_quantized(type_v) &&
+            hparams.n_embd_head_v() % 64 == 0;
+    }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
@@ -1541,14 +1571,23 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        int nrot = 64;
-
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+        // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
+        // for K, mirroring V's choice. Master defaults to the largest power-of-2
+        // that divides head_dim, but the upstream comment hypothesizes smaller
+        // tiles preserve more local structure → less PPL hit on sensitive models
+        // (gemma-4 26B-A4B reportedly regresses with the largest tile).
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
+        int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
+
+        // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
+        if (nrot == 0) {
+            nrot = 64;
+            do {
+                nrot *= 2;
+            } while (n_embd_head_k_all % nrot == 0);
+            nrot /= 2;
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
