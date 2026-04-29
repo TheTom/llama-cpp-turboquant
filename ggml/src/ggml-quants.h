@@ -112,6 +112,7 @@ GGML_API size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_R
 GGML_API void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 
 // TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max)
 GGML_API void quantize_row_tq3_1s_ref(const float * GGML_RESTRICT x, block_tq3_1s * GGML_RESTRICT y, int64_t k);
