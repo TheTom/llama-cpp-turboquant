@@ -462,8 +462,12 @@ llama_kv_cache::llama_kv_cache(
     //
     // LLAMA_ATTN_ROT_DISABLE retained as a no-op alias (default OFF makes it
     // redundant but historical scripts may set it).
+    // Default attn_rot_disable=false now that rotation is OFF by default. The
+    // env var is preserved as a hard lock-out (=1 forces rotation off and
+    // blocks overrides), useful for users who want to guarantee no rotation
+    // regardless of any LLAMA_ATTN_ROT_*_OVERRIDE settings.
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : true;
+    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? (atoi(LLAMA_ATTN_ROT_DISABLE) != 0) : false;
 
     // Default: rotation OFF on both sides (safe across all tested model families).
     // Override per side via env vars below.
