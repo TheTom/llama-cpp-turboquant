@@ -1,6 +1,15 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+// Tile-uniform sparse V skip in the VEC kernel (TurboQuant). Off by default;
+// opt in by defining GGML_CUDA_TURBO_SPARSE_V_VEC at build time. Threshold
+// defaults to 0.001 (matches vllm-project/vllm#41422 — bit-identical PPL +
+// NIAH all-pass on Qwen3-8B at 32K). Override with
+// -DGGML_CUDA_TURBO_SPARSE_V_VEC_THRESHOLD=<val>.
+#if defined(GGML_CUDA_TURBO_SPARSE_V_VEC) && !defined(GGML_CUDA_TURBO_SPARSE_V_VEC_THRESHOLD)
+#define GGML_CUDA_TURBO_SPARSE_V_VEC_THRESHOLD 0.001f
+#endif
+
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
     GGML_UNUSED(cc);
@@ -412,12 +421,33 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
 
-            // Sparse V: skip V dequant if all attention weights for this position are negligible.
-            // For turbo types, the check is compiled out: at typical decode context lengths
-            // (< ~4K tokens) with threshold 1e-6, no positions are ever skipped, so the
-            // per-position branch is pure overhead (misprediction + comparison cost). This
-            // also dodges the warp-divergence regression on turbo paths that motivated the
-            // April 24 revert (commit f2dc968).
+            // Sparse V skip — two strategies:
+            //
+            //   GGML_CUDA_TURBO_SPARSE_V_VEC (opt-in, default off):
+            //     Warp-uniform skip via warp_reduce_max — all lanes branch on
+            //     the same value so no warp divergence. Works on every V type
+            //     including turbo. Threshold defaults to 0.001 (matches the
+            //     vllm-project/vllm#41422 design that validated +7.13% decode
+            //     at 32K on AMD MI300X with PPL bit-identical and NIAH all-
+            //     pass).
+            //
+            //   default (signalnine PR #115):
+            //     Per-lane skip with `if constexpr (!V_is_turbo)` compile-time
+            //     gate. Compiled out for turbo to dodge the warp-divergence
+            //     regression that motivated the April 24 revert (commit
+            //     f2dc968). Kept as the default while the warp-uniform variant
+            //     is bench-validated cross-platform.
+#ifdef GGML_CUDA_TURBO_SPARSE_V_VEC
+            {
+                float my_kq_max = 0.0f;
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    my_kq_max = fmaxf(my_kq_max, __half2float(__low2half(KQ_k[j])));
+                }
+                const float warp_max = warp_reduce_max(my_kq_max);
+                if (warp_max < (float) GGML_CUDA_TURBO_SPARSE_V_VEC_THRESHOLD) continue;
+            }
+#else
             if constexpr (!V_is_turbo) {
                 bool dominated = true;
 #pragma unroll
@@ -426,6 +456,7 @@ static __global__ void flash_attn_ext_vec(
                 }
                 if (dominated) { continue; }
             }
+#endif
 
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -461,8 +492,18 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
 
-            // Sparse V: skip V dequant if all attention weights for this position are negligible.
-            // Compiled out for turbo types — see half2 path comment above.
+            // Sparse V skip — see half2-path comment above. Same two strategies.
+#ifdef GGML_CUDA_TURBO_SPARSE_V_VEC
+            {
+                float my_kq_max = 0.0f;
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    my_kq_max = fmaxf(my_kq_max, KQ_k[j]);
+                }
+                const float warp_max = warp_reduce_max(my_kq_max);
+                if (warp_max < (float) GGML_CUDA_TURBO_SPARSE_V_VEC_THRESHOLD) continue;
+            }
+#else
             if constexpr (!V_is_turbo) {
                 bool dominated = true;
 #pragma unroll
@@ -471,6 +512,7 @@ static __global__ void flash_attn_ext_vec(
                 }
                 if (dominated) { continue; }
             }
+#endif
 
             // Turbo V path: precompute scaled centroids once per block to eliminate
             // per-element norm multiply.  centroid[idx]*norm is computed 8/4/16 times
