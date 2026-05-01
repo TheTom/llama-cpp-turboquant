@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -90,11 +92,38 @@ extern TURBO_IQ_IMPORT float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
 TURBO_IQ_IMPORT bool turbo_innerq_needs_tensor_update(void);
 TURBO_IQ_IMPORT void turbo_innerq_mark_tensor_updated(void);
 #else
-static bool  g_innerq_finalized = false;
-static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
+[[maybe_unused]] static bool  g_innerq_finalized = false;
+[[maybe_unused]] static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
 static bool turbo_innerq_needs_tensor_update(void) { return false; }
 static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
+
+//
+static uint32_t chrono_parse_env_u32(const char * name, uint32_t fallback, uint32_t min_value, uint32_t max_value, bool * present) {
+    const char * env = getenv(name);
+    if (!env) {
+        return fallback;
+    }
+
+    if (present) {
+        *present = true;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value < min_value || value > max_value) {
+        LLAMA_LOG_WARN("llama_kv_cache: ignoring invalid %s=%s (expected %u..%u)\n",
+                name, env, min_value, max_value);
+        return fallback;
+    }
+
+    return (uint32_t) value;
+}
+
+static bool chrono_cache_type_supported(ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32;
+}
 
 //
 // llama_kv_cache
@@ -117,6 +146,23 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
+    // ChronoQuant: initialize config from environment.
+    bool chrono_env_seen = false;
+    chrono_config.stride_k = chrono_parse_env_u32("CHRONO_STRIDE_K", chrono_config.stride_k, 1, 4096, &chrono_env_seen);
+    chrono_config.stride_v = chrono_parse_env_u32("CHRONO_STRIDE_V", chrono_config.stride_v, 1, 4096, &chrono_env_seen);
+    chrono_config.delta_bits = chrono_parse_env_u32("CHRONO_DELTA_BITS", chrono_config.delta_bits, 4, 4, nullptr);
+    chrono_config.enabled = chrono_env_seen;
+
+    if (chrono_config.enabled) {
+        if (!chrono_cache_type_supported(type_k) || !chrono_cache_type_supported(type_v)) {
+            throw std::runtime_error("ChronoQuant llama.cpp currently supports only F16/F32 KV cache types");
+        }
+        if (v_trans) {
+            throw std::runtime_error("ChronoQuant llama.cpp requires non-transposed V cache; enable Flash Attention");
+        }
+        LLAMA_LOG_INFO("%s: ChronoQuant compressed KV storage enabled; fused attention will be selected on supported backends\n", __func__);
+    }
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
@@ -134,8 +180,11 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 3)*ggml_tensor_overhead()),
+                // Per KV layer we now allocate:
+                // - full K and V tensors
+                // - K/V per-stream views
+                // - ChronoQuant anchor/delta/scale tensors for K and V
+                /*.mem_size   =*/ size_t(((8u + 2u*n_stream)*n_layer_kv + 8u)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -330,6 +379,35 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
 
+        ggml_tensor * chrono_k_anchor = nullptr;
+        ggml_tensor * chrono_k_delta  = nullptr;
+        ggml_tensor * chrono_k_scale  = nullptr;
+        ggml_tensor * chrono_v_anchor = nullptr;
+        ggml_tensor * chrono_v_delta  = nullptr;
+        ggml_tensor * chrono_v_scale  = nullptr;
+
+        const uint32_t chrono_head_kv = has_k ? n_embd_k_gqa_eff / n_embd_head_k : 0;
+        if (chrono_config.enabled && has_k) {
+            const uint32_t packed_k = (n_embd_head_k + 7) / 8;
+            chrono_k_anchor = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_embd_head_k, chrono_head_kv, kv_size, n_stream);
+            chrono_k_delta  = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, packed_k,      chrono_head_kv, kv_size, n_stream);
+            chrono_k_scale  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,             chrono_head_kv, kv_size, n_stream);
+            ggml_format_name(chrono_k_anchor, "chrono_k_anchor_l%d", il);
+            ggml_format_name(chrono_k_delta,  "chrono_k_delta_l%d", il);
+            ggml_format_name(chrono_k_scale,  "chrono_k_scale_l%d", il);
+        }
+
+        if (chrono_config.enabled && has_v) {
+            const uint32_t chrono_heads_v = n_embd_v_gqa_eff / n_embd_head_v;
+            const uint32_t packed_v = (n_embd_head_v + 7) / 8;
+            chrono_v_anchor = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_embd_head_v, chrono_heads_v, kv_size, n_stream);
+            chrono_v_delta  = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, packed_v,       chrono_heads_v, kv_size, n_stream);
+            chrono_v_scale  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,              chrono_heads_v, kv_size, n_stream);
+            ggml_format_name(chrono_v_anchor, "chrono_v_anchor_l%d", il);
+            ggml_format_name(chrono_v_delta,  "chrono_v_delta_l%d", il);
+            ggml_format_name(chrono_v_scale,  "chrono_v_scale_l%d", il);
+        }
+
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
@@ -343,19 +421,22 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({
+            il,
+            k, v,
+            chrono_k_anchor, chrono_k_delta, chrono_k_scale,
+            chrono_v_anchor, chrono_v_delta, chrono_v_scale,
+            n_embd_head_k,
+            n_embd_head_v,
+            chrono_head_kv,
+            chrono_config.stride_k,
+            chrono_config.stride_v,
+            k_stream, v_stream,
+        });
 
-        // TurboQuant: create rotation matrix tensors (once, shared across layers)
-        if (turbo_rotation == nullptr &&
-            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0)) {
-            turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
-            ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
-            turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
-            ggml_format_name(turbo_rotation_inv, "turbo_rotation_inv");  // R
-
-            // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
-            turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
-            ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
+        if (chrono_config.enabled) {
+            LLAMA_LOG_INFO("%s: ChronoQuant initialized for layer %d (K/V stride: %d/%d, bits: %d)\n",
+                           __func__, il, chrono_config.stride_k, chrono_config.stride_v, chrono_config.delta_bits);
         }
     }
 
@@ -402,27 +483,7 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
 
-        // Fill turbo rotation matrices AFTER buffer clear (clear zeroes everything)
-        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
-            #include "turbo-rotation-data.h"
-            // ggml is column-major; C arrays are row-major. Storing a row-major matrix
-            // into ggml implicitly transposes it. ggml_mul_mat(A, x) computes A^T @ x.
-            // To get R @ q: store R^T → ggml sees (R^T)^T_col = R → mul_mat gives R @ q. Wait no —
-            // store R so ggml col-major reads it as R^T, then mul_mat gives (R^T)^T = R. ✓
-            // Store R for Q forward rotation, R^T for V inverse rotation
-            // ggml_mul_mat(A,x) computes A@x for row-major stored A (verified by test)
-            ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
-            ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
-
-            // Initialize InnerQ scale_inv to all 1.0 (identity scaling)
-            if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
-                float ones[INNERQ_MAX_CHANNELS];
-                for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
-                ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
-            }
-
-            LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
-        }
+        // ChronoQuant: no rotation matrices to fill
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -436,15 +497,10 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
-    // TurboQuant: disable upstream graph-level activation rotation by default.
-    // Our fork uses kernel-level WHT rotation (simd_shuffle_xor in Metal/CUDA)
-    // which is independent and more efficient. The upstream rotation adds extra
-    // graph nodes that cause hash table overflow on some models (e.g. Phi-4).
-    // Users can re-enable with LLAMA_ATTN_ROT_DISABLE=0 if needed.
-    const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : true;
+    // Disable upstream attention rotation when ChronoQuant is enabled
+    const bool attn_rot_disable = chrono_config.enabled;
     if (attn_rot_disable) {
-        LLAMA_LOG_INFO("%s: upstream attention rotation disabled (TurboQuant uses kernel-level WHT)\n", __func__);
+        LLAMA_LOG_INFO("%s: upstream attention rotation disabled (ChronoQuant active)\n", __func__);
     }
 
     attn_rot_k =
@@ -487,6 +543,8 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::~llama_kv_cache() = default;
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -498,19 +556,6 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
 
-        // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
-        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr) {
-            #include "turbo-rotation-data.h"
-            ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
-            ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
-
-            // Re-initialize InnerQ scale_inv to all 1.0
-            if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
-                float ones[INNERQ_MAX_CHANNELS];
-                for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
-                ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
-            }
-        }
     }
 }
 
@@ -1300,6 +1345,33 @@ ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
 }
 
+bool llama_kv_cache::chrono_fused_enabled(int32_t il) const {
+    if (!chrono_config.enabled) {
+        return false;
+    }
+
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+
+    const auto & layer = layers[it->second];
+    return layer.chrono_k_anchor != nullptr &&
+           layer.chrono_k_delta  != nullptr &&
+           layer.chrono_k_scale  != nullptr &&
+           layer.chrono_v_anchor != nullptr &&
+           layer.chrono_v_delta  != nullptr &&
+           layer.chrono_v_scale  != nullptr;
+}
+
+uint32_t llama_kv_cache::chrono_stride_k() const {
+    return chrono_config.stride_k;
+}
+
+uint32_t llama_kv_cache::chrono_stride_v() const {
+    return chrono_config.stride_v;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -1385,7 +1457,49 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_chrono_k_anchor(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * t = layers[ikv].chrono_k_anchor;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_kv, ns, t->nb[1], t->nb[2], t->nb[3], t->nb[3]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_chrono_k_delta(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * t = layers[ikv].chrono_k_delta;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_kv, ns, t->nb[1], t->nb[2], t->nb[3], t->nb[3]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_chrono_k_scale(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * t = layers[ikv].chrono_k_scale;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_kv, ns, t->nb[1], t->nb[2], t->nb[3], t->nb[3]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_chrono_v_anchor(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * t = layers[ikv].chrono_v_anchor;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_kv, ns, t->nb[1], t->nb[2], t->nb[3], t->nb[3]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_chrono_v_delta(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * t = layers[ikv].chrono_v_delta;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_kv, ns, t->nb[1], t->nb[2], t->nb[3], t->nb[3]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_chrono_v_scale(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * t = layers[ikv].chrono_v_scale;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_kv, ns, t->nb[1], t->nb[2], t->nb[3], t->nb[3]*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, bool chrono_store_full) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -1396,16 +1510,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
 
-    // Turbo zero-padding: pad each head to next multiple of 128 before merging dims.
-    // k_cur shape here is (n_embd_head, n_head, n_tokens).
-    // ggml_pad pads ne[0] with zeros — exactly what we need per-head.
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    const bool k_needs_pad = k_is_turbo && (n_embd_head % 128 != 0);
-    if (k_needs_pad) {
-        const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
-        k_cur = ggml_pad(ctx, k_cur, pad_amount, 0, 0, 0);
-        n_embd_head = k_cur->ne[0];  // now 128-aligned
-    }
+
 
     int64_t n_embd_gqa = n_embd_head * n_head;
 
@@ -1427,20 +1532,36 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
     }
 
+    const bool use_chrono_k =
+        chrono_config.enabled &&
+        layers[ikv].chrono_k_anchor != nullptr &&
+        layers[ikv].chrono_k_delta  != nullptr &&
+        layers[ikv].chrono_k_scale  != nullptr;
+
+    if (use_chrono_k) {
+        k_cur = ggml_cast(ctx, k_cur, GGML_TYPE_F32);
+        return ggml_set_rows_chrono(
+                ctx,
+                k,
+                k_cur,
+                k_idxs,
+                layers[ikv].chrono_k_anchor,
+                layers[ikv].chrono_k_delta,
+                layers[ikv].chrono_k_scale,
+                (int32_t) layers[ikv].chrono_head_k,
+                (int32_t) layers[ikv].chrono_head_kv,
+                (int32_t) layers[ikv].chrono_stride_k,
+                chrono_store_full);
+    }
+
     // store the current K values into the cache
     ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
 
-    // For turbo: store WHT group size in op_params so the CUDA kernel knows.
-    // With zero-padding, all groups are always full 128-element WHT groups.
-    if (k_is_turbo) {
-        int32_t wht_group = 128;  // always 128 with padding
-        memcpy(result->op_params, &wht_group, sizeof(int32_t));
-    }
 
     return result;
 }
 
-ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, bool chrono_store_full) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -1451,14 +1572,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_head      = v_cur->ne[1];
     const int64_t n_tokens    = v_cur->ne[2];
 
-    // Turbo zero-padding: pad V head_dim to next multiple of 128
-    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
-    const bool v_needs_pad = v_is_turbo && (n_embd_head % 128 != 0);
-    if (v_needs_pad) {
-        const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
-        v_cur = ggml_pad(ctx, v_cur, pad_amount, 0, 0, 0);
-        n_embd_head = v_cur->ne[0];  // now 128-aligned
-    }
+
 
     int64_t n_embd_gqa = n_embd_head * n_head;
 
@@ -1481,12 +1595,30 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
-        // With zero-padding, all groups are always full 128-element WHT groups
-        if (v_is_turbo) {
-            int32_t wht_group = 128;  // always 128 with padding
-            memcpy(result->op_params, &wht_group, sizeof(int32_t));
+        const bool use_chrono_v =
+            chrono_config.enabled &&
+            layers[ikv].chrono_v_anchor != nullptr &&
+            layers[ikv].chrono_v_delta  != nullptr &&
+            layers[ikv].chrono_v_scale  != nullptr;
+
+        if (use_chrono_v) {
+            v_cur = ggml_cast(ctx, v_cur, GGML_TYPE_F32);
+            return ggml_set_rows_chrono(
+                    ctx,
+                    v,
+                    v_cur,
+                    v_idxs,
+                    layers[ikv].chrono_v_anchor,
+                    layers[ikv].chrono_v_delta,
+                    layers[ikv].chrono_v_scale,
+                    (int32_t) layers[ikv].chrono_head_v,
+                    (int32_t) layers[ikv].chrono_head_kv,
+                    (int32_t) layers[ikv].chrono_stride_v,
+                    chrono_store_full);
         }
+
+        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
+
         return result;
     }
 
@@ -1501,6 +1633,10 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     // [TAG_V_CACHE_VARIABLE]
     if (n_embd_gqa < v->ne[0]) {
         v_cur = ggml_pad(ctx, v_cur, v->ne[0] - n_embd_gqa, 0, 0, 0);
+    }
+
+    if (chrono_config.enabled) {
+        GGML_ABORT("ChronoQuant requires non-transposed V cache; enable Flash Attention");
     }
 
     // in this branch the v_idxs are constructed in such a way that each row is a single head element
@@ -1929,6 +2065,9 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += layer.chrono_k_anchor ? ggml_nbytes(layer.chrono_k_anchor) : 0;
+        size_k_bytes += layer.chrono_k_delta  ? ggml_nbytes(layer.chrono_k_delta)  : 0;
+        size_k_bytes += layer.chrono_k_scale  ? ggml_nbytes(layer.chrono_k_scale)  : 0;
     }
 
     return size_k_bytes;
@@ -1939,6 +2078,9 @@ size_t llama_kv_cache::size_v_bytes() const {
 
     for (const auto & layer : layers) {
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += layer.chrono_v_anchor ? ggml_nbytes(layer.chrono_v_anchor) : 0;
+        size_v_bytes += layer.chrono_v_delta  ? ggml_nbytes(layer.chrono_v_delta)  : 0;
+        size_v_bytes += layer.chrono_v_scale  ? ggml_nbytes(layer.chrono_v_scale)  : 0;
     }
 
     return size_v_bytes;
@@ -2204,8 +2346,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
         auto * k = layer.k_stream[cr.strm];
 
         // Use actual tensor width (may be padded for turbo types: e.g. 576→640)
@@ -2229,8 +2369,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     if (!v_trans) {
         for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;
@@ -2649,16 +2787,6 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
-    // InnerQ: check if CUDA calibration finalized and tensor needs update
-    if (kv->get_turbo_innerq_scale_inv() != nullptr && turbo_innerq_needs_tensor_update()) {
-        ggml_tensor * t = kv->get_turbo_innerq_scale_inv();
-        if (t->buffer != nullptr) {
-            ggml_backend_tensor_set(t, g_innerq_scale_inv_host, 0, INNERQ_MAX_CHANNELS * sizeof(float));
-            turbo_innerq_mark_tensor_updated();
-            LLAMA_LOG_INFO("%s: InnerQ scale_inv tensor updated\n", __func__);
-        }
-    }
-
     return true;
 }
 
@@ -2684,6 +2812,18 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
+bool llama_kv_cache_context::chrono_fused_enabled(int32_t il) const {
+    return kv->chrono_fused_enabled(il);
+}
+
+uint32_t llama_kv_cache_context::chrono_stride_k() const {
+    return kv->chrono_stride_k();
+}
+
+uint32_t llama_kv_cache_context::chrono_stride_v() const {
+    return kv->chrono_stride_v();
+}
+
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
@@ -2692,32 +2832,36 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
-    return kv->get_turbo_rotation();
+ggml_tensor * llama_kv_cache_context::get_chrono_k_anchor(ggml_context * ctx, int32_t il) const {
+    return kv->get_chrono_k_anchor(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::get_turbo_rotation_inv() const {
-    return kv->get_turbo_rotation_inv();
+ggml_tensor * llama_kv_cache_context::get_chrono_k_delta(ggml_context * ctx, int32_t il) const {
+    return kv->get_chrono_k_delta(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::get_turbo_rot_forward() const {
-    return kv->get_turbo_rotation();
+ggml_tensor * llama_kv_cache_context::get_chrono_k_scale(ggml_context * ctx, int32_t il) const {
+    return kv->get_chrono_k_scale(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
-    return kv->get_turbo_rotation_inv();
+ggml_tensor * llama_kv_cache_context::get_chrono_v_anchor(ggml_context * ctx, int32_t il) const {
+    return kv->get_chrono_v_anchor(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
-    return kv->get_turbo_innerq_scale_inv();
+ggml_tensor * llama_kv_cache_context::get_chrono_v_delta(ggml_context * ctx, int32_t il) const {
+    return kv->get_chrono_v_delta(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_chrono_v_scale(ggml_context * ctx, int32_t il) const {
+    return kv->get_chrono_v_scale(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
-    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, bool chrono_store_full) const {
+    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur], chrono_store_full);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, bool chrono_store_full) const {
+    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur], chrono_store_full);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

@@ -4916,6 +4916,158 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
+static inline float ggml_set_rows_chrono_load_anchor(const ggml_tensor * t, int64_t d, int64_t h, int64_t cell, int64_t stream) {
+    const char * ptr = (const char *) t->data + d*t->nb[0] + h*t->nb[1] + cell*t->nb[2] + stream*t->nb[3];
+    switch (t->type) {
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(*(const ggml_fp16_t *) ptr);
+        case GGML_TYPE_F32:
+            return *(const float *) ptr;
+        default:
+            GGML_ABORT("unsupported ChronoQuant anchor type %s", ggml_type_name(t->type));
+    }
+}
+
+static inline void ggml_set_rows_chrono_store_anchor(ggml_tensor * t, float value, int64_t d, int64_t h, int64_t cell, int64_t stream) {
+    char * ptr = (char *) t->data + d*t->nb[0] + h*t->nb[1] + cell*t->nb[2] + stream*t->nb[3];
+    switch (t->type) {
+        case GGML_TYPE_F16:
+            *(ggml_fp16_t *) ptr = ggml_fp32_to_fp16(value);
+            break;
+        case GGML_TYPE_F32:
+            *(float *) ptr = value;
+            break;
+        default:
+            GGML_ABORT("unsupported ChronoQuant anchor type %s", ggml_type_name(t->type));
+    }
+}
+
+static inline void ggml_set_rows_chrono_store_full(ggml_tensor * t, float value, int64_t d, int64_t row) {
+    char * ptr = (char *) t->data + d*t->nb[0] + row*t->nb[1];
+    switch (t->type) {
+        case GGML_TYPE_F16:
+            *(ggml_fp16_t *) ptr = ggml_fp32_to_fp16(value);
+            break;
+        case GGML_TYPE_F32:
+            *(float *) ptr = value;
+            break;
+        default:
+            GGML_ABORT("unsupported ChronoQuant cache type %s", ggml_type_name(t->type));
+    }
+}
+
+static inline uint32_t ggml_set_rows_chrono_pack_i4x8(const int8_t qs[8]) {
+    uint32_t packed = 0;
+    for (int i = 0; i < 8; ++i) {
+        packed |= ((uint32_t) qs[i] & 0xFu) << (4*i);
+    }
+    return packed;
+}
+
+template<typename idx_t>
+static void ggml_compute_forward_set_rows_chrono_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0   = dst->src[0];
+    const ggml_tensor * src1   = dst->src[1];
+          ggml_tensor * full   = dst->src[2];
+          ggml_tensor * anchor = dst->src[3];
+          ggml_tensor * delta  = dst->src[4];
+          ggml_tensor * scale  = dst->src[5];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT((full->type == GGML_TYPE_F16 || full->type == GGML_TYPE_F32) && anchor->type == full->type);
+    GGML_ASSERT(delta->type == GGML_TYPE_I32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+    GGML_ASSERT(full->ne[2] == 1 && full->ne[3] == 1);
+    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1);
+
+    const int32_t head_dim  = ggml_get_op_params_i32(dst, 0);
+    const int32_t n_head_kv = ggml_get_op_params_i32(dst, 1);
+    const int32_t stride    = ggml_get_op_params_i32(dst, 2);
+    const bool store_full    = ggml_get_op_params_i32(dst, 3) != 0;
+
+    GGML_ASSERT(head_dim > 0 && n_head_kv > 0 && stride > 0);
+    GGML_ASSERT(src0->ne[0] == (int64_t) head_dim * n_head_kv);
+
+    const int64_t n_rows = src0->ne[1];
+    const int64_t kv_size = anchor->ne[2];
+    const int64_t packed_words = delta->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr = (n_rows + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = std::min(ir0 + dr, n_rows);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const idx_t raw_idx = *(const idx_t *) ((const char *) src1->data + i*src1->nb[0]);
+        GGML_ASSERT(raw_idx >= 0);
+        const int64_t global_idx = (int64_t) raw_idx;
+        const int64_t stream = global_idx / kv_size;
+        const int64_t cell   = global_idx % kv_size;
+        const int64_t anchor_pos = cell - (cell % stride);
+        const int64_t anchor_global_idx = stream*kv_size + anchor_pos;
+        const bool is_keyframe = (cell % stride) == 0;
+
+        const float * src_row = (const float *) ((const char *) src0->data + i*src0->nb[1]);
+        const float * anchor_src_row = nullptr;
+        const int64_t anchor_row_delta = cell - anchor_pos;
+        if (!is_keyframe && anchor_row_delta <= i) {
+            const int64_t candidate_row = i - anchor_row_delta;
+            const idx_t candidate_idx = *(const idx_t *) ((const char *) src1->data + candidate_row*src1->nb[0]);
+            if ((int64_t) candidate_idx == anchor_global_idx) {
+                anchor_src_row = (const float *) ((const char *) src0->data + candidate_row*src0->nb[1]);
+            }
+        }
+
+        for (int32_t h = 0; h < n_head_kv; ++h) {
+            const int64_t off = (int64_t) h * head_dim;
+            float head_scale = 0.0f;
+            if (!is_keyframe) {
+                float max_abs = 0.0f;
+                for (int32_t d = 0; d < head_dim; ++d) {
+                    const float base = anchor_src_row ? anchor_src_row[off + d] : ggml_set_rows_chrono_load_anchor(anchor, d, h, anchor_pos, stream);
+                    max_abs = std::max(max_abs, fabsf(src_row[off + d] - base));
+                }
+                head_scale = max_abs > 0.0f ? max_abs / 7.0f : 0.0f;
+            }
+
+            *(float *) ((char *) scale->data + h*scale->nb[1] + cell*scale->nb[2] + stream*scale->nb[3]) = head_scale;
+
+            for (int64_t w = 0; w < packed_words; ++w) {
+                int8_t qs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int j = 0; j < 8; ++j) {
+                    const int32_t d = (int32_t) (w*8 + j);
+                    if (d >= head_dim) {
+                        break;
+                    }
+
+                    const float raw = src_row[off + d];
+                    if (is_keyframe) {
+                        ggml_set_rows_chrono_store_anchor(anchor, raw, d, h, cell, stream);
+                        if (store_full) {
+                            ggml_set_rows_chrono_store_full(full, raw, off + d, global_idx);
+                        }
+                    } else {
+                        const float base = anchor_src_row ? anchor_src_row[off + d] : ggml_set_rows_chrono_load_anchor(anchor, d, h, anchor_pos, stream);
+                        const int q = head_scale > 0.0f ? (int) std::nearbyint((raw - base) / head_scale) : 0;
+                        const int q_clamped = std::max(-8, std::min(7, q));
+                        qs[j] = (int8_t) q_clamped;
+                        if (store_full) {
+                            ggml_set_rows_chrono_store_full(full, base + head_scale*q_clamped, off + d, global_idx);
+                        }
+                    }
+                }
+
+                *(int32_t *) ((char *) delta->data + w*delta->nb[0] + h*delta->nb[1] + cell*delta->nb[2] + stream*delta->nb[3]) =
+                        (int32_t) ggml_set_rows_chrono_pack_i4x8(qs);
+            }
+        }
+    }
+}
+
 template<typename idx_t>
 static void ggml_compute_forward_set_rows_f32(
         const ggml_compute_params * params,
@@ -4980,6 +5132,19 @@ void ggml_compute_forward_set_rows(
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (dst->src[3] != nullptr) {
+        switch (src1->type) {
+            case GGML_TYPE_I64:
+                ggml_compute_forward_set_rows_chrono_f32<int64_t>(params, dst);
+                return;
+            case GGML_TYPE_I32:
+                ggml_compute_forward_set_rows_chrono_f32<int32_t>(params, dst);
+                return;
+            default:
+                GGML_ABORT("src1->type = %d (%s) not supported", src1->type, ggml_type_name(src1->type));
+        }
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32:
@@ -8936,6 +9101,128 @@ void ggml_compute_forward_flash_attn_ext(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+static inline int8_t ggml_chrono_unpack_i4(uint32_t packed, int idx) {
+    const uint32_t nibble = (packed >> (4*idx)) & 0xFu;
+    return nibble >= 8 ? (int8_t) (nibble - 16) : (int8_t) nibble;
+}
+
+static inline float ggml_chrono_load_anchor(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    const char * ptr = (const char *) t->data + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+    switch (t->type) {
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(*(const ggml_fp16_t *) ptr);
+        case GGML_TYPE_F32:
+            return *(const float *) ptr;
+        default:
+            GGML_ABORT("unsupported ChronoQuant anchor type %s", ggml_type_name(t->type));
+    }
+}
+
+void ggml_compute_forward_flash_attn_ext_chrono(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q        = dst->src[0];
+    const ggml_tensor * k_anchor = dst->src[1];
+    const ggml_tensor * k_delta  = dst->src[2];
+    const ggml_tensor * k_scale  = dst->src[3];
+    const ggml_tensor * v_anchor = dst->src[4];
+    const ggml_tensor * v_delta  = dst->src[5];
+    const ggml_tensor * v_scale  = dst->src[6];
+    const ggml_tensor * mask     = dst->src[7];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_delta->type == GGML_TYPE_I32);
+    GGML_ASSERT(v_delta->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_scale->type == GGML_TYPE_F32);
+
+    float scale = 0.0f;
+    memcpy(&scale, dst->op_params + 0, sizeof(scale));
+    const int32_t stride_k = ggml_get_op_params_i32(dst, 1);
+    const int32_t stride_v = ggml_get_op_params_i32(dst, 2);
+
+    const int64_t dk        = q->ne[0];
+    const int64_t nq        = q->ne[1];
+    const int64_t n_head    = q->ne[2];
+    const int64_t n_stream  = q->ne[3];
+    const int64_t n_head_kv = k_anchor->ne[1];
+    const int64_t n_kv      = k_anchor->ne[2];
+    const int64_t dv        = v_anchor->ne[0];
+    const int64_t repeat    = n_head / n_head_kv;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t n_jobs = nq * n_head * n_stream;
+
+    std::vector<float> logits((size_t) n_kv);
+    std::vector<float> values((size_t) dv);
+
+    for (int64_t job = ith; job < n_jobs; job += nth) {
+        const int64_t iq3 = job / (nq * n_head);
+        const int64_t rem = job % (nq * n_head);
+        const int64_t iq1 = rem / n_head;
+        const int64_t iq2 = rem % n_head;
+        const int64_t ikv = iq2 / repeat;
+
+        const float * q_row = (const float *) ((const char *) q->data + iq1*q->nb[1] + iq2*q->nb[2] + iq3*q->nb[3]);
+
+        float max_logit = -INFINITY;
+        for (int64_t kv = 0; kv < n_kv; ++kv) {
+            const int64_t anchor_pos = kv - (kv % stride_k);
+            float dot = 0.0f;
+            const float qk_scale = *(const float *) ((const char *) k_scale->data + ikv*k_scale->nb[1] + kv*k_scale->nb[2] + iq3*k_scale->nb[3]);
+
+            for (int64_t d = 0; d < dk; ++d) {
+                float kval = ggml_chrono_load_anchor(k_anchor, d, ikv, anchor_pos, iq3);
+                if (kv % stride_k != 0) {
+                    const int64_t word_idx = d / 8;
+                    const int32_t packed = *(const int32_t *) ((const char *) k_delta->data + word_idx*k_delta->nb[0] + ikv*k_delta->nb[1] + kv*k_delta->nb[2] + iq3*k_delta->nb[3]);
+                    kval += qk_scale * ggml_chrono_unpack_i4((uint32_t) packed, (int) (d % 8));
+                }
+                dot += q_row[d] * kval;
+            }
+
+            dot *= scale;
+            if (mask) {
+                const int64_t im2 = iq2 % mask->ne[2];
+                const int64_t im3 = iq3 % mask->ne[3];
+                dot += ggml_fp16_to_fp32(*(const ggml_fp16_t *) ((const char *) mask->data + kv*mask->nb[0] + iq1*mask->nb[1] + im2*mask->nb[2] + im3*mask->nb[3]));
+            }
+
+            logits[(size_t) kv] = dot;
+            max_logit = MAX(max_logit, dot);
+        }
+
+        float denom = 0.0f;
+        for (int64_t d = 0; d < dv; ++d) {
+            values[(size_t) d] = 0.0f;
+        }
+
+        for (int64_t kv = 0; kv < n_kv; ++kv) {
+            const float w = expf(logits[(size_t) kv] - max_logit);
+            const int64_t anchor_pos = kv - (kv % stride_v);
+            const float vv_scale = *(const float *) ((const char *) v_scale->data + ikv*v_scale->nb[1] + kv*v_scale->nb[2] + iq3*v_scale->nb[3]);
+
+            denom += w;
+            for (int64_t d = 0; d < dv; ++d) {
+                float vval = ggml_chrono_load_anchor(v_anchor, d, ikv, anchor_pos, iq3);
+                if (kv % stride_v != 0) {
+                    const int64_t word_idx = d / 8;
+                    const int32_t packed = *(const int32_t *) ((const char *) v_delta->data + word_idx*v_delta->nb[0] + ikv*v_delta->nb[1] + kv*v_delta->nb[2] + iq3*v_delta->nb[3]);
+                    vval += vv_scale * ggml_chrono_unpack_i4((uint32_t) packed, (int) (d % 8));
+                }
+                values[(size_t) d] += w * vval;
+            }
+        }
+
+        const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+        float * out = (float *) ((char *) dst->data + iq2*dst->nb[1] + iq1*dst->nb[2] + iq3*dst->nb[3]);
+        for (int64_t d = 0; d < dv; ++d) {
+            out[d] = values[(size_t) d] * inv;
+        }
     }
 }
 

@@ -8728,6 +8728,157 @@ template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vq8_0_dk320_dv256")]] ke
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vq8_0_dk512_dv512")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4, 512, 512, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vq8_0_dk576_dv512")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4, 576, 512, 2>;
 
+constant bool FC_flash_attn_ext_chrono_has_mask [[function_constant(0)]];
+
+static inline int chrono_unpack_i4_word(uint packed, uint idx) {
+    const uint nibble = (packed >> (4*idx)) & 0xFu;
+    return nibble >= 8 ? int(nibble) - 16 : int(nibble);
+}
+
+kernel void kernel_flash_attn_ext_chrono(
+        constant ggml_metal_kargs_flash_attn_ext_chrono & args,
+        device const char * q,
+        device const char * k_anchor,
+        device const char * k_delta,
+        device const char * k_scale,
+        device const char * v_anchor,
+        device const char * v_delta,
+        device const char * v_scale,
+        device const char * mask,
+        device       char * dst,
+        threadgroup  float * tg_scratch [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint    tid  [[thread_index_in_threadgroup]],
+        uint    lane [[thread_index_in_simdgroup]],
+        uint    sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint iq1 = tgpig.x;
+    const uint iq2 = tgpig.y;
+    const uint iq3 = tgpig.z;
+
+    if (iq1 >= (uint) args.nq || iq2 >= (uint) args.n_head || iq3 >= (uint) args.n_stream) {
+        return;
+    }
+
+    const uint repeat = max((uint) 1, (uint) args.n_head / (uint) args.n_head_kv);
+    const uint ikh = iq2 / repeat;
+
+    constexpr uint TG_SIZE = 512;
+    constexpr uint SG_SIZE = 32;
+    constexpr uint KV_BLOCK = 16;
+    constexpr uint MAX_SLOT = 32;
+    float out_acc[MAX_SLOT];
+    uint out_idx[MAX_SLOT];
+    uint out_count = 0;
+    for (uint d = tid; d < (uint) args.dv && out_count < MAX_SLOT; d += TG_SIZE) {
+        out_idx[out_count++] = d;
+        out_acc[out_count - 1] = 0.0f;
+    }
+
+    const device char * q_row = q + iq1*args.nbq1 + iq2*args.nbq2 + iq3*args.nbq3;
+    const device float * q_row_f32 = (device const float *) q_row;
+    float running_m = -INFINITY;
+    float running_s = 0.0f;
+
+    for (uint kv_block = 0; kv_block < (uint) args.n_kv; kv_block += KV_BLOCK) {
+        const uint kv = kv_block + sgid;
+        const bool valid_kv = kv < (uint) args.n_kv;
+
+        float dot_partial = 0.0f;
+        if (valid_kv) {
+            const bool is_k_anchor = (kv % (uint) args.stride_k) == 0;
+            const uint k_anchor_pos = kv - (kv % (uint) args.stride_k);
+            const float k_row_scale = *((device const float *) (k_scale + ikh*args.nbks1 + kv*args.nbks2 + iq3*args.nbks3));
+
+            for (uint d = lane; d < (uint) args.dk; d += SG_SIZE) {
+                const float qv = q_row_f32[d];
+                const half base_h = *((device const half *) (k_anchor + d*sizeof(half) + ikh*args.nbka1 + k_anchor_pos*args.nbka2 + iq3*args.nbka3));
+                float kval = float(base_h);
+                if (!is_k_anchor) {
+                    const uint word_idx = d / 8;
+                    const uint packed = *((device const uint *) (k_delta + word_idx*args.nbkd0 + ikh*args.nbkd1 + kv*args.nbkd2 + iq3*args.nbkd3));
+                    kval += k_row_scale * chrono_unpack_i4_word(packed, d % 8);
+                }
+                dot_partial += qv * kval;
+            }
+        }
+
+        const float dot = simd_sum(dot_partial);
+
+        if (lane == 0) {
+            float logit = -INFINITY;
+            if (valid_kv) {
+                logit = dot * args.scale;
+                if (FC_flash_attn_ext_chrono_has_mask) {
+                    logit += float(*((device const half *) (mask + kv*args.nbm0 + iq1*args.nbm1 + iq3*args.nbm3)));
+                }
+            }
+            tg_scratch[16 + sgid] = logit;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float next_m = running_m;
+            float weights[KV_BLOCK];
+            for (uint bi = 0; bi < KV_BLOCK; ++bi) {
+                next_m = max(next_m, tg_scratch[16 + bi]);
+            }
+            const float ms = running_m == -INFINITY ? 0.0f : exp(running_m - next_m);
+            float block_sum = 0.0f;
+            for (uint bi = 0; bi < KV_BLOCK; ++bi) {
+                const float logit = tg_scratch[16 + bi];
+                const float w = logit == -INFINITY ? 0.0f : exp(logit - next_m);
+                weights[bi] = w;
+                block_sum += w;
+            }
+            running_s = running_s * ms + block_sum;
+            running_m = next_m;
+            tg_scratch[0] = ms;
+            for (uint bi = 0; bi < KV_BLOCK; ++bi) {
+                tg_scratch[1 + bi] = weights[bi];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float ms = tg_scratch[0];
+
+        for (uint s = 0; s < out_count; ++s) {
+            const uint d = out_idx[s];
+            float acc = out_acc[s] * ms;
+
+            for (uint bi = 0; bi < KV_BLOCK; ++bi) {
+                const float w = tg_scratch[1 + bi];
+                const uint kv_i = kv_block + bi;
+                if (kv_i < (uint) args.n_kv && w != 0.0f) {
+                    const bool is_v_anchor = (kv_i % (uint) args.stride_v) == 0;
+                    const uint v_anchor_pos = kv_i - (kv_i % (uint) args.stride_v);
+                    const float v_row_scale = *((device const float *) (v_scale + ikh*args.nbvs1 + kv_i*args.nbvs2 + iq3*args.nbvs3));
+                    const half base_h = *((device const half *) (v_anchor + d*sizeof(half) + ikh*args.nbva1 + v_anchor_pos*args.nbva2 + iq3*args.nbva3));
+                    float vval = float(base_h);
+                    if (!is_v_anchor) {
+                        const uint word_idx = d / 8;
+                        const uint packed = *((device const uint *) (v_delta + word_idx*args.nbvd0 + ikh*args.nbvd1 + kv_i*args.nbvd2 + iq3*args.nbvd3));
+                        vval += v_row_scale * chrono_unpack_i4_word(packed, d % 8);
+                    }
+                    acc += w * vval;
+                }
+            }
+
+            out_acc[s] = acc;
+        }
+    }
+
+    if (tid == 0) {
+        tg_scratch[0] = running_s > 0.0f ? 1.0f / running_s : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = tg_scratch[0];
+
+    device float * out_row = (device float *) (dst + iq2*args.nbd1 + iq1*args.nbd2 + iq3*args.nbd3);
+    for (uint s = 0; s < out_count; ++s) {
+        out_row[out_idx[s]] = out_acc[s] * inv;
+    }
+}
+
 #undef FA_TYPES
 #undef FA_TYPES_F32
 
@@ -11432,6 +11583,109 @@ kernel void kernel_set_rows_f(
     }
 }
 
+template<typename T, typename TI>
+kernel void kernel_set_rows_chrono(
+        constant ggml_metal_kargs_set_rows_chrono & args,
+        device const float * src0,
+        device const TI    * src1,
+        device       T     * dst,
+        device       T     * anchor,
+        device       int   * delta,
+        device       float * scale,
+        threadgroup  float * tg_scratch [[threadgroup(0)]],
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tid  [[thread_index_in_threadgroup]]) {
+    constexpr uint TG_SIZE = 128;
+
+    const uint irow = tgpig.x;
+    const uint ih   = tgpig.y;
+    if (irow >= (uint) args.n_rows || ih >= (uint) args.n_head_kv) {
+        return;
+    }
+
+    const int64_t global_idx = (int64_t) *((device const TI *) ((device const char *) src1 + irow*args.nb_idx));
+    const int64_t stream = global_idx / args.kv_size;
+    const int64_t cell   = global_idx % args.kv_size;
+    const int64_t anchor_pos = cell - (cell % args.stride);
+    const int64_t anchor_global_idx = stream*args.kv_size + anchor_pos;
+    const bool is_keyframe = (cell % args.stride) == 0;
+    const uint packed_words = (uint) ((args.head_dim + 7) / 8);
+    const uint row_off = ih * (uint) args.head_dim;
+
+    const device float * src_row = (const device float *) ((const device char *) src0 + irow*args.nb_src_row);
+    const device float * anchor_src_row = nullptr;
+    const int64_t anchor_row_delta = cell - anchor_pos;
+    if (!is_keyframe && anchor_row_delta <= (int64_t) irow) {
+        const uint candidate_row = irow - (uint) anchor_row_delta;
+        const int64_t candidate_idx = (int64_t) *((device const TI *) ((device const char *) src1 + candidate_row*args.nb_idx));
+        if (candidate_idx == anchor_global_idx) {
+            anchor_src_row = (const device float *) ((const device char *) src0 + candidate_row*args.nb_src_row);
+        }
+    }
+    device T * dst_row = (device T *) ((device char *) dst + global_idx*args.nb_dst1);
+
+    float local_max = 0.0f;
+    if (!is_keyframe) {
+        for (uint d = tid; d < (uint) args.head_dim; d += TG_SIZE) {
+            const float base = anchor_src_row != nullptr
+                ? anchor_src_row[row_off + d]
+                : float(*((const device T *) ((const device char *) anchor + d*sizeof(T) + ih*args.nb_anchor1 + anchor_pos*args.nb_anchor2 + stream*args.nb_anchor3)));
+            local_max = max(local_max, fabs(src_row[row_off + d] - base));
+        }
+    }
+
+    tg_scratch[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = TG_SIZE / 2; step > 0; step >>= 1) {
+        if (tid < step) {
+            tg_scratch[tid] = max(tg_scratch[tid], tg_scratch[tid + step]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float head_scale = is_keyframe ? 0.0f : tg_scratch[0] / 7.0f;
+    if (tid == 0) {
+        *((device float *) ((device char *) scale + ih*args.nb_scale1 + cell*args.nb_scale2 + stream*args.nb_scale3)) = head_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint w = tid; w < packed_words; w += TG_SIZE) {
+        char qs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (uint j = 0; j < 8; ++j) {
+            const uint d = w*8 + j;
+            if (d >= (uint) args.head_dim) {
+                break;
+            }
+
+            const float raw = src_row[row_off + d];
+            device T * dst_ptr = dst_row + row_off + d;
+            if (is_keyframe) {
+                device T * anchor_ptr = (device T *) ((device char *) anchor + d*sizeof(T) + ih*args.nb_anchor1 + cell*args.nb_anchor2 + stream*args.nb_anchor3);
+                *anchor_ptr = (T) raw;
+                if (args.store_full != 0) {
+                    *dst_ptr = (T) raw;
+                }
+            } else {
+                const float base = anchor_src_row != nullptr
+                    ? anchor_src_row[row_off + d]
+                    : float(*((const device T *) ((const device char *) anchor + d*sizeof(T) + ih*args.nb_anchor1 + anchor_pos*args.nb_anchor2 + stream*args.nb_anchor3)));
+                const int q = head_scale > 0.0f ? (int) rint((raw - base) / head_scale) : 0;
+                const int q_clamped = clamp(q, -8, 7);
+                qs[j] = (char) q_clamped;
+                if (args.store_full != 0) {
+                    *dst_ptr = (T) (base + head_scale * q_clamped);
+                }
+            }
+        }
+
+        uint packed = 0;
+        for (uint j = 0; j < 8; ++j) {
+            packed |= (uint(qs[j]) & 0xFu) << (4*j);
+        }
+        *((device int *) ((device char *) delta + w*args.nb_delta0 + ih*args.nb_delta1 + cell*args.nb_delta2 + stream*args.nb_delta3)) = (int) packed;
+    }
+}
+
 kernel void kernel_diag_f32(
         constant ggml_metal_kargs_diag & args,
         device   const char * src0,
@@ -12188,11 +12442,15 @@ template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get
 //
 
 typedef decltype(kernel_set_rows_f<float, int64_t>) set_rows_f_t;
+typedef decltype(kernel_set_rows_chrono<float, int64_t>) set_rows_chrono_f32_t;
+typedef decltype(kernel_set_rows_chrono<half,  int64_t>) set_rows_chrono_f16_t;
 
 template [[host_name("kernel_set_rows_f32_i64")]]  kernel set_rows_f_t kernel_set_rows_f<float, int64_t>;
 template [[host_name("kernel_set_rows_f32_i32")]]  kernel set_rows_f_t kernel_set_rows_f<float, int32_t>;
 template [[host_name("kernel_set_rows_f16_i64")]]  kernel set_rows_f_t kernel_set_rows_f<half, int64_t>;
 template [[host_name("kernel_set_rows_f16_i32")]]  kernel set_rows_f_t kernel_set_rows_f<half, int32_t>;
+template [[host_name("kernel_set_rows_chrono_f32_i64")]] kernel set_rows_chrono_f32_t kernel_set_rows_chrono<float, int64_t>;
+template [[host_name("kernel_set_rows_chrono_f16_i64")]] kernel set_rows_chrono_f16_t kernel_set_rows_chrono<half, int64_t>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_set_rows_bf16_i64")]] kernel set_rows_f_t kernel_set_rows_f<bfloat, int64_t>;
 template [[host_name("kernel_set_rows_bf16_i32")]] kernel set_rows_f_t kernel_set_rows_f<bfloat, int32_t>;

@@ -1235,6 +1235,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_CHRONO:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F16 &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
+                   op->src[4]->type == GGML_TYPE_F16 &&
+                   op->src[5]->type == GGML_TYPE_I32 &&
+                   op->src[6]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[1] == 1;
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
@@ -1318,6 +1327,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             {
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
+                }
+
+                if (op->src[3] != NULL) {
+                    return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                           op->src[1]->type == GGML_TYPE_I64 &&
+                           op->src[2]->type == op->type &&
+                           op->src[3]->type == op->type &&
+                           op->src[4]->type == GGML_TYPE_I32 &&
+                           op->src[5]->type == GGML_TYPE_F32 &&
+                           op->src[0]->ne[2] == 1 &&
+                           op->src[0]->ne[3] == 1;
                 }
 
                 switch (op->type) {

@@ -554,6 +554,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_CHRONO,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -1680,6 +1681,19 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    GGML_API struct ggml_tensor * ggml_set_rows_chrono(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * anchor,
+            struct ggml_tensor  * delta,
+            struct ggml_tensor  * scale,
+            int32_t               head_dim,
+            int32_t               n_head_kv,
+            int32_t               stride,
+            bool                  store_full);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2410,6 +2424,29 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // q:        [n_embd_k, n_batch, n_head,    ne3]
+    // k_anchor: [n_embd_k, n_head_kv, n_kv,    ne3]
+    // k_delta:  [n_packed, n_head_kv, n_kv,    ne3] where each int32 packs 8 signed INT4 values
+    // k_scale:  [1,        n_head_kv, n_kv,    ne3]
+    // v_anchor: [n_embd_v, n_head_kv, n_kv,    ne3]
+    // v_delta:  [n_packed, n_head_kv, n_kv,    ne3] where each int32 packs 8 signed INT4 values
+    // v_scale:  [1,        n_head_kv, n_kv,    ne3]
+    // mask:     [n_kv,     n_batch,   ne32,    ne33] (optional)
+    // res:      [n_embd_v, n_head,    n_batch, ne3] !! permuted !!
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_chrono(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_anchor,
+            struct ggml_tensor  * k_delta,
+            struct ggml_tensor  * k_scale,
+            struct ggml_tensor  * v_anchor,
+            struct ggml_tensor  * v_delta,
+            struct ggml_tensor  * v_scale,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            int32_t               stride_k,
+            int32_t               stride_v);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

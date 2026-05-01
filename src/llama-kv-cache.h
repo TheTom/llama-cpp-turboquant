@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "chrono-quant.h"
 
 #include <unordered_map>
 #include <vector>
@@ -108,7 +109,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -164,19 +165,20 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_chrono_k_anchor(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_chrono_k_delta (ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_chrono_k_scale (ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_chrono_v_anchor(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_chrono_v_delta (ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_chrono_v_scale (ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
-    // TurboQuant: get rotation matrices (stored as row-major C arrays)
-    // turbo_rotation = R (forward rotation, for Q pre-rotate-queries)
-    // turbo_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)
-    ggml_tensor * get_turbo_rotation() const { return turbo_rotation; }
-    ggml_tensor * get_turbo_rotation_inv() const { return turbo_rotation_inv; }
-
-    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
-    ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
+    bool chrono_fused_enabled(int32_t il) const;
+    uint32_t chrono_stride_k() const;
+    uint32_t chrono_stride_v() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, bool chrono_store_full) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, bool chrono_store_full) const;
 
     //
     // preparation API
@@ -217,10 +219,7 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
-private:
-    const llama_model & model;
-    const llama_hparams & hparams;
-
+public:
     struct kv_layer {
         // layer index in the model
         // note: can be different from the layer index in the KV cache
@@ -229,9 +228,26 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
+        ggml_tensor * chrono_k_anchor;
+        ggml_tensor * chrono_k_delta;
+        ggml_tensor * chrono_k_scale;
+        ggml_tensor * chrono_v_anchor;
+        ggml_tensor * chrono_v_delta;
+        ggml_tensor * chrono_v_scale;
+
+        uint32_t chrono_head_k = 0;
+        uint32_t chrono_head_v = 0;
+        uint32_t chrono_head_kv = 0;
+        uint32_t chrono_stride_k = 0;
+        uint32_t chrono_stride_v = 0;
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
+
+private:
+    const llama_model & model;
+    const llama_hparams & hparams;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -279,12 +295,9 @@ private:
 
     std::vector<kv_layer> layers;
 
-    // TurboQuant rotation matrices (128x128, row-major stored)
-    ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)
-    ggml_tensor * turbo_rotation_inv = nullptr;   // R^T = R^{-1} (inverse rotation)
-
-    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
-    ggml_tensor * turbo_innerq_scale_inv = nullptr;
+    // ChronoQuant configuration. Compressed K/V payloads live in backend tensors
+    // owned by kv_layer, not CPU-side shadow buffers.
+    chrono_quant_config chrono_config;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -368,21 +381,19 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+    bool chrono_fused_enabled(int32_t il) const;
+    uint32_t chrono_stride_k() const;
+    uint32_t chrono_stride_v() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
-
-    // TurboQuant rotation accessors
-    ggml_tensor * get_turbo_rotation() const;
-    ggml_tensor * get_turbo_rotation_inv() const;
-
-    // Override virtual methods from llama_memory_context_i
-    ggml_tensor * get_turbo_rot_forward() const override;
-    ggml_tensor * get_turbo_rot_inverse() const override;
-
-    // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
-    ggml_tensor * get_turbo_innerq_scale_inv() const override;
+    ggml_tensor * get_chrono_k_anchor(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_chrono_k_delta (ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_chrono_k_scale (ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_chrono_v_anchor(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_chrono_v_delta (ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_chrono_v_scale (ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -390,8 +401,8 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, bool chrono_store_full = true) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, bool chrono_store_full = true) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

@@ -1086,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FILL",
 
     "FLASH_ATTN_EXT",
+    "FLASH_ATTN_EXT_CHRONO",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1116,7 +1117,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1197,6 +1198,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "fill(x, c)",
 
     "flash_attn_ext(x)",
+    "flash_attn_ext_chrono(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1227,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3951,6 +3953,53 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_set_rows_chrono(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * anchor,
+        struct ggml_tensor  * delta,
+        struct ggml_tensor  * scale,
+        int32_t               head_dim,
+        int32_t               n_head_kv,
+        int32_t               stride,
+        bool                  store_full) {
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[2] == b->ne[2]);
+    GGML_ASSERT(a->ne[3] == b->ne[3]);
+    GGML_ASSERT(b->ne[1] == c->ne[0]);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32);
+    GGML_ASSERT(anchor->type == a->type);
+    GGML_ASSERT(delta->type == GGML_TYPE_I32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(head_dim > 0);
+    GGML_ASSERT(n_head_kv > 0);
+    GGML_ASSERT(b->ne[0] == (int64_t) head_dim * n_head_kv);
+    GGML_ASSERT(anchor->ne[0] == head_dim);
+    GGML_ASSERT(anchor->ne[1] == n_head_kv);
+    GGML_ASSERT(delta->ne[0] == (head_dim + 7)/8);
+    GGML_ASSERT(delta->ne[1] == n_head_kv);
+    GGML_ASSERT(scale->ne[0] == 1);
+    GGML_ASSERT(scale->ne[1] == n_head_kv);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+    result->op     = GGML_OP_SET_ROWS;
+    result->src[0] = b;
+    result->src[1] = c;
+    result->src[2] = a;
+    result->src[3] = anchor;
+    result->src[4] = delta;
+    result->src[5] = scale;
+
+    int32_t params[4] = { head_dim, n_head_kv, stride, store_full ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
@@ -5430,6 +5479,59 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_chrono(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_anchor,
+        struct ggml_tensor  * k_delta,
+        struct ggml_tensor  * k_scale,
+        struct ggml_tensor  * v_anchor,
+        struct ggml_tensor  * v_delta,
+        struct ggml_tensor  * v_scale,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        int32_t               stride_k,
+        int32_t               stride_v) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_anchor->ne[2] == v_anchor->ne[2]);
+    GGML_ASSERT(k_anchor->ne[3] == v_anchor->ne[3]);
+    GGML_ASSERT(k_anchor->ne[1] == v_anchor->ne[1]);
+    GGML_ASSERT(k_scale->ne[2] == k_anchor->ne[2]);
+    GGML_ASSERT(k_scale->ne[3] == k_anchor->ne[3]);
+    GGML_ASSERT(v_scale->ne[2] == v_anchor->ne[2]);
+    GGML_ASSERT(v_scale->ne[3] == v_anchor->ne[3]);
+    GGML_ASSERT(k_scale->ne[0] == 1);
+    GGML_ASSERT(v_scale->ne[0] == 1);
+    GGML_ASSERT(k_delta->type == GGML_TYPE_I32);
+    GGML_ASSERT(v_delta->type == GGML_TYPE_I32);
+
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+    }
+
+    int64_t ne[4] = { v_anchor->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[3];
+    memcpy(&params[0], &scale, sizeof(scale));
+    params[1] = stride_k;
+    params[2] = stride_v;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_CHRONO;
+    result->src[0] = q;
+    result->src[1] = k_anchor;
+    result->src[2] = k_delta;
+    result->src[3] = k_scale;
+    result->src[4] = v_anchor;
+    result->src[5] = v_delta;
+    result->src[6] = v_scale;
+    result->src[7] = mask;
+
+    return result;
 }
 
 // ggml_flash_attn_back

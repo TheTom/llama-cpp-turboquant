@@ -904,6 +904,18 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    ggml_tensor * build_attn_mha_chrono(
+            ggml_tensor * q,
+            ggml_tensor * k_anchor,
+            ggml_tensor * k_delta,
+            ggml_tensor * k_scale_rows,
+            ggml_tensor * v_anchor,
+            ggml_tensor * v_delta,
+            ggml_tensor * v_scale_rows,
+            ggml_tensor * kq_mask,
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(

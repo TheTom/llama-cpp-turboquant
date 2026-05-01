@@ -464,6 +464,49 @@ typedef struct {
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
 typedef struct {
+    int32_t  nq;
+    int32_t  n_head;
+    int32_t  n_stream;
+    int32_t  n_kv;
+    int32_t  n_head_kv;
+    int32_t  dk;
+    int32_t  dv;
+    int32_t  stride_k;
+    int32_t  stride_v;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbq3;
+    uint64_t nbka1;
+    uint64_t nbka2;
+    uint64_t nbka3;
+    uint64_t nbkd0;
+    uint64_t nbkd1;
+    uint64_t nbkd2;
+    uint64_t nbkd3;
+    uint64_t nbks1;
+    uint64_t nbks2;
+    uint64_t nbks3;
+    uint64_t nbva1;
+    uint64_t nbva2;
+    uint64_t nbva3;
+    uint64_t nbvd0;
+    uint64_t nbvd1;
+    uint64_t nbvd2;
+    uint64_t nbvd3;
+    uint64_t nbvs1;
+    uint64_t nbvs2;
+    uint64_t nbvs3;
+    uint64_t nbm0;
+    uint64_t nbm1;
+    uint64_t nbm2;
+    uint64_t nbm3;
+    uint64_t nbd1;
+    uint64_t nbd2;
+    uint64_t nbd3;
+    float    scale;
+} ggml_metal_kargs_flash_attn_ext_chrono;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne02;
     uint64_t nb01;
@@ -981,6 +1024,28 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
 } ggml_metal_kargs_set_rows;
+
+typedef struct {
+    int32_t  head_dim;
+    int32_t  n_head_kv;
+    int32_t  n_rows;
+    int32_t  kv_size;
+    int32_t  stride;
+    int32_t  store_full;
+    uint64_t nb_src_row;
+    uint64_t nb_idx;
+    uint64_t nb_dst1;
+    uint64_t nb_anchor1;
+    uint64_t nb_anchor2;
+    uint64_t nb_anchor3;
+    uint64_t nb_delta0;
+    uint64_t nb_delta1;
+    uint64_t nb_delta2;
+    uint64_t nb_delta3;
+    uint64_t nb_scale1;
+    uint64_t nb_scale2;
+    uint64_t nb_scale3;
+} ggml_metal_kargs_set_rows_chrono;
 
 typedef struct {
     int32_t  ne00;
