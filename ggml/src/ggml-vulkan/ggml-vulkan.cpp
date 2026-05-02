@@ -4502,7 +4502,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_1],     "set_rows_q5_1" #itype,     set_rows_q5_1 ## itype ## _len,     set_rows_q5_1 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q8_0],     "set_rows_q8_0" #itype,     set_rows_q8_0 ## itype ## _len,     set_rows_q8_0 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL],   "set_rows_iq4_nl" #itype,   set_rows_iq4_nl ## itype ## _len,   set_rows_iq4_nl ## itype ## _data,   "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TURBO2_0], "set_rows_turbo2_0" #itype, set_rows_turbo2_0 ## itype ## _len, set_rows_turbo2_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TURBO3_0], "set_rows_turbo3_0" #itype, set_rows_turbo3_0 ## itype ## _len, set_rows_turbo3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TURBO4_0], "set_rows_turbo4_0" #itype, set_rows_turbo4_0 ## itype ## _len, set_rows_turbo4_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TQ4_1S],   "set_rows_tq4_1s" #itype,   set_rows_tq4_1s ## itype ## _len,   set_rows_tq4_1s ## itype ## _data,   "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
 
     SET_ROWS(_i32)
@@ -10258,7 +10260,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_SET_ROWS:
         {
             uint32_t ne = ggml_nelements(src0);
-            if (dst->type == GGML_TYPE_TURBO3_0) {
+            if (dst->type == GGML_TYPE_TURBO2_0 ||
+                dst->type == GGML_TYPE_TURBO3_0 ||
+                dst->type == GGML_TYPE_TURBO4_0) {
                 ne = ne / 128;
             } else if (dst->type == GGML_TYPE_TQ4_1S) {
                 ne = ne / 32;
@@ -15653,7 +15657,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO2_0:
                     case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
                     case GGML_TYPE_TQ4_1S:
                         return true;
                     default:
