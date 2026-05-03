@@ -1747,6 +1747,36 @@ struct block_turbo3_0
 #define A_TYPE block_turbo3_0
 #endif
 
+#define QUANT_K_TURBO2_0 128
+#define QUANT_R_TURBO2_0 1
+struct block_turbo2_0
+{
+    float16_t norm;
+    uint8_t qs[32];     // 2-bit centroid indices (4 per byte), 128/4 = 32 bytes
+};
+#if defined(DATA_A_TURBO2_0)
+#define QUANT_K QUANT_K_TURBO2_0
+#define QUANT_R QUANT_R_TURBO2_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo2_0
+#endif
+
+#define QUANT_K_TURBO4_0 128
+#define QUANT_R_TURBO4_0 1
+struct block_turbo4_0
+{
+    float16_t norm;
+    float16_t rnorm;    // reserved in 4-bit mode (kept for ABI parity with legacy)
+    uint8_t qs[64];     // 4-bit centroid indices, nibble-packed (2 per byte), 128/2 = 64 bytes
+};
+#if defined(DATA_A_TURBO4_0)
+#define QUANT_K QUANT_K_TURBO4_0
+#define QUANT_R QUANT_R_TURBO4_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo4_0
+#endif
+
+
 #define QUANT_K_TQ4_1S 32
 #define QUANT_R_TQ4_1S 1
 

@@ -5,7 +5,7 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #include "types.glsl"
 
-#if defined(SET_ROWS) && defined(DATA_A_TURBO3_0)
+#if defined(SET_ROWS) && (defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO4_0))
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 const uint BLOCK_SIZE = 128;
 #elif defined(SET_ROWS) && QUANT_K == 1
@@ -469,6 +469,245 @@ void main() {
         data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
     }
 }
+#elif defined(SET_ROWS) && defined(DATA_A_TURBO2_0)
+// Mirror of the TURBO3_0 block above, adapted for turbo2 (4 centroids,
+// 2-bit pack, no signs byte). WHT tables and reduction structure are
+// identical (QK = 128 for both).
+const float TS1_T2[128] = float[128](
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
+    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
+     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
+    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
+     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
+     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
+);
+const float TS2_T2[128] = float[128](
+     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
+     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
+     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
+);
+const float TINV_T2 = 0.08838834764831845;  // 1 / sqrt(128)
+// Lloyd-Max centroids for N(0, 1/128), 4 levels (matches CENTROIDS_2BIT in C ref)
+const float TC2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+// Midpoints between adjacent centroids
+const float TM2[3] = float[3](-0.086728, 0.0, 0.086728);
+
+shared float wht_t2[128];
+shared float sg_acc_t2[16];
+shared float gnrm_t2;
+
+void main() {
+    const uint t   = gl_LocalInvocationID.x;
+    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint gpr = p.ne00 / 128;
+
+    if (gpr == 0) return;
+    if (g >= p.ne / 128) return;
+
+    uint tmp = g;
+    const uint ig  = tmp % gpr; tmp /= gpr;
+    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
+    const uint i02 = tmp % p.ne12;
+    const uint i03 = tmp / p.ne12;
+
+    const uint sb  = src0_idx(ig * 128, i01, i02, i03) + get_aoffset();
+    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
+    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
+
+    wht_t2[t] = data_s[sb + t];
+    barrier();
+
+    float v2 = wht_t2[t] * wht_t2[t];
+    v2 = subgroupAdd(v2);
+    if (gl_SubgroupInvocationID == 0) sg_acc_t2[gl_SubgroupID] = v2;
+    barrier();
+    if (t == 0) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t2[w];
+        gnrm_t2 = sqrt(total);
+    }
+    barrier();
+
+    wht_t2[t] *= (gnrm_t2 > 1e-10) ? (1.0 / gnrm_t2) : 0.0;
+    barrier();
+
+    wht_t2[t] *= TS1_T2[t];
+    barrier();
+
+    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
+        if ((t % (2 * h)) < h) {
+            float a    = wht_t2[t];
+            float b    = wht_t2[t + h];
+            wht_t2[t]     = a + b;
+            wht_t2[t + h] = a - b;
+        }
+        barrier();
+    }
+
+    float rv = wht_t2[t] * TINV_T2 * TS2_T2[t];
+
+    // Quantize to nearest of 4 centroids (2-bit index, no signs byte)
+    uint idx = rv < TM2[0] ? 0u : rv < TM2[1] ? 1u : rv < TM2[2] ? 2u : 3u;
+
+    // Pack qs: 4 elements per byte (full 2-bit each, no high bit)
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint qs_byte = 0u;
+    [[unroll]] for (uint k = 0; k < 4; k++) {
+        uint contrib = subgroupShuffle(idx & 0x3u, (sg_lane & ~3u) + k);
+        qs_byte |= contrib << (k * 2u);
+    }
+    if (sg_lane % 4u == 0u) {
+        data_q[db].qs[t / 4u] = uint8_t(qs_byte);
+    }
+
+    // Reconstruction norm via subgroup reduction
+    float rc = TC2[idx] * TC2[idx];
+    rc = subgroupAdd(rc);
+    if (sg_lane == 0u) sg_acc_t2[gl_SubgroupID] = rc;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t2[w];
+        float rn = sqrt(total);
+        data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm_t2 / rn) : gnrm_t2);
+    }
+}
+
+#elif defined(SET_ROWS) && defined(DATA_A_TURBO4_0)
+// Mirror of the TURBO3_0 block above, adapted for turbo4 (16 centroids,
+// 4-bit nibble pack, no signs byte). WHT tables and reduction structure
+// are identical (QK = 128 for both). The block struct keeps a reserved
+// rnorm field for ABI parity with the legacy 3-bit + QJL layout.
+const float TS1_T4[128] = float[128](
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
+    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
+     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
+    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
+     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
+     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
+);
+const float TS2_T4[128] = float[128](
+     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
+     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
+     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
+);
+const float TINV_T4 = 0.08838834764831845;  // 1 / sqrt(128)
+// Lloyd-Max centroids for N(0, 1/128), 16 levels (matches CENTROIDS_4BIT in C ref)
+const float TC4[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926
+);
+// 15 midpoints between adjacent centroids
+const float TM4[15] = float[15](
+    -0.145561, -0.103361, -0.079142, -0.060009,
+    -0.043430, -0.028293, -0.013964,  0.0,
+     0.013964,  0.028293,  0.043430,  0.060009,
+     0.079142,  0.103361,  0.145561
+);
+
+shared float wht_t4[128];
+shared float sg_acc_t4[16];
+shared float gnrm_t4;
+
+void main() {
+    const uint t   = gl_LocalInvocationID.x;
+    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint gpr = p.ne00 / 128;
+
+    if (gpr == 0) return;
+    if (g >= p.ne / 128) return;
+
+    uint tmp = g;
+    const uint ig  = tmp % gpr; tmp /= gpr;
+    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
+    const uint i02 = tmp % p.ne12;
+    const uint i03 = tmp / p.ne12;
+
+    const uint sb  = src0_idx(ig * 128, i01, i02, i03) + get_aoffset();
+    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
+    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
+
+    wht_t4[t] = data_s[sb + t];
+    barrier();
+
+    float v2 = wht_t4[t] * wht_t4[t];
+    v2 = subgroupAdd(v2);
+    if (gl_SubgroupInvocationID == 0) sg_acc_t4[gl_SubgroupID] = v2;
+    barrier();
+    if (t == 0) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t4[w];
+        gnrm_t4 = sqrt(total);
+    }
+    barrier();
+
+    wht_t4[t] *= (gnrm_t4 > 1e-10) ? (1.0 / gnrm_t4) : 0.0;
+    barrier();
+
+    wht_t4[t] *= TS1_T4[t];
+    barrier();
+
+    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
+        if ((t % (2 * h)) < h) {
+            float a    = wht_t4[t];
+            float b    = wht_t4[t + h];
+            wht_t4[t]     = a + b;
+            wht_t4[t + h] = a - b;
+        }
+        barrier();
+    }
+
+    float rv = wht_t4[t] * TINV_T4 * TS2_T4[t];
+
+    // Quantize to nearest of 16 centroids (4-bit index, no signs byte)
+    uint idx = 0u;
+    [[unroll]] for (uint i = 0; i < 15; i++) {
+        if (rv >= TM4[i]) idx = i + 1u;
+    }
+
+    // Pack qs: 2 elements per byte (4-bit nibble each)
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint pair_low  = subgroupShuffle(idx & 0xFu, sg_lane & ~1u);
+    uint pair_high = subgroupShuffle(idx & 0xFu, (sg_lane & ~1u) + 1u);
+    uint qs_byte = pair_low | (pair_high << 4u);
+    if (sg_lane % 2u == 0u) {
+        data_q[db].qs[t / 2u] = uint8_t(qs_byte);
+    }
+
+    // Reset rnorm field (reserved in 4-bit mode)
+    if (t == 0u) {
+        data_q[db].rnorm = float16_t(0.0);
+    }
+
+    // Reconstruction norm via subgroup reduction
+    float rc = TC4[idx] * TC4[idx];
+    rc = subgroupAdd(rc);
+    if (sg_lane == 0u) sg_acc_t4[gl_SubgroupID] = rc;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t4[w];
+        float rn = sqrt(total);
+        data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm_t4 / rn) : gnrm_t4);
+    }
+}
+
 #elif defined(SET_ROWS) && defined(DATA_A_TQ4_1S)
 
 void main() {
