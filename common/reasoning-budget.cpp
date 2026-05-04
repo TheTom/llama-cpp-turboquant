@@ -157,26 +157,13 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->force_pos = 0;
 }
 
-// forward declaration for use in clone
+// forward declarations for use in the i-struct (defined below)
 static struct llama_sampler * common_reasoning_budget_init_state(
         const struct llama_vocab * vocab, const std::vector<llama_token> & start_tokens,
         const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
         int32_t budget, common_reasoning_budget_state initial_state);
-
-static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
-    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
-    return common_reasoning_budget_init_state(
-        ctx->vocab,
-        ctx->start_matcher.tokens,
-        ctx->end_matcher.tokens,
-        ctx->forced_tokens,
-        ctx->budget,
-        ctx->state);
-}
-
-static void common_reasoning_budget_free(struct llama_sampler * smpl) {
-    delete (common_reasoning_budget_ctx *) smpl->ctx;
-}
+static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl);
+static void common_reasoning_budget_free(struct llama_sampler * smpl);
 
 static struct llama_sampler_i common_reasoning_budget_i = {
     /* .name              = */ common_reasoning_budget_name,
@@ -190,6 +177,22 @@ static struct llama_sampler_i common_reasoning_budget_i = {
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
 };
+
+static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
+    // Deep clone: preserve ALL internal state (matcher positions, remaining count, force_pos),
+    // not just budget+state. Previously delegated to init_state which hardcoded matcher.pos=0,
+    // remaining=budget, force_pos=0 — under speculative decoding, partial-acceptance restores
+    // (slot.smpl = move(smpl_save)) refunded the budget every batch, so it never exhausted.
+    const auto * src = (const common_reasoning_budget_ctx *) smpl->ctx;
+    return llama_sampler_init(
+        /* .iface = */ &common_reasoning_budget_i,
+        /* .ctx   = */ new common_reasoning_budget_ctx(*src)
+    );
+}
+
+static void common_reasoning_budget_free(struct llama_sampler * smpl) {
+    delete (common_reasoning_budget_ctx *) smpl->ctx;
+}
 
 static struct llama_sampler * common_reasoning_budget_init_state(
         const struct llama_vocab             * vocab,
