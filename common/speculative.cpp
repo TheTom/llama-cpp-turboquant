@@ -597,21 +597,29 @@ struct common_speculative_state_mtp : public common_speculative_state {
             attn_pos = 0;
         }
 
+        // Async pipeline (see plan async-mtp-pipeline): submit the request to the
+        // dedicated MTP worker thread, then immediately wait. This routes the work
+        // through sched_mtp instead of the target's sched, isolating the MTP graph
+        // from target-decode reuse / reset cycles. True overlap with target verify
+        // requires pipeline depth 2 (drafts from cycle K-1 used in cycle K) plus
+        // optimistic last-token prediction — out of scope for this phase.
         draft_tokens.resize((size_t) n_steps);
-        const int32_t rc = llama_decode_mtp(
+        int32_t rc = llama_decode_mtp_async(
                 ctx_tgt,
                 seq_id,
                 attn_pos,
                 id_last,
                 h_prev.data(),
-                n_steps,
-                draft_tokens.data(),
-                /*out_logits*/ nullptr,
-                /*out_h_prev_last*/ nullptr);
-
+                n_steps);
         if (rc != 0) {
-            LOG_ERR("%s: llama_decode_mtp failed (%d)\n", __func__, (int) rc);
+            LOG_ERR("%s: llama_decode_mtp_async failed (%d)\n", __func__, (int) rc);
             draft_tokens.clear();
+        } else {
+            rc = llama_decode_mtp_wait(ctx_tgt, draft_tokens.data(), /*out_h_prev_last*/ nullptr);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode_mtp_wait failed (%d)\n", __func__, (int) rc);
+                draft_tokens.clear();
+            }
         }
 
         // Snapshot accepted-draft counter for next call's zero-accept detection.

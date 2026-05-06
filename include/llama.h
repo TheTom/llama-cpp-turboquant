@@ -994,6 +994,33 @@ extern "C" {
             float * out_logits,
             float * out_h_prev_last);
 
+    // Async MTP draft pipeline (see plan async-mtp-pipeline). Submits a draft request
+    // to a dedicated worker thread that runs the MTP graph on its own ggml_backend_sched.
+    // This lets the main thread proceed with target verify while MTP encodes in parallel.
+    //
+    // Contract:
+    //   - At most one in-flight request per context. Submitting a second _async without
+    //     calling _wait first returns -7 (and leaves the previous request in flight).
+    //   - h_prev must hold n_embd_backbone floats; the buffer is copied into the request,
+    //     so the caller may free or modify it after _async returns.
+    //   - The caller must guarantee that target KV positions ≤ attn_pos remain stable
+    //     until _wait returns. With the current append-only KV cache this is implicitly
+    //     true as long as no cache eviction is triggered between _async and _wait.
+    LLAMA_API int32_t llama_decode_mtp_async(
+            struct llama_context * ctx,
+            llama_seq_id  seq_id,
+            llama_pos     attn_pos,
+            llama_token   last_token,
+            const float * h_prev,
+            int32_t       n_steps);
+
+    // Block until the in-flight MTP request completes. Copies up to n_steps drafts into
+    // out_drafts and the last hidden state into out_h_prev_last (may be NULL).
+    LLAMA_API int32_t llama_decode_mtp_wait(
+            struct llama_context * ctx,
+            llama_token * out_drafts,
+            float       * out_h_prev_last);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

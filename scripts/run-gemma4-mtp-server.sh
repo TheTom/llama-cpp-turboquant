@@ -87,7 +87,7 @@ if [[ "$SPEC" == "mtp" ]]; then
   ARGS+=(
     --mtp-head "$DRAFT"
     --spec-type mtp
-    --draft-block-size "${DRAFT_BLOCK_SIZE:-4}"
+    --draft-block-size "${DRAFT_BLOCK_SIZE:-3}"
     --draft-max "${DRAFT_MAX:-16}"
     --draft-min "${DRAFT_MIN:-0}"
   )

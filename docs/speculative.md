@@ -39,6 +39,51 @@ llama-server \
 
 Repo helper (defaults under `.scratch/`): `scripts/run-gemma4-mtp-server.sh`.
 
+#### Async MTP draft pipeline
+
+The MTP draft head runs on a dedicated `ggml_backend_sched` (`sched_mtp`) and a
+worker thread, isolated from the target's scheduler. This is exposed via two C
+APIs:
+
+```c
+LLAMA_API int32_t llama_decode_mtp_async(
+        struct llama_context * ctx,
+        llama_seq_id  seq_id,
+        llama_pos     attn_pos,
+        llama_token   last_token,
+        const float * h_prev,
+        int32_t       n_steps);
+
+LLAMA_API int32_t llama_decode_mtp_wait(
+        struct llama_context * ctx,
+        llama_token * out_drafts,
+        float       * out_h_prev_last);
+```
+
+Contract:
+
+- At most **one in-flight request per context**. Calling `_async` while a
+  previous request has not been waited on returns `-7`.
+- `h_prev` is copied into the request, so the caller may free or reuse it
+  immediately after `_async` returns.
+- Target KV positions ≤ `attn_pos` must remain stable until `_wait` returns.
+  The current append-only KV cache satisfies this as long as no eviction or
+  overlapping `seq_rm` happens between submit and wait.
+- `llama_decode_mtp(...)` is preserved as a backward-compatible synchronous
+  facade (= `_async` immediately followed by `_wait`).
+
+Why use the async pair?
+
+- **Graph-cache isolation**: MTP graph reuse is no longer invalidated by target
+  decode resets. On Gemma 4 + Q4_K_XL, this alone delivered **~+8% throughput**
+  in single-slot benchmarks (95.3 → 102.8 tps at `--draft-block-size 3`), with
+  identical accept rate.
+- **Concurrency hook** for future work: the worker thread is the foundation for
+  pipeline-depth-2 speculation, where MTP encoding for cycle K+1 can overlap
+  with target verify of cycle K. Single-slot single-stream MTP cannot achieve
+  full overlap without optimistic last-token prediction (drafts for K+1 use
+  `drafts_K[-1]` as the assumed accepted token).
+
 #### Reconverting `gemma4_assistant` from Hugging Face
 
 Example (paths relative to repo root):

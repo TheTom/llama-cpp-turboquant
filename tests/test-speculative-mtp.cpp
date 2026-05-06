@@ -103,6 +103,69 @@ int main() {
             llama_model_free(model_tgt);
             return 1;
         }
+
+        // Async pipeline parity test (Phase E of async-mtp-pipeline plan):
+        // sync facade and async submit/wait must agree on drafts for identical inputs.
+        {
+            llama_token drafts_async[4] = {};
+            std::vector<float> h_async = h_prev;
+            const int32_t rc_a = llama_decode_mtp_async(ctx, 0, attn_pos, bos, h_async.data(), 1);
+            if (rc_a != 0) {
+                std::cerr << "llama_decode_mtp_async returned " << rc_a << "\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+            const int32_t rc_w = llama_decode_mtp_wait(ctx, drafts_async, nullptr);
+            if (rc_w != 0) {
+                std::cerr << "llama_decode_mtp_wait returned " << rc_w << "\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+            if (drafts_async[0] != drafts[0]) {
+                std::cerr << "async/sync MTP draft mismatch: sync=" << drafts[0]
+                          << " async=" << drafts_async[0] << "\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+        }
+
+        // Double-submit must be rejected without corrupting state.
+        {
+            std::vector<float> h2 = h_prev;
+            if (llama_decode_mtp_async(ctx, 0, attn_pos, bos, h2.data(), 1) != 0) {
+                std::cerr << "first async submit should succeed\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+            if (llama_decode_mtp_async(ctx, 0, attn_pos, bos, h2.data(), 1) != -7) {
+                std::cerr << "second async submit before wait should return -7\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+            llama_token drain[4] = {};
+            if (llama_decode_mtp_wait(ctx, drain, nullptr) != 0) {
+                std::cerr << "drain wait should succeed\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+        }
+
+        // Wait without prior submit must report "no in-flight" (-7).
+        {
+            llama_token drain[4] = {};
+            if (llama_decode_mtp_wait(ctx, drain, nullptr) != -7) {
+                std::cerr << "wait without submit should return -7\n";
+                llama_free(ctx);
+                llama_model_free(model_tgt);
+                return 1;
+            }
+        }
     }
 
     llama_free(ctx);

@@ -318,8 +318,11 @@ struct common_params_speculative {
     int32_t n_max   = 16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min   = 0; // minimum number of draft tokens to use for speculative decoding
 
-    // MTP (Gemma 4 assistant): draft block size B produces B-1 draft tokens per round (default 4)
-    int32_t draft_block_size = 4;
+    // MTP (Gemma 4 assistant): draft block size B produces B-1 draft tokens per round.
+    // Default 3 (= 2 chained MTP draft steps): empirically the universal sweet spot for
+    // both f16 and turbo3 KV cache types after the chained MTP draft optimization
+    // (see docs/speculative.md and bench-block-size scripts).
+    int32_t draft_block_size = 3;
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
 

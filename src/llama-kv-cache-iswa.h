@@ -71,6 +71,14 @@ public:
     llama_kv_cache * get_swa () const;
 
     // Read-only MTP cross-attention: pairs base+swa slot infos with a 1-token ubatch. Do not call apply() before compute.
+    //
+    // Async MTP pipeline contract (see plan async-mtp-pipeline, Phase E):
+    //   When the MTP graph is computed on a worker thread (via decode_mtp_async +
+    //   sched_mtp), the snapshot of slot info captured here must remain valid until
+    //   decode_mtp_wait returns. The current append-only KV cache satisfies this as
+    //   long as no cache eviction or seq_rm overlapping positions ≤ attn_pos happens
+    //   between submit and wait. Callers must therefore ensure target llama_decode
+    //   for the same seq_id does not trigger eviction during an in-flight MTP request.
     llama_memory_context_ptr init_mtp(llama_seq_id seq_id, llama_ubatch ubatch);
 
 private:

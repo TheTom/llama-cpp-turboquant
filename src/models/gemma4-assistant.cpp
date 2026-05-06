@@ -27,34 +27,43 @@ static int32_t gemma4_mtp_kv_layer_last_in_range(
     return best;
 }
 
-llm_build_gemma4_mtp::llm_build_gemma4_mtp(
-        const llama_model & target_model,
-        const llama_model & mtp_model,
-        const llm_graph_params & params) :
-        llm_graph_context(graph_params_for_mtp(params, mtp_model)),
-        target(target_model),
-        mtp(mtp_model) {
+// Build a single MTP step: token embedding (from target) + h_prev -> N transformer blocks ->
+// (post-projected backbone hidden, vocabulary logits).
+//
+// Used by both the single-step path (n_mtp_steps==1) and the chained path
+// (n_mtp_steps>1, called n_mtp_steps times within the same graph).
+//
+// `pos_step` must be a scalar I32 tensor [1] holding the absolute target position
+// for this step's RoPE (the cross-attn mask is shared across steps because the
+// target's KV cache only contains positions ≤ attn_pos and all step positions
+// are > attn_pos, so causal/SWA admit all target cells uniformly).
+static void gemma4_mtp_build_one_step(
+        const llm_graph_context & gctx,
+        const llama_model & target,
+        const llama_model & mtp,
+        llm_graph_input_attn_kv_iswa * inp_attn,
+        ggml_tensor * tok_step,            // I32 [1]
+        ggml_tensor * h_step,              // F32 [n_bb, 1]
+        ggml_tensor * pos_step,            // I32 [1]
+        ggml_tensor ** out_logits,         // F32 [n_vocab, 1]
+        ggml_tensor ** out_h_post) {       // F32 [n_bb, 1]
+    auto * ctx0    = gctx.ctx0;
+    auto * gf      = gctx.gf;
+    const auto & hparams = gctx.hparams;
+    const auto & cparams = gctx.cparams;
+    const int    n_layer = (int) gctx.n_layer;
+    const int    n_tokens     = (int) gctx.n_tokens;
+    const int    n_ctx_orig   = (int) gctx.n_ctx_orig;
+    const int    rope_type    = gctx.rope_type;
+    const float  ext_factor   = gctx.ext_factor;
+    const float  attn_factor  = gctx.attn_factor;
+    const float  beta_fast    = gctx.beta_fast;
+    const float  beta_slow    = gctx.beta_slow;
+    auto         cb = [&](ggml_tensor * t, const char * name, int il) { gctx.cb(t, name, il); };
+
     const int64_t n_bb = mtp.hparams.n_embd_backbone;
-    GGML_ASSERT(n_bb > 0);
-    GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
-    GGML_ASSERT(!mtp.hparams.use_ordered_embeddings && "ordered embeddings (centroid head) not implemented in MTP graph yet");
 
-    ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-    ggml_set_input(inp_tok);
-    cb(inp_tok, "mtp_inp_last_token", -1);
-
-    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_bb, 1);
-    ggml_set_input(inp_h);
-    cb(inp_h, "mtp_inp_h_prev", -1);
-
-    {
-        auto inp_wrap = std::make_unique<llm_graph_input_mtp>();
-        inp_wrap->inp_last_token = inp_tok;
-        inp_wrap->inp_h_prev     = inp_h;
-        res->add_input(std::move(inp_wrap));
-    }
-
-    ggml_tensor * tok_e = ggml_get_rows(ctx0, target.tok_embd, inp_tok);
+    ggml_tensor * tok_e = ggml_get_rows(ctx0, target.tok_embd, tok_step);
     cb(tok_e, "mtp_tgt_tok_embd", -1);
 
     // Gemma 4 scales token embeddings by sqrt(hidden_size) at the input pipeline
@@ -63,17 +72,13 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
     tok_e = ggml_scale(ctx0, tok_e, sqrtf((float) n_bb));
     cb(tok_e, "mtp_tgt_tok_embd_scaled", -1);
 
-    ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, inp_h, 0);
+    ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, h_step, 0);
     cb(inp_cat, "mtp_concat", -1);
 
-    ggml_tensor * inpL = build_lora_mm(mtp.mtp_pre_projection, inp_cat);
+    ggml_tensor * inpL = gctx.build_lora_mm(mtp.mtp_pre_projection, inp_cat);
     cb(inpL, "mtp_pre_proj_out", -1);
 
     ggml_build_forward_expand(gf, inpL);
-
-    ggml_tensor * inp_pos = build_inp_pos();
-
-    auto * inp_attn = build_attn_inp_kv_iswa();
 
     ggml_tensor * cur = nullptr;
 
@@ -87,7 +92,7 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
         const float freq_scale_l = mtp.get_rope_freq_scale(cparams, il);
         const int   n_rot_l      = hparams.n_rot(il);
 
-        cur = build_norm(inpL, mtp.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = gctx.build_norm(inpL, mtp.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         ggml_tensor * freq_factors = nullptr;
@@ -95,15 +100,15 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
             freq_factors = mtp.layers[il].rope_freqs;
         }
 
-        ggml_tensor * Qcur = build_lora_mm(mtp.layers[il].wq, cur);
+        ggml_tensor * Qcur = gctx.build_lora_mm(mtp.layers[il].wq, cur);
         cb(Qcur, "Qcur", il);
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
-        Qcur = build_norm(Qcur, mtp.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        Qcur = gctx.build_norm(Qcur, mtp.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
         cb(Qcur, "Qcur_normed", il);
 
-        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+        Qcur = ggml_rope_ext(ctx0, Qcur, pos_step, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                              ext_factor, attn_factor, beta_fast, beta_slow);
         cb(Qcur, "Qcur_pos", il);
 
@@ -128,10 +133,10 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
         const int64_t kv_embd_head_v = target.hparams.n_embd_head_v(il_kv);
         const int64_t kv_n_head_v    = target.hparams.n_head_kv(il_kv);
 
-        cur = build_attn_mtp(inp_attn, mtp.layers[il].wo, nullptr, Qcur, nullptr, nullptr, nullptr,
+        cur = gctx.build_attn_mtp(inp_attn, mtp.layers[il].wo, nullptr, Qcur, nullptr, nullptr, nullptr,
                 hparams.f_attention_scale, il, il_kv, read_swa, kv_embd_head_v, kv_n_head_v, use_k_as_v);
 
-        cur = build_norm(cur, mtp.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        cur = gctx.build_norm(cur, mtp.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_post_norm", il);
 
         ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
@@ -139,10 +144,10 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
 
         GGML_ASSERT(mtp.layers[il].ffn_gate_inp == nullptr && "gemma4_assistant MTP does not support MoE FFN");
 
-        cur = build_norm(attn_out, mtp.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = gctx.build_norm(attn_out, mtp.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
+        cur = gctx.build_ffn(cur,
                 mtp.layers[il].ffn_up,   nullptr, nullptr,
                 mtp.layers[il].ffn_gate, nullptr, nullptr,
                 mtp.layers[il].ffn_down, nullptr, nullptr,
@@ -150,7 +155,7 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
                 LLM_FFN_GELU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
-        cur = build_norm(cur, mtp.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
+        cur = gctx.build_norm(cur, mtp.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
         cb(cur, "ffn_post_norm", il);
 
         cur = ggml_add(ctx0, cur, attn_out);
@@ -160,7 +165,7 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
             cb(cur, "out_scaled", il);
         }
 
-        cur = build_cvec(cur, il);
+        cur = gctx.build_cvec(cur, il);
         cb(cur, "l_out", il);
 
         inpL = cur;
@@ -168,16 +173,15 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
 
     cur = inpL;
 
-    cur = build_norm(cur, mtp.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cur = gctx.build_norm(cur, mtp.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
     ggml_tensor * h_inner = cur;
 
-    ggml_tensor * backbone = build_lora_mm(mtp.mtp_post_projection, h_inner);
+    ggml_tensor * backbone = gctx.build_lora_mm(mtp.mtp_post_projection, h_inner);
     cb(backbone, "mtp_post_proj_out", -1);
-    res->t_embd = backbone;
 
-    cur = build_lora_mm(mtp.tok_embd, h_inner);
+    cur = gctx.build_lora_mm(mtp.tok_embd, h_inner);
 
     if (hparams.f_final_logit_softcapping) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
@@ -186,7 +190,50 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
     }
 
     cb(cur, "result_output", -1);
-    res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    *out_logits = cur;
+    *out_h_post = backbone;
+}
+
+llm_build_gemma4_mtp::llm_build_gemma4_mtp(
+        const llama_model & target_model,
+        const llama_model & mtp_model,
+        const llm_graph_params & params) :
+        llm_graph_context(graph_params_for_mtp(params, mtp_model)),
+        target(target_model),
+        mtp(mtp_model) {
+    const int64_t n_bb = mtp.hparams.n_embd_backbone;
+    GGML_ASSERT(n_bb > 0);
+    GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
+    GGML_ASSERT(!mtp.hparams.use_ordered_embeddings && "ordered embeddings (centroid head) not implemented in MTP graph yet");
+
+    // Single-step MTP build. Async pipeline (see plan async-mtp-pipeline) calls this once
+    // per draft step on a dedicated worker thread + dedicated ggml_backend_sched.
+    ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_input(inp_tok);
+    cb(inp_tok, "mtp_inp_last_token", -1);
+
+    ggml_tensor * inp_h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_bb, 1);
+    ggml_set_input(inp_h);
+    cb(inp_h, "mtp_inp_h_prev", -1);
+
+    {
+        auto inp_wrap = std::make_unique<llm_graph_input_mtp>();
+        inp_wrap->inp_last_token = inp_tok;
+        inp_wrap->inp_h_prev     = inp_h;
+        res->add_input(std::move(inp_wrap));
+    }
+
+    ggml_tensor * inp_pos = build_inp_pos();
+    auto *        inp_attn = build_attn_inp_kv_iswa();
+
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * h_post = nullptr;
+    gemma4_mtp_build_one_step(*this, target, mtp, inp_attn,
+            inp_tok, inp_h, inp_pos, &logits, &h_post);
+
+    res->t_embd   = h_post;
+    res->t_logits = logits;
+
+    ggml_build_forward_expand(gf, logits);
 }
