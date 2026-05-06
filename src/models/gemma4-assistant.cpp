@@ -28,7 +28,7 @@ static int32_t gemma4_mtp_kv_layer_last_in_range(
 }
 
 // Build a single MTP step: token embedding (from target) + h_prev -> N transformer blocks ->
-// (post-projected backbone hidden, vocabulary logits).
+// (post-projected backbone hidden, vocabulary logits, argmax token id).
 //
 // Used by both the single-step path (n_mtp_steps==1) and the chained path
 // (n_mtp_steps>1, called n_mtp_steps times within the same graph).
@@ -37,6 +37,10 @@ static int32_t gemma4_mtp_kv_layer_last_in_range(
 // for this step's RoPE (the cross-attn mask is shared across steps because the
 // target's KV cache only contains positions ≤ attn_pos and all step positions
 // are > attn_pos, so causal/SWA admit all target cells uniformly).
+//
+// `out_argmax` (I32 [1]) is computed on-device so the host can read a 4-byte
+// token id instead of dragging the full F32 [n_vocab, 1] logits row back over
+// PCIe/Metal-shared and running a sequential argmax on the CPU.
 static void gemma4_mtp_build_one_step(
         const llm_graph_context & gctx,
         const llama_model & target,
@@ -46,7 +50,8 @@ static void gemma4_mtp_build_one_step(
         ggml_tensor * h_step,              // F32 [n_bb, 1]
         ggml_tensor * pos_step,            // I32 [1]
         ggml_tensor ** out_logits,         // F32 [n_vocab, 1]
-        ggml_tensor ** out_h_post) {       // F32 [n_bb, 1]
+        ggml_tensor ** out_h_post,         // F32 [n_bb, 1]
+        ggml_tensor ** out_argmax) {       // I32 [1]
     auto * ctx0    = gctx.ctx0;
     auto * gf      = gctx.gf;
     const auto & hparams = gctx.hparams;
@@ -191,8 +196,15 @@ static void gemma4_mtp_build_one_step(
 
     cb(cur, "result_output", -1);
 
+    // Greedy argmax computed on-device; reading this back is 4 bytes vs n_vocab*4
+    // bytes for the raw logits row. ggml_argmax over a 2D [n_vocab, 1] tensor
+    // returns I32 [1] (one index per row).
+    ggml_tensor * arg = ggml_argmax(ctx0, cur);
+    cb(arg, "result_argmax", -1);
+
     *out_logits = cur;
     *out_h_post = backbone;
+    *out_argmax = arg;
 }
 
 llm_build_gemma4_mtp::llm_build_gemma4_mtp(
@@ -229,11 +241,17 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
 
     ggml_tensor * logits = nullptr;
     ggml_tensor * h_post = nullptr;
+    ggml_tensor * arg    = nullptr;
     gemma4_mtp_build_one_step(*this, target, mtp, inp_attn,
-            inp_tok, inp_h, inp_pos, &logits, &h_post);
+            inp_tok, inp_h, inp_pos, &logits, &h_post, &arg);
 
     res->t_embd   = h_post;
     res->t_logits = logits;
+    res->t_argmax = arg;
 
-    ggml_build_forward_expand(gf, logits);
+    // Expand the argmax (the only output the host actually consumes for greedy MTP);
+    // the backend will pull in `logits` automatically as its dependency, and `h_post`
+    // is also built into the graph via ggml_build_forward_expand on the backbone path.
+    ggml_build_forward_expand(gf, arg);
+    ggml_build_forward_expand(gf, h_post);
 }

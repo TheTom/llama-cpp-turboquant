@@ -2641,9 +2641,11 @@ int32_t llama_context::decode_mtp_sync(
     }
 
     // Sequential MTP draft on the dedicated sched_mtp: per step run a fresh single-token
-    // graph; each step's logits feed CPU argmax → next step's last_token; h_post → next
-    // step's h_prev. Position passed via ubatch.pos[0] = attn_pos+1+k drives both RoPE
-    // and the cross-attention causal/SWA mask.
+    // graph; each step's argmax feeds next step's last_token; h_post → next step's h_prev.
+    // Position passed via ubatch.pos[0] = attn_pos+1+k drives both RoPE and the
+    // cross-attention causal/SWA mask. Greedy argmax is computed inside the graph
+    // (see llm_build_gemma4_mtp), so we read 4 bytes per step instead of n_vocab*4.
+    // The full F32 logits row is only fetched on demand (out_logits != nullptr).
     for (int32_t k = 0; k < n_steps; ++k) {
         data->token[0] = last_token;
         data->pos[0]   = attn_pos + 1 + (llama_pos) k;
@@ -2664,33 +2666,25 @@ int32_t llama_context::decode_mtp_sync(
 
         ggml_backend_sched_synchronize(sched_mtp.get());
 
-        ggml_tensor * t_logits = res->get_logits();
-        GGML_ASSERT(t_logits);
+        ggml_tensor * t_arg = res->get_argmax();
+        GGML_ASSERT(t_arg && "MTP graph must publish in-graph argmax tensor");
 
-        std::vector<float> logits_row((size_t) n_vocab);
-        ggml_backend_tensor_get(t_logits, logits_row.data(), 0, (size_t) n_vocab * sizeof(float));
+        int32_t best_i32 = 0;
+        ggml_backend_tensor_get(t_arg, &best_i32, 0, sizeof(int32_t));
+        out_drafts[k] = (llama_token) best_i32;
 
-        llama_token best = 0;
-        float       lmax = -INFINITY;
-        for (int32_t i = 0; i < n_vocab; ++i) {
-            if (logits_row[(size_t) i] > lmax) {
-                lmax = logits_row[(size_t) i];
-                best = (llama_token) i;
-            }
-        }
-
-        out_drafts[k] = best;
         if (out_logits) {
-            std::memcpy(out_logits + (int64_t) k * n_vocab,
-                        logits_row.data(),
-                        (size_t) n_vocab * sizeof(float));
+            ggml_tensor * t_logits = res->get_logits();
+            GGML_ASSERT(t_logits);
+            ggml_backend_tensor_get(t_logits, out_logits + (int64_t) k * n_vocab,
+                                    0, (size_t) n_vocab * sizeof(float));
         }
 
         ggml_tensor * t_post = res->get_embd();
         GGML_ASSERT(t_post);
         ggml_backend_tensor_get(t_post, h_prev, 0, n_bb * sizeof(float));
 
-        last_token = best;
+        last_token = (llama_token) best_i32;
     }
 
     if (out_h_prev_last) {
@@ -2778,7 +2772,6 @@ int32_t llama_context::decode_mtp_run(const mtp_request & req, mtp_response & re
         return -3;
     }
 
-    const int32_t  n_vocab = model.vocab.n_tokens();
     const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
 
     auto data = std::make_shared<llama_ubatch::data_t>();
@@ -2840,27 +2833,22 @@ int32_t llama_context::decode_mtp_run(const mtp_request & req, mtp_response & re
 
         ggml_backend_sched_synchronize(sched_mtp.get());
 
-        ggml_tensor * t_logits = res->get_logits();
-        GGML_ASSERT(t_logits);
+        // In-graph argmax: read a single I32 token id (4 bytes) from device instead of
+        // pulling the full F32 [n_vocab, 1] logits row and running a serial CPU argmax.
+        // For greedy MTP draft this is bit-identical to the previous CPU argmax (modulo
+        // tie-breaking, which ggml_argmax resolves by smallest index — same as our loop).
+        ggml_tensor * t_arg = res->get_argmax();
+        GGML_ASSERT(t_arg && "MTP graph must publish in-graph argmax tensor");
 
-        std::vector<float> logits_row((size_t) n_vocab);
-        ggml_backend_tensor_get(t_logits, logits_row.data(), 0, (size_t) n_vocab * sizeof(float));
-
-        llama_token best = 0;
-        float       lmax = -INFINITY;
-        for (int32_t i = 0; i < n_vocab; ++i) {
-            if (logits_row[(size_t) i] > lmax) {
-                lmax = logits_row[(size_t) i];
-                best = (llama_token) i;
-            }
-        }
-        resp.drafts[(size_t) k] = best;
+        int32_t best_i32 = 0;
+        ggml_backend_tensor_get(t_arg, &best_i32, 0, sizeof(int32_t));
+        resp.drafts[(size_t) k] = (llama_token) best_i32;
 
         ggml_tensor * t_post = res->get_embd();
         GGML_ASSERT(t_post);
         ggml_backend_tensor_get(t_post, h.data(), 0, n_bb * sizeof(float));
 
-        last_token = best;
+        last_token = (llama_token) best_i32;
     }
 
     resp.h_prev_last = std::move(h);

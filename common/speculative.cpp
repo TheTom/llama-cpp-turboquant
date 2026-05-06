@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -518,6 +520,55 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 };
 
+// Optional NDJSON tracer for MTP draft/accept events, gated by env LLAMA_MTP_ACC_TRACE.
+// Value semantics:
+//   unset / "0" / ""           -> disabled
+//   "1"                        -> stderr
+//   anything else              -> treated as a file path (append mode)
+// Each event is one JSON object per line. Disabled at zero overhead; otherwise computes
+// h_prev L2 norm (n_bb floats) per draft, which is negligible vs the MTP step itself.
+namespace {
+struct mtp_acc_tracer {
+    bool       enabled = false;
+    FILE *     fp      = nullptr;
+    std::mutex mu;
+
+    mtp_acc_tracer() {
+        const char * v = std::getenv("LLAMA_MTP_ACC_TRACE");
+        if (!v || v[0] == '\0' || std::strcmp(v, "0") == 0) {
+            return;
+        }
+        if (std::strcmp(v, "1") == 0) {
+            fp = stderr;
+        } else {
+            fp = std::fopen(v, "a");
+        }
+        enabled = (fp != nullptr);
+    }
+
+    ~mtp_acc_tracer() {
+        if (fp && fp != stderr) {
+            std::fclose(fp);
+        }
+    }
+
+    void writeln(const std::string & line) {
+        if (!enabled) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        std::fputs(line.c_str(), fp);
+        std::fputc('\n', fp);
+        std::fflush(fp);
+    }
+};
+
+mtp_acc_tracer & mtp_tracer() {
+    static mtp_acc_tracer t;
+    return t;
+}
+} // namespace
+
 struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt;
     llama_seq_id    seq_id = 0; // target-side sequence id (set by host, e.g. server slot.id)
@@ -534,6 +585,65 @@ struct common_speculative_state_mtp : public common_speculative_state {
     bool                         has_pending      = false;
     int32_t                      pending_n_steps  = 0;
     common_params_speculative    last_spec_params;
+
+    // ---- MTP acceptance tracing (LLAMA_MTP_ACC_TRACE), no behavior change ----
+    int        trace_iter           = 0;
+    int        trace_submit_id_last = -1;     // id_last passed to the most recent submit
+    int        trace_submit_h_idx   = -1;     // h_idx used for h_prev at submit time
+    llama_pos  trace_submit_attn_pos = -1;    // attn_pos used at submit time
+    float      trace_submit_h_l2    = 0.0f;   // L2 norm of h_prev at submit time
+    int32_t    trace_submit_n_steps = 0;
+    int        trace_last_n_drafted = 0;      // drafts.size() returned to caller (for accept pairing)
+
+    static float compute_h_l2(const float * h, int32_t n) {
+        if (!h || n <= 0) {
+            return 0.0f;
+        }
+        double s = 0.0;
+        for (int32_t i = 0; i < n; ++i) {
+            const float v = h[i];
+            s += (double) v * (double) v;
+        }
+        return (float) std::sqrt(s);
+    }
+
+    void trace_emit_draft(const llama_tokens & drafts, const char * path) {
+        trace_last_n_drafted = (int) drafts.size();
+        if (!mtp_tracer().enabled) {
+            return;
+        }
+        std::ostringstream oss;
+        oss << "{\"evt\":\"mtp_draft\""
+            << ",\"iter\":" << trace_iter
+            << ",\"path\":\"" << path << "\""
+            << ",\"seq_id\":" << (int) seq_id
+            << ",\"id_last\":" << trace_submit_id_last
+            << ",\"h_idx\":" << trace_submit_h_idx
+            << ",\"attn_pos\":" << (int) trace_submit_attn_pos
+            << ",\"n_steps\":" << trace_submit_n_steps
+            << ",\"h_l2\":" << std::fixed << std::setprecision(4) << trace_submit_h_l2
+            << ",\"drafts\":[";
+        for (size_t i = 0; i < drafts.size(); ++i) {
+            if (i) oss << ',';
+            oss << (int) drafts[i];
+        }
+        oss << "]}";
+        mtp_tracer().writeln(oss.str());
+    }
+
+    void trace_emit_accept(int n_accepted) {
+        if (!mtp_tracer().enabled) {
+            return;
+        }
+        std::ostringstream oss;
+        oss << "{\"evt\":\"mtp_accept\""
+            << ",\"iter\":" << trace_iter
+            << ",\"n_accepted\":" << n_accepted
+            << ",\"n_drafted_prev\":" << trace_last_n_drafted
+            << "}";
+        mtp_tracer().writeln(oss.str());
+        ++trace_iter;
+    }
 
     explicit common_speculative_state_mtp(enum common_speculative_type type, llama_context * ctx_tgt)
         : common_speculative_state(type), ctx_tgt(ctx_tgt) {
@@ -611,6 +721,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
             zero_accept_streak = 0;
             prev_n_acc_drafts  = n_acc_drafts;
             mtp_drain_pending_discard();
+            trace_submit_id_last  = (int) id_last;
+            trace_submit_n_steps  = 0;
+            trace_emit_draft(draft_tokens, "skip-streak");
             return; // empty draft_tokens — server falls back to single-token verify
         }
 
@@ -619,6 +732,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         if (n_steps <= 0) {
             mtp_drain_pending_discard();
+            trace_submit_id_last  = (int) id_last;
+            trace_submit_n_steps  = 0;
+            trace_emit_draft(draft_tokens, "skip-nsteps");
             return;
         }
 
@@ -640,6 +756,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
                     draft_tokens.clear();
                 }
                 prev_n_acc_drafts = n_acc_drafts;
+                // submit-time fields were captured by prepare_next() of previous iter
+                trace_emit_draft(draft_tokens, "lazy");
                 return;
             }
         }
@@ -660,6 +778,15 @@ struct common_speculative_state_mtp : public common_speculative_state {
         if (attn_pos < 0) {
             attn_pos = 0;
         }
+
+        // Capture submit-time fields for tracing.
+        trace_submit_id_last  = (int) id_last;
+        trace_submit_h_idx    = h_idx;
+        trace_submit_attn_pos = attn_pos;
+        trace_submit_n_steps  = n_steps;
+        trace_submit_h_l2     = mtp_tracer().enabled
+                                    ? compute_h_l2(h_prev.data(), n_bb)
+                                    : 0.0f;
 
         // Bootstrap path (first iter or after drain): submit and wait immediately on sched_mtp.
         draft_tokens.resize((size_t) n_steps);
@@ -683,6 +810,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         // Snapshot accepted-draft counter for next call's zero-accept detection.
         prev_n_acc_drafts = n_acc_drafts;
+        trace_emit_draft(draft_tokens, "sync");
     }
 
     void accept(uint16_t n_accepted) override {
@@ -732,6 +860,15 @@ struct common_speculative_state_mtp : public common_speculative_state {
         if (attn_pos < 0) {
             attn_pos = 0;
         }
+
+        // Capture submit-time fields for tracing of the upcoming lazy-wait.
+        trace_submit_id_last  = (int) id_last;
+        trace_submit_h_idx    = h_idx;
+        trace_submit_attn_pos = attn_pos;
+        trace_submit_n_steps  = n_steps;
+        trace_submit_h_l2     = mtp_tracer().enabled
+                                    ? compute_h_l2(h_prev.data(), n_bb)
+                                    : 0.0f;
 
         const int32_t rc = llama_decode_mtp_async(
                 ctx_tgt,
@@ -1363,6 +1500,13 @@ llama_tokens common_speculative_draft(
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
+    // Trace BEFORE the early-out: the n_accepted==0 case is a zero-accept event we want to record.
+    if (mtp_tracer().enabled && spec && spec->curr_impl
+            && spec->curr_impl->type == COMMON_SPECULATIVE_TYPE_MTP) {
+        static_cast<common_speculative_state_mtp *>(spec->curr_impl)
+            ->trace_emit_accept((int) n_accepted);
+    }
+
     if (n_accepted == 0) {
         return;
     }
