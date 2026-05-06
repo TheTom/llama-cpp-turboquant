@@ -187,7 +187,8 @@ jobs:
           target_zip="artifact/llama-bin-win-cuda-12.4-x64.zip"
           if [ -f "$target_zip" ]; then
             echo "Adding CPU backend to $(basename "$target_zip")"
-            (cd "$temp_dir" && zip -r "$target_zip" .)
+            realpath_target_zip=$(realpath "$target_zip")
+            (cd "$temp_dir" && zip -r "$realpath_target_zip" .)
           fi
           
           rm -rf "$temp_dir"
