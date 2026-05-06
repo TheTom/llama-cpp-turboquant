@@ -555,6 +555,15 @@ struct llama_model {
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
+    // Gemma 4 MTP assistant weights (populated only when arch == GEMMA4_ASSISTANT nested model)
+    struct ggml_tensor * mtp_pre_projection  = nullptr;
+    struct ggml_tensor * mtp_post_projection = nullptr;
+    struct ggml_tensor * mtp_centroids       = nullptr;
+    struct ggml_tensor * mtp_token_ordering  = nullptr;
+
+    // Nested assistant model loaded via llama_model_load_mtp_from_file (owns mtp_* tensors above)
+    std::unique_ptr<llama_model> mtp_assistant;
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma

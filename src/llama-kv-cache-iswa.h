@@ -70,6 +70,9 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+    // Read-only MTP cross-attention: pairs base+swa slot infos with a 1-token ubatch. Do not call apply() before compute.
+    llama_memory_context_ptr init_mtp(llama_seq_id seq_id, llama_ubatch ubatch);
+
 private:
     const llama_hparams & hparams;
 

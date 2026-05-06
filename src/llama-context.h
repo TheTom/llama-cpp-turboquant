@@ -133,7 +133,24 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                           bool     apply_mctx = true);
+
+    llm_graph_params graph_params_mtp(
+            llm_graph_result * res,
+            const llama_ubatch & ubatch,
+            const llama_memory_context_i * mctx) const;
+
+    // Gemma4 MTP: greedy multi-step draft using nested gemma4_assistant + target KV (seq_id / attn_pos for masks).
+    int32_t decode_mtp(
+            llama_seq_id seq_id,
+            llama_pos attn_pos,
+            llama_token last_token,
+            float * h_prev,
+            int32_t n_steps,
+            llama_token * out_drafts,
+            float * out_logits,
+            float * out_h_prev_last);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);

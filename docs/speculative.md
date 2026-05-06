@@ -13,6 +13,43 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### Gemma 4 MTP assistant (`mtp`)
+
+For **Gemma 4** targets with the **gemma4_assistant** (MTP head) GGUF, use `--spec-type mtp`. The assistant is **not** a second `llama_context`: weights are loaded into the target model via `llama_model_load_mtp_from_file` (done automatically when using the server/CLI init path). Cross-attention in the MTP graph reads **K/V from the target KV cache** (shared full/sliding layers).
+
+- Prefer **`--mtp-head /path/to/assistant.gguf`** for clarity; **`--model-draft` (`-md`)** is accepted as a backward-compatible alias (same path field).
+- The draft block size \(B\) is **`--draft-block-size`** (the head proposes `B - 1` tokens per round; default 4).
+- **`--gpu-layers-draft` / `-ngld`** and **`-ctkd` / `-ctvd`** still apply to how the **assistant tensors** are placed and typed when the assistant GGUF is loaded; the target uses `-ngl` and `-ctk`/`-ctv`.
+
+Example (paths illustrative). **TurboQuant** KV on the target: `-ctk`/`-ctv`. Assistant-side cache types follow the draft flags if you use them for offload/quant selection.
+
+```sh
+llama-server \
+  -m /path/to/gemma-4-target.gguf \
+  --mtp-head /path/to/gemma-4-assistant.gguf \
+  --spec-type mtp \
+  --draft-block-size 4 \
+  -c 16384 \
+  -ngl 99 -ngld 99 \
+  -ctk turbo3 -ctv turbo3 \
+  -ctkd turbo3 -ctvd turbo3 \
+  -fa on \
+  --host 127.0.0.1 --port 8080
+```
+
+Repo helper (defaults under `.scratch/`): `scripts/run-gemma4-mtp-server.sh`.
+
+#### Reconverting `gemma4_assistant` from Hugging Face
+
+Example (paths relative to repo root):
+
+```sh
+python convert_hf_to_gguf.py .scratch/gemma-4-26B-A4B-it-assistant \
+  --outfile .scratch/gemma-assistant-mtp.gguf --outtype f16
+```
+
+Use the resulting GGUF as `--mtp-head` (or `-md`) with `--spec-type mtp`. Older assistant GGUFs with `token_embd.weight` first axis 2816 (backbone width) instead of 1024 will fail load; run `scripts/verify-gemma4-assistant-gguf.py` on the file to check.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.

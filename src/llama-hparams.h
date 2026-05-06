@@ -217,6 +217,13 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
+    // gemma4 MTP assistant (speculative drafter)
+    uint32_t n_centroids              = 0;
+    uint32_t centroid_top_k           = 0;
+    uint32_t n_embd_backbone          = 0;
+    bool     attention_k_eq_v         = false;
+    bool     use_ordered_embeddings   = false;
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;
