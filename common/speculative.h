@@ -48,5 +48,15 @@ llama_tokens common_speculative_draft(
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
+// After target sample/accept, submit MTP work for the next iteration so it can overlap
+// server bookkeeping until the next common_speculative_draft() (pipeline depth-2, no optimistic token).
+// Safe no-op for non-MTP implementations.
+void common_speculative_prepare_next(common_speculative * spec, llama_token id_last);
+
+// Drain any pending async draft from a previous prepare_next() and discard the result.
+// MUST be called before the host mutates target KV in a way that would invalidate the
+// snapshot (e.g. slot stop / release / new request seq_rm). Safe no-op when nothing is pending.
+void common_speculative_cancel(common_speculative * spec);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

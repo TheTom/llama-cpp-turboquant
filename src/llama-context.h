@@ -445,12 +445,6 @@ private:
     // or multi-worker variant where target encode and MTP encode actually overlap.
     std::mutex backend_cfg_mu;
 
-    // #region agent log
-    // Debug-only: submit timestamp (us, steady_clock) used by debug session c800c4
-    // to measure async submit -> wait latency. Kept zero unless LLAMA_DBG_C800C4 is set.
-    std::atomic<long long> mtp_dbg_submit_us{0};
-    // #endregion
-
     // Lazily create sched_mtp and reserve its compute buffers on the first MTP call.
     bool ensure_sched_mtp();
 

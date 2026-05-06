@@ -78,11 +78,19 @@ Why use the async pair?
   decode resets. On Gemma 4 + Q4_K_XL, this alone delivered **~+8% throughput**
   in single-slot benchmarks (95.3 → 102.8 tps at `--draft-block-size 3`), with
   identical accept rate.
-- **Concurrency hook** for future work: the worker thread is the foundation for
-  pipeline-depth-2 speculation, where MTP encoding for cycle K+1 can overlap
-  with target verify of cycle K. Single-slot single-stream MTP cannot achieve
-  full overlap without optimistic last-token prediction (drafts for K+1 use
-  `drafts_K[-1]` as the assumed accepted token).
+- **Pipeline depth-2 (pure overlap, `llama-server`)**: after target
+  sample/accept and `llama_memory_seq_rm`, the server calls
+  `common_speculative_prepare_next(spec, last_accepted_token)`, which submits
+  `llama_decode_mtp_async` for the *next* round. The blocking
+  `llama_decode_mtp_wait` is deferred to the start of the next
+  `common_speculative_draft`, so MTP work can overlap with post-accept
+  bookkeeping and token I/O. This uses the real sampled token (no optimistic
+  guess). **KV contract**: submit uses `attn_pos` after `seq_rm`; the next
+  `llama_decode` appends only positions `> attn_pos`, so backbone cells read by
+  MTP remain stable until `_wait` (append-only cache). Stale in-flight requests
+  are drained in `common_speculative_begin` and on skip / param-mismatch paths.
+- **Future work**: optimistic last-token prediction could hide an additional
+  `llama_decode` latency on hits but risks wrong drafts on misses.
 
 #### Reconverting `gemma4_assistant` from Hugging Face
 

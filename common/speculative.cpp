@@ -190,6 +190,14 @@ struct common_speculative_state {
             llama_tokens & result) = 0;
 
     virtual void accept(uint16_t n_accepted) = 0;
+
+    // Optional hook: MTP submits async draft work after accept for overlap with the next draft() wait.
+    virtual void prepare_next(llama_token id_last) {
+        GGML_UNUSED(id_last);
+    }
+
+    // Optional hook: drain any in-flight async work (prepare_next) and discard.
+    virtual void cancel() {}
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -522,15 +530,49 @@ struct common_speculative_state_mtp : public common_speculative_state {
     int             zero_accept_streak  = 0;
     int             skip_streak_threshold = 2;
 
+    // Pipeline depth-2: submit at end of iteration via prepare_next(); draft() waits first.
+    bool                         has_pending      = false;
+    int32_t                      pending_n_steps  = 0;
+    common_params_speculative    last_spec_params;
+
     explicit common_speculative_state_mtp(enum common_speculative_type type, llama_context * ctx_tgt)
         : common_speculative_state(type), ctx_tgt(ctx_tgt) {
         // MTP reads last backbone hidden from the target; keep embeddings on across decodes.
         llama_set_embeddings(ctx_tgt, true);
     }
 
+    // If a prepare_next() is in flight, block and discard its output (keeps worker contract sane).
+    void mtp_drain_pending_discard() {
+        if (!has_pending) {
+            return;
+        }
+        std::vector<llama_token> discard((size_t) pending_n_steps);
+        const int32_t rc = llama_decode_mtp_wait(ctx_tgt, discard.data(), /*out_h_prev_last*/ nullptr);
+        if (rc != 0) {
+            LOG_ERR("%s: llama_decode_mtp_wait (drain) failed (%d)\n", __func__, (int) rc);
+        }
+        has_pending     = false;
+        pending_n_steps = 0;
+    }
+
+    // Projected skip on the next draft() call, without mutating zero_accept_streak.
+    bool mtp_would_skip_next_draft() const {
+        const int proj = (n_call_draft > 0)
+                ? (n_acc_drafts == prev_n_acc_drafts ? zero_accept_streak + 1 : 0)
+                : zero_accept_streak;
+        return proj >= skip_streak_threshold;
+    }
+
+    static int32_t mtp_effective_n_steps(const common_params_speculative & p) {
+        const int32_t n_steps_raw = p.draft_block_size > 1 ? p.draft_block_size - 1 : 0;
+        return std::min(n_steps_raw, p.n_max);
+    }
+
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
         llama_set_embeddings(ctx_tgt, true);
+        // New request / prompt: do not leak in-flight MTP from the previous generation.
+        mtp_drain_pending_discard();
     }
 
     void draft(
@@ -549,6 +591,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
         const int32_t n_bb = (int32_t) n_bb_u;
 
+        last_spec_params = params;
+
         // Detect zero-accept of previous draft batch: n_acc_drafts only increments when
         // common_speculative_accept is called with n_accepted>0. So if it didn't move
         // since our previous draft() return, the previous batch produced 0 accepted drafts.
@@ -566,6 +610,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             // Reset streak after one skip; if next batch still misses (streak resumes), we'll skip again.
             zero_accept_streak = 0;
             prev_n_acc_drafts  = n_acc_drafts;
+            mtp_drain_pending_discard();
             return; // empty draft_tokens — server falls back to single-token verify
         }
 
@@ -573,13 +618,33 @@ struct common_speculative_state_mtp : public common_speculative_state {
         int32_t n_steps     = std::min(n_steps_raw, params.n_max);
 
         if (n_steps <= 0) {
+            mtp_drain_pending_discard();
             return;
         }
 
         llama_set_embeddings(ctx_tgt, true);
 
+        // Lazy wait: overlap MTP worker with server post-accept work from the previous iteration.
+        if (has_pending) {
+            if (pending_n_steps != n_steps) {
+                mtp_drain_pending_discard();
+                // Fall through to synchronous submit below.
+            } else {
+                draft_tokens.resize((size_t) n_steps);
+                const int32_t rc = llama_decode_mtp_wait(
+                        ctx_tgt, draft_tokens.data(), /*out_h_prev_last*/ nullptr);
+                has_pending     = false;
+                pending_n_steps = 0;
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode_mtp_wait failed (%d)\n", __func__, (int) rc);
+                    draft_tokens.clear();
+                }
+                prev_n_acc_drafts = n_acc_drafts;
+                return;
+            }
+        }
+
         std::vector<float> h_prev((size_t) n_bb, 0.0f);
-        bool h_tgt_used = false;
         // Use the explicit h_idx pointing at the last accepted output (set by the host after
         // sample_and_accept_n). If unset, fall back to -1 (last output) which is correct only
         // when the previous decode was prefill or when ALL drafts of the previous batch were
@@ -588,7 +653,6 @@ struct common_speculative_state_mtp : public common_speculative_state {
             const int32_t n_out_tgt = llama_model_n_embd_out(model_tgt);
             const int32_t n_copy  = std::min(n_bb, n_out_tgt);
             std::memcpy(h_prev.data(), h_tgt, (size_t) n_copy * sizeof(float));
-            h_tgt_used = true;
         }
 
         llama_memory_t mem = llama_get_memory(ctx_tgt);
@@ -597,12 +661,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             attn_pos = 0;
         }
 
-        // Async pipeline (see plan async-mtp-pipeline): submit the request to the
-        // dedicated MTP worker thread, then immediately wait. This routes the work
-        // through sched_mtp instead of the target's sched, isolating the MTP graph
-        // from target-decode reuse / reset cycles. True overlap with target verify
-        // requires pipeline depth 2 (drafts from cycle K-1 used in cycle K) plus
-        // optimistic last-token prediction — out of scope for this phase.
+        // Bootstrap path (first iter or after drain): submit and wait immediately on sched_mtp.
         draft_tokens.resize((size_t) n_steps);
         int32_t rc = llama_decode_mtp_async(
                 ctx_tgt,
@@ -628,6 +687,65 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
     void accept(uint16_t n_accepted) override {
         GGML_UNUSED(n_accepted);
+    }
+
+    void cancel() override {
+        mtp_drain_pending_discard();
+    }
+
+    void prepare_next(llama_token id_last) override {
+        // Kill switch for A/B testing depth-2 vs sync.
+        static const bool depth2_disabled = []() {
+            const char * v = std::getenv("LLAMA_PIPELINE_DEPTH2");
+            return v && std::strcmp(v, "0") == 0;
+        }();
+        if (depth2_disabled) {
+            return;
+        }
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+        const uint32_t      n_bb_u   = llama_model_mtp_n_embd_backbone(model_tgt);
+        if (n_bb_u == 0) {
+            return;
+        }
+        if (has_pending) {
+            LOG_WRN("%s: MTP prepare_next called while a draft is already pending; ignoring\n", __func__);
+            return;
+        }
+        if (mtp_would_skip_next_draft()) {
+            return;
+        }
+        const int32_t n_steps = mtp_effective_n_steps(last_spec_params);
+        if (n_steps <= 0) {
+            return;
+        }
+        const int32_t n_bb = (int32_t) n_bb_u;
+
+        std::vector<float> h_prev((size_t) n_bb, 0.0f);
+        if (float * h_tgt = llama_get_embeddings_ith(ctx_tgt, h_idx)) {
+            const int32_t n_out_tgt = llama_model_n_embd_out(model_tgt);
+            const int32_t n_copy  = std::min(n_bb, n_out_tgt);
+            std::memcpy(h_prev.data(), h_tgt, (size_t) n_copy * sizeof(float));
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        llama_pos attn_pos = mem ? llama_memory_seq_pos_max(mem, seq_id) : (llama_pos) 0;
+        if (attn_pos < 0) {
+            attn_pos = 0;
+        }
+
+        const int32_t rc = llama_decode_mtp_async(
+                ctx_tgt,
+                seq_id,
+                attn_pos,
+                id_last,
+                h_prev.data(),
+                n_steps);
+        if (rc != 0) {
+            LOG_ERR("%s: llama_decode_mtp_async failed (%d)\n", __func__, (int) rc);
+            return;
+        }
+        has_pending     = true;
+        pending_n_steps = n_steps;
     }
 };
 
@@ -1262,6 +1380,24 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
 
         impl->accept(n_accepted);
         impl->n_call_accept++;
+    }
+}
+
+void common_speculative_prepare_next(common_speculative * spec, llama_token id_last) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->prepare_next(id_last);
+    }
+}
+
+void common_speculative_cancel(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->cancel();
     }
 }
 

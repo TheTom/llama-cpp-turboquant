@@ -15,35 +15,9 @@
 
 #include <cinttypes>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <chrono>
 #include <limits>
 #include <stdexcept>
-
-// #region agent log
-namespace {
-inline bool dbg_c800c4_enabled() {
-    static const bool e = std::getenv("LLAMA_DBG_C800C4") != nullptr;
-    return e;
-}
-inline long long dbg_c800c4_now_us() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-inline void dbg_c800c4_log(const char * loc, const char * msg, const char * data_json, const char * hyp) {
-    if (!dbg_c800c4_enabled()) return;
-    auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    FILE * f = std::fopen("/Users/aleksejkalina/code/playground/atomic-llama-cpp-turboquant/.cursor/debug-c800c4.log", "a");
-    if (!f) return;
-    std::fprintf(f, "{\"sessionId\":\"c800c4\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n",
-                 hyp, loc, msg, data_json, (long long) ts_ms);
-    std::fclose(f);
-}
-}
-// #endregion
 
 //
 // llama_context
@@ -1411,67 +1385,31 @@ llm_graph_result * llama_context::process_ubatch_mtp(
     gparams.n_outputs = 1;
     gparams.sched     = sched_mtp.get();
 
-    // #region agent log
-    const long long _t0 = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-    int _reused = 0;
-    long long _build_us = 0, _alloc_us = 0, _setin_us = 0, _compute_us = 0;
-    // #endregion
-
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         // sched_mtp does not use pipeline parallelism (created with pipeline=false),
         // so no synchronize is needed before set_inputs.
-        // #region agent log
-        _reused = 1;
-        // #endregion
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched_mtp.get());
         ggml_backend_sched_set_eval_callback(sched_mtp.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        // #region agent log
-        const long long _tb = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-        // #endregion
         gf = model.build_graph(gparams);
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize MTP graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-        // #region agent log
-        if (dbg_c800c4_enabled()) _build_us = dbg_c800c4_now_us() - _tb;
-        const long long _ta = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-        // #endregion
         if (!ggml_backend_sched_alloc_graph(sched_mtp.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate MTP graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        // #region agent log
-        if (dbg_c800c4_enabled()) _alloc_us = dbg_c800c4_now_us() - _ta;
-        // #endregion
     }
 
-    // #region agent log
-    const long long _ts = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-    // #endregion
     res->set_inputs(&ubatch);
-    // #region agent log
-    if (dbg_c800c4_enabled()) _setin_us = dbg_c800c4_now_us() - _ts;
-    const long long _tc = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-    // #endregion
 
     const auto status = graph_compute_mtp(res->get_gf());
-    // #region agent log
-    if (dbg_c800c4_enabled()) {
-        _compute_us = dbg_c800c4_now_us() - _tc;
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-            "{\"reused\":%d,\"build_us\":%lld,\"alloc_us\":%lld,\"setin_us\":%lld,\"compute_us\":%lld,\"total_us\":%lld}",
-            _reused, _build_us, _alloc_us, _setin_us, _compute_us, dbg_c800c4_now_us() - _t0);
-        dbg_c800c4_log("llama-context.cpp:process_ubatch_mtp", "mtp_substep", buf, "H1+H3");
-    }
-    // #endregion
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute MTP graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1509,28 +1447,7 @@ ggml_status llama_context::graph_compute_mtp(ggml_cgraph * gf) {
         }
     }
 
-    // #region agent log
-    const long long _gc_t0 = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-    // #endregion
     auto status = ggml_backend_sched_graph_compute_async(sched_mtp.get(), gf);
-    // #region agent log
-    if (dbg_c800c4_enabled()) {
-        const long long _async_us = dbg_c800c4_now_us() - _gc_t0;
-        // Optional immediate-sync probe to separate encoding (CPU) from GPU work.
-        // Enable with LLAMA_DBG_IMMEDIATE_SYNC=1.
-        long long _immed_sync_us = -1;
-        static const bool dbg_immed = std::getenv("LLAMA_DBG_IMMEDIATE_SYNC") != nullptr;
-        if (dbg_immed) {
-            const long long _t = dbg_c800c4_now_us();
-            ggml_backend_sched_synchronize(sched_mtp.get());
-            _immed_sync_us = dbg_c800c4_now_us() - _t;
-        }
-        char buf[128];
-        std::snprintf(buf, sizeof(buf),
-            "{\"async_us\":%lld,\"immed_sync_us\":%lld}", _async_us, _immed_sync_us);
-        dbg_c800c4_log("llama-context.cpp:graph_compute_mtp", "mtp_compute_split", buf, "H20");
-    }
-    // #endregion
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async (MTP) failed with %d\n",
                 __func__, status);
@@ -1930,18 +1847,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
-    // #region agent log
-    const long long _dec_t0 = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-    const int _dec_n_tokens = (int) batch_inp.n_tokens;
-    auto _dec_log = [&](int rc) {
-        if (!dbg_c800c4_enabled()) return;
-        char buf[128];
-        std::snprintf(buf, sizeof(buf),
-            "{\"n_tokens\":%d,\"decode_us\":%lld,\"rc\":%d}",
-            _dec_n_tokens, dbg_c800c4_now_us() - _dec_t0, rc);
-        dbg_c800c4_log("llama-context.cpp:decode", "target_decode", buf, "BASELINE");
-    };
-    // #endregion
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -2301,9 +2206,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
-    // #region agent log
-    _dec_log(0);
-    // #endregion
     return 0;
 }
 
@@ -2839,23 +2741,12 @@ int32_t llama_context::decode_mtp_async(
         mtp_pending = std::move(req);
     }
     mtp_cv_request.notify_one();
-    // #region agent log
-    if (dbg_c800c4_enabled()) {
-        mtp_dbg_submit_us.store(dbg_c800c4_now_us(), std::memory_order_relaxed);
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "{\"n_steps\":%d,\"last_token\":%d}", n_steps, (int) last_token);
-        dbg_c800c4_log("llama-context.cpp:decode_mtp_async", "async_submit", buf, "H2");
-    }
-    // #endregion
     return 0;
 }
 
 int32_t llama_context::decode_mtp_wait(
         llama_token * out_drafts,
         float       * out_h_prev_last) {
-    // #region agent log
-    const long long _wait_t0 = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-    // #endregion
     std::unique_lock<std::mutex> lk(mtp_mu);
     mtp_cv_response.wait(lk, [this] {
         return mtp_completed.has_value() || (!mtp_in_flight && !mtp_pending.has_value());
@@ -2867,17 +2758,6 @@ int32_t llama_context::decode_mtp_wait(
     mtp_response resp = std::move(*mtp_completed);
     mtp_completed.reset();
     lk.unlock();
-    // #region agent log
-    if (dbg_c800c4_enabled()) {
-        const long long now = dbg_c800c4_now_us();
-        const long long submit = mtp_dbg_submit_us.load(std::memory_order_relaxed);
-        char buf[160];
-        std::snprintf(buf, sizeof(buf),
-            "{\"wait_us\":%lld,\"submit_to_wait_us\":%lld,\"status\":%d}",
-            now - _wait_t0, submit ? (now - submit) : -1LL, (int) resp.status);
-        dbg_c800c4_log("llama-context.cpp:decode_mtp_wait", "async_wait_done", buf, "H2");
-    }
-    // #endregion
 
     if (resp.status != 0) {
         return resp.status;
@@ -2940,18 +2820,10 @@ int32_t llama_context::decode_mtp_run(const mtp_request & req, mtp_response & re
 
     resp.drafts.assign(req.n_steps, 0);
 
-    // #region agent log
-    const long long _t_run0 = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-    // #endregion
-
     for (int32_t k = 0; k < req.n_steps; ++k) {
         data->token[0] = last_token;
         data->pos[0]   = req.attn_pos + 1 + (llama_pos) k;
         std::memcpy(data->embd.data(), h.data(), n_bb * sizeof(float));
-
-        // #region agent log
-        const long long _t_step0 = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-        // #endregion
 
         llama_memory_context_ptr mctx = kv_iswa->init_mtp(req.seq_id, ub);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
@@ -2966,14 +2838,7 @@ int32_t llama_context::decode_mtp_run(const mtp_request & req, mtp_response & re
             return -6;
         }
 
-        // #region agent log
-        const long long _t_sync0 = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-        // #endregion
         ggml_backend_sched_synchronize(sched_mtp.get());
-        // #region agent log
-        const long long _sync_us = dbg_c800c4_enabled() ? (dbg_c800c4_now_us() - _t_sync0) : 0;
-        const long long _t_ext0  = dbg_c800c4_enabled() ? dbg_c800c4_now_us() : 0;
-        // #endregion
 
         ggml_tensor * t_logits = res->get_logits();
         GGML_ASSERT(t_logits);
@@ -2995,29 +2860,8 @@ int32_t llama_context::decode_mtp_run(const mtp_request & req, mtp_response & re
         GGML_ASSERT(t_post);
         ggml_backend_tensor_get(t_post, h.data(), 0, n_bb * sizeof(float));
 
-        // #region agent log
-        if (dbg_c800c4_enabled()) {
-            const long long _ext_us  = dbg_c800c4_now_us() - _t_ext0;
-            const long long _step_us = dbg_c800c4_now_us() - _t_step0;
-            char buf[192];
-            std::snprintf(buf, sizeof(buf),
-                "{\"step\":%d,\"sync_us\":%lld,\"extract_us\":%lld,\"step_us\":%lld}",
-                k, _sync_us, _ext_us, _step_us);
-            dbg_c800c4_log("llama-context.cpp:decode_mtp_run", "mtp_step_post", buf, "H1+H5");
-        }
-        // #endregion
-
         last_token = best;
     }
-
-    // #region agent log
-    if (dbg_c800c4_enabled()) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf),
-            "{\"n_steps\":%d,\"run_us\":%lld}", req.n_steps, dbg_c800c4_now_us() - _t_run0);
-        dbg_c800c4_log("llama-context.cpp:decode_mtp_run", "mtp_run_total", buf, "H1+H2");
-    }
-    // #endregion
 
     resp.h_prev_last = std::move(h);
     return 0;
