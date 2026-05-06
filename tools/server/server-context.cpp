@@ -2896,9 +2896,12 @@ private:
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
+                    // - the model is hybrid (recurrent state can't be partially rolled back
+                    //   even though seq_rm returns true for speculative decode purposes)
                     do_checkpoint = do_checkpoint && (
                             (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
-                            (n_swa > 0));
+                            (n_swa > 0) ||
+                            llama_model_is_hybrid(model));
 
                     bool has_mtmd = false;
 

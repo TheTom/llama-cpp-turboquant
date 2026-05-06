@@ -116,6 +116,26 @@ static int get_mmq_x_max_host(const int cc) {
 #endif // GGML_CUDA_FORCE_MMQ
 }
 
+template <ggml_type type>
+static int get_mmq_x_max_host_for_type(const int cc) {
+    const int mmq_x_max = get_mmq_x_max_host(cc);
+
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+        switch (type) {
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_Q3_K:
+                return mmq_x_max < 64 ? mmq_x_max : 64;
+            default:
+                break;
+        }
+    }
+
+    return mmq_x_max;
+}
+
 static constexpr __device__ int get_mmq_x_max_device() {
 #if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 128;
@@ -4060,7 +4080,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    const int mmq_x_max = get_mmq_x_max_host_for_type<type>(cc);
     const int mmq_y = get_mmq_y_host(cc);
 
     int mmq_x_best  = 0;
@@ -4173,4 +4193,3 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-

@@ -1493,6 +1493,16 @@ static void ggml_cuda_op_mul_mat_cublas(
     // ldc == nrows of the matrix that cuBLAS writes into
     int64_t ldc = id == ctx.device ? ne0 : row_diff;
 
+    // Guard: cuBLAS requires m >= 1, n >= 1, k >= 1 for Sgemm/GemmEx.
+    // During speculative decoding (DFlash/copyspec), draft verification can
+    // produce non-consecutive token positions which result in zero-size
+    // sub-matrices. cuBLAS treats these as invalid parameters and aborts
+    // with CUBLAS_STATUS_INVALID_VALUE. Zero-size GEMMs are defined as
+    // no-ops (no output written), matching OpenBLAS and MKL behavior.
+    if (row_diff == 0 || src1_ncols == 0 || ne10 == 0 || ne00 == 0 || ldc == 0) {
+        return;
+    }
+
     const int cc = ggml_cuda_info().devices[id].cc;
 
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
