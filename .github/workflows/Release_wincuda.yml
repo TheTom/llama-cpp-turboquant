@@ -1,7 +1,7 @@
-name: Release_wincuda
+name: release_win
 
 on:
-  workflow_dispatch: # allows manual triggering
+  workflow_dispatch:
     inputs:
       create_release:
         description: 'Create new release'
@@ -10,22 +10,16 @@ on:
   push:
     branches:
       - master
-    paths: [
-      '.github/workflows/release.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl'
-    ]
+    paths:
+      - '.github/workflows/release_win.yml'
+      - '**/CMakeLists.txt'
+      - '**/.cmake'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.cu'
+      - '**/*.cuh'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -36,36 +30,88 @@ env:
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
 
 jobs:
-
-  windows-cuda:
-    runs-on: windows-2022
-
+  # Windows CPU builds (x64 only)
+  windows-cpu:
+    runs-on: windows-2025
+    strategy:
+      matrix:
+        include:
+          - arch: 'x64' # 仅保留 x64
     steps:
       - name: Clone
-        id: checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Install ccache
+      - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: windows-cuda-12.4
+          key: windows-latest-cpu-${{ matrix.arch }}
           variant: ccache
           evict-old-files: 1d
 
-      - name: Install Cuda Toolkit
-        uses: ./.github/actions/windows-setup-cuda
-        with:
-          cuda_version: '12.4'
-
       - name: Install Ninja
-        id: install_ninja
         run: |
           choco install ninja
 
       - name: Build
         id: cmake_build
         shell: cmd
-        # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          # Copy OpenMP DLL for x64
+          Copy-Item "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\14.44.35112\debug_nonredist\x64\Microsoft.VC143.OpenMP.LLVM\libomp140.x86_64.dll" .\build\bin\Release\
+          7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cpu-${{ matrix.arch }}.zip
+          name: llama-bin-win-cpu-${{ matrix.arch }}.zip
+
+  # Windows CUDA builds (Only CUDA 12.4 x64)
+  windows-cuda:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        cuda: ['12.4'] 
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-cuda-${{ matrix.cuda }}
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
@@ -81,13 +127,13 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          7z a -snl llama-bin-win-cuda-12.4-x64.zip .\build\bin\Release\ggml-cuda.dll
+          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\ggml-cuda.dll
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cuda-12.4-x64.zip
-          name: llama-bin-win-cuda-12.4-x64.zip
+          path: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
 
       - name: Copy and pack Cuda runtime
         run: |
@@ -96,28 +142,25 @@ jobs:
           robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-12.4-x64.zip $dst\*
+          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
 
       - name: Upload Cuda runtime
         uses: actions/upload-artifact@v6
         with:
-          path: cudart-llama-bin-win-cuda-12.4-x64.zip
-          name: cudart-llama-bin-win-cuda-12.4-x64.zip
+          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
 
+  # Release job to merge artifacts and create GitHub Release
   release:
     if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
-
     permissions:
-        contents: write
-
+      contents: write
     runs-on: ubuntu-slim
-
     needs:
+      - windows-cpu
       - windows-cuda
-
     steps:
       - name: Clone
-        id: checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -127,17 +170,47 @@ jobs:
         uses: ./.github/actions/get-tag-name
 
       - name: Download artifacts
-        id: download-artifact
         uses: actions/download-artifact@v7
         with:
           path: ./artifact
           merge-multiple: true
 
       - name: Move artifacts
-        id: move_artifacts
         run: |
           mkdir -p release
-          mv -v artifact/*.zip release
+          echo "Adding CPU backend files to existing zips..."
+          arch="x64"
+          cpu_zip="artifact/llama-bin-win-cpu-${arch}.zip"
+          temp_dir=$(mktemp -d)
+          echo "Extracting CPU backend for $arch..."
+          unzip "$cpu_zip" -d "$temp_dir"
+          
+          # Add CPU files to CUDA zip (CUDA is x64 only)
+          target_zip="artifact/llama-bin-win-cuda-12.4-x64.zip"
+          if [ -f "$target_zip" ]; then
+            echo "Adding CPU backend to $(basename "$target_zip")"
+            (cd "$temp_dir" && zip -r "$target_zip" .)
+          fi
+          
+          # Also keep standalone CPU zips
+          zip_name="llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${arch}.zip"
+          cp "$cpu_zip" "release/$zip_name"
+          echo "Copied $zip_name"
+          
+          rm -rf "$temp_dir"
+
+          echo "Renaming and moving CUDA zips to release..."
+          for zip_file in artifact/llama-bin-win-cuda-*.zip; do
+            if [ -f "$zip_file" ]; then
+              base_name=$(basename "$zip_file" .zip)
+              zip_name="llama-${{ steps.tag.outputs.name }}-${base_name#llama-}.zip"
+              echo "Moving $zip_file to release/$zip_name"
+              mv "$zip_file" "release/$zip_name"
+            fi
+          done
+
+          echo "Moving other artifacts..."
+          mv -v artifact/*.zip release 2>/dev/null || true
 
       - name: Create release
         id: create_release
@@ -148,16 +221,15 @@ jobs:
           tag_name: ${{ steps.tag.outputs.name }}
           body: |
             <details open>
-
             ${{ github.event.head_commit.message }}
-
             </details>
-
+            
             **Windows:**
-            - [Windows x64 (CUDA 12.4)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-12.4-x64.zip) - [CUDA 12.4 DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-12.4-x64.zip)
+            - [Windows x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip)
+            - [Windows x64 (CUDA 12.4)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-12.4-x64.zip)
+            - [CUDA 12.4 Runtime DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-12.4-x64.zip)
 
       - name: Upload release
-        id: upload_release
         uses: actions/github-script@v8
         with:
           github-token: ${{secrets.GITHUB_TOKEN}}
@@ -166,7 +238,7 @@ jobs:
             const fs = require('fs');
             const release_id = '${{ steps.create_release.outputs.id }}';
             for (let file of await fs.readdirSync('./release')) {
-              if (path.extname(file) === '.zip') {
+              if (path.extname(file) === '.zip' || file.endsWith('.tar.gz')) {
                 console.log('uploadReleaseAsset', file);
                 await github.rest.repos.uploadReleaseAsset({
                   owner: context.repo.owner,
