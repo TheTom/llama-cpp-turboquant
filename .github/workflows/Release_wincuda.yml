@@ -36,7 +36,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - arch: 'x64' # 仅保留 x64
+          - arch: 'x64'
     steps:
       - name: Clone
         uses: actions/checkout@v6
@@ -60,20 +60,21 @@ jobs:
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_OPENMP=ON ^
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
 
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          # Copy OpenMP DLL for x64
           Copy-Item "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\14.44.35112\debug_nonredist\x64\Microsoft.VC143.OpenMP.LLVM\libomp140.x86_64.dll" .\build\bin\Release\
-          7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
+          7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*.exe .\build\bin\Release\*.dll
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -90,8 +91,6 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Install ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -185,19 +184,18 @@ jobs:
           echo "Extracting CPU backend for $arch..."
           unzip "$cpu_zip" -d "$temp_dir"
           
-          # Add CPU files to CUDA zip (CUDA is x64 only)
           target_zip="artifact/llama-bin-win-cuda-12.4-x64.zip"
           if [ -f "$target_zip" ]; then
             echo "Adding CPU backend to $(basename "$target_zip")"
             (cd "$temp_dir" && zip -r "$target_zip" .)
           fi
           
-          # Also keep standalone CPU zips
-          zip_name="llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${arch}.zip"
-          cp "$cpu_zip" "release/$zip_name"
-          echo "Copied $zip_name"
-          
           rm -rf "$temp_dir"
+
+          echo "Renaming and moving CPU zip to release..."
+          cpu_zip_name="llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${arch}.zip"
+          mv "$cpu_zip" "release/$cpu_zip_name"
+          echo "Moved to release/$cpu_zip_name"
 
           echo "Renaming and moving CUDA zips to release..."
           for zip_file in artifact/llama-bin-win-cuda-*.zip; do
@@ -209,8 +207,15 @@ jobs:
             fi
           done
 
-          echo "Moving other artifacts..."
-          mv -v artifact/*.zip release 2>/dev/null || true
+          echo "Renaming and moving Cuda runtime zips to release..."
+          for zip_file in artifact/cudart-llama-bin-win-*.zip; do
+            if [ -f "$zip_file" ]; then
+              base_name=$(basename "$zip_file" .zip)
+              zip_name="llama-${{ steps.tag.outputs.name }}-${base_name}.zip"
+              echo "Moving $zip_file to release/$zip_name"
+              mv "$zip_file" "release/$zip_name"
+            fi
+          done
 
       - name: Create release
         id: create_release
@@ -227,7 +232,7 @@ jobs:
             **Windows:**
             - [Windows x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip)
             - [Windows x64 (CUDA 12.4)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-12.4-x64.zip)
-            - [CUDA 12.4 Runtime DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-12.4-x64.zip)
+            - [CUDA 12.4 Runtime DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-cudart-llama-bin-win-cuda-12.4-x64.zip)
 
       - name: Upload release
         uses: actions/github-script@v8
