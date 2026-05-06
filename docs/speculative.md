@@ -89,8 +89,38 @@ Why use the async pair?
   `llama_decode` appends only positions `> attn_pos`, so backbone cells read by
   MTP remain stable until `_wait` (append-only cache). Stale in-flight requests
   are drained in `common_speculative_begin` and on skip / param-mismatch paths.
+- **In-graph argmax**: the MTP graph publishes a `ggml_argmax` of the final
+  logits (I32 [1]) via `llm_graph_result::get_argmax()`. Per draft step the host
+  reads back 4 bytes (one token id) instead of the full F32 [n_vocab] logits
+  row, and the serial CPU argmax over `n_vocab` is gone. The full logits are
+  still computed in-graph and can be fetched on demand by passing a non-null
+  `out_logits` to the synchronous `llama_decode_mtp(...)` API (diagnostic /
+  legacy path). On Gemma 4 + Q4_K_XL this delivered an additional **~+2-3%
+  throughput** (`109.5 → 112.5 tps` at `n=128`, `95.8 → 97.8 tps` at `n=512`),
+  with bit-identical greedy drafts.
 - **Future work**: optimistic last-token prediction could hide an additional
   `llama_decode` latency on hits but risks wrong drafts on misses.
+
+#### Diagnostic: per-draft acceptance trace
+
+Set `LLAMA_MTP_ACC_TRACE` to enable a per-iteration NDJSON tracer in
+`common/speculative.cpp`. Each `mtp_draft` event records `iter`, `path`
+(`sync` / `lazy` / `skip-streak` / `skip-nsteps`), `seq_id`, `id_last`,
+`h_idx`, `attn_pos`, `n_steps`, `h_l2` (L2 norm of the input hidden state),
+and the drafted token ids; each `mtp_accept` event records the iteration
+counter, `n_accepted`, and `n_drafted_prev`. The host can pair them by `iter`
+to reconstruct per-position acceptance, MTP h_prev stability, and
+selection-bias breakdowns by `h_idx`.
+
+```sh
+# write trace to stderr
+LLAMA_MTP_ACC_TRACE=1 ./llama-server [...]
+# write trace to a file
+LLAMA_MTP_ACC_TRACE=/tmp/mtp.ndjson ./llama-server [...]
+```
+
+Disabled at zero overhead (no env var or value `0` / empty); when enabled the
+extra cost is one `n_bb`-wide L2 reduction per draft and a small NDJSON write.
 
 #### Reconverting `gemma4_assistant` from Hugging Face
 
