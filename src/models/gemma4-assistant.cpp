@@ -38,9 +38,8 @@ static int32_t gemma4_mtp_kv_layer_last_in_range(
 // target's KV cache only contains positions ≤ attn_pos and all step positions
 // are > attn_pos, so causal/SWA admit all target cells uniformly).
 //
-// `out_argmax` (I32 [1]) is computed on-device so the host can read a 4-byte
-// token id instead of dragging the full F32 [n_vocab, 1] logits row back over
-// PCIe/Metal-shared and running a sequential argmax on the CPU.
+// `out_logits`: F32 [n_vocab, 1] (full row for ordered embeddings too — required for greedy match with verify).
+// `out_argmax` (I32 [1]): greedy token id on-device.
 static void gemma4_mtp_build_one_step(
         const llm_graph_context & gctx,
         const llama_model & target,
@@ -66,15 +65,14 @@ static void gemma4_mtp_build_one_step(
     const float  beta_slow    = gctx.beta_slow;
     auto         cb = [&](ggml_tensor * t, const char * name, int il) { gctx.cb(t, name, il); };
 
-    const int64_t n_bb = mtp.hparams.n_embd_backbone;
+    const float   tok_scale = sqrtf((float) target.hparams.n_embd);
 
     ggml_tensor * tok_e = ggml_get_rows(ctx0, target.tok_embd, tok_step);
     cb(tok_e, "mtp_tgt_tok_embd", -1);
 
-    // Gemma 4 scales token embeddings by sqrt(hidden_size) at the input pipeline
-    // (see gemma4-iswa.cpp). The MTP head was trained on the same scaled embeddings
-    // before the pre_projection, so apply the matching scale here.
-    tok_e = ggml_scale(ctx0, tok_e, sqrtf((float) n_bb));
+    // Gemma 4 scales token embeddings by sqrt(n_embd) at the input pipeline (gemma4-iswa.cpp).
+    // Use target n_embd so Edge / non-Edge targets match the main forward.
+    tok_e = ggml_scale(ctx0, tok_e, tok_scale);
     cb(tok_e, "mtp_tgt_tok_embd_scaled", -1);
 
     ggml_tensor * inp_cat = ggml_concat(ctx0, tok_e, h_step, 0);
@@ -186,7 +184,59 @@ static void gemma4_mtp_build_one_step(
     ggml_tensor * backbone = gctx.build_lora_mm(mtp.mtp_post_projection, h_inner);
     cb(backbone, "mtp_post_proj_out", -1);
 
-    cur = gctx.build_lora_mm(mtp.tok_embd, h_inner);
+    const int64_t n_vocab      = mtp.tok_embd->ne[1];
+    const int64_t n_tokens_mtp = h_inner->ne[1];
+
+    if (mtp.hparams.use_ordered_embeddings) {
+        // Centroid-routed LM head (HF Gemma4AssistantMaskedEmbedder): scatter candidate logits into a full
+        // [n_vocab] row then argmax — matches masked full-vocab greedy (sparse-only argmax broke server accept).
+        GGML_ASSERT(mtp.mtp_centroids != nullptr && mtp.mtp_token_ordering != nullptr);
+        GGML_ASSERT(n_tokens_mtp == 1 && "ordered embeddings MTP expects a single token column");
+        const uint32_t n_c   = mtp.hparams.n_centroids;
+        const uint32_t top_k = mtp.hparams.centroid_top_k;
+        GGML_ASSERT(n_c > 0 && top_k > 0 && (int64_t) top_k <= (int64_t) n_c);
+        GGML_ASSERT(n_vocab % (int64_t) n_c == 0);
+        const int64_t vsc = n_vocab / (int64_t) n_c;
+
+        ggml_tensor * centroid_logits = gctx.build_lora_mm(mtp.mtp_centroids, h_inner);
+        cb(centroid_logits, "mtp_centroid_logits", -1);
+
+        ggml_tensor * topk_idx = ggml_top_k(ctx0, centroid_logits, (int) top_k);
+        cb(topk_idx, "mtp_centroid_topk_idx", -1);
+
+        const size_t ordering_nb1 = ggml_row_size(GGML_TYPE_I32, vsc);
+        ggml_tensor * ordering = ggml_view_2d(
+                ctx0, mtp.mtp_token_ordering, vsc, (int64_t) n_c, ordering_nb1, 0);
+        cb(ordering, "mtp_token_ordering_view", -1);
+
+        ggml_tensor * sel_ids = ggml_get_rows(ctx0, ordering, topk_idx);
+        cb(sel_ids, "mtp_selected_token_ids", -1);
+
+        const int64_t n_sel = (int64_t) top_k * vsc * n_tokens_mtp;
+        ggml_tensor * flat_ids = ggml_reshape_1d(ctx0, sel_ids, n_sel);
+        cb(flat_ids, "mtp_selected_token_ids_flat", -1);
+
+        ggml_tensor * sel_emb = ggml_get_rows(ctx0, mtp.tok_embd, flat_ids);
+        cb(sel_emb, "mtp_selected_embd", -1);
+
+        ggml_tensor * sel_logits = gctx.build_lora_mm(sel_emb, h_inner);
+        cb(sel_logits, "mtp_selected_logits", -1);
+        ggml_tensor * sel_logits_f32 = ggml_cast(ctx0, sel_logits, GGML_TYPE_F32);
+
+        ggml_tensor * logits_full = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab, n_tokens_mtp);
+        logits_full = ggml_fill_inplace(ctx0, logits_full, -1e30f);
+        cb(logits_full, "mtp_logits_masked_base", -1);
+
+        ggml_tensor * scatter_dst = ggml_cont_2d(ctx0, logits_full, 1, n_vocab * n_tokens_mtp);
+        ggml_tensor * scatter_src = ggml_cont_2d(ctx0, sel_logits_f32, 1, n_sel);
+        cur = ggml_set_rows(ctx0, scatter_dst, scatter_src, flat_ids);
+        cb(cur, "mtp_logits_scatter_view", -1);
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_tokens_mtp);
+        cb(cur, "mtp_logits_full", -1);
+    } else {
+        cur = gctx.build_lora_mm(mtp.tok_embd, h_inner);
+        cb(cur, "result_output_dense", -1);
+    }
 
     if (hparams.f_final_logit_softcapping) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
@@ -196,9 +246,7 @@ static void gemma4_mtp_build_one_step(
 
     cb(cur, "result_output", -1);
 
-    // Greedy argmax computed on-device; reading this back is 4 bytes vs n_vocab*4
-    // bytes for the raw logits row. ggml_argmax over a 2D [n_vocab, 1] tensor
-    // returns I32 [1] (one index per row).
+    // Greedy argmax on-device: I32 [1] token index into the vocabulary row.
     ggml_tensor * arg = ggml_argmax(ctx0, cur);
     cb(arg, "result_argmax", -1);
 
@@ -217,7 +265,6 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
     const int64_t n_bb = mtp.hparams.n_embd_backbone;
     GGML_ASSERT(n_bb > 0);
     GGML_ASSERT(mtp.mtp_pre_projection != nullptr && mtp.mtp_post_projection != nullptr);
-    GGML_ASSERT(!mtp.hparams.use_ordered_embeddings && "ordered embeddings (centroid head) not implemented in MTP graph yet");
 
     // Single-step MTP build. Async pipeline (see plan async-mtp-pipeline) calls this once
     // per draft step on a dedicated worker thread + dedicated ggml_backend_sched.
@@ -249,9 +296,6 @@ llm_build_gemma4_mtp::llm_build_gemma4_mtp(
     res->t_logits = logits;
     res->t_argmax = arg;
 
-    // Expand the argmax (the only output the host actually consumes for greedy MTP);
-    // the backend will pull in `logits` automatically as its dependency, and `h_post`
-    // is also built into the graph via ggml_build_forward_expand on the backbone path.
     ggml_build_forward_expand(gf, arg);
     ggml_build_forward_expand(gf, h_post);
 }

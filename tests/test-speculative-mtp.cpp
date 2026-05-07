@@ -13,13 +13,27 @@ int main() {
     const char * path_tgt  = std::getenv("LLAMA_MTP_TEST_TARGET");
     const char * path_head = std::getenv("LLAMA_MTP_TEST_HEAD");
     const char * path_bad  = std::getenv("LLAMA_MTP_TEST_BAD_ARCH");
+    const char * path_tgt_edge  = std::getenv("LLAMA_MTP_TEST_TARGET_EDGE");
+    const char * path_head_edge = std::getenv("LLAMA_MTP_TEST_HEAD_EDGE");
 
-    if (!path_tgt || std::strlen(path_tgt) == 0) {
-        std::cout << "skip: set LLAMA_MTP_TEST_TARGET; optional LLAMA_MTP_TEST_HEAD, LLAMA_MTP_TEST_BAD_ARCH\n";
+    const bool run_primary = path_tgt && std::strlen(path_tgt) > 0;
+    const bool run_edge    = path_tgt_edge && std::strlen(path_tgt_edge) > 0 && path_head_edge
+        && std::strlen(path_head_edge) > 0;
+
+    if (!run_primary && !run_edge) {
+        std::cout << "skip: set LLAMA_MTP_TEST_TARGET (optional LLAMA_MTP_TEST_HEAD, LLAMA_MTP_TEST_BAD_ARCH), "
+                     "and/or LLAMA_MTP_TEST_TARGET_EDGE + LLAMA_MTP_TEST_HEAD_EDGE for E2B/E4B centroid assistants\n";
         return 0;
     }
 
     llama_model_params mparams = llama_model_default_params();
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx       = 512;
+    cparams.n_batch     = 512;
+    cparams.embeddings  = true;
+
+    if (run_primary) {
     llama_model * model_tgt = llama_model_load_from_file(path_tgt, mparams);
     if (!model_tgt) {
         std::cerr << "failed to load target model\n";
@@ -54,11 +68,6 @@ int main() {
             return 1;
         }
     }
-
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx       = 512;
-    cparams.n_batch     = 512;
-    cparams.embeddings  = true;
 
     llama_context * ctx = llama_init_from_model(model_tgt, cparams);
     if (!ctx) {
@@ -170,8 +179,83 @@ int main() {
 
     llama_free(ctx);
     llama_model_free(model_tgt);
+    }
 
-    if (path_bad && std::strlen(path_bad) > 0) {
+    // Optional fixture: Gemma 4 Edge target + assistant with use_ordered_embeddings (centroid LM head).
+    if (run_edge) {
+        llama_model_params mparams_edge = llama_model_default_params();
+        llama_model * model_edge = llama_model_load_from_file(path_tgt_edge, mparams_edge);
+        if (!model_edge) {
+            std::cerr << "failed to load LLAMA_MTP_TEST_TARGET_EDGE model\n";
+            return 1;
+        }
+        if (std::strcmp(llama_model_arch_str(model_edge), "gemma4") != 0) {
+            std::cerr << "EDGE target arch must be gemma4\n";
+            llama_model_free(model_edge);
+            return 1;
+        }
+        if (llama_model_load_mtp_from_file(model_edge, path_head_edge, mparams_edge) != 0) {
+            std::cerr << "llama_model_load_mtp_from_file failed (EDGE head)\n";
+            llama_model_free(model_edge);
+            return 1;
+        }
+        llama_context * ctx_edge = llama_init_from_model(model_edge, cparams);
+        if (!ctx_edge) {
+            std::cerr << "failed to create EDGE context\n";
+            llama_model_free(model_edge);
+            return 1;
+        }
+
+        llama_token bos_e = llama_vocab_bos(llama_model_get_vocab(model_edge));
+        if (bos_e == LLAMA_TOKEN_NULL) {
+            bos_e = 0;
+        }
+        llama_batch b_e = llama_batch_get_one(&bos_e, 1);
+        if (llama_decode(ctx_edge, b_e) != 0) {
+            std::cerr << "EDGE initial decode failed\n";
+            llama_free(ctx_edge);
+            llama_model_free(model_edge);
+            return 1;
+        }
+
+        const uint32_t n_bb_e = llama_model_mtp_n_embd_backbone(model_edge);
+        std::vector<float> h_prev_e(n_bb_e, 0.f);
+        if (float * h = llama_get_embeddings_ith(ctx_edge, -1)) {
+            const int no = llama_model_n_embd_out(model_edge);
+            const int nc = (int) std::min((size_t) no, (size_t) n_bb_e);
+            std::memcpy(h_prev_e.data(), h, (size_t) nc * sizeof(float));
+        }
+
+        llama_memory_t mem_e = llama_get_memory(ctx_edge);
+        llama_pos attn_pos_e = mem_e ? llama_memory_seq_pos_max(mem_e, 0) : 0;
+        if (attn_pos_e < 0) {
+            attn_pos_e = 0;
+        }
+
+        llama_token drafts_e[4] = {};
+        if (llama_decode_mtp(ctx_edge, 0, attn_pos_e, bos_e, h_prev_e.data(), 1, drafts_e, nullptr, nullptr) != 0) {
+            std::cerr << "EDGE llama_decode_mtp failed\n";
+            llama_free(ctx_edge);
+            llama_model_free(model_edge);
+            return 1;
+        }
+
+        const int32_t n_vocab_e = llama_vocab_n_tokens(llama_model_get_vocab(model_edge));
+        if (drafts_e[0] < 0 || drafts_e[0] >= n_vocab_e) {
+            std::cerr << "EDGE MTP draft token out of vocabulary range\n";
+            llama_free(ctx_edge);
+            llama_model_free(model_edge);
+            return 1;
+        }
+
+        // Async parity is enforced on the primary fixture; centroid MTP can diverge between schedulers (top_k / set_rows).
+
+        llama_free(ctx_edge);
+        llama_model_free(model_edge);
+        std::cout << "mtp EDGE (E2B/E4B ordered embeddings) smoke ok\n";
+    }
+
+    if (run_primary && path_bad && std::strlen(path_bad) > 0) {
         llama_model * tgt2 = llama_model_load_from_file(path_tgt, mparams);
         if (!tgt2) {
             std::cerr << "failed to reload target for bad-arch test\n";

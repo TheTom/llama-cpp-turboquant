@@ -119,6 +119,13 @@ LLAMA_MTP_ACC_TRACE=1 ./llama-server [...]
 LLAMA_MTP_ACC_TRACE=/tmp/mtp.ndjson ./llama-server [...]
 ```
 
+#### Throughput tuning (Edge assistants / heavy backends)
+
+Ordered-embeddings MTP (`use_ordered_embeddings`) runs a centroid LM head (`top_k`, routed `get_rows`) per draft step; the greedy graph still materializes a full-vocab logits row (masked fill + scatter) so argmax and optional full-row export stay consistent with verify.
+
+- **`LLAMA_MTP_SKIP_STREAK_THRESHOLD`**: **off by default** (`0` / unset). If set to `1`–`32`, after that many consecutive batches with **zero** accepted **MTP** drafts, MTP drafting is skipped for one verify-only batch, then retried.
+- Helper scripts `scripts/run-gemma4-e4b-mtp-server.sh` and `scripts/run-gemma4-e2b-mtp-server.sh` support **`MTP_PRESET`**: `throughput` (block 2 / max 6), `lift` (block 3 / max 8), `balanced`, or `quality`. Override with `DRAFT_BLOCK_SIZE`, `DRAFT_MAX`, and optionally `LLAMA_MTP_SKIP_STREAK_THRESHOLD`.
+
 Disabled at zero overhead (no env var or value `0` / empty); when enabled the
 extra cost is one `n_bb`-wide L2 reduction per draft and a small NDJSON write.
 

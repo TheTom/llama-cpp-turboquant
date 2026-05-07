@@ -4754,7 +4754,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (n_c == 0) {
                             throw std::runtime_error("gemma4_assistant: use_ordered_embeddings requires n_centroids > 0");
                         }
-                        mtp_centroids      = create_tensor(tn(LLM_TENSOR_MTP_CENTROIDS,      "weight"), {n_c, n_embd}, 0);
+                        // ggml_mul_mat(centroids, h) requires centroids.ne[0] == n_embd (same as token_embd.weight).
+                        mtp_centroids      = create_tensor(tn(LLM_TENSOR_MTP_CENTROIDS,      "weight"), {n_embd, (int64_t) n_c}, 0);
                         mtp_token_ordering = create_tensor(tn(LLM_TENSOR_MTP_TOKEN_ORDERING, "weight"), {(int64_t) n_vocab}, TENSOR_NOT_REQUIRED);
                     }
 

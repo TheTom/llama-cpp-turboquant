@@ -36,3 +36,25 @@ This document records the expected tensor layout for `Gemma4AssistantForCausalLM
 1. MTP consumes **target K/V** for the last sliding-attention and last full-attention layers; the assistant has **no independent KV** in the reference design. The initial C++ integration uses the assistant as a loadable arch with standard KV for bring-up; full KV sharing is wired through `--spec-type mtp` and remains dependent on target/draft pairing and cache layout.
 2. `attention_k_eq_v: true` maps to missing `blk.*.attn_v.weight` (V taken from K), matching Gemma 4 handling in `gemma4-iswa.cpp`.
 3. Greedy parity with the target requires byte-identical drafting; validate with `tests/test-speculative-mtp` when model paths are available.
+
+## Centroid / ordered embeddings LM head (E2B / E4B) — implemented in MTP
+
+When `use_ordered_embeddings=true`, the MTP step uses the masked LM head (same idea as HF `Gemma4AssistantMaskedEmbedder` / MLX `MaskedEmbedder`), implemented in `gemma4_mtp_build_one_step()` in `src/models/gemma4-assistant.cpp`:
+
+1. `centroid_logits = mul_mat(mtp.centroids, h)` → `[n_centroids, n_tokens]`.
+2. `top_k(centroid_logits, centroid_intermediate_top_k)` → centroid indices (I32).
+3. `token_ordering` is viewed as `[vsc, n_centroids]` with `vsc = n_vocab / n_centroids` so each centroid column lists `vsc` token ids (matches HF flat layout); `get_rows` gathers candidate token ids for the top centroids.
+4. `get_rows(token_embd, ids)` then `mul_mat` yields sparse logits over those ids.
+5. Full `[n_vocab, n_tokens]` logits are built for host sampling / tracing: base tensor filled with **`-1e30f`**, then **SET_ROWS** writes the sparse logits at the selected ids (MLX-style `min(selected)-1` is optional if parity tests require it).
+
+### GGUF / converter layout
+
+- **`mtp.centroids.weight`**: HF checkpoint stores `[n_centroids, n_embd]` rows; numpy is written as-is so that after GGUF’s dimension packing the loader sees **`[n_embd, n_centroids]`**, matching `create_tensor(..., {n_embd, n_c})` and `mul_mat(mtp_centroids, h)` like the dense tied head.
+- **`mtp.token_ordering.weight`**: stored as **I32**, length `n_vocab`.
+
+Verification: `scripts/verify-gemma4-assistant-gguf.py` checks embedding-length parity, and when `use_ordered_embeddings` is true asserts centroid shape, I32 ordering, and `n_vocab % n_centroids == 0`.
+
+### Tests / scripts
+
+- Edge smoke (optional): `LLAMA_MTP_TEST_TARGET_EDGE` + `LLAMA_MTP_TEST_HEAD_EDGE` in `tests/test-speculative-mtp.cpp` (paths must exist locally; CI skips when unset).
+- Server helpers: `scripts/run-gemma4-e4b-mtp-server.sh`, `scripts/run-gemma4-e2b-mtp-server.sh`.

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 //
 // llama_context
@@ -1410,6 +1411,7 @@ llm_graph_result * llama_context::process_ubatch_mtp(
     res->set_inputs(&ubatch);
 
     const auto status = graph_compute_mtp(res->get_gf());
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute MTP graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2641,11 +2643,7 @@ int32_t llama_context::decode_mtp_sync(
     }
 
     // Sequential MTP draft on the dedicated sched_mtp: per step run a fresh single-token
-    // graph; each step's argmax feeds next step's last_token; h_post → next step's h_prev.
-    // Position passed via ubatch.pos[0] = attn_pos+1+k drives both RoPE and the
-    // cross-attention causal/SWA mask. Greedy argmax is computed inside the graph
-    // (see llm_build_gemma4_mtp), so we read 4 bytes per step instead of n_vocab*4.
-    // The full F32 logits row is only fetched on demand (out_logits != nullptr).
+    // graph; each step's argmax feeds next step's last_token; h_post -> next step's h_prev.
     for (int32_t k = 0; k < n_steps; ++k) {
         data->token[0] = last_token;
         data->pos[0]   = attn_pos + 1 + (llama_pos) k;
@@ -2677,7 +2675,7 @@ int32_t llama_context::decode_mtp_sync(
             ggml_tensor * t_logits = res->get_logits();
             GGML_ASSERT(t_logits);
             ggml_backend_tensor_get(t_logits, out_logits + (int64_t) k * n_vocab,
-                                    0, (size_t) n_vocab * sizeof(float));
+                    0, (size_t) n_vocab * sizeof(float));
         }
 
         ggml_tensor * t_post = res->get_embd();
@@ -2833,22 +2831,18 @@ int32_t llama_context::decode_mtp_run(const mtp_request & req, mtp_response & re
 
         ggml_backend_sched_synchronize(sched_mtp.get());
 
-        // In-graph argmax: read a single I32 token id (4 bytes) from device instead of
-        // pulling the full F32 [n_vocab, 1] logits row and running a serial CPU argmax.
-        // For greedy MTP draft this is bit-identical to the previous CPU argmax (modulo
-        // tie-breaking, which ggml_argmax resolves by smallest index — same as our loop).
         ggml_tensor * t_arg = res->get_argmax();
         GGML_ASSERT(t_arg && "MTP graph must publish in-graph argmax tensor");
 
         int32_t best_i32 = 0;
         ggml_backend_tensor_get(t_arg, &best_i32, 0, sizeof(int32_t));
-        resp.drafts[(size_t) k] = (llama_token) best_i32;
+
+        last_token = (llama_token) best_i32;
+        resp.drafts[(size_t) k] = last_token;
 
         ggml_tensor * t_post = res->get_embd();
         GGML_ASSERT(t_post);
         ggml_backend_tensor_get(t_post, h.data(), 0, n_bb * sizeof(float));
-
-        last_token = (llama_token) best_i32;
     }
 
     resp.h_prev_last = std::move(h);

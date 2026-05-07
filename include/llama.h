@@ -1066,6 +1066,10 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Dense LM-head logits row for batch position i ([n_vocab], no backend sampling view).
+    // Prefer this for greedy speculative verification; llama_get_logits_ith() may return
+    // sparse / backend-sampled buffers that change argmax.
+    // Returns NULL if logits are unavailable for this index.
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
