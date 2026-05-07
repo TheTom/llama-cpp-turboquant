@@ -176,6 +176,8 @@ MIT, same as upstream llama.cpp.
 
 ## Hot topics
 
+- **Gemma 4 MTP speculative decoding: pair a `gemma4` target with the official `gemma4_assistant` head (loaded via `--mtp-head`) for ~+30-50 % short-prompt throughput. See [MTP.md](MTP.md) and the pre-built Q4 assistant GGUFs at the [AtomicChat/Gemma 4 Assistant GGUF collection](https://huggingface.co/collections/AtomicChat/gemma-4-assistant-gguf).**
+- **TurboQuant KV cache & weights: WHT-rotated low-bit quantization with backend-native kernels (Metal `TurboFlash`, CUDA, Vulkan, HIP). Use `-ctk turbo3 -ctv turbo3` for ~4.3× KV compression, or quantize weights to `TQ4_1S`/`TQ3_1S`. See [Compression below](#turboquant-kv-cache--weight-compression).**
 - **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
 - **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
 - [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
@@ -229,6 +231,76 @@ range of hardware - locally and in the cloud.
 - CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
 
 The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
+
+## TurboQuant — KV cache & weight compression
+
+> **Credits.** TurboQuant in this fork is built on top of the absolutely
+> awesome work by **[@TheTom](https://github.com/TheTom)** in
+> [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant).
+> Huge thanks for the original WHT-rotated quantization design, the reference
+> kernels, and the relentless backend ports — none of this would exist
+> without that project. ❤️
+
+This fork (`atomic-llama-cpp-turboquant`) packages **TurboQuant** as a family
+of WHT-rotated low-bit quantization formats with backend-native kernels. They
+target two distinct memory-traffic problems:
+
+- **KV cache compression** — `TURBO2_0` / `TURBO3_0` / `TURBO4_0` (2/3/4-bit,
+  WHT + PolarQuant). Selected at runtime via `-ctk` / `-ctv`.
+- **Model weight compression** — `TQ3_1S` / `TQ4_1S` (3/4-bit, WHT-rotated
+  Lloyd-Max with `block_size = 32`). Selected at quantize time as a
+  `--type` for `llama-quantize`.
+
+### KV cache types (`-ctk` / `-ctv`)
+
+| Type | Bits | Compression vs F16 | Notes |
+|---|---:|---:|---|
+| `turbo2` | 2 | ~6.4× | maximum compression, intended for large-context budgets |
+| `turbo3` | 3 | ~4.3× | **recommended default**; Metal `TurboFlash` decode kernel |
+| `turbo4` | 4 | ~3.8× | highest accuracy of the family, safest fallback |
+
+Typical invocation with full GPU offload + Flash-Attention:
+
+```bash
+llama-server -m model.gguf -c 32768 -ngl 99 \
+  -ctk turbo3 -ctv turbo3 -fa on
+```
+
+Pair with `--cache-reuse N` and a long `-c` to see the practical KV-budget
+win — TurboQuant typically shifts the OOM ceiling on Apple Silicon /
+discrete GPUs by 3-6× at the same context length.
+
+### Weight quantization types (`llama-quantize`)
+
+| Type | Bits | Block size | Notes |
+|---|---:|---:|---|
+| `TQ3_1S` | 3 | 32 | 8-level Lloyd-Max + WHT rotation |
+| `TQ4_1S` | 4 | 32 | 16-level Lloyd-Max + WHT rotation; fused Metal/Vulkan MUL_MAT_VEC kernels |
+
+```bash
+# Convert / re-quantize an F16/F32 GGUF to TQ4_1S.
+llama-quantize model-f16.gguf model-tq4_1s.gguf TQ4_1S
+```
+
+`TQ4_1S` typically delivers ~25-35 % size reduction vs Q8_0 with single-digit-%
+PPL deltas; on bandwidth-bound models / GPUs it can also be faster than Q8_0
+because of the lighter memory traffic.
+
+### Backend support
+
+| Backend | KV `turbo2` / `turbo3` / `turbo4` | Weights `TQ3_1S` / `TQ4_1S` |
+|---|---|---|
+| Metal (Apple Silicon) | yes; `TurboFlash` flash-attn decode kernel for `turbo3` (off-by-default on Apple10 — see PR #91) | yes (V2.1 fused kernels) |
+| CUDA (NVIDIA) | `turbo3` / `turbo4` (full); `turbo2` via reference path | `TQ4_1S` MUL_MAT_VEC |
+| Vulkan | `turbo3` KV (FA + coopmat), `SET_ROWS` for `turbo2/4` | `TQ4_1S` (specialised MUL_MAT_VEC, SET_ROWS, CPY) |
+| HIP / ROCm | `turbo3` KV; F16-K + TURBO-V mixed dispatch | reference |
+| CPU | reference (correctness, not throughput) | reference |
+
+For combining TurboQuant KV with **Gemma 4 MTP speculative decoding**, see
+[MTP.md §11-12](MTP.md). The matrix bench shows that the combo
+(`turbo3` KV + MTP) is the right pick when the target model is bandwidth-bound
+(e.g. Gemma 4 31B), and that f16-KV + MTP wins when the target is
+compute-bound (e.g. Gemma 4 26B-A4B on M4 Max).
 
 <details>
 <summary>Models</summary>
@@ -566,6 +638,87 @@ To learn more about model quantization, [read this documentation](tools/quantize
     # the draft.gguf model should be a small variant of the target model.gguf
     llama-server -m model.gguf -md draft.gguf
     ```
+
+    </details>
+
+- <details>
+    <summary>Enable TurboQuant KV cache compression (this fork)</summary>
+
+    Use a TurboQuant KV-cache type for both K and V — typically with
+    Flash-Attention enabled — to cut KV memory traffic and footprint at
+    long contexts. Recommended default is **`turbo3`** (3-bit, ~4.3× vs F16,
+    accelerated by `TurboFlash` on Metal and dedicated kernels on
+    CUDA / Vulkan / HIP).
+
+    ```bash
+    # ~4.3x KV compression vs F16, full GPU offload, Flash-Attn on.
+    llama-server -m model.gguf -c 32768 \
+      -ngl 99 -ctk turbo3 -ctv turbo3 -fa on
+    ```
+
+    Pick a stronger compression preset by stepping the bit-width:
+
+    ```bash
+    -ctk turbo2 -ctv turbo2   # 2-bit KV, ~6.4x vs F16 (highest compression)
+    -ctk turbo3 -ctv turbo3   # 3-bit KV, ~4.3x  (default sweet spot)
+    -ctk turbo4 -ctv turbo4   # 4-bit KV, ~3.8x  (highest accuracy / fallback)
+    ```
+
+    See the longer write-up [below](#turboquant-kv-cache--weight-compression)
+    for weight quantization (`TQ4_1S` / `TQ3_1S`) and the per-backend support
+    matrix.
+
+    </details>
+
+- <details>
+    <summary>Enable Gemma 4 MTP speculative decoding (this fork)</summary>
+
+    Pair a `gemma4` target with the official `gemma4_assistant` MTP head. The
+    head is loaded **into** the target context (no second `llama_context`,
+    no second KV cache) and runs on a dedicated scheduler so MTP draft compute
+    overlaps target verification.
+
+    Pre-built assistant GGUFs (recommended **`Q4_K_M`** / `Q4_K_S` for best
+    speed/quality) are published in the [AtomicChat / Gemma 4 Assistant GGUF
+    collection](https://huggingface.co/collections/AtomicChat/gemma-4-assistant-gguf):
+
+    | Target model | Assistant (MTP head) GGUF |
+    |---|---|
+    | Gemma 4 E2B | [`AtomicChat/gemma-4-E2B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-E2B-it-assistant-GGUF) |
+    | Gemma 4 E4B | [`AtomicChat/gemma-4-E4B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF) |
+    | Gemma 4 26B-A4B | [`AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF) |
+    | Gemma 4 31B | [`AtomicChat/gemma-4-31B-it-assistant-GGUF`](https://huggingface.co/AtomicChat/gemma-4-31B-it-assistant-GGUF) |
+
+    ```bash
+    # Manual invocation — works for any of the four targets above.
+    llama-server \
+      -m   /path/to/gemma-4-target.gguf \
+      --mtp-head /path/to/gemma-4-assistant-Q4_K_M.gguf \
+      --spec-type mtp \
+      --draft-block-size 3 \
+      -c 16384 \
+      -ngl 99 -ngld 99 \
+      -fa on \
+      --host 127.0.0.1 --port 8080
+    ```
+
+    Repo helper scripts pick the right defaults per target (and prefer
+    a quantized assistant when present under `.scratch/`):
+
+    ```bash
+    # Dense targets (block size 3 by default).
+    scripts/run-gemma4-mtp-server.sh           # 26B-A4B
+    scripts/run-gemma4-31b-mtp-server.sh       # 31B
+
+    # Edge / centroid-head targets (MTP_PRESET aware: throughput|lift|balanced|quality).
+    MTP_PRESET=throughput scripts/run-gemma4-e4b-mtp-server.sh
+    MTP_PRESET=throughput scripts/run-gemma4-e2b-mtp-server.sh
+    ```
+
+    Full architecture, async pipeline, KV-safety contract, tuning knobs and
+    the latest matrix benchmark live in [MTP.md](MTP.md). User-facing CLI
+    flags (`--spec-type`, `--draft-*`) are documented in
+    [docs/speculative.md](docs/speculative.md).
 
     </details>
 
