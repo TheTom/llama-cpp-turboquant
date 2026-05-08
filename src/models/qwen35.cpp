@@ -144,8 +144,10 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);
 
+    const int64_t n_head_kv_il = model.hparams.n_head_kv(il);
+
     // Apply K normalization
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
@@ -156,7 +158,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
 
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);
 
     // Apply MRoPE
     Qcur = ggml_rope_multi(
