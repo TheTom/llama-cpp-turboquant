@@ -1497,6 +1497,16 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         return;
     }
 
+    // partial offload: if any recurrent layer's state lives on CPU, fall back to CPU replay
+    // (GPU graph uses DeviceToDevice copies that crash when the state buffer is host memory)
+    for (int li = 0; li < (int) rec_ids.size(); ++li) {
+        ggml_tensor * s_tensor = mem_recurrent->s_l[rec_ids[li]];
+        if (s_tensor && s_tensor->buffer && ggml_backend_buffer_is_host(s_tensor->buffer)) {
+            tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+            return;
+        }
+    }
+
     // GPU tape replay: build a ggml graph with GDN ops for all recurrent layers
     const int n_rec = (int) rec_ids.size();
     if (n_rec == 0) goto conv_rebuild;
