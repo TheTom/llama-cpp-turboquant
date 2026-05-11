@@ -1376,6 +1376,8 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 bool llama_kv_cache::get_has_shift() const {
+    // TurboQuant uses kernel-level WHT rotation -- position shift is a no-op
+    if (!layers.empty() && (layers[0].k->type == GGML_TYPE_TURBO2_0 || layers[0].k->type == GGML_TYPE_TURBO3_0 || layers[0].k->type == GGML_TYPE_TURBO4_0)) { return false; }
     bool result = false;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2140,6 +2142,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
+        const bool is_turbo_k = (layer.k->type == GGML_TYPE_TURBO2_0 || layer.k->type == GGML_TYPE_TURBO3_0 || layer.k->type == GGML_TYPE_TURBO4_0);
+        if (is_turbo_k) { continue; }
 
         const int64_t n_head_kv    = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
