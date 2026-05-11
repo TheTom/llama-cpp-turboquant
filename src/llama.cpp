@@ -513,7 +513,17 @@ int llama_model_load_mtp_from_file(struct llama_model * model, const char * path
         llama_model_free(aux);
         return -7;
     }
-
+    // Rename all MTP assistant tensors with "mtp." prefix so they can be
+    // uniquely targeted by -ot rules without colliding with the main model's
+    // tensors. Tensors already prefixed with "mtp." (pre_projection,
+    // post_projection, centroids, token_ordering) are left unchanged.
+    for (auto & kv : aux->tensors_by_name) {
+        if (kv.first.substr(0, 4) != "mtp.") {
+            std::string new_name = "mtp." + kv.first;
+            ggml_set_name(kv.second, new_name.c_str());
+            kv.first = new_name;
+        }
+    }
     tgt->mtp_assistant.reset(aux);
     return 0;
 }
