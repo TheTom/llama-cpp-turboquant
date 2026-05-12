@@ -84,9 +84,15 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #if defined(DATA_A_F32)
 layout (binding = 1) readonly buffer K_PACKED {vec4 k_data_packed[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED {vec4 v_data_packed[];} v_packed;
+#elif defined(DATA_A_TURBO2_0)
+layout (binding = 1) readonly buffer K_T2 {block_turbo2_0 data_k_t2[];};
+layout (binding = 2) readonly buffer V_T2 {block_turbo2_0 data_v_t2[];};
 #elif defined(DATA_A_TURBO3_0)
 layout (binding = 1) readonly buffer K_T3 {block_turbo3_0 data_k_t3[];};
 layout (binding = 2) readonly buffer V_T3 {block_turbo3_0 data_v_t3[];};
+#elif defined(DATA_A_TURBO4_0)
+layout (binding = 1) readonly buffer K_T4 {block_turbo4_0 data_k_t4[];};
+layout (binding = 2) readonly buffer V_T4 {block_turbo4_0 data_v_t4[];};
 #elif defined(A_TYPE_PACKED16)
 layout (binding = 1) readonly buffer K_PACKED16 {A_TYPE_PACKED16 k_data_packed16[];} k_packed;
 layout (binding = 2) readonly buffer V_PACKED16 {A_TYPE_PACKED16 v_data_packed16[];} v_packed;
@@ -102,8 +108,12 @@ layout (binding = 2) readonly buffer V_PACKED32 {A_TYPE_PACKED32 v_data_packed32
 #endif
 
 // turbo3: define BLOCK_BYTE_SIZE early (before first use in FA offset computation)
-#if defined(DATA_A_TURBO3_0) && !defined(BLOCK_BYTE_SIZE)
+#if defined(DATA_A_TURBO2_0) && !defined(BLOCK_BYTE_SIZE)
+#define BLOCK_BYTE_SIZE 34
+#elif defined(DATA_A_TURBO3_0) && !defined(BLOCK_BYTE_SIZE)
 #define BLOCK_BYTE_SIZE 50 // block_turbo3_0: 2 (norm) + 32 (qs) + 16 (signs) = 50 bytes
+#elif defined(DATA_A_TURBO4_0) && !defined(BLOCK_BYTE_SIZE)
+#define BLOCK_BYTE_SIZE 68
 #endif
 
 #if defined(DATA_A_F32)
@@ -260,32 +270,84 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 }
 #endif
 
+#if defined(DATA_A_TURBO2_0)
+const float T2C[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+// iqs is always a multiple of 4 (4 consecutive elements within the same qs byte group)
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float nm;
+    uint  qb;
+    if (binding_idx == BINDING_IDX_K) {
+        nm = float(data_k_t2[a_offset + ib].norm);
+        qb = uint(data_k_t2[a_offset + ib].qs[iqs / 4]);
+    } else {
+        nm = float(data_v_t2[a_offset + ib].norm);
+        qb = uint(data_v_t2[a_offset + ib].qs[iqs / 4]);
+    }
+    return FLOAT_TYPEV4(
+        T2C[(qb      ) & 0x3] * nm,
+        T2C[(qb >>  2) & 0x3] * nm,
+        T2C[(qb >>  4) & 0x3] * nm,
+        T2C[(qb >>  6) & 0x3] * nm
+    );
+}
+#endif
+
 #if defined(DATA_A_TURBO3_0)
 const float T3C[8] = float[8](
     -0.190685, -0.117832, -0.065717, -0.021460,
      0.021460,  0.065717,  0.117832,  0.190685
 );
+// iqs is always a multiple of 4: all 4 elements share the same qs byte and same signs byte.
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    FLOAT_TYPEV4 r;
-    for (int k = 0; k < 4; k++) {
-        uint  j  = iqs + uint(k);
-        float nm;
-        uint  qb;
-        uint  sb;
-        if (binding_idx == BINDING_IDX_K) {
-            nm = float(data_k_t3[a_offset + ib].norm);
-            qb = uint(data_k_t3[a_offset + ib].qs[j / 4]);
-            sb = uint(data_k_t3[a_offset + ib].signs[j / 8]);
-        } else {
-            nm = float(data_v_t3[a_offset + ib].norm);
-            qb = uint(data_v_t3[a_offset + ib].qs[j / 4]);
-            sb = uint(data_v_t3[a_offset + ib].signs[j / 8]);
-        }
-        uint lo = (qb >> ((j % 4) * 2)) & 0x3;
-        uint hi = (sb >> (j % 8)) & 0x1;
-        r[k] = FLOAT_TYPE(T3C[lo | (hi << 2)] * nm);
+    float nm;
+    uint  qb;
+    uint  sb;
+    if (binding_idx == BINDING_IDX_K) {
+        nm = float(data_k_t3[a_offset + ib].norm);
+        qb = uint(data_k_t3[a_offset + ib].qs[iqs / 4]);
+        sb = uint(data_k_t3[a_offset + ib].signs[iqs / 8]);
+    } else {
+        nm = float(data_v_t3[a_offset + ib].norm);
+        qb = uint(data_v_t3[a_offset + ib].qs[iqs / 4]);
+        sb = uint(data_v_t3[a_offset + ib].signs[iqs / 8]);
     }
-    return r;
+    // iqs is a multiple of 4; within the signs byte, the 4 elements start at bit (iqs%8).
+    uint sshift = iqs & 4u;  // 0 if iqs%8 < 4, else 4
+    return FLOAT_TYPEV4(
+        T3C[((qb      ) & 0x3) | (((sb >> (sshift + 0)) & 1u) << 2)] * nm,
+        T3C[((qb >>  2) & 0x3) | (((sb >> (sshift + 1)) & 1u) << 2)] * nm,
+        T3C[((qb >>  4) & 0x3) | (((sb >> (sshift + 2)) & 1u) << 2)] * nm,
+        T3C[((qb >>  6) & 0x3) | (((sb >> (sshift + 3)) & 1u) << 2)] * nm
+    );
+}
+#endif
+
+#if defined(DATA_A_TURBO4_0)
+const float T4C[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926
+);
+// iqs is always even: pairs of elements share a qs nibble byte.
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float nm;
+    uint  qb0, qb1;
+    if (binding_idx == BINDING_IDX_K) {
+        nm  = float(data_k_t4[a_offset + ib].norm);
+        qb0 = uint(data_k_t4[a_offset + ib].qs[iqs / 2    ]);
+        qb1 = uint(data_k_t4[a_offset + ib].qs[iqs / 2 + 1]);
+    } else {
+        nm  = float(data_v_t4[a_offset + ib].norm);
+        qb0 = uint(data_v_t4[a_offset + ib].qs[iqs / 2    ]);
+        qb1 = uint(data_v_t4[a_offset + ib].qs[iqs / 2 + 1]);
+    }
+    return FLOAT_TYPEV4(
+        T4C[ qb0       & 0xF] * nm,
+        T4C[(qb0 >> 4) & 0xF] * nm,
+        T4C[ qb1       & 0xF] * nm,
+        T4C[(qb1 >> 4) & 0xF] * nm
+    );
 }
 #endif
 

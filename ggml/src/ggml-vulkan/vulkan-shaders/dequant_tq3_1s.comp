@@ -1,0 +1,66 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_tq3_1s data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    const float centroids[8] = float[8](
+        -1.996684, -1.291398, -0.740341, -0.247508,
+         0.230106,  0.725222,  1.277503,  1.988943
+    );
+
+    const float signs[32] = float[32](
+        +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+        -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0
+    );
+
+    const float INV_SQRT32 = 0.17677669529663688;
+
+    const uint ib = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (ib >= p.nel / 32) return;
+
+    const float d0 = float(data_a[ib].d0);
+    const float d1 = float(data_a[ib].d1);
+
+    float buf[32];
+    for (int group = 0; group < 4; group++) {
+        const uint b0 = uint(data_a[ib].qs[group * 3 + 0]);
+        const uint b1 = uint(data_a[ib].qs[group * 3 + 1]);
+        const uint b2 = uint(data_a[ib].qs[group * 3 + 2]);
+        
+        buf[group * 8 + 0] = centroids[b0 & 7u];
+        buf[group * 8 + 1] = centroids[(b0 >> 3u) & 7u];
+        buf[group * 8 + 2] = centroids[((b0 >> 6u) | (b1 << 2u)) & 7u];
+        buf[group * 8 + 3] = centroids[(b1 >> 1u) & 7u];
+        buf[group * 8 + 4] = centroids[(b1 >> 4u) & 7u];
+        buf[group * 8 + 5] = centroids[((b1 >> 7u) | (b2 << 1u)) & 7u];
+        buf[group * 8 + 6] = centroids[(b2 >> 2u) & 7u];
+        buf[group * 8 + 7] = centroids[(b2 >> 5u) & 7u];
+    }
+
+    for (int j = 0; j < 32; j++) {
+        buf[j] *= (j < 16) ? d0 : d1;
+    }
+
+    for (uint step = 1u; step < 32u; step <<= 1u) {
+        for (uint i = 0u; i < 32u; i += step * 2u) {
+            for (uint j = i; j < i + step; j++) {
+                const float a = buf[j];
+                const float b = buf[j + step];
+                buf[j]        = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+
+    const uint out_base = ib * 32u;
+    for (int j = 0; j < 32; j++) {
+        data_b[out_base + uint(j)] = D_TYPE(buf[j] * INV_SQRT32 * signs[j]);
+    }
+}
