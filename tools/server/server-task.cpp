@@ -1,5 +1,6 @@
 #include "server-task.h"
 
+#include "build-info.h"
 #include "chat.h"
 #include "common.h"
 #include "json-schema-to-grammar.h"
@@ -268,6 +269,7 @@ task_params server_task::params_from_json_cmpl(
     params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
     params.n_keep           = json_value(data,       "n_keep",             defaults.n_keep);
     params.n_discard        = json_value(data,       "n_discard",          defaults.n_discard);
+    params.n_discard        = std::max(0, params.n_discard);
     params.n_cmpl           = json_value(data,       "n_cmpl",             json_value(data, "n", 1));
     params.n_cache_reuse    = json_value(data,       "n_cache_reuse",      defaults.n_cache_reuse);
     //params.t_max_prompt_ms  = json_value(data,       "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
@@ -793,7 +795,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         })},
         {"created",            t},
         {"model",              oaicompat_model},
-        {"system_fingerprint", build_info},
+        {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "text_completion"},
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
@@ -841,7 +843,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"choices",            json::array({choice})},
         {"created",            t},
         {"model",              oaicompat_model},
-        {"system_fingerprint", build_info},
+        {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion"},
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
@@ -878,7 +880,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
             {"created", t},
             {"id", oaicompat_cmpl_id},
             {"model", oaicompat_model},
-            {"system_fingerprint", build_info},
+            {"system_fingerprint", std::string(llama_build_info())},
             {"object", "chat.completion.chunk"},
         });
     }
@@ -894,7 +896,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         {"created",            t},
         {"id",                 oaicompat_cmpl_id},
         {"model",              oaicompat_model},
-        {"system_fingerprint", build_info},
+        {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion.chunk"},
     });
 
@@ -906,7 +908,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
             {"created",            t},
             {"id",                 oaicompat_cmpl_id},
             {"model",              oaicompat_model},
-            {"system_fingerprint", build_info},
+            {"system_fingerprint", std::string(llama_build_info())},
             {"object",             "chat.completion.chunk"},
             {"usage",              usage_json_oaicompat()},
         });
@@ -1471,7 +1473,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
         })},
         {"created",            t},
         {"model",              oaicompat_model},
-        {"system_fingerprint", build_info},
+        {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "text_completion"},
         {"id",                 oaicompat_cmpl_id}
     };
@@ -1508,7 +1510,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
             {"created", t},
             {"id", oaicompat_cmpl_id},
             {"model", oaicompat_model},
-            {"system_fingerprint", build_info},
+            {"system_fingerprint", std::string(llama_build_info())},
             {"object", "chat.completion.chunk"},
         });
     };
