@@ -155,7 +155,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = (n_outputs > 0 && (!cparams.embeddings_pre_norm || n_outputs < n_tokens)) ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
@@ -531,7 +531,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = (n_outputs > 0 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
     auto * inp_attn           = build_attn_inp_kv();
 
     ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
