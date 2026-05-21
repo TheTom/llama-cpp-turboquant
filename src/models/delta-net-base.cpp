@@ -544,7 +544,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    const bool keep = cparams.n_rs_seq > 0 && n_seq_tokens > 1;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
