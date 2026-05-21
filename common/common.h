@@ -159,7 +159,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
-    COMMON_SPECULATIVE_TYPE_MTP,           // multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,           // multi-token prediction
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -367,7 +367,7 @@ struct common_params_speculative {
 
     bool has_mtp() const {
         for (auto t : types) {
-            if (t == COMMON_SPECULATIVE_TYPE_MTP) {
+            if (t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
                 return mtp.model != nullptr;
             }
         }
@@ -634,6 +634,9 @@ struct common_params {
     bool webui_mcp_proxy = false;
     std::string webui_config_json;
 
+    bool ui_mcp_proxy = false;
+    std::string ui_config_json;
+
     // "advanced" endpoints are disabled by default for better security
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
@@ -711,6 +714,7 @@ struct common_params {
 // initializes the logging system and prints info about the build
 void common_init();
 
+void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
