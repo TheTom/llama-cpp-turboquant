@@ -1,0 +1,101 @@
+[
+  {
+    "codec": "f16/f16",
+    "k_type": "f16",
+    "v_type": "f16",
+    "ctx": 256,
+    "n_chunks": 20,
+    "final_ppl": 15.0727,
+    "elapsed_s": 4.1419618129730225,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_f16-f16_c256.log"
+  },
+  {
+    "codec": "f16/f16",
+    "k_type": "f16",
+    "v_type": "f16",
+    "ctx": 1024,
+    "n_chunks": 20,
+    "final_ppl": 8.3404,
+    "elapsed_s": 10.63742995262146,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_f16-f16_c1024.log"
+  },
+  {
+    "codec": "f16/f16",
+    "k_type": "f16",
+    "v_type": "f16",
+    "ctx": 4096,
+    "n_chunks": 20,
+    "final_ppl": 7.8734,
+    "elapsed_s": 38.38897395133972,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_f16-f16_c4096.log"
+  },
+  {
+    "codec": "q8_0/turbo3",
+    "k_type": "q8_0",
+    "v_type": "turbo3",
+    "ctx": 256,
+    "n_chunks": 20,
+    "final_ppl": 15.124,
+    "elapsed_s": 4.094803810119629,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_q8_0-turbo3_c256.log"
+  },
+  {
+    "codec": "q8_0/turbo3",
+    "k_type": "q8_0",
+    "v_type": "turbo3",
+    "ctx": 1024,
+    "n_chunks": 20,
+    "final_ppl": 8.3741,
+    "elapsed_s": 10.139601230621338,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_q8_0-turbo3_c1024.log"
+  },
+  {
+    "codec": "q8_0/turbo3",
+    "k_type": "q8_0",
+    "v_type": "turbo3",
+    "ctx": 4096,
+    "n_chunks": 20,
+    "final_ppl": 7.9015,
+    "elapsed_s": 39.90361309051514,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_q8_0-turbo3_c4096.log"
+  },
+  {
+    "codec": "q8_0/turbo2",
+    "k_type": "q8_0",
+    "v_type": "turbo2",
+    "ctx": 256,
+    "n_chunks": 20,
+    "final_ppl": 15.2355,
+    "elapsed_s": 4.084810018539429,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_q8_0-turbo2_c256.log"
+  },
+  {
+    "codec": "q8_0/turbo2",
+    "k_type": "q8_0",
+    "v_type": "turbo2",
+    "ctx": 1024,
+    "n_chunks": 20,
+    "final_ppl": 8.4323,
+    "elapsed_s": 10.131688117980957,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_q8_0-turbo2_c1024.log"
+  },
+  {
+    "codec": "q8_0/turbo2",
+    "k_type": "q8_0",
+    "v_type": "turbo2",
+    "ctx": 4096,
+    "n_chunks": 20,
+    "final_ppl": 7.9474,
+    "elapsed_s": 39.89297604560852,
+    "ok": true,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/rps_q8_0-turbo2_c4096.log"
+  }
+]

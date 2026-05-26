@@ -1,0 +1,22 @@
+[step 1] generating f16/f16 baseline logits → /Users/tom/local_llms/llama.cpp/bench-tq+/results/f16_base.kld
+  ✓ base logits saved (42s)
+[step 2] q8_0/turbo4
+  ✓ mean_kld=0.003513 99%=0.030897 max=0.850545 same_top%=97.487  elapsed=41s
+[step 2] q8_0/turbo3
+  ✓ mean_kld=0.004833 99%=0.039284 max=1.85337 same_top%=97.003  elapsed=41s
+[step 2] q8_0/turbo2
+  ✓ mean_kld=0.012598 99%=0.095866 max=1.731294 same_top%=95.142  elapsed=41s
+
+KL-divergence summary (lower = closer to fp16 baseline):
+  codec                    mean        med        95%        99%      99.9%        max     top%
+  q8_0/turbo4            0.0035     0.0015     0.0126     0.0309     0.1040     0.8505  97.4870
+  q8_0/turbo3            0.0048     0.0021     0.0171     0.0393     0.1298     1.8534  97.0030
+  q8_0/turbo2            0.0126     0.0060     0.0437     0.0959     0.2874     1.7313  95.1420
+
+# DIAGNOSTIC INTERPRETATION:
+# If max_kld and 99.9% kld are LARGE relative to median:
+#   → error is concentrated in a small fraction of positions
+#   → sink+recency selectively protects those positions, would help
+# If max_kld ≈ 99% kld ≈ 95% kld:
+#   → error is uniform across positions
+#   → sink+recency wouldn't help; position-agnostic codec improvement needed

@@ -1,0 +1,108 @@
+=== KL DONE, starting recency-position split ===
+Mon May 25 23:10:41 CDT 2026
+[run] f16/f16 ctx=256 n_chunks=20
+  → PPL=15.0727  elapsed=4s
+[run] f16/f16 ctx=1024 n_chunks=20
+  → PPL=8.3404  elapsed=11s
+[run] f16/f16 ctx=4096 n_chunks=20
+  → PPL=7.8734  elapsed=38s
+[run] q8_0/turbo3 ctx=256 n_chunks=20
+  → PPL=15.124  elapsed=4s
+[run] q8_0/turbo3 ctx=1024 n_chunks=20
+  → PPL=8.3741  elapsed=10s
+[run] q8_0/turbo3 ctx=4096 n_chunks=20
+  → PPL=7.9015  elapsed=40s
+[run] q8_0/turbo2 ctx=256 n_chunks=20
+  → PPL=15.2355  elapsed=4s
+[run] q8_0/turbo2 ctx=1024 n_chunks=20
+  → PPL=8.4323  elapsed=10s
+[run] q8_0/turbo2 ctx=4096 n_chunks=20
+  → PPL=7.9474  elapsed=40s
+
+  codec                     256       1024       4096
+  f16/f16               15.0727     8.3404     7.8734
+  q8_0/turbo2           15.2355     8.4323     7.9474
+  q8_0/turbo3           15.1240     8.3741     7.9015
+
+ΔPPL% vs f16/f16 (positive = quant codec worse):
+  codec                     256       1024       4096
+  q8_0/turbo2            +1.08%     +1.10%     +0.94%
+  q8_0/turbo3            +0.34%     +0.40%     +0.36%
+
+# Interpretation:
+# If ΔPPL is small at ctx=256 and large at ctx=4096:
+#   → quant error accumulates with context. Recency window WOULD help.
+# If ΔPPL is similar across ctx sizes:
+#   → quant error is per-token, not accumulating. Sink+recency unlikely to help.
+=== RECENCY-POS DONE ===
+Mon May 25 23:13:23 CDT 2026
+=== NIAH STARTING ===
+Mon May 25 23:13:34 CDT 2026
+[run] k=f16_v=f16_c2048_d10  needle≈178/1789 project=Mercury code=27269
+  → ✗ got '' (want 27269), 0s
+[run] k=f16_v=f16_c2048_d30  needle≈536/1789 project=Tomato code=90817
+  → ✗ got '' (want 90817), 0s
+[run] k=f16_v=f16_c2048_d50  needle≈894/1789 project=Mercury code=59669
+  → ✗ got '' (want 59669), 0s
+[run] k=f16_v=f16_c2048_d70  needle≈1252/1789 project=Falcon code=46059
+  → ✗ got '' (want 46059), 0s
+[run] k=f16_v=f16_c2048_d90  needle≈1610/1789 project=Orchid code=77573
+  → ✗ got '' (want 77573), 0s
+[run] k=f16_v=f16_c4096_d10  needle≈379/3796 project=Mercury code=13137
+  → ✗ got '' (want 13137), 0s
+[run] k=f16_v=f16_c4096_d30  needle≈1138/3796 project=Mercury code=30628
+  → ✗ got '' (want 30628), 0s
+[run] k=f16_v=f16_c4096_d50  needle≈1898/3796 project=Orchid code=85208
+  → ✗ got '' (want 85208), 0s
+[run] k=f16_v=f16_c4096_d70  needle≈2657/3796 project=Crater code=72446
+  → ✗ got '' (want 72446), 0s
+[run] k=f16_v=f16_c4096_d90  needle≈3416/3796 project=Tomato code=13535
+  → ✗ got '' (want 13535), 0s
+[run] k=q8_0_v=turbo3_c2048_d10  needle≈178/1789 project=Orchid code=76293
+  → ✗ got '' (want 76293), 0s
+[run] k=q8_0_v=turbo3_c2048_d30  needle≈536/1789 project=Orchid code=33571
+  → ✗ got '' (want 33571), 0s
+[run] k=q8_0_v=turbo3_c2048_d50  needle≈894/1789 project=Falcon code=25887
+  → ✗ got '' (want 25887), 0s
+[run] k=q8_0_v=turbo3_c2048_d70  needle≈1252/1789 project=Orchid code=41159
+  → ✗ got '' (want 41159), 0s
+[run] k=q8_0_v=turbo3_c2048_d90  needle≈1610/1789 project=Crater code=84667
+  → ✗ got '' (want 84667), 0s
+[run] k=q8_0_v=turbo3_c4096_d10  needle≈379/3796 project=Crater code=92473
+  → ✗ got '' (want 92473), 0s
+[run] k=q8_0_v=turbo3_c4096_d30  needle≈1138/3796 project=Orchid code=68401
+  → ✗ got '' (want 68401), 0s
+[run] k=q8_0_v=turbo3_c4096_d50  needle≈1898/3796 project=Tomato code=45950
+  → ✗ got '' (want 45950), 0s
+[run] k=q8_0_v=turbo3_c4096_d70  needle≈2657/3796 project=Falcon code=10530
+  → ✗ got '' (want 10530), 0s
+[run] k=q8_0_v=turbo3_c4096_d90  needle≈3416/3796 project=Falcon code=32050
+  → ✗ got '' (want 32050), 0s
+[run] k=q8_0_v=turbo2_c2048_d10  needle≈178/1789 project=Atlas code=54070
+  → ✗ got '' (want 54070), 0s
+[run] k=q8_0_v=turbo2_c2048_d30  needle≈536/1789 project=Crater code=56603
+  → ✗ got '' (want 56603), 0s
+[run] k=q8_0_v=turbo2_c2048_d50  needle≈894/1789 project=Atlas code=61711
+  → ✗ got '' (want 61711), 0s
+[run] k=q8_0_v=turbo2_c2048_d70  needle≈1252/1789 project=Mercury code=52050
+  → ✗ got '' (want 52050), 0s
+[run] k=q8_0_v=turbo2_c2048_d90  needle≈1610/1789 project=Crater code=50244
+  → ✗ got '' (want 50244), 0s
+[run] k=q8_0_v=turbo2_c4096_d10  needle≈379/3796 project=Orchid code=55136
+  → ✗ got '' (want 55136), 0s
+[run] k=q8_0_v=turbo2_c4096_d30  needle≈1138/3796 project=Atlas code=83368
+  → ✗ got '' (want 83368), 0s
+[run] k=q8_0_v=turbo2_c4096_d50  needle≈1898/3796 project=Mercury code=45121
+  → ✗ got '' (want 45121), 0s
+[run] k=q8_0_v=turbo2_c4096_d70  needle≈2657/3796 project=Mercury code=20321
+  → ✗ got '' (want 20321), 0s
+[run] k=q8_0_v=turbo2_c4096_d90  needle≈3416/3796 project=Crater code=72682
+  → ✗ got '' (want 72682), 0s
+
+NIAH accuracy (over depths):
+  codec                    2048       4096
+  f16/f16              0% (0/5)   0% (0/5)
+  q8_0/turbo2          0% (0/5)   0% (0/5)
+  q8_0/turbo3          0% (0/5)   0% (0/5)
+=== NIAH DONE ===
+Mon May 25 23:13:34 CDT 2026

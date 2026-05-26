@@ -1,0 +1,29 @@
+[run] f16-f16  (f16/f16)  ctx=4096 chunks=40
+      /Users/tom/local_llms/llama.cpp/build/bin/llama-perplexity -m /Users/tom/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q8_0.gguf -f wikitext-2-raw/wiki.test.raw -c 4096 --chunks 40 --cache-type-k f16 --cache-type-v f16 -ngl 999 -t 8 -fa on --fit off
+  ✓ ppl=7.9553  kv=NoneMB  prompt_tps=None  eval_tps=None  elapsed=75s
+[run] f16-turbo4  (f16/turbo4)  ctx=4096 chunks=40
+      /Users/tom/local_llms/llama.cpp/build/bin/llama-perplexity -m /Users/tom/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q8_0.gguf -f wikitext-2-raw/wiki.test.raw -c 4096 --chunks 40 --cache-type-k f16 --cache-type-v turbo4 -ngl 999 -t 8 -fa on --fit off
+  ✓ ppl=7.9686  kv=NoneMB  prompt_tps=None  eval_tps=None  elapsed=443s
+[run] q8-turbo4  (q8_0/turbo4)  ctx=4096 chunks=40
+      /Users/tom/local_llms/llama.cpp/build/bin/llama-perplexity -m /Users/tom/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q8_0.gguf -f wikitext-2-raw/wiki.test.raw -c 4096 --chunks 40 --cache-type-k q8_0 --cache-type-v turbo4 -ngl 999 -t 8 -fa on --fit off
+  ✓ ppl=7.9706  kv=NoneMB  prompt_tps=None  eval_tps=None  elapsed=77s
+[run] q8-turbo3  (q8_0/turbo3)  ctx=4096 chunks=40
+      /Users/tom/local_llms/llama.cpp/build/bin/llama-perplexity -m /Users/tom/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q8_0.gguf -f wikitext-2-raw/wiki.test.raw -c 4096 --chunks 40 --cache-type-k q8_0 --cache-type-v turbo3 -ngl 999 -t 8 -fa on --fit off
+  ✓ ppl=7.9823  kv=NoneMB  prompt_tps=None  eval_tps=None  elapsed=78s
+[run] q8-turbo2  (q8_0/turbo2)  ctx=4096 chunks=40
+      /Users/tom/local_llms/llama.cpp/build/bin/llama-perplexity -m /Users/tom/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q8_0.gguf -f wikitext-2-raw/wiki.test.raw -c 4096 --chunks 40 --cache-type-k q8_0 --cache-type-v turbo2 -ngl 999 -t 8 -fa on --fit off
+  ✓ ppl=8.0264  kv=NoneMB  prompt_tps=None  eval_tps=None  elapsed=78s
+[run] turbo3-turbo3  (turbo3/turbo3)  ctx=4096 chunks=40
+      /Users/tom/local_llms/llama.cpp/build/bin/llama-perplexity -m /Users/tom/models/nvidia_Nemotron-Cascade-2-30B-A3B-Q8_0.gguf -f wikitext-2-raw/wiki.test.raw -c 4096 --chunks 40 --cache-type-k turbo3 --cache-type-v turbo3 -ngl 999 -t 8 -fa on --fit off
+  ✓ ppl=8.4329  kv=NoneMB  prompt_tps=None  eval_tps=None  elapsed=78s
+
+Wrote 6 rows to bench-tq+/results/baseline_c4k_n40.json
+
+Summary (vs f16/f16 baseline):
+  label                     ppl     Δppl    kv_MB    p_tps    e_tps
+  f16-f16                7.9553   +0.00%        —        —        —
+  f16-turbo4             7.9686   +0.17%        —        —        —
+  q8-turbo4              7.9706   +0.19%        —        —        —
+  q8-turbo3              7.9823   +0.34%        —        —        —
+  q8-turbo2              8.0264   +0.89%        —        —        —
+  turbo3-turbo3          8.4329   +6.00%        —        —        —

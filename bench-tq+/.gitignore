@@ -1,0 +1,6 @@
+logs/*.log
+results/f16_base.kld
+logs/ppl_*.log
+logs/niah_*.log
+logs/rps_*.log
+logs/kld_*-*_*.log

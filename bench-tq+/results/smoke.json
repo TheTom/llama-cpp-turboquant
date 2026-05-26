@@ -1,0 +1,42 @@
+[
+  {
+    "label": "f16-f16",
+    "k_type": "f16",
+    "v_type": "f16",
+    "ctx": 2048,
+    "chunks": 2,
+    "threads": 8,
+    "extra_args": "",
+    "elapsed_s": 0.5622069835662842,
+    "final_ppl": null,
+    "first_chunk_ppl": null,
+    "kv_total_mb": null,
+    "kv_k_mb": null,
+    "kv_v_mb": null,
+    "eval_tps": null,
+    "prompt_tps": null,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/ppl_f16-f16_c2048_n2.log",
+    "ok": false,
+    "note": "rc=1"
+  },
+  {
+    "label": "q8-turbo3",
+    "k_type": "q8_0",
+    "v_type": "turbo3",
+    "ctx": 2048,
+    "chunks": 2,
+    "threads": 8,
+    "extra_args": "",
+    "elapsed_s": 0.5537571907043457,
+    "final_ppl": null,
+    "first_chunk_ppl": null,
+    "kv_total_mb": null,
+    "kv_k_mb": null,
+    "kv_v_mb": null,
+    "eval_tps": null,
+    "prompt_tps": null,
+    "log_path": "/Users/tom/local_llms/llama.cpp/bench-tq+/logs/ppl_q8-turbo3_c2048_n2.log",
+    "ok": false,
+    "note": "rc=1"
+  }
+]
