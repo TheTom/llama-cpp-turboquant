@@ -46,3 +46,19 @@ Importance matrices use the existing quantize interface:
 Advanced mixed recipes can be expressed with the existing
 `--tensor-type` and `--tensor-type-file` options instead of adding extra
 public file-type presets.
+
+## Fork integration notes
+
+In this fork these formats are experimental and CPU/reference only. The
+type identifiers are assigned after the existing turbo/TQ types so they
+coexist without clashing:
+
+| symbol                        | `GGML_TYPE` | `LLAMA_FTYPE` |
+|-------------------------------|:-----------:|:-------------:|
+| `Q4_0_ROCMFP4`                | 47          | 41            |
+| `Q4_0_ROCMFP4_FAST`           | 48          | 42            |
+
+These IDs are stored in the GGUF tensor type field, so a file produced by
+this fork must be read back by a build that uses the same assignment.
+Accelerated (GPU) paths are intended as follow-up work; for now both
+formats run through the portable CPU reference quantize/dequantize path.
