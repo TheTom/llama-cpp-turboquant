@@ -434,7 +434,9 @@ extern "C" {
         GGML_TYPE_TURBO4_0 = 44, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_Q4_0_ROCMFP4      = 47, // ROCmFP4 experimental: UE4M3 scales + packed AMD FP4 blocks, 4.50 bpw
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 48, // ROCmFP4 experimental: single-scale speed layout, 4.25 bpw
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision
@@ -478,6 +480,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 101, // ROCmFP4 single-scale speed layout
     };
 
     // available tensor operations:
