@@ -28,6 +28,7 @@
 
 struct chan_acc {
     std::vector<double> sum;
+    std::vector<double> sumsq;
     int64_t count = 0;
 };
 
@@ -60,6 +61,7 @@ static void accumulate(std::map<int, chan_acc> & acc_map, int il, const struct g
     auto & acc = acc_map[il];
     if (acc.sum.empty()) {
         acc.sum.assign(n_chan, 0.0);
+        acc.sumsq.assign(n_chan, 0.0);
     }
     if ((int64_t) acc.sum.size() != n_chan) {
         return; // shape changed mid-run - should not happen
@@ -68,7 +70,8 @@ static void accumulate(std::map<int, chan_acc> & acc_map, int il, const struct g
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const float * row = data + tok*n_chan;
         for (int64_t c = 0; c < n_chan; ++c) {
-            acc.sum[c] += row[c];
+            acc.sum[c]   += row[c];
+            acc.sumsq[c] += (double) row[c]*row[c];
         }
     }
     acc.count += n_tokens;
@@ -222,9 +225,29 @@ int main(int argc, char ** argv) {
         if (!mu_k.empty()) { fwrite(mu_k.data(), sizeof(float), mu_k.size(), f); }
         if (!mu_v.empty()) { fwrite(mu_v.data(), sizeof(float), mu_v.size(), f); }
 
-        LOG_INF("%s: layer %3d: n_k = %5zu, n_v = %5zu, tokens = %lld\n", __func__, il,
-                mu_k.size(), mu_v.size(),
-                (long long) (g_acc_k.count(il) ? g_acc_k[il].count : 0));
+        // DC energy fraction per side: ||mu||^2 / sum_c E[x_c^2], and the
+        // equivalent wasted-bits bound eq_bits = -0.5*log2(1 - frac)
+        auto dc_stats = [&](const std::map<int, chan_acc> & m, std::vector<float> & mu) -> std::pair<double,double> {
+            auto it = m.find(il);
+            if (it == m.end() || it->second.count == 0 || mu.empty()) {
+                return {0.0, 0.0};
+            }
+            double e2 = 0.0, m2 = 0.0;
+            for (size_t c = 0; c < mu.size(); ++c) {
+                e2 += it->second.sumsq[c] / (double) it->second.count;
+                m2 += (double) mu[c]*mu[c];
+            }
+            const double frac = e2 > 0.0 ? m2/e2 : 0.0;
+            const double bits = frac < 1.0 ? -0.5*log2(1.0 - frac) : INFINITY;
+            return {frac, bits};
+        };
+        const auto [kfrac, kbits] = dc_stats(g_acc_k, mu_k);
+        const auto [vfrac, vbits] = dc_stats(g_acc_v, mu_v);
+
+        LOG_INF("%s: layer %3d: n_k = %5zu, n_v = %5zu, tokens = %lld | DC K: %6.4f (%.3f bits)  DC V: %6.4f (%.3f bits)\n",
+                __func__, il, mu_k.size(), mu_v.size(),
+                (long long) (g_acc_k.count(il) ? g_acc_k[il].count : 0),
+                kfrac, kbits, vfrac, vbits);
     }
 
     fclose(f);
