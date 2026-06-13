@@ -580,6 +580,105 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // TorQuant affine tap: load per-(layer, channel) K/V mean tables
+    const char * LLAMA_AFFINE_TAP = getenv("LLAMA_AFFINE_TAP");
+    if (LLAMA_AFFINE_TAP && LLAMA_AFFINE_TAP[0] != '\0') {
+        affine_tap_load(LLAMA_AFFINE_TAP);
+    }
+}
+
+void llama_kv_cache::affine_tap_load(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        LLAMA_LOG_WARN("%s: affine tap table '%s' not found - tap disabled\n", __func__, path);
+        return;
+    }
+
+    auto read_u32 = [&](uint32_t & v) { return fread(&v, sizeof(v), 1, f) == 1; };
+
+    uint32_t magic = 0, version = 0, n_layer_file = 0;
+    if (!read_u32(magic) || magic != 0x54464641 /* 'AFFT' */ || !read_u32(version) || version != 1 || !read_u32(n_layer_file)) {
+        LLAMA_LOG_WARN("%s: affine tap table '%s' has bad header - tap disabled\n", __func__, path);
+        fclose(f);
+        return;
+    }
+
+    std::vector<std::vector<float>> mu_k(n_layer_file), mu_v(n_layer_file);
+    for (uint32_t il = 0; il < n_layer_file; ++il) {
+        uint32_t nk = 0, nv = 0;
+        if (!read_u32(nk) || !read_u32(nv)) { fclose(f); return; }
+        mu_k[il].resize(nk);
+        mu_v[il].resize(nv);
+        if (nk && fread(mu_k[il].data(), sizeof(float), nk, f) != nk) { fclose(f); return; }
+        if (nv && fread(mu_v[il].data(), sizeof(float), nv, f) != nv) { fclose(f); return; }
+    }
+    fclose(f);
+
+    const char * K_OV = getenv("LLAMA_AFFINE_TAP_K");
+    const char * V_OV = getenv("LLAMA_AFFINE_TAP_V");
+    const bool want_k = !(K_OV && atoi(K_OV) == 0);
+    const bool want_v = !(V_OV && atoi(V_OV) == 0);
+
+    affine_n_layer = n_layer_file;
+
+    int64_t kd = 0, vd = 0, vod = 0;
+    for (uint32_t il = 0; il < n_layer_file; ++il) {
+        kd = std::max<int64_t>(kd, (int64_t) mu_k[il].size());
+        vd = std::max<int64_t>(vd, (int64_t) mu_v[il].size());
+        if (!mu_v[il].empty()) {
+            const int64_t n_embd_head = hparams.n_embd_head_v(il);
+            const int64_t n_head_kv   = hparams.n_head_kv(il);
+            const int64_t n_head      = hparams.n_head(il);
+            if (n_head_kv > 0 && (int64_t) mu_v[il].size() == n_embd_head * n_head_kv) {
+                vod = std::max(vod, n_embd_head * n_head);
+            }
+        }
+    }
+
+    if (want_k && kd > 0) {
+        affine_tap_k    = true;
+        affine_mu_k_dim = kd;
+        affine_mu_k_flat.assign(n_layer_file * kd, 0.0f);
+        for (uint32_t il = 0; il < n_layer_file; ++il) {
+            std::copy(mu_k[il].begin(), mu_k[il].end(), affine_mu_k_flat.begin() + il * kd);
+        }
+    }
+
+    if (want_v && vd > 0 && vod > 0) {
+        affine_tap_v        = true;
+        affine_mu_v_dim     = vd;
+        affine_mu_v_out_dim = vod;
+        affine_mu_v_flat.assign(n_layer_file * vd, 0.0f);
+        affine_mu_v_out_flat.assign(n_layer_file * vod, 0.0f);
+        for (uint32_t il = 0; il < n_layer_file; ++il) {
+            if (mu_v[il].empty()) {
+                continue;
+            }
+            std::copy(mu_v[il].begin(), mu_v[il].end(), affine_mu_v_flat.begin() + il * vd);
+
+            // expand per-KV-head means across grouped Q heads for the output restore
+            const int64_t n_embd_head = hparams.n_embd_head_v(il);
+            const int64_t n_head_kv   = hparams.n_head_kv(il);
+            const int64_t n_head      = hparams.n_head(il);
+            if (n_head_kv == 0 || (int64_t) mu_v[il].size() != n_embd_head * n_head_kv) {
+                continue;
+            }
+            const int64_t rep = n_head / n_head_kv;
+            for (int64_t h = 0; h < n_head; ++h) {
+                const int64_t g = h / rep;
+                std::copy(mu_v[il].begin() + g * n_embd_head,
+                          mu_v[il].begin() + (g + 1) * n_embd_head,
+                          affine_mu_v_out_flat.begin() + il * vod + h * n_embd_head);
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: affine tap loaded from '%s': K %s (dim %lld), V %s (dim %lld, out %lld), %lld layers\n",
+            __func__, path,
+            affine_tap_k ? "ON" : "off", (long long) affine_mu_k_dim,
+            affine_tap_v ? "ON" : "off", (long long) affine_mu_v_dim, (long long) affine_mu_v_out_dim,
+            (long long) affine_n_layer);
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1726,6 +1825,54 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     }
 
     return res;
+}
+
+ggml_tensor * llama_kv_cache::build_input_affine_mu_k(ggml_context * ctx) const {
+    if (!affine_tap_k) {
+        return nullptr;
+    }
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, affine_mu_k_dim, affine_n_layer);
+    ggml_set_input(res);
+    ggml_set_name(res, "affine_mu_k");
+    return res;
+}
+
+ggml_tensor * llama_kv_cache::build_input_affine_mu_v(ggml_context * ctx) const {
+    if (!affine_tap_v) {
+        return nullptr;
+    }
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, affine_mu_v_dim, affine_n_layer);
+    ggml_set_input(res);
+    ggml_set_name(res, "affine_mu_v");
+    return res;
+}
+
+ggml_tensor * llama_kv_cache::build_input_affine_mu_v_out(ggml_context * ctx) const {
+    if (!affine_tap_v) {
+        return nullptr;
+    }
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, affine_mu_v_out_dim, affine_n_layer);
+    ggml_set_input(res);
+    ggml_set_name(res, "affine_mu_v_out");
+    return res;
+}
+
+void llama_kv_cache::set_input_affine_mu_k(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT((size_t) ggml_nelements(dst) == affine_mu_k_flat.size());
+    memcpy(dst->data, affine_mu_k_flat.data(), ggml_nbytes(dst));
+}
+
+void llama_kv_cache::set_input_affine_mu_v(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT((size_t) ggml_nelements(dst) == affine_mu_v_flat.size());
+    memcpy(dst->data, affine_mu_v_flat.data(), ggml_nbytes(dst));
+}
+
+void llama_kv_cache::set_input_affine_mu_v_out(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT((size_t) ggml_nelements(dst) == affine_mu_v_out_flat.size());
+    memcpy(dst->data, affine_mu_v_out_flat.data(), ggml_nbytes(dst));
 }
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -2918,4 +3065,28 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_affine_mu_k(ggml_context * ctx) const {
+    return kv->build_input_affine_mu_k(ctx);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_affine_mu_v(ggml_context * ctx) const {
+    return kv->build_input_affine_mu_v(ctx);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_affine_mu_v_out(ggml_context * ctx) const {
+    return kv->build_input_affine_mu_v_out(ctx);
+}
+
+void llama_kv_cache_context::set_input_affine_mu_k(ggml_tensor * dst) const {
+    kv->set_input_affine_mu_k(dst);
+}
+
+void llama_kv_cache_context::set_input_affine_mu_v(ggml_tensor * dst) const {
+    kv->set_input_affine_mu_v(dst);
+}
+
+void llama_kv_cache_context::set_input_affine_mu_v_out(ggml_tensor * dst) const {
+    kv->set_input_affine_mu_v_out(dst);
 }

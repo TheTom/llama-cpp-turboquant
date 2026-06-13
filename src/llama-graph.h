@@ -331,6 +331,12 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // TorQuant affine tap: per-layer K/V means (subtracted at cache write) and
+    // the Q-head-expanded V mean (added back to the attention output)
+    ggml_tensor * self_affine_mu_k     = nullptr; // F32 [mu_k_dim, n_layer]
+    ggml_tensor * self_affine_mu_v     = nullptr; // F32 [mu_v_dim, n_layer]
+    ggml_tensor * self_affine_mu_v_out = nullptr; // F32 [mu_v_out_dim, n_layer]
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return

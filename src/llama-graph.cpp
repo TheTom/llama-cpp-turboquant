@@ -495,6 +495,18 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (self_affine_mu_k) {
+        mctx->set_input_affine_mu_k(self_affine_mu_k);
+    }
+
+    if (self_affine_mu_v) {
+        mctx->set_input_affine_mu_v(self_affine_mu_v);
+    }
+
+    if (self_affine_mu_v_out) {
+        mctx->set_input_affine_mu_v_out(self_affine_mu_v_out);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -2260,6 +2272,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    inp->self_affine_mu_k     = mctx_cur->build_input_affine_mu_k(ctx0);
+    inp->self_affine_mu_v     = mctx_cur->build_input_affine_mu_v(ctx0);
+    inp->self_affine_mu_v_out = mctx_cur->build_input_affine_mu_v_out(ctx0);
+
     return inp;
 }
 
@@ -2285,6 +2301,30 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
+
+    // TorQuant affine tap: subtract calibrated per-channel means before the
+    // (optional) rotation and the quantized cache write. The K shift is exact
+    // under softmax (constant across cache positions for each query); the V
+    // shift is restored after attention below.
+    // NOT exact with attention sinks (the sink logit does not shift with the
+    // scores, and the weights no longer sum to 1) - tap disabled there.
+    if (sinks == nullptr &&
+            inp->self_affine_mu_k && il < inp->self_affine_mu_k->ne[1] &&
+            k_cur->ne[0]*k_cur->ne[1] <= inp->self_affine_mu_k->ne[0]) {
+        ggml_tensor * t  = inp->self_affine_mu_k;
+        ggml_tensor * mu = ggml_view_3d(ctx0, t, k_cur->ne[0], k_cur->ne[1], 1,
+                k_cur->ne[0]*ggml_element_size(t), t->nb[1], il*t->nb[1]);
+        k_cur = ggml_sub(ctx0, k_cur, mu);
+    }
+
+    if (sinks == nullptr &&
+            inp->self_affine_mu_v && il < inp->self_affine_mu_v->ne[1] &&
+            v_cur->ne[0]*v_cur->ne[1] <= inp->self_affine_mu_v->ne[0]) {
+        ggml_tensor * t  = inp->self_affine_mu_v;
+        ggml_tensor * mu = ggml_view_3d(ctx0, t, v_cur->ne[0], v_cur->ne[1], 1,
+                v_cur->ne[0]*ggml_element_size(t), t->nb[1], il*t->nb[1]);
+        v_cur = ggml_sub(ctx0, v_cur, mu);
+    }
 
     if (inp->self_k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
@@ -2363,6 +2403,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    }
+
+    // TorQuant affine tap: restore the V mean. Attention weights sum to 1, so
+    // sum_i a_i (v_i - mu) + mu == sum_i a_i v_i exactly (standard softmax).
+    if (sinks == nullptr &&
+            inp->self_affine_mu_v_out && il < inp->self_affine_mu_v_out->ne[1] &&
+            cur->ne[0] <= inp->self_affine_mu_v_out->ne[0]) {
+        ggml_tensor * t  = inp->self_affine_mu_v_out;
+        ggml_tensor * mu = ggml_view_2d(ctx0, t, cur->ne[0], 1, t->nb[1], il*t->nb[1]);
+        cur = ggml_add(ctx0, cur, mu);
     }
 
     if (wo) {
