@@ -1315,6 +1315,13 @@ void launch_fattn(
     //
     // Small batches (Q->ne[1] <= 8) always route through the pool so the warmup run
     // populates it; these match the decode/speculative cases that get captured.
+    //
+    // Caveat (memory, not correctness): when a captured decode cannot use VEC
+    // (head_dim == 192, or K->ne[1] not a multiple of FATTN_KQ_STRIDE) it falls
+    // through to this TILE/MMA path and pool-allocs the full f16 dequant buffer.
+    // The legacy pool then retains that buffer permanently -- these configs trade
+    // VRAM for graph compatibility. VEC-eligible head dims (e.g. Gemma) never hit
+    // this: their decode uses the VEC kernel, which does not call launch_fattn.
     cudaStreamCaptureStatus fa_capture_status = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(main_stream, &fa_capture_status));
     const bool fa_use_pool = (fa_capture_status != cudaStreamCaptureStatusNone) || (Q->ne[1] <= 8);
