@@ -341,6 +341,23 @@ class ModelBase:
 
                 return weight.float() * scale
 
+            def dequant_mxfp8(weight: Tensor, scale: Tensor, block_size: Sequence[int] | None = None) -> Tensor:
+                # MXFP8 (e.g. MiniMax-M3): scale_inv is a U8 UE8M0 exponent, so the
+                # actual block scale is 2^(scale - 127). Differs from the "fp8" path,
+                # whose scale_inv is already a float multiplier.
+                scale = (2.0 ** (scale.float() - 127.0))
+
+                if block_size is not None:
+                    dim_offset = scale.ndim - len(block_size)
+                    for i, size in enumerate(block_size):
+                        scale = scale.repeat_interleave(size, dim_offset + i)
+                    scale = scale[tuple(slice(0, size) for size in weight.shape)]
+
+                while scale.ndim < weight.ndim:
+                    scale = scale.unsqueeze(-1)
+
+                return weight.float() * scale
+
             # ref: https://github.com/ModelCloud/GPTQModel/blob/037c5c0f6c9e33c500d975b038d02e7ca437546d/gptqmodel/nn_modules/qlinear/__init__.py#L437-L476
             def dequant_gptq(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
                 bits = quant_config["bits"]
@@ -452,6 +469,18 @@ class ModelBase:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith(".qscale_act"):
                         tensors_to_remove.append(name)
+            elif quant_method == "mxfp8":
+                # MiniMax-M3 style: F8_E4M3 weights + U8 UE8M0 block scales ([1, 32]).
+                block_size = quant_config.get("weight_block_size")
+                for name in list(self.model_tensors.keys()):
+                    if name.endswith("_scale_inv"):
+                        weight_name = name.removesuffix("_scale_inv")
+                        w = self.model_tensors[weight_name]
+                        s = self.model_tensors[name]
+                        self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_mxfp8(w(), s(), bs)
+                        tensors_to_remove.append(name)
+                        if self._fp8_as_q8:
+                            self._fp8_dequantized.add(weight_name)
             elif quant_method == "gptq":
                 for name in self.model_tensors.keys():
                     if name.endswith(".qweight"):
