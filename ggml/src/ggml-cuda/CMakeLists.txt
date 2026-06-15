@@ -289,3 +289,11 @@ if (CUDAToolkit_FOUND)
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()
+
+# Suppress upstream warnings from GGML_ABORT host-side compilation
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(ggml-cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-missing-noreturn,-Wno-unreachable-code-break,-Wno-unused-command-line-argument,-Wno-tautological-compare>
+        $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=177>
+    )
+endif()
