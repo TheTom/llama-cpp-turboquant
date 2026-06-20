@@ -15862,7 +15862,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    // On integrated GPUs / APUs, batching too much work into a single vkQueueSubmit
+    // can exceed the GPU job watchdog (e.g. amdgpu.lockup_timeout default 2000ms on
+    // RADV) and trigger a device-lost at deep context / heavy graphs (issue #185; cf.
+    // upstream ggml-org/llama.cpp#21724, where lowering this resolves the same
+    // ErrorDeviceLost with no measurable regression). The byte-based submit heuristic
+    // below only accounts for matmul work, so flash-attention-heavy graphs (e.g. the
+    // dense MTP head doing full attention over deep KV) can otherwise accumulate far
+    // past the timeout. Submit frequently on uma devices; allow an env override.
+    int nodes_per_submit = ctx->device->uma ? 1 : 100;
+    if (const char * env_nps = getenv("GGML_VK_NODES_PER_SUBMIT")) {
+        const int v = atoi(env_nps);
+        if (v > 0) {
+            nodes_per_submit = v;
+        }
+    }
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
