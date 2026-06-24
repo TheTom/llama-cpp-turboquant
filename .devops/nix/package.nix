@@ -20,7 +20,6 @@
   spirv-headers,
   openssl,
   shaderc,
-  spirv-headers,
   nodejs,
   importNpmLock,
   useBlas ?
