@@ -654,7 +654,6 @@ void quantize_turbo4_0(device const float * src, device block_turbo4_0 & dst) {
         recon_norm_sq += turbo_centroids_4bit[idx] * turbo_centroids_4bit[idx];
     }
 
-    dst.rnorm = half(0.0f);
     float recon_norm = sqrt(recon_norm_sq);
     dst.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
 }
@@ -11495,8 +11494,6 @@ kernel void kernel_set_rows_turbo4(
             float c = turbo_centroids_4bit[idx];
             recon_norm_sq += c * c;
         }
-
-        blk.rnorm = half(0.0f);  // reserved field, unused in 4-bit mode
 
         // Norm correction
         float recon_norm = sqrt(recon_norm_sq);
