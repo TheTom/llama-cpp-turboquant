@@ -2847,6 +2847,71 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
     return ggml_cuda_mmq_has_config(src0->type, src0->ne[1], cc, ggml_cuda_info().devices[id].smpbo);
 }
 
+// True when this process drives multiple GPUs of differing compute archs (e.g. an
+// RDNA4 gfx1201 + gfx1200 tensor-split). rocBLAS/Tensile caches a GEMM solution's code
+// object process-globally without the arch in the key, so the same problem run on both
+// archs reuses one arch's module on the other device -> "no kernel image is available"
+// (program ISA gfx1200 not compatible with device ISA gfx1201). Used to steer float
+// GEMMs onto ggml's own per-arch mmf kernel instead of cuBLAS.
+static bool ggml_cuda_mixed_gpu_archs() {
+    static const bool mixed = [] {
+        const ggml_cuda_device_info & info = ggml_cuda_info();
+        for (int id = 1; id < info.device_count; ++id) {
+            if (info.devices[id].cc != info.devices[0].cc) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return mixed;
+}
+
+// mmf can substitute for cuBLAS on the mixed-arch path, but its non-MUL_MAT_ID kernel
+// only handles up to 16 dst columns per launch. Slice src1/dst along the column (ne[1])
+// dimension and run mmf per <=16-column block. Requires a 2D problem (ne[2]==ne[3]==1)
+// and contiguous column stride, which the caller checks via ggml_cuda_can_chunk_mmf.
+static void ggml_cuda_mul_mat_f_chunked(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t ncols = src1->ne[1];
+    for (int64_t c0 = 0; c0 < ncols; c0 += 16) {
+        const int64_t cn = MIN((int64_t) 16, ncols - c0);
+        ggml_tensor s1 = *src1;
+        s1.ne[1] = cn;
+        s1.data  = (char *) src1->data + c0*src1->nb[1];
+        ggml_tensor d = *dst;
+        d.ne[1] = cn;
+        d.data  = (char *) dst->data + c0*dst->nb[1];
+        ggml_cuda_mul_mat_f(ctx, src0, &s1, nullptr, &d);
+    }
+}
+
+// The mixed-arch chunked-mmf workaround applies only to a 2D float GEMM whose src0 meets
+// mmf's structural preconditions (checked with a representative 16-column batch).
+// NB: the original patch guarded this with `!split` at the call site. Upstream has since
+// removed CUDA split *buffer types* altogether -- ggml_backend_buft_is_cuda_split no longer
+// exists, and only default_tensor_split (a VRAM proportion, unrelated) remains -- so there is
+// no split buffer path left to exclude. Upstream dropped their own `!split` guard here for
+// the same reason.
+static bool ggml_cuda_can_chunk_mmf(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_cuda_mixed_gpu_archs()) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ggml_is_quantized(src0->type)) {
+        return false;
+    }
+    if (src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1) || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    return ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, /*src1_ncols=*/16, /*mul_mat_id=*/false);
+}
+
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
@@ -3090,6 +3155,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S) {
         // Large prefill: runtime TQ4_1S -> q8_0 scratch conversion + cuBLAS
         ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (ggml_cuda_can_chunk_mmf(ctx, src0, src1, dst)) {
+        // Heterogeneous-arch multi-GPU: the cuBLAS call below aborts with a rocBLAS/Tensile
+        // cross-arch code-object mismatch (see ggml_cuda_mixed_gpu_archs). Run this large-batch
+        // float GEMM through ggml's own per-arch mmf kernel in <=16-column slices instead.
+        ggml_cuda_mul_mat_f_chunked(ctx, src0, src1, dst);
         return;
     }
 
