@@ -2911,6 +2911,43 @@ static bool ggml_cuda_can_chunk_mmf(ggml_backend_cuda_context & ctx,
     return ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, /*src1_ncols=*/16, /*mul_mat_id=*/false);
 }
 
+// mmvf fallback of the mixed-arch chunked-mmf workaround for a float src0 that mmf cannot
+// take (e.g. an F32 MoE router on RDNA4, which has no F32 MMA, so ggml_cuda_should_use_mmf
+// declines it and the cuBLAS path aborts with the rocBLAS/Tensile cross-arch mismatch).
+// Slice along ne[1] and run mmvf per <=MMVF_MAX_BATCH_SIZE block.
+static void ggml_cuda_mul_mat_vec_f_chunked(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t ncols = src1->ne[1];
+    for (int64_t c0 = 0; c0 < ncols; c0 += MMVF_MAX_BATCH_SIZE) {
+        const int64_t cn = MIN((int64_t) MMVF_MAX_BATCH_SIZE, ncols - c0);
+        ggml_tensor s1 = *src1;
+        s1.ne[1] = cn;
+        s1.data  = (char *) src1->data + c0*src1->nb[1];
+        ggml_tensor d = *dst;
+        d.ne[1] = cn;
+        d.data  = (char *) dst->data + c0*dst->nb[1];
+        ggml_cuda_mul_mat_vec_f(ctx, src0, &s1, nullptr, &d);
+    }
+}
+
+static bool ggml_cuda_can_chunk_mmvf(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_cuda_mixed_gpu_archs()) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ggml_is_quantized(src0->type)) {
+        return false;
+    }
+    if (src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1) || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    return ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, /*ne11=*/MMVF_MAX_BATCH_SIZE);
+}
+
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
     // Q8_CR weights are stored rotated: rotate the activations with the same
@@ -3163,6 +3200,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // cross-arch code-object mismatch (see ggml_cuda_mixed_gpu_archs). Run this large-batch
         // float GEMM through ggml's own per-arch mmf kernel in <=16-column slices instead.
         ggml_cuda_mul_mat_f_chunked(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (ggml_cuda_can_chunk_mmvf(ctx, src0, src1, dst)) {
+        // Same mixed-arch guard, for a float src0 that mmf declines (e.g. an F32 MoE router
+        // on RDNA4, which has no F32 MMA). Route it through ggml's per-arch mmvf kernel in
+        // <=MMVF_MAX_BATCH_SIZE slices rather than the cross-arch-unsafe cuBLAS GEMM.
+        ggml_cuda_mul_mat_vec_f_chunked(ctx, src0, src1, dst);
         return;
     }
 
