@@ -1,4 +1,6 @@
-# llama.cpp + TurboQuant+
+# llama.cpp with TurboQuant+
+
+![llama](banner.png)
 
 > Production-grade KV-cache and weight quantization for llama.cpp, with cross-backend kernel support for Apple Silicon, NVIDIA CUDA, AMD ROCm, and Vulkan.
 
@@ -28,10 +30,8 @@ This fork's TurboQuant integration is used in:
 | | |
 |---|---|
 | Default branch | `feature/turboquant-kv-cache` |
-| Commits ahead of upstream | ~300 |
 | Upstream tracking | continuous sync from `ggml-org/llama.cpp` master |
-| Upstream PR status | not yet upstreamed; running as a long-lived feature branch |
-
+| Release | [`cb295bf59663cd3577389315636772f4060bd1f5 b9888`](https://github.com/ggml-org/llama.cpp/releases/tag/b9888) |
 ---
 
 ## What this fork adds
