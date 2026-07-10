@@ -31,7 +31,7 @@ This fork's TurboQuant integration is used in:
 |---|---|
 | Default branch | `feature/turboquant-kv-cache` |
 | Upstream tracking | continuous sync from `ggml-org/llama.cpp` master |
-| Release | [`cb295bf59663cd3577389315636772f4060bd1f5 b9888`](https://github.com/ggml-org/llama.cpp/releases/tag/b9888) |
+| Release | [`fb30ba9a6c5b4674174d06aed14794832ab33278 b9946`](https://github.com/ggml-org/llama.cpp/releases/tag/b9946) |
 ---
 
 ## What this fork adds

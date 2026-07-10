@@ -968,7 +968,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -2182,14 +2182,14 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
         // rotate back
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
 
         tmp = ggml_rope_ext(ctx, tmp,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
 
         // rotate fwd
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
