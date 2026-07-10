@@ -994,10 +994,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
-    const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
-    int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
-
+        const half2 * __restrict__ mask, int * __restrict__ KV_max, const int ne30, const int64_t s31, const int64_t s33) {
     const int ne31     = gridDim.x;
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;

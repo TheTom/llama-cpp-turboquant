@@ -495,6 +495,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+            // turbo KV types; head-dim geometry is validated separately in
+            // ggml_cuda_get_best_fattn_kernel (multiples of 64 only)
             return true;
         default:
             return false;
@@ -604,10 +606,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
         return BEST_FATTN_KERNEL_NONE;
     }
-    // turbo VEC kernels require head_dim aligned to 64
-    if ((K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0) &&
-        K->ne[0] % 64 != 0) {
-        return BEST_FATTN_KERNEL_NONE;
+
+    // turbo VEC/MMA kernels are instantiated for head dims that are multiples of 64
+    {
+        auto is_turbo = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        };
+        if ((is_turbo(K->type) && K->ne[0] % 64 != 0) ||
+            (is_turbo(V->type) && V->ne[0] % 64 != 0)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 
     if (mask && mask->ne[2] != 1) {

@@ -89,7 +89,40 @@ struct trie {
         return match_result{match_result::NO_MATCH};
     }
 
+    struct prefix_and_next {
+        std::vector<uint32_t> prefix;
+        std::vector<uint32_t> next_chars;
+    };
+
+    std::vector<prefix_and_next> collect_prefix_and_next() {
+        std::vector<uint32_t>        prefix;
+        std::vector<prefix_and_next> result;
+        collect_prefix_and_next(0, prefix, result);
+        return result;
+    }
+
   private:
+    void collect_prefix_and_next(size_t index, std::vector<uint32_t> & prefix, std::vector<prefix_and_next> & out) {
+        if (!nodes[index].is_word) {
+            if (!nodes[index].children.empty()) {
+                std::vector<uint32_t> chars;
+                chars.reserve(nodes[index].children.size());
+                for (const auto & p : nodes[index].children) {
+                    chars.push_back(p.first);
+                }
+                out.emplace_back(prefix_and_next{prefix, chars});
+            }
+        }
+
+        for (const auto & p : nodes[index].children) {
+            uint32_t ch = p.first;
+            auto child = p.second;
+            prefix.push_back(ch);
+            collect_prefix_and_next(child, prefix, out);
+            prefix.pop_back();
+        }
+    }
+
     size_t create_node() {
         size_t index = nodes.size();
         nodes.emplace_back();
@@ -1549,6 +1582,55 @@ static std::string gbnf_char_class(const std::vector<uint32_t> & chars, bool neg
         s += gbnf_escape_char_class(ch);
     }
     return s + "]";
+}
+
+static std::string gbnf_excluding_pattern(const std::vector<std::string> & strings) {
+    trie matcher(strings);
+    auto pieces = matcher.collect_prefix_and_next();
+
+    std::string pattern;
+    std::string trailing;  // optional proper-prefix of a delimiter, allowed only at the very end
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        if (i > 0) {
+            pattern += " | ";
+        }
+
+        const auto & pre = pieces[i].prefix;
+        const auto & chars = pieces[i].next_chars;
+
+        std::string cls;
+        cls.reserve(chars.size());
+        for (uint32_t ch : chars) {
+            cls += gbnf_escape_char_class(ch);
+        }
+
+        if (!pre.empty()) {
+            std::string pre_literal = gbnf_format_literal(common_unicode_cpts_to_utf8(pre));
+            pattern += pre_literal + " [^" + cls + "]";
+            // Each interior alternative consumes a delimiter-prefix plus a disambiguating
+            // char, so the repetition alone cannot match a value that *ends* on a proper
+            // prefix of a delimiter (e.g. a trailing "\n" when the delimiter is
+            // "\n</parameter>\n"). The runtime until() (greedy first-match) accepts such
+            // values, so without this the grammar would reject input the parser accepts.
+            // Allow the value to terminate on any proper prefix as an optional tail.
+            // This makes the grammar a slight superset of the runtime language (a value
+            // may end on the longest prefix, which greedy first-match would not itself
+            // produce); harmless for constrained generation, which only needs to admit
+            // every runtime-valid string.
+            if (!trailing.empty()) {
+                trailing += " | ";
+            }
+            trailing += pre_literal;
+        } else {
+            pattern += "[^" + cls + "]";
+        }
+    }
+
+    std::string result = "(" + pattern + ")*";
+    if (!trailing.empty()) {
+        result += " (" + trailing + ")?";
+    }
+    return result;
 }
 
 static std::string gbnf_ac_grammar(
