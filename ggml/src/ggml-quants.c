@@ -418,6 +418,67 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// OSCAR q2_0 Lloyd-Max centroids for 2-bit reconstruction
+static const float kQ2_0_LM_centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+
+void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK2_0 == 0);
+    const int nb = k / QK2_0;
+
+    for (int i = 0; i < nb; i++) {
+        const float sigma = GGML_FP16_TO_FP32(x[i].d);
+        const float mean  = GGML_FP16_TO_FP32(x[i].m);
+        for (int j = 0; j < QK2_0 / 4; j++) {
+            const uint8_t packed = x[i].qs[j];
+            for (int b = 0; b < 4; b++) {
+                const int code = (packed >> (2 * b)) & 0x03;
+                y[i * QK2_0 + j * 4 + b] = mean + sigma * kQ2_0_LM_centroids[code];
+            }
+        }
+    }
+}
+
+void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK2_0 == 0);
+    const int nb = k / QK2_0;
+
+    for (int i = 0; i < nb; i++) {
+        float min = x[i * QK2_0];
+        float max = x[i * QK2_0];
+        for (int j = 1; j < QK2_0; j++) {
+            const float v = x[i * QK2_0 + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        const float range = max - min;
+        const float scale = (range < 1e-8f) ? 1.0f : (range / 3.0f);
+        const float mean  = (min + max) * 0.5f;
+        y[i].d = GGML_FP32_TO_FP16(scale);
+        y[i].m = GGML_FP32_TO_FP16(mean);
+        const float inv_scale = (scale > 1e-8f) ? 1.0f / scale : 1.0f;
+        for (int j = 0; j < QK2_0 / 4; j++) {
+            uint8_t packed = 0;
+            for (int b = 0; b < 4; b++) {
+                const float v = (x[i * QK2_0 + j * 4 + b] - mean) * inv_scale;
+                // Lloyd-Max: classify to nearest centroid
+                int code;
+                if (v < -0.4528f) code = 0;
+                else if (v < 0.0f) code = 1;
+                else if (v < 0.4528f) code = 2;
+                else code = 3;
+                packed |= code << (2 * b);
+            }
+            y[i].qs[j] = packed;
+        }
+    }
+}
+
+size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * GGML_RESTRICT imatrix) {
+    (void)imatrix;
+    quantize_row_q2_0_ref(src, (block_q2_0 *) dst, nrows * n_per_row);
+    return nrows * sizeof(block_q2_0) * (n_per_row / QK2_0);
+}
+
 void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_1;
 

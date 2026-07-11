@@ -277,6 +277,15 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// OSCAR q2_0 (Lloyd-Max 2-bit, block_size=32)
+#define QK2_0 32
+typedef struct {
+    ggml_half d;           // scale: (max-min)/3
+    ggml_half m;           // min
+    uint8_t qs[QK2_0 / 4]; // 4 packed 2-bit values per byte [0..3]
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == 2 * sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
 // TurboQuant 3-bit MSE-only: 3-bit PolarQuant indices (no QJL)
 // Storage block size = 32 (matches q4_0 for optimal GPU parallelism)
 // Transform group size = 128 (head_dim, for rotation Gaussianization)

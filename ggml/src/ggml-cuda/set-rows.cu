@@ -1,6 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "turbo-quant.cuh"
+#include <cstdlib>
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -1249,12 +1250,169 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 }
 
 
+// ---- OSCAR q2_0 (INT2) SET_ROWS write kernel ----
+// Quantizes an f32 K/V row into q2_0 using the calibrated OSCAR encode:
+// per-128-group mean, optional outlier clip (clip_ratio percentile),
+// per-32-block sigma, and 2-bit Lloyd-Max packing.
+template <typename idx_t>
+static __global__ void set_rows_cuda_q2_0(
+        const char * src0, const char * src1, char * dst,
+        const int32_t ne01, const int32_t ne11, const int32_t ne12,
+        const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12,
+        const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3,
+        const int32_t nk0, const float clip_ratio) {
+
+    const int32_t i03 = blockIdx.z;
+    const int32_t i02 = blockIdx.y;
+    const int32_t i01 = blockIdx.x;
+    if (i01 >= ne01) return;
+
+    const int32_t i12 = i03 % ne12;
+    const int32_t i11 = i02 % ne11;
+    const int32_t i10 = i01;
+
+    const idx_t i1 = *((const idx_t *) (src1 + i10*nb10 + i11*nb11 + i12*nb12));
+
+    block_q2_0 * dst_row = (block_q2_0 *) (dst + (uint64_t)i1*nb1 + i02*nb2 + i03*nb3);
+    const float * src_row = (const float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    const int ngrp = nk0 / 4;  // 128-wide groups per row (4 blocks of 32)
+
+    __shared__ float sh[128];
+    __shared__ float sh_sigma[4];
+    __shared__ float sh_mean;
+    __shared__ float sh_thr;
+
+    const unsigned t = threadIdx.x;  // 0..31
+
+    for (int g = 0; g < ngrp; ++g) {
+        const float * gsrc = src_row + g * 128;
+
+        for (int k = 0; k < 4; ++k) {
+            sh[t * 4 + k] = gsrc[t * 4 + k];
+        }
+        __syncthreads();
+
+        // group mean
+        if (t == 0) {
+            float s = 0.0f;
+            for (int j = 0; j < 128; ++j) s += sh[j];
+            sh_mean = s / 128.0f;
+        }
+        __syncthreads();
+
+        const float mean = sh_mean;
+        for (int k = 0; k < 4; ++k) sh[t * 4 + k] -= mean;
+        __syncthreads();
+
+        // OSCAR outlier clip: threshold = clip_ratio percentile over the 128 group,
+        // found by exact rank counting (matches CPU qsort + index selection).
+        if (clip_ratio > 0.0f && clip_ratio < 1.0f) {
+            if (t == 0) sh_thr = 0.0f;
+            __syncthreads();
+
+            int idx = (int)(clip_ratio * 128.0f);
+            if (idx >= 128) idx = 127;
+            for (int k = 0; k < 4; ++k) {
+                const float a = fabsf(sh[t * 4 + k]);
+                int lo = 0, le = 0;
+                for (int j = 0; j < 128; ++j) {
+                    const float aj = fabsf(sh[j]);
+                    lo += (aj <  a) ? 1 : 0;
+                    le += (aj <= a) ? 1 : 0;
+                }
+                if (lo <= idx && idx < le) sh_thr = a;
+            }
+            __syncthreads();
+
+            const float thr = sh_thr;
+            for (int k = 0; k < 4; ++k) {
+                float v = sh[t * 4 + k];
+                if (v >  thr) v =  thr;
+                if (v < -thr) v = -thr;
+                sh[t * 4 + k] = v;
+            }
+            __syncthreads();
+        }
+
+        // per-32-block sigma (RMS)
+        if (t < 4) {
+            float ss = 0.0f;
+            for (int j = 0; j < 32; ++j) ss += sh[t * 32 + j] * sh[t * 32 + j];
+            sh_sigma[t] = sqrtf(ss / 32.0f);
+        }
+        __syncthreads();
+
+        // quantize: thread t writes one packed byte (block b = t/8, byte t%8)
+        const int   b         = t / 8;
+        const float sigma     = sh_sigma[b];
+        const float inv_sigma = (sigma > 1e-8f) ? (1.0f / sigma) : 0.0f;
+
+        uint8_t packed = 0;
+        for (int k = 0; k < 4; ++k) {
+            const float vs = sh[t * 4 + k] * inv_sigma;
+            uint8_t code;
+            if      (vs < -0.6745f) code = 0;
+            else if (vs <  0.0f)    code = 1;
+            else if (vs <  0.6745f)  code = 2;
+            else                     code = 3;
+            packed |= code << (2 * k);
+        }
+
+        block_q2_0 & blk = dst_row[g * 4 + b];
+        blk.qs[t % 8] = packed;
+        if (t % 8 == 0) {
+            blk.d = __float2half(sigma);
+            blk.m = __float2half(mean);
+        }
+        __syncthreads();
+    }
+}
+
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    if (dst->type == GGML_TYPE_Q2_0) {
+        // OSCAR INT2 KV write: dedicated kernel (per-128-group mean + clip + per-block
+        // Lloyd-Max). clip_ratio comes from LLAMA_KV_CLIP_RATIO (0 disables).
+        float clip_ratio = 0.0f;
+        if (const char * e = getenv("LLAMA_KV_CLIP_RATIO")) {
+            clip_ratio = (float) atof(e);
+        }
+
+        GGML_TENSOR_BINARY_OP_LOCALS(src0, src1, dst);
+
+        const int32_t nk0 = (int32_t)(ne00 / ggml_blck_size(GGML_TYPE_Q2_0));
+        cudaStream_t stream = ctx.stream();
+
+        const dim3 grid_size(ne01, ne02, ne03);
+        const dim3 block_size(32, 1, 1);
+
+        const char * src0_d = (const char *) src0->data;
+        const char * src1_d = (const char *) src1->data;
+        char       * dst_d  = (char *)       dst->data;
+
+        if (src1->type == GGML_TYPE_I64) {
+            set_rows_cuda_q2_0<int64_t><<<grid_size, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d,
+                ne01, ne11, ne12,
+                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
+                nk0, clip_ratio);
+        } else {
+            set_rows_cuda_q2_0<int32_t><<<grid_size, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d,
+                ne01, ne11, ne12,
+                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
+                nk0, clip_ratio);
+        }
+        GGML_ASSERT(cudaGetLastError() == cudaSuccess);
+        return;
+    }
 
     if (src1->type == GGML_TYPE_I64) {
         set_rows_cuda<float, int64_t>(ctx, src0, src1, dst);

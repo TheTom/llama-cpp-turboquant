@@ -735,6 +735,30 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
 }
 
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
+    const float d  = __half2float(bq2_0->d);
+    const float m  = __half2float(bq2_0->m);
+    const float d8 = __low2float(bq8_1->ds);
+    constexpr float kQ2_0_lm_centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+    float S = 0.0f;
+    float C = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t q8_pack = get_int_b4(bq8_1->qs, j);
+        const uint8_t  q2_pack = bq2_0->qs[j];
+        for (int b = 0; b < 4; ++b) {
+            const int    qv  = (int)(int8_t)(q8_pack >> (8 * b));
+            const uint8_t code = (q2_pack >> (2 * b)) & 0x03;
+            const float  cen = kQ2_0_lm_centroids[code];
+            S += (float)qv;
+            C += cen * (float)qv;
+        }
+    }
+    (void)iqs;
+    return d8 * (m * S + d * C);
+}
 
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
