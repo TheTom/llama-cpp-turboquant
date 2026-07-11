@@ -153,7 +153,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_0(
         const int   u  = Q_q8[k_KQ_0/nthreads];
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
         const float q8scale = Q_ds.x;
-        const float q8off   = Q_ds.y / QI8_1;
+        const float q8off   = Q_ds.y / (float)QI8_1;
         #pragma unroll
         for (int b = 0; b < 4; ++b) {
             const int  k   = k_KQ * 4 + b;
@@ -163,7 +163,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_0(
             const uint8_t code = (K_q2_0[ib].qs[by] >> (2 * sub)) & 0x03;
             const float val = m + d * kQ2_0_lm_centroids[code];
             const int   qv  = (int)(int8_t)(u >> (8 * b));
-            const float q8eff = q8scale * qv - q8off;
+            const float q8eff = q8scale * (float)qv - q8off;
             sum += val * q8eff;
         }
     }

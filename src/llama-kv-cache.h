@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_cparams;
@@ -40,7 +41,11 @@ public:
         uint32_t s1;
 
         std::vector<llama_seq_id> strm; // [ns]
-        std::vector<idx_vec_t>    idxs; // [ns]
+        std::vector<idx_vec_t>    idxs; // [ns] LP global slot indices
+
+        // HP (high-precision) slot info — populated when HP mode is enabled
+        std::vector<idx_vec_t> hp_idxs;       // [ns] HP global slot indices per HP token
+        std::vector<idx_vec_t> hp_batch_idxs; // [ns] batch-local token row indices for HP tokens
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -52,6 +57,8 @@ public:
         void resize(size_t n) {
             strm.resize(n);
             idxs.resize(n);
+            hp_idxs.resize(n);
+            hp_batch_idxs.resize(n);
         }
 
         size_t size() const {
@@ -171,6 +178,12 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // HP (high-precision) variants — only valid when n_hp_total > 0
+    uint32_t get_n_hp() const { return n_hp_total; }
+    uint32_t get_n_hp_kv(const slot_info & sinfo) const;
+    ggml_tensor * get_k_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const;
+
     // TurboQuant: get rotation matrices (stored as row-major C arrays)
     // turbo_rotation = R (forward rotation, for Q pre-rotate-queries)
     // turbo_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)
@@ -183,6 +196,10 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+
+    // HP write: extract HP-token rows from k_cur/v_cur and store in HP buffer
+    ggml_tensor * cpy_k_hp(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_hp(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
 
     //
     // preparation API
@@ -212,8 +229,17 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // HP input tensors (non-null only when n_hp_total > 0 and there are HP tokens in the batch)
+    ggml_tensor * build_input_hp_k_idxs(ggml_context * ctx, uint32_t n_hp_batch) const;
+    ggml_tensor * build_input_hp_batch_idxs(ggml_context * ctx, uint32_t n_hp_batch) const;
+    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
+    void set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -232,11 +258,16 @@ private:
         // note: can be different from the layer index in the KV cache
         uint32_t il;
 
-        ggml_tensor * k;
-        ggml_tensor * v;
+        ggml_tensor * k;     // LP: type_k (e.g. Q2_0)
+        ggml_tensor * v;     // LP: type_v
+
+        ggml_tensor * k_hp = nullptr;  // HP: Q8_0, size = n_hp_total (null if HP disabled)
+        ggml_tensor * v_hp = nullptr;  // HP: Q8_0
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_hp_stream;
+        std::vector<ggml_tensor *> v_hp_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -264,6 +295,21 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // OSCAR-style HP (high-precision) sink+recent buffer
+    // env: LLAMA_KV_HP_SINK, LLAMA_KV_HP_RECENT
+    // sink tokens (pos < n_kv_sink) and recent tokens (latest n_kv_recent) are kept in F16
+    // all other tokens use the main LP (e.g. Q2_0) cache
+    uint32_t n_kv_sink   = 0;  // # permanent sink tokens in HP
+    uint32_t n_kv_recent = 0;  // # recent tokens in HP ring buffer
+    uint32_t n_hp_total  = 0;  // n_kv_sink + n_kv_recent
+
+    // HP cell tracking (indexed 0..n_hp_total-1 per stream)
+    // sink region: [0, n_kv_sink), recent ring: [n_kv_sink, n_hp_total)
+    std::vector<llama_kv_cells> v_hp_cells;
+
+    // set of positions currently stored in HP, for LP mask exclusion
+    std::vector<std::unordered_set<llama_pos>> hp_positions;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -384,6 +430,14 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    // HP (high-precision) sink+recent cache — only valid when has_hp() == true
+    bool     has_hp()      const;
+    uint32_t get_n_hp()    const;
+    uint32_t get_n_hp_kv() const;
+    uint32_t get_n_hp_batch() const;  // # HP tokens in current ubatch
+    ggml_tensor * get_k_hp(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hp(ggml_context * ctx, int32_t il) const;
+
     // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;
     ggml_tensor * get_turbo_rotation_inv() const;
@@ -404,6 +458,10 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
+    // HP write: extract rows selected by hp_batch_idxs from k_cur/v_cur, write to HP buffer at hp_k_idxs
+    ggml_tensor * cpy_k_hp(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_hp(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
+
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
     //   helps understand the implementation logic of cpy_k and cpy_v
@@ -413,8 +471,18 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // HP input tensors for graph construction
+    ggml_tensor * build_input_hp_k_idxs(ggml_context * ctx) const;
+    ggml_tensor * build_input_hp_batch_idxs(ggml_context * ctx) const;
+    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx) const;
+    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    void set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;

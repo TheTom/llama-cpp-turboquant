@@ -126,6 +126,44 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 
 //===================================== Dot products =================================
 
+void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK2_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    
+    const int nb = n / QK2_0;
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    
+    // Lloyd-Max 2-bit centroids (matches CUDA kernel and quantize_row_q2_0_ref)
+    static const float kQ2_0_lm_centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+    
+    float sumf = 0.0f;
+    
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float m = GGML_CPU_FP16_TO_FP32(x[i].m);
+        const float yd = GGML_CPU_FP16_TO_FP32(y[i].d);
+        
+        // Dequantize q2_0 block and compute dot product with q8_0
+        float dot = 0.0f;
+        for (int j = 0; j < QK2_0 / 4; j++) {
+            const uint8_t packed = x[i].qs[j];
+            const int8_t * yb = y[i].qs + j * 4;
+            
+            for (int b = 0; b < 4; b++) {
+                const int code = (packed >> (2 * b)) & 0x03;
+                const float val = m + d * kQ2_0_lm_centroids[code];
+                dot += val * (float)yb[b];
+            }
+        }
+        
+        sumf += dot * yd;
+    }
+    
+    *s = sumf;
+}
+
 void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;
     const int nb = n / qk;
