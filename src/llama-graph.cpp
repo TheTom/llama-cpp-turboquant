@@ -2455,7 +2455,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     if (inp->self_v_rot) {
-        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+        cur = ggml_mul_mat_aux(ctx0, cur, ggml_cont(ctx0, ggml_transpose(ctx0, inp->self_v_rot)));
     }
 
     if (wo) {
@@ -2880,7 +2880,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     if (v_rot) {
-        cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
+        cur = ggml_mul_mat_aux(ctx0, cur, ggml_cont(ctx0, ggml_transpose(ctx0, v_rot)));
     }
 
     if (wo) {
