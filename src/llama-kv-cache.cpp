@@ -1690,20 +1690,23 @@ ggml_tensor * llama_kv_cache::get_k_hp(ggml_context * ctx, int32_t il, uint32_t 
 
 ggml_tensor * llama_kv_cache::get_v_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const {
     if (n_hp_total == 0) return nullptr;
-    
+
     const int32_t ikv = map_layer_ids.at(il);
     ggml_tensor * v_hp = layers[ikv].v_hp;
     GGML_ASSERT(v_hp != nullptr);
-    
+
     const uint64_t n_embd_v_gqa = v_hp->ne[0];
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
-    
+
     return ggml_view_4d(ctx, v_hp,
-            n_hp_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
-            ggml_row_size(v_hp->type, n_hp_total*hparams.n_embd_head_v(il)),
-            ggml_row_size(v_hp->type, n_hp_total),
-            ggml_row_size(v_hp->type, n_hp_total*n_embd_v_gqa),
-            ggml_row_size(v_hp->type, n_hp_total*n_embd_v_gqa)*sinfo.s0);
+            hparams.n_embd_head_v(il),    // ne[0]: head dim (match LP V view)
+            hparams.n_head_kv(il),        // ne[1]: n_head_kv
+            n_hp_kv,                       // ne[2]: HP tokens used
+            ns,                            // ne[3]: streams
+            ggml_row_size(v_hp->type, hparams.n_embd_head_v(il)), // nb[1]: per head
+            ggml_row_size(v_hp->type, n_embd_v_gqa),              // nb[2]: all heads
+            ggml_row_size(v_hp->type, n_embd_v_gqa*n_hp_total),   // nb[3]: stride per HP slot
+            ggml_row_size(v_hp->type, n_embd_v_gqa*n_hp_total)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k_hp(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const {
