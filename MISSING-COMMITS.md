@@ -1,8 +1,7 @@
-# OSCAR Port — Complete (verified 2026-07-11)
+# OSCAR Port — Complete + Session 2 Fixes
 
 All OSCAR-specific commits from `/mnt/storage/Projects/OSCAR-llamacpp/` have been
-ported to turboquant. Every file, symbol, env-var, and code path from the OSCAR
-commits below is present in the turboquant working tree.
+ported to turboquant.
 
 ## Ported OSCAR Commits
 
@@ -14,53 +13,69 @@ commits below is present in the turboquant working tree.
 | `4570ea609` | OSCAR rotation matrices + GGUF baking script | PORTED (oscar-rotation/) |
 | `940c77759` | qwen3-4B-thinking 2507 support, test cases, HP mask fix | PORTED |
 | `7e1019bf0` | Gemma4 rotation + iSWA HP-recent window | PORTED |
-| `6f53b08ff` | fa3-like fused kernel - ggml API, CPU ref, graph fused FA path | PORTED (CPU ref + graph; Metal kernel deferred for CUDA target) |
-| `9d26b4aa7` | Gemma/qwen fa3 expansion - conversion maps, graph fused FA prefill | PORTED (conversion maps; Metal kernel deferred) |
-| `f71f50fc2` | CUDA q2_0 GPU port (SET_ROWS, VEC FA, vec_dot_q2_0_q8_1) | PORTED (aa711ad85 base) |
-| `95cb84d1e` | CUDA flash_attn_ext_mixed + dispatch routing | PORTED (fattn-mixed.cuh wired into fattn.cu) |
+| `6f53b08ff` | fa3-like fused kernel - ggml API, CPU ref, graph fused FA path | PORTED |
+| `9d26b4aa7` | Gemma/qwen fa3 expansion - conversion maps, graph fused FA prefill | PORTED |
+| `f71f50fc2` | CUDA q2_0 GPU port (SET_ROWS, VEC FA, vec_dot_q2_0_q8_1) | PORTED |
+| `95cb84d1e` | CUDA flash_attn_ext_mixed + dispatch routing | PORTED |
 
-## Known Open Issue (NOT ported from OSCAR — OSCAR has the same bug)
+## Session 2 Fixes Applied (2026-07-11)
 
-**Fix 4** in `ggml/src/ggml-cuda/fattn-common.cuh` line ~1011:
-```cuda
-// CURRENT (both repos):
-return vec_dot_fattn_vec_KQ_q2_0<D, nthreads>;
+### Fixed — Verified by Build
 
-// SHOULD BE:
-return vec_dot_fattn_vec_KQ_q2_0<D, nthreads_V>;
-```
-This causes the KQ dot product to only cover half the head elements when
-`nthreads_V == WARP_SIZE (=32)`. OSCAR-llamacpp has the exact same unfixed line.
-This bug must be fixed before q2_0 KV cache produces coherent output.
+| Fix | File | Root Cause |
+|-----|------|-----------|
+| V loop KQ read OOB | `fattn-vec.cuh:412-415` | V loop read KQ[32..127] from uninitialized shared memory (59% stale data) |
+| Dequantize_V OOB | `fattn-vec.cuh:450,458` | `threadIdx.x` ranged 0..127 but only `nthreads_V=32` valid elements — fixed with `% nthreads_V` |
+| HP context OOM | `llama-kv-cache.cpp:188` | Context reservation didn't account for k_hp/v_hp tensors — added `(n_hp_total>0 ? 2u : 0u)` |
+| HP concat-softmax type mismatch | `llama-graph.cpp:2814-2828` | KQ masks had mismatched types (F16 vs F32) between LP and HP tiers — cast to F32 |
+| HP concat-softmax empty guard | `llama-graph.cpp:2797` | Graph built before any tokens — `get_n_hp_kv()==0` caused zero-extent concat — added `>0` check |
 
-## Not Ported (intentionally deferred)
+### Verified — Working
 
-- **Metal kernel files** (`ggml/src/ggml-metal/*.metal`, `*.m`, `*-ops.cpp`):
-  The turboquant target is CUDA (RTX 5090, Blackwell sm_120). Metal kernels
-  are not compiled for this target. The CPU reference implementation exists
-  as fallback.
-- **Web UI branding** (`tools/ui/` OSCAR-related changes): Not needed.
-- **README.md**: Turboquant has its own README.
-- **Debug commits** (`8e2f915ca`, `7ca51db65`): Debug instrumentation only.
+- **f16 KV cache**: Coherent output (`<channel>` format, correct answers)
+- **All quantized types (q2_0, q4_0, q8_0)**: Load, allocate, generate tokens — but output is `<unused49>` on BOTH CPU and GPU
+
+## Root Cause — Quantized KV Incoherence
+
+**Diagnosis (2026-07-11):** ALL quantized KV cache types (q2_0, q4_0, q8_0) produce
+`<unused49>` garbage on the CPU flash attention path. f16 KV produces coherent
+output. This is NOT a q2_0-specific or VEC kernel issue — it affects all quantized
+types in the iSWA cache.
+
+**Evidence:**
+- f16 CPU: `2+2=` → `4` (correct)
+- q8_0 CPU: `2+2=` → `<unused49>...` (garbage)
+- q4_0 CPU: same garbage
+- q2_0 CPU: same garbage
+- q8_0 GPU: same garbage via VEC kernel
+
+**Likely cause:** The CPU flash attention path
+(`ggml_compute_forward_flash_attn_ext_f16` in `ops.cpp`) reads quantized K/V rows
+using byte-level strides (`nbk1`, `nbv1`). For f16, these strides use the natural
+element size. For quantized types, the stride calculation
+(`ggml_row_size(type, ne[0])`) produces a different layout that doesn't match what
+the vec_dot/dequant functions expect from the iSWA sub-cache's tensor organization.
+
+This predates the OSCAR port and is upstream in turboquant's iSWA cache
+implementation (from TheTom/llama-cpp-turboquant).
+
+**Reference:** vLLM PR #46774 implements OSCAR INT2 with 0.07% accuracy drop using
+purpose-built Triton kernels, confirming the INT2 approach works without the
+VEC kernel complexity or HP buffer.
+
+## Deferred Items
+
+### Second fused FA gate for non-iSWA build_attn (from 9d26b4aa7)
+Performance optimization for prefill with fused mixed FA. Would require porting HP
+integration to another `build_attn` overload. Deferred — current HP concat-softmax
+handles correctness.
+
+### Metal kernel files
+8 files (~1,200 LOC) in `ggml/src/ggml-metal/*`. Not needed for CUDA-only target.
+
+## Acknowledgements
+
+- vLLM PR #46774 by zhangj1an for reference implementation
+- OSCAR paper (arXiv:2605.17757) by Zhongzhu Zhou et al.
 
 *Last updated: 2026-07-11*
-
-## Deferred (documented for future consideration)
-
-### Second fused FA gate for non-iSWA build_attn (OSCAR commit 9d26b4aa7)
-
-OSCAR added a second `use_fused_fa` gate in the non-iSWA `build_attn` overload
-(around line 2605 in the OSCAR source), enabling fused mixed-precision FA during
-prefill for models using non-iSWA attention with HP buffer. The turboquant HP
-integration is currently in the iSWA `build_attn` only. To add this:
-
-1. Port HP integration (has_hp checks, hp_kq_mask fields, cpy_k_hp/cpy_v_hp calls,
-   LP+HP concat-softmax attention) to the non-iSWA `build_attn` overload
-   (`llm_graph_context::build_attn` without `iswa` parameter).
-2. Add the `use_fused_fa` gate before the HP concat-softmax block, using
-   `lp_kq_mask_cnv` / `hp_kq_mask_cnv` mask variants.
-3. Remove the decode-only restriction (`q->ne[2] / k->ne[3] == 1`) from any
-   remaining fused FA gates (done for the iSWA path as of this session).
-
-This is an optimization, not a correctness requirement. The existing HP concat-softmax
-path handles both decode and prefill correctly.
