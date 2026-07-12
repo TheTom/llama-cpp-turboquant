@@ -2434,6 +2434,29 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // OSCAR mixed-precision (two-tier KV) fused flash attention.
+    // Computes a single joint online-softmax attention over two KV tiers:
+    //   - LP tier: k_lp/v_lp (e.g. Q2_0 history), mask_lp
+    //   - HP tier: k_hp/v_hp (e.g. F16 sink+recent window), mask_hp
+    // This is mathematically identical to concatenating the two tiers along the
+    // KV dimension and running a single softmax, but fused (no materialized
+    // scores, no V re-cast). Reuses GGML_OP_FLASH_ATTN_EXT with a mixed-mode
+    // flag in op_params and the HP tier in src[5..7] (src[4] reserved for sinks).
+    // res: [n_embd_v, n_head, n_batch, ne3] !! permuted !! (same as ggml_flash_attn_ext)
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_mixed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_lp,
+            struct ggml_tensor  * v_lp,
+            struct ggml_tensor  * mask_lp,
+            struct ggml_tensor  * k_hp,
+            struct ggml_tensor  * v_hp,
+            struct ggml_tensor  * mask_hp,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

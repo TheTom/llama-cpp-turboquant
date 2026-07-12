@@ -36,6 +36,22 @@ static inline int best_index_int8(int n, const int8_t * val, float x) {
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
+// Orthonormal Walsh-Hadamard Transform (any power-of-2 n).
+// Self-inverse: ortho_hadamard_f32(ortho_hadamard_f32(x)) == x.
+static void ortho_hadamard_f32(float * GGML_RESTRICT x, int n) {
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += h << 1) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) x[i] *= scale;
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
@@ -421,20 +437,94 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
 // OSCAR q2_0 Lloyd-Max centroids for 2-bit reconstruction
 static const float kQ2_0_LM_centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
 
+// Quantize one value to a 2-bit Lloyd-Max code against per-block sigma.
+static inline uint8_t lm_quantize(float v, float inv_sigma) {
+    float vs = v * inv_sigma;
+    if (vs < -0.6745f) return 0;
+    if (vs <  0.0f)    return 1;
+    if (vs <  0.6745f) return 2;
+    return 3;
+}
+
+// Full head-vector OWHT: apply Hadamard over the entire head dimension so outliers
+// spread across all dims before per-block Lloyd-Max quant. Q2_0_HAD_SIZE is the array
+// cap (max supported head_dim); the actual OWHT width is q2_0_had_size() = head_dim at
+// runtime (128 Qwen3, 512 Gemma4) via LLAMA_KV_HAD_SIZE. Falls back to QK2_0=32 if k < width.
+#define Q2_0_HAD_SIZE 512
+
+// OSCAR outlier clip: clamp each rotated head-vector to the clip_ratio percentile
+// of |value| (matches sglang SGLANG_OSCAR_*_CLIP_RATIO; K=0.96, V=0.92). One shared
+// ratio from LLAMA_KV_CLIP_RATIO (0 disables). Applied after OWHT, before quant.
+static int q2_0_cmp_abs_asc(const void * a, const void * b) {
+    const float fa = *(const float *)a;
+    const float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static float q2_0_clip_ratio(void) {
+    static float r = -2.0f;
+    if (r < -1.0f) {
+        const char * e = getenv("LLAMA_KV_CLIP_RATIO");
+        r = e ? (float) atof(e) : 0.0f;
+    }
+    return r;
+}
+
+// When the calibrated OSCAR rotation (R.H.P) is applied in-graph, the quant must
+// NOT re-apply its own Hadamard. Set LLAMA_KV_NO_HADAMARD=1 in that case.
+static int q2_0_skip_hadamard(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+        v = (e && atoi(e)) ? 1 : 0;
+    }
+    return v;
+}
+
+// Full-head OWHT width = head_dim (128 Qwen3, 256 Gemma). From LLAMA_KV_HAD_SIZE
+// (default 128), clamped to [QK2_0, Q2_0_HAD_SIZE].
+static int q2_0_had_size(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char * e = getenv("LLAMA_KV_HAD_SIZE");
+        s = e ? atoi(e) : 128;
+        if (s < (int) QK2_0)   s = (int) QK2_0;
+        if (s > Q2_0_HAD_SIZE) s = Q2_0_HAD_SIZE;
+    }
+    return s;
+}
+
 void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK2_0 == 0);
     const int nb = k / QK2_0;
 
-    for (int i = 0; i < nb; i++) {
-        const float sigma = GGML_FP16_TO_FP32(x[i].d);
-        const float mean  = GGML_FP16_TO_FP32(x[i].m);
-        for (int j = 0; j < QK2_0 / 4; j++) {
-            const uint8_t packed = x[i].qs[j];
-            for (int b = 0; b < 4; b++) {
-                const int code = (packed >> (2 * b)) & 0x03;
-                y[i * QK2_0 + j * 4 + b] = mean + sigma * kQ2_0_LM_centroids[code];
+    const int had_n  = (k >= q2_0_had_size()) ? q2_0_had_size() : QK2_0;
+    const int had_nb = had_n / QK2_0;
+
+    float tmp[Q2_0_HAD_SIZE];
+
+    for (int ig = 0; ig < nb; ig += had_nb) {
+        const int actual_nb = (ig + had_nb <= nb) ? had_nb : (nb - ig);
+        const int actual_n  = actual_nb * QK2_0;
+
+        // Mean was subtracted before OWHT during quantization; stored in first block's m field.
+        const float mean = GGML_FP16_TO_FP32(x[ig].m);
+
+        // Decode all blocks in the Hadamard group using Lloyd-Max centroids
+        for (int ib = 0; ib < actual_nb; ib++) {
+            const float sigma = GGML_FP16_TO_FP32(x[ig + ib].d);
+            float * blk = tmp + ib * QK2_0;
+            for (int j = 0; j < QK2_0 / 4; j++) {
+                const uint8_t packed = x[ig + ib].qs[j];
+                for (int b = 0; b < 4; b++) {
+                    blk[j*4 + b] = kQ2_0_LM_centroids[(packed >> (2 * b)) & 0x03] * sigma;
+                }
             }
         }
+        // Undo full-head OWHT (self-inverse) and restore mean
+        if (!q2_0_skip_hadamard()) ortho_hadamard_f32(tmp, actual_n);
+        for (int j = 0; j < actual_n; j++) tmp[j] += mean;
+        memcpy(y + ig * QK2_0, tmp, actual_n * sizeof(float));
     }
 }
 
@@ -442,33 +532,69 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     assert(k % QK2_0 == 0);
     const int nb = k / QK2_0;
 
-    for (int i = 0; i < nb; i++) {
-        float min = x[i * QK2_0];
-        float max = x[i * QK2_0];
-        for (int j = 1; j < QK2_0; j++) {
-            const float v = x[i * QK2_0 + j];
-            if (v < min) min = v;
-            if (v > max) max = v;
-        }
-        const float range = max - min;
-        const float scale = (range < 1e-8f) ? 1.0f : (range / 3.0f);
-        const float mean  = (min + max) * 0.5f;
-        y[i].d = GGML_FP32_TO_FP16(scale);
-        y[i].m = GGML_FP32_TO_FP16(mean);
-        const float inv_scale = (scale > 1e-8f) ? 1.0f / scale : 1.0f;
-        for (int j = 0; j < QK2_0 / 4; j++) {
-            uint8_t packed = 0;
-            for (int b = 0; b < 4; b++) {
-                const float v = (x[i * QK2_0 + j * 4 + b] - mean) * inv_scale;
-                // Lloyd-Max: classify to nearest centroid
-                int code;
-                if (v < -0.4528f) code = 0;
-                else if (v < 0.0f) code = 1;
-                else if (v < 0.4528f) code = 2;
-                else code = 3;
-                packed |= code << (2 * b);
+    // Process in groups of (HAD_SIZE/QK2_0) blocks, each group gets a joint OWHT.
+    // For k < Q2_0_HAD_SIZE, fall back to per-block (32-dim) OWHT.
+    const int had_n   = (k >= q2_0_had_size()) ? q2_0_had_size() : QK2_0;
+    const int had_nb  = had_n / QK2_0;  // blocks per Hadamard group
+
+    float tmp[Q2_0_HAD_SIZE];
+
+    for (int ig = 0; ig < nb; ig += had_nb) {
+        const int actual_nb = (ig + had_nb <= nb) ? had_nb : (nb - ig);
+        const int actual_n  = actual_nb * QK2_0;
+
+        memcpy(tmp, x + ig * QK2_0, actual_n * sizeof(float));
+
+        // Subtract mean before OWHT: K vectors have non-zero DC bias which
+        // concentrates into position 0 after OWHT, creating extreme sigma values
+        // in the first sub-block and breaking Lloyd-Max (which assumes N(0,sigma^2)).
+        float mean = 0.0f;
+        for (int j = 0; j < actual_n; j++) mean += tmp[j];
+        mean /= actual_n;
+        for (int j = 0; j < actual_n; j++) tmp[j] -= mean;
+
+        if (!q2_0_skip_hadamard()) ortho_hadamard_f32(tmp, actual_n);  // full-head OWHT on zero-centered values
+
+        // OSCAR outlier clip on the rotated head-vector (before per-block quant).
+        {
+            const float cr = q2_0_clip_ratio();
+            if (cr > 0.0f && cr < 1.0f) {
+                float absv[Q2_0_HAD_SIZE];
+                for (int j = 0; j < actual_n; j++) absv[j] = fabsf(tmp[j]);
+                qsort(absv, actual_n, sizeof(float), q2_0_cmp_abs_asc);
+                int idx = (int)(cr * actual_n);
+                if (idx >= actual_n) idx = actual_n - 1;
+                const float thr = absv[idx];
+                for (int j = 0; j < actual_n; j++) {
+                    if (tmp[j] >  thr) tmp[j] =  thr;
+                    if (tmp[j] < -thr) tmp[j] = -thr;
+                }
             }
-            y[i].qs[j] = packed;
+        }
+
+        // Store the group mean in *every* block's m field. The CPU dequant only
+        // reads the first block's m, but a per-block GPU dequant (Metal) cannot
+        // reach the group's first block from an arbitrary block, so replicating
+        // the mean into each block keeps the CPU and GPU decode paths identical.
+        for (int ib = 0; ib < actual_nb; ib++) y[ig + ib].m = GGML_FP32_TO_FP16(mean);
+
+        for (int ib = 0; ib < actual_nb; ib++) {
+            const float * blk = tmp + ib * QK2_0;
+
+            float sum_sq = 0.0f;
+            for (int j = 0; j < QK2_0; j++) sum_sq += blk[j] * blk[j];
+            const float sigma    = sqrtf(sum_sq / QK2_0);
+            const float inv_sigma = (sigma > 1e-8f) ? 1.0f / sigma : 0.0f;
+
+            y[ig + ib].d = GGML_FP32_TO_FP16(sigma);
+
+            for (int j = 0; j < QK2_0 / 4; j++) {
+                uint8_t packed = 0;
+                for (int b = 0; b < 4; b++) {
+                    packed |= lm_quantize(blk[j*4 + b], inv_sigma) << (2 * b);
+                }
+                y[ig + ib].qs[j] = packed;
+            }
         }
     }
 }

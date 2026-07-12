@@ -421,6 +421,8 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        { static bool once = false; if (!once) { once = true; fprintf(stderr, "[OSCAR] KV cache dtype: K=%s V=%s (n_embd_k_gqa=%d, kv_size=%d)\n", ggml_type_name(layer_type_k), ggml_type_name(layer_type_v), (int) n_embd_k_gqa_eff, (int) kv_size); fflush(stderr); } }
+
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
 
@@ -1383,6 +1385,48 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     assert(res.s1 >= res.s0);
 
+    // Compute HP slot assignments if HP buffer is enabled
+    if (n_hp_total > 0) {
+        // Compute max batch position per sequence (for "recent" determination)
+        llama_pos max_batch_pos[LLAMA_MAX_SEQ];
+        std::fill(max_batch_pos, max_batch_pos + LLAMA_MAX_SEQ, -1);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][0];
+            max_batch_pos[seq_id] = std::max(max_batch_pos[seq_id], ubatch.pos[i]);
+        }
+
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const uint32_t global_i = (n_stream > 1) ? s*n_tokens + ii : ii;
+                if (global_i >= ubatch.n_tokens) break;
+
+                const llama_pos    pos    = ubatch.pos[global_i];
+                const llama_seq_id seq_id = ubatch.seq_id[global_i][0];
+
+                bool is_hp = false;
+                uint32_t hp_slot = UINT32_MAX;
+
+                if (n_kv_sink > 0 && pos < (llama_pos)n_kv_sink) {
+                    // Sink token: permanent HP slot indexed by position
+                    is_hp   = true;
+                    hp_slot = (uint32_t)pos;
+                } else if (n_kv_recent > 0) {
+                    // Recent token: HP if among latest n_kv_recent positions for this seq
+                    const llama_pos seq_max = max_batch_pos[seq_id];
+                    if (pos > seq_max - (llama_pos)n_kv_recent) {
+                        is_hp   = true;
+                        hp_slot = n_kv_sink + (uint32_t)((uint32_t)pos % n_kv_recent);
+                    }
+                }
+
+                if (is_hp) {
+                    res.hp_idxs[s].push_back(hp_slot);
+                    res.hp_batch_idxs[s].push_back(global_i);
+                }
+            }
+        }
+    }
+
     return res;
 }
 
@@ -1461,6 +1505,33 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    // Update HP cells (sink+recent token tracking)
+    if (n_hp_total > 0) {
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            auto & hp_cells = v_hp_cells[sinfo.strm[s]];
+            auto & hp_pos   = hp_positions[sinfo.strm[s]];
+
+            for (uint32_t j = 0; j < sinfo.hp_idxs[s].size(); ++j) {
+                const uint32_t hp_slot  = sinfo.hp_idxs[s][j];
+                const uint32_t global_i = sinfo.hp_batch_idxs[s][j];
+                const llama_pos pos     = ubatch.pos[global_i];
+
+                // Evict old HP token from position set if slot was occupied
+                if (!hp_cells.is_empty(hp_slot)) {
+                    hp_pos.erase(hp_cells.pos_get(hp_slot));
+                    hp_cells.rm(hp_slot);
+                }
+
+                // Assign new HP token
+                hp_cells.pos_set(hp_slot, pos);
+                for (int32_t si = 0; si < ubatch.n_seq_id[global_i]; ++si) {
+                    hp_cells.seq_add(hp_slot, ubatch.seq_id[global_i][si]);
+                }
+                hp_pos.insert(pos);
+            }
+        }
     }
 }
 
@@ -3185,4 +3256,73 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+// HP forwarding methods for llama_kv_cache_context
+
+bool llama_kv_cache_context::has_hp() const {
+    return kv->get_n_hp() > 0;
+}
+
+uint32_t llama_kv_cache_context::get_n_hp() const {
+    return kv->get_n_hp();
+}
+
+uint32_t llama_kv_cache_context::get_n_hp_kv() const {
+    if (sinfos.empty()) return 0;
+    return kv->get_n_hp_kv(sinfos[i_cur]);
+}
+
+uint32_t llama_kv_cache_context::get_n_hp_batch() const {
+    if (sinfos.empty()) return 0;
+    const auto & sinfo = sinfos[i_cur];
+    uint32_t total = 0;
+    for (const auto & v : sinfo.hp_batch_idxs) {
+        total += v.size();
+    }
+    return total;
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_hp(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_hp(ctx, il, get_n_hp_kv(), sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_hp(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_hp(ctx, il, get_n_hp_kv(), sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_hp(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const {
+    return kv->cpy_k_hp(ctx, k_cur, hp_batch_idxs, hp_k_idxs, il);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_v_hp(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const {
+    return kv->cpy_v_hp(ctx, v_cur, hp_batch_idxs, hp_k_idxs, il);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_hp_k_idxs(ggml_context * ctx) const {
+    return kv->build_input_hp_k_idxs(ctx, get_n_hp_batch());
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_hp_batch_idxs(ggml_context * ctx) const {
+    return kv->build_input_hp_batch_idxs(ctx, get_n_hp_batch());
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_hp_kq_mask(ggml_context * ctx) const {
+    return kv->build_input_hp_kq_mask(ctx, get_ubatch());
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_hp_kq_mask(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_hp_k_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_hp_batch_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_hp_kq_mask(dst, ubatch, causal_attn);
 }

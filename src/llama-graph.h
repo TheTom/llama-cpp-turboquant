@@ -453,6 +453,16 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    // HP (high-precision) sink+recent buffer inputs — null when HP disabled (per sub-cache)
+    ggml_tensor * hp_k_idxs          = nullptr; // I32 [n_hp_batch]: HP global slot indices to write
+    ggml_tensor * hp_batch_idxs      = nullptr; // I32 [n_hp_batch]: which rows in k_cur/v_cur are HP tokens
+    ggml_tensor * hp_kq_mask         = nullptr; // F32 [n_hp_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * hp_kq_mask_cnv     = nullptr; //     [n_hp_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * hp_k_idxs_swa      = nullptr; // I32 [n_hp_batch_swa]
+    ggml_tensor * hp_batch_idxs_swa  = nullptr; // I32 [n_hp_batch_swa]
+    ggml_tensor * hp_kq_mask_swa     = nullptr; // F32 [n_hp_kv_swa, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * hp_kq_mask_swa_cnv = nullptr; //     [n_hp_kv_swa, n_batch/n_stream, 1, n_stream]
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 

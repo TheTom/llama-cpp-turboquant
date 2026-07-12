@@ -115,7 +115,7 @@ static __global__ void fattn_mixed_kernel(
 
 // Host-side driver for the mixed kernel.
 // Adapted from ggml_cuda_flash_attn_ext_mixed in the OSCAR fork.
-static void ggml_cuda_flash_attn_ext_mixed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_flash_attn_ext_mixed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];

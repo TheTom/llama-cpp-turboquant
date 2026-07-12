@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
+#include "fattn-mixed.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -851,6 +852,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    // OSCAR two-tier mixed-precision attention (INT2-LP + F16-HP) has a native
+    // CUDA kernel (fattn-mixed.cuh) regardless of head dims, so it is always
+    // supported when mixed mode is set.
+    if (ggml_get_op_params_i32(dst, 4) == 1) {
+        return true;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
 

@@ -3363,7 +3363,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_cuda_flash_attn_ext(ctx, dst);
+            // OSCAR two-tier mixed-precision fused attention (q2_0-LP + f16-HP).
+            if (ggml_get_op_params_i32(dst, 4) == 1) {
+                ggml_cuda_flash_attn_ext_mixed(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext(ctx, dst);
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -5742,6 +5747,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
+            // OSCAR two-tier mixed-precision attention (q2_0-LP + f16-HP)
+            // always supported when mixed mode is set
+            if (ggml_get_op_params_i32(op, 4) == 1) {
+                return true;
+            }
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:

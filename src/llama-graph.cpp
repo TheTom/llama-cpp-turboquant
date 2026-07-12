@@ -601,6 +601,26 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot_swa && self_v_rot_swa->buffer) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
+
+    // HP sink+recent buffers, per sub-cache (base + swa)
+    if (hp_k_idxs && hp_k_idxs->buffer) {
+        mctx->get_base()->set_input_hp_k_idxs(hp_k_idxs, ubatch);
+    }
+    if (hp_batch_idxs && hp_batch_idxs->buffer) {
+        mctx->get_base()->set_input_hp_batch_idxs(hp_batch_idxs, ubatch);
+    }
+    if (hp_kq_mask && hp_kq_mask->buffer) {
+        mctx->get_base()->set_input_hp_kq_mask(hp_kq_mask, ubatch, cparams.causal_attn);
+    }
+    if (hp_k_idxs_swa && hp_k_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_hp_k_idxs(hp_k_idxs_swa, ubatch);
+    }
+    if (hp_batch_idxs_swa && hp_batch_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_hp_batch_idxs(hp_batch_idxs_swa, ubatch);
+    }
+    if (hp_kq_mask_swa && hp_kq_mask_swa->buffer) {
+        mctx->get_swa()->set_input_hp_kq_mask(hp_kq_mask_swa, ubatch, cparams.causal_attn);
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -628,6 +648,18 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+    }
+
+    // HP: rebuild graph if number of HP tokens in this batch changed
+    if (mctx->get_base()->has_hp()) {
+        const uint32_t n_hp_batch_cur = mctx->get_base()->get_n_hp_batch();
+        const bool had_hp = hp_k_idxs != nullptr;
+        const bool has_hp_now = n_hp_batch_cur > 0;
+        if (had_hp != has_hp_now) {
+            res = false;
+        } else if (had_hp && hp_k_idxs->ne[0] != (int64_t)n_hp_batch_cur) {
+            res = false;
+        }
     }
 
     return res;
@@ -2703,6 +2735,14 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    // store to HP KV cache (sink+recent tokens only), per sub-cache
+    ggml_tensor * hp_batch_idxs = is_swa ? inp->hp_batch_idxs_swa : inp->hp_batch_idxs;
+    ggml_tensor * hp_k_idxs     = is_swa ? inp->hp_k_idxs_swa     : inp->hp_k_idxs;
+    if (mctx_cur->has_hp() && hp_batch_idxs && k_cur && v_cur) {
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k_hp(ctx0, k_cur, hp_batch_idxs, hp_k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v_hp(ctx0, v_cur, hp_batch_idxs, hp_k_idxs, il));
+    }
+
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
@@ -2710,6 +2750,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
+    // The rotation is applied unconditionally (also needed for the HP path)
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -2720,7 +2761,98 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur;
+
+    ggml_tensor * hp_kq_mask_f32 = is_swa ? inp->hp_kq_mask_swa  : inp->hp_kq_mask;
+    ggml_tensor * lp_kq_mask_f32 = is_swa ? inp->self_kq_mask_swa : inp->self_kq_mask;
+    // OSCAR fused mixed-precision flash attention: fold the LP (Q2_0 history) and
+    // HP (F16 sink+recent) tiers into one joint online-softmax FA op. Avoids the
+    // explicit-mul_mat path's score materialization and per-step V re-cast.
+    // Gated by LLAMA_KV_FUSED_FA; requires -fa on (F16 masks) and non-transposed V.
+    // fused mixed-precision FA: decode and prefill both supported
+    // by the per-query kernel (causal handled via the mask).
+    const bool use_fused_fa = (getenv("LLAMA_KV_FUSED_FA") != nullptr) &&
+                              cparams.flash_attn && (v->nb[1] <= v->nb[2]);
+
+    if (mctx_cur->has_hp() && hp_kq_mask_f32 && use_fused_fa) {
+        ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
+        ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
+
+        const int64_t n_stream = k->ne[3];
+
+        ggml_tensor * q_perm = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+
+        ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
+        ggml_tensor * v_lp_p = ggml_permute(ctx0, v,    0, 2, 1, 3);
+        ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+        ggml_tensor * v_hp_p = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+
+        cur = ggml_flash_attn_ext_mixed(ctx0, q_perm, k_lp_p, v_lp_p, is_swa ? inp->self_kq_mask_swa_cnv : inp->self_kq_mask_cnv,
+                                        k_hp_p, v_hp_p, is_swa ? inp->hp_kq_mask_swa_cnv : inp->hp_kq_mask_cnv,
+                                        kq_scale, hparams.f_max_alibi_bias, 0.0f);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else
+    if (mctx_cur->has_hp() && hp_kq_mask_f32) {
+        // Exact LP+HP attention via concatenated softmax (mirrors the non-iSWA build_attn):
+        // LP tokens (Q2_0 KV) and HP tokens (sink+recent, F16 KV) are scored separately,
+        // concatenated along the KV dim, joint-softmaxed with a combined mask (LP mask has HP
+        // positions -inf to avoid double-counting), then their weighted value contributions summed.
+        ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
+        ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
+
+        const int64_t n_stream = k->ne[3];
+
+        ggml_tensor * q_perm = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                             q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+
+        ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
+        ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+
+        ggml_tensor * kq_lp = ggml_mul_mat(ctx0, k_lp_p, q_perm);
+        ggml_mul_mat_set_prec(kq_lp, GGML_PREC_F32);
+        ggml_tensor * kq_hp = ggml_mul_mat(ctx0, k_hp_p, q_perm);
+        ggml_mul_mat_set_prec(kq_hp, GGML_PREC_F32);
+
+        ggml_tensor * kq_all = ggml_concat(ctx0, kq_lp, kq_hp, 0);
+        ggml_tensor * combined_mask = ggml_concat(ctx0, lp_kq_mask_f32, hp_kq_mask_f32, 0);
+
+        kq_all = ggml_soft_max_ext(ctx0, kq_all, combined_mask, kq_scale, hparams.f_max_alibi_bias);
+        cb(kq_all, "kq_soft_max", il);
+
+        const int64_t n_kv       = k->ne[2];
+        const int64_t n_hp_total = k_hp->ne[2];
+        ggml_tensor * w_lp = ggml_view_4d(ctx0, kq_all, n_kv, kq_all->ne[1], kq_all->ne[2], kq_all->ne[3],
+                                           kq_all->nb[1], kq_all->nb[2], kq_all->nb[3], 0);
+        ggml_tensor * w_hp = ggml_view_4d(ctx0, kq_all, n_hp_total, kq_all->ne[1], kq_all->ne[2], kq_all->ne[3],
+                                           kq_all->nb[1], kq_all->nb[2], kq_all->nb[3],
+                                           n_kv * ggml_type_size(kq_all->type));
+
+        const bool v_lp_trans = v->nb[1] > v->nb[2];
+        ggml_tensor * v_lp_p = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (!v_lp_trans) {
+            if (ggml_is_quantized(v->type)) {
+                v_lp_p = ggml_cast(ctx0, v_lp_p, GGML_TYPE_F32);
+            }
+            v_lp_p = ggml_cont(ctx0, ggml_transpose(ctx0, v_lp_p));
+        }
+        ggml_tensor * vkq_lp = ggml_mul_mat(ctx0, v_lp_p, w_lp);
+
+        // HP V is always non-transposed F16; arrange as [n_hp_total, n_embd_head_v, n_head_kv, n_stream]
+        ggml_tensor * v_hp_p = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+        v_hp_p = ggml_cont(ctx0, ggml_transpose(ctx0, v_hp_p));
+        // w_hp is a non-contiguous view of kq_all; make it contiguous for mul_mat backends
+        ggml_tensor * w_hp_cont = ggml_cont(ctx0, w_hp);
+        ggml_tensor * vkq_hp = ggml_mul_mat(ctx0, v_hp_p, w_hp_cont);
+
+        ggml_tensor * kqv = ggml_add(ctx0, vkq_lp, vkq_hp);
+        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
@@ -2881,6 +3013,24 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+
+    // HP sink+recent buffers, per sub-cache (base + swa)
+    if (mctx_cur->get_base()->has_hp()) {
+        inp->hp_k_idxs     = mctx_cur->get_base()->build_input_hp_k_idxs(ctx0);
+        inp->hp_batch_idxs = mctx_cur->get_base()->build_input_hp_batch_idxs(ctx0);
+        inp->hp_kq_mask    = mctx_cur->get_base()->build_input_hp_kq_mask(ctx0, ubatch);
+        if (inp->hp_kq_mask) {
+            inp->hp_kq_mask_cnv = ggml_cast(ctx0, inp->hp_kq_mask, GGML_TYPE_F16);
+        }
+    }
+    if (mctx_cur->get_swa()->has_hp()) {
+        inp->hp_k_idxs_swa     = mctx_cur->get_swa()->build_input_hp_k_idxs(ctx0);
+        inp->hp_batch_idxs_swa = mctx_cur->get_swa()->build_input_hp_batch_idxs(ctx0);
+        inp->hp_kq_mask_swa    = mctx_cur->get_swa()->build_input_hp_kq_mask(ctx0, ubatch);
+        if (inp->hp_kq_mask_swa) {
+            inp->hp_kq_mask_swa_cnv = ggml_cast(ctx0, inp->hp_kq_mask_swa, GGML_TYPE_F16);
+        }
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }

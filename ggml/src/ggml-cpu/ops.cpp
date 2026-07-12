@@ -9086,9 +9086,206 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+// OSCAR mixed-precision (two-tier KV) fused flash attention - CPU reference.
+// Computes a single joint online softmax over the LP tier (src[1]/src[2]/src[3])
+// and the HP tier (src[5]/src[6]/src[7]) into the same (M, S, VKQ) accumulators.
+// This is the correctness oracle for the fused Metal kernel and a portable fallback.
+static void ggml_compute_forward_flash_attn_ext_mixed(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k_lp    = dst->src[1];
+    const ggml_tensor * v_lp    = dst->src[2];
+    const ggml_tensor * mask_lp = dst->src[3];
+    const ggml_tensor * k_hp    = dst->src[5];
+    const ggml_tensor * v_hp    = dst->src[6];
+    const ggml_tensor * mask_hp = dst->src[7];
+
+    GGML_TENSOR_LOCALS(int64_t, neq,  q,    ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq,  q,    nb)
+    GGML_TENSOR_LOCALS(int64_t, nek,  k_lp, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk,  k_lp, nb)
+    GGML_TENSOR_LOCALS(int64_t, nev,  v_lp, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv,  v_lp, nb)
+    GGML_TENSOR_LOCALS(int64_t, nekh, k_hp, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbkh, k_hp, nb)
+    GGML_TENSOR_LOCALS(int64_t, nevh, v_hp, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbvh, v_hp, nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,   dst,  ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,   dst,  nb)
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t N  = neq1;
+
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne2 == N);
+
+    GGML_ASSERT(nbq0  == ggml_type_size(q->type));
+    GGML_ASSERT(nbk0  == ggml_type_size(k_lp->type));
+    GGML_ASSERT(nbv0  == ggml_type_size(v_lp->type));
+    GGML_ASSERT(nbkh0 == ggml_type_size(k_hp->type));
+    GGML_ASSERT(nbvh0 == ggml_type_size(v_hp->type));
+
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    // broadcast factors (LP / HP share the same KV-head layout)
+    const int64_t rk2  = neq2/nek2;  const int64_t rk3  = neq3/nek3;
+    const int64_t rv2  = neq2/nev2;  const int64_t rv3  = neq3/nev3;
+    const int64_t rk2h = neq2/nekh2; const int64_t rk3h = neq3/nekh3;
+    const int64_t rv2h = neq2/nevh2; const int64_t rv3h = neq3/nevh3;
+
+    ggml_type         const k_lp_vdt = ggml_get_type_traits_cpu(k_lp->type)->vec_dot_type;
+    ggml_from_float_t const q_to_lp  = ggml_get_type_traits_cpu(k_lp_vdt)->from_float;
+    ggml_vec_dot_t    const kq_lp    = ggml_get_type_traits_cpu(k_lp->type)->vec_dot;
+    ggml_to_float_t   const v_lp_tof = ggml_get_type_traits(v_lp->type)->to_float;
+
+    ggml_type         const k_hp_vdt = ggml_get_type_traits_cpu(k_hp->type)->vec_dot_type;
+    ggml_from_float_t const q_to_hp  = ggml_get_type_traits_cpu(k_hp_vdt)->from_float;
+    ggml_vec_dot_t    const kq_hp    = ggml_get_type_traits_cpu(k_hp->type)->vec_dot;
+    ggml_to_float_t   const v_hp_tof = ggml_get_type_traits(v_hp->type)->to_float;
+
+    GGML_ASSERT(q_to_lp && q_to_hp && "fattn-mixed: unsupported K-type");
+    GGML_ASSERT((v_lp->type == GGML_TYPE_F32 || v_lp_tof) && "fattn-mixed: unsupported V-type (LP)");
+    GGML_ASSERT((v_hp->type == GGML_TYPE_F32 || v_hp_tof) && "fattn-mixed: unsupported V-type (HP)");
+
+    const int64_t n_kv = nek1;   // LP kv count
+    const int64_t n_hp = nekh1;  // HP kv count
+
+    const int64_t nr = neq1*neq2*neq3;
+    const int64_t dr = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int iq3 = ir/(neq2*neq1);
+        const int iq2 = (ir - iq3*neq2*neq1)/neq1;
+        const int iq1 = (ir - iq3*neq2*neq1 - iq2*neq1);
+
+        const uint32_t h = iq2;
+        const float slope = (max_bias > 0.0f) ? (h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1)) : 1.0f;
+
+        float S = 0.0f;
+        float M = -INFINITY;
+
+        float * VKQ32 = (float *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
+        float * V32   = VKQ32 + 1*DV;
+        void  * Q_q   = (void *)(VKQ32 + 2*DV); // reused for each tier's q conversion
+
+        memset(VKQ32, 0, DV*sizeof(float));
+
+        const float * pq = (const float *)((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+
+        // ---- LP tier (e.g. Q2_0 history) ----
+        {
+            const ggml_fp16_t * mp = mask_lp ? (ggml_fp16_t *)((char *) mask_lp->data + iq1*mask_lp->nb[1] + (iq2%mask_lp->ne[2])*mask_lp->nb[2] + (iq3%mask_lp->ne[3])*mask_lp->nb[3]) : NULL;
+            const int ik2 = iq2 / rk2; const int ik3 = iq3 / rk3;
+            const int iv2 = iq2 / rv2; const int iv3 = iq3 / rv3;
+
+            q_to_lp(pq, Q_q, DK);
+
+            for (int64_t ic = 0; ic < n_kv; ++ic) {
+                const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+                if (mv == -INFINITY) {
+                    continue;
+                }
+
+                float s;
+                const char * k_data = (const char *) k_lp->data + (ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                kq_lp(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+
+                s = s*scale;
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap*tanhf(s);
+                }
+                s += mv;
+
+                const float Mold = M;
+                float ms = 1.0f;
+                float vs = 1.0f;
+                const char * v_data = (const char *) v_lp->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3);
+                if (s > M) { M = s; ms = expf(Mold - M); ggml_vec_scale_f32(DV, VKQ32, ms); }
+                else       { vs = expf(s - M); }
+                if (v_lp_tof) { v_lp_tof(v_data, V32, DV); ggml_vec_mad_f32(DV, VKQ32, V32, vs); }
+                else          { ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs); }
+                S = S*ms + vs;
+            }
+        }
+
+        // ---- HP tier (F16 sink + recent window) ----
+        {
+            const ggml_fp16_t * mp = mask_hp ? (ggml_fp16_t *)((char *) mask_hp->data + iq1*mask_hp->nb[1] + (iq2%mask_hp->ne[2])*mask_hp->nb[2] + (iq3%mask_hp->ne[3])*mask_hp->nb[3]) : NULL;
+            const int ik2 = iq2 / rk2h; const int ik3 = iq3 / rk3h;
+            const int iv2 = iq2 / rv2h; const int iv3 = iq3 / rv3h;
+
+            q_to_hp(pq, Q_q, DK);
+
+            for (int64_t ic = 0; ic < n_hp; ++ic) {
+                const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+                if (mv == -INFINITY) {
+                    continue;
+                }
+
+                float s;
+                const char * k_data = (const char *) k_hp->data + (ic*nbkh1 + ik2*nbkh2 + ik3*nbkh3);
+                kq_hp(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+
+                s = s*scale;
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap*tanhf(s);
+                }
+                s += mv;
+
+                const float Mold = M;
+                float ms = 1.0f;
+                float vs = 1.0f;
+                const char * v_data = (const char *) v_hp->data + (ic*nbvh1 + iv2*nbvh2 + iv3*nbvh3);
+                if (s > M) { M = s; ms = expf(Mold - M); ggml_vec_scale_f32(DV, VKQ32, ms); }
+                else       { vs = expf(s - M); }
+                if (v_hp_tof) { v_hp_tof(v_data, V32, DV); ggml_vec_mad_f32(DV, VKQ32, V32, vs); }
+                else          { ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs); }
+                S = S*ms + vs;
+            }
+        }
+
+        const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+        ggml_vec_scale_f32(DV, VKQ32, S_inv);
+
+        // permute(0, 2, 1, 3) - write in the flash_attn_ext output layout
+        memcpy((char *) dst->data + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1, VKQ32, nb1);
+    }
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // OSCAR two-tier mixed-precision fused attention (flag in op_params[4])
+    if (ggml_get_op_params_i32(dst, 4) == 1) {
+        ggml_compute_forward_flash_attn_ext_mixed(params, dst);
+        return;
+    }
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
