@@ -185,7 +185,7 @@ llama_kv_cache::llama_kv_cache(
                 // Size this for the actual layer loop below. Some models expose extra
                 // KV-bearing layers through n_layer_all, and under-reserving tensor
                 // metadata corrupts later KV/checkpoint operations.
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((2u + (n_hp_total > 0 ? 2u : 0u))*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -3290,6 +3290,15 @@ ggml_tensor * llama_kv_cache_context::get_k_hp(ggml_context * ctx, int32_t il) c
 ggml_tensor * llama_kv_cache_context::get_v_hp(ggml_context * ctx, int32_t il) const {
     return kv->get_v_hp(ctx, il, get_n_hp_kv(), sinfos[i_cur]);
 }
+
+ggml_tensor * llama_kv_cache_context::get_k_hp_full(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_hp(ctx, il, kv->get_n_hp(), sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_hp_full(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_hp(ctx, il, kv->get_n_hp(), sinfos[i_cur]);
+}
+
 
 ggml_tensor * llama_kv_cache_context::cpy_k_hp(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const {
     return kv->cpy_k_hp(ctx, k_cur, hp_batch_idxs, hp_k_idxs, il);

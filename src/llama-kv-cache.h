@@ -437,6 +437,10 @@ public:
     uint32_t get_n_hp_batch() const;  // # HP tokens in current ubatch
     ggml_tensor * get_k_hp(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_hp(ggml_context * ctx, int32_t il) const;
+    // Returns HP K/V using ALL n_hp_total slots (not just n_hp_kv tracked ones).
+    // Use when the mask uses n_hp_total but KQ needs matching dimensions.
+    ggml_tensor * get_k_hp_full(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hp_full(ggml_context * ctx, int32_t il) const;
 
     // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;

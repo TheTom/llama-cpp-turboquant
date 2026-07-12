@@ -2794,13 +2794,13 @@ ggml_tensor * llm_graph_context::build_attn(
                                         kq_scale, hparams.f_max_alibi_bias, 0.0f);
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else
-    if (mctx_cur->has_hp() && hp_kq_mask_f32) {
+    if (mctx_cur->has_hp() && hp_kq_mask_f32 && mctx_cur->get_n_hp_kv() > 0) {
         // Exact LP+HP attention via concatenated softmax (mirrors the non-iSWA build_attn):
         // LP tokens (Q2_0 KV) and HP tokens (sink+recent, F16 KV) are scored separately,
         // concatenated along the KV dim, joint-softmaxed with a combined mask (LP mask has HP
         // positions -inf to avoid double-counting), then their weighted value contributions summed.
-        ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
-        ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
+        ggml_tensor * k_hp = mctx_cur->get_k_hp_full(ctx0, il);
+        ggml_tensor * v_hp = mctx_cur->get_v_hp_full(ctx0, il);
 
         const int64_t n_stream = k->ne[3];
 
@@ -2811,13 +2811,16 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
         ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
 
-        ggml_tensor * kq_lp = ggml_mul_mat(ctx0, k_lp_p, q_perm);
-        ggml_mul_mat_set_prec(kq_lp, GGML_PREC_F32);
-        ggml_tensor * kq_hp = ggml_mul_mat(ctx0, k_hp_p, q_perm);
-        ggml_mul_mat_set_prec(kq_hp, GGML_PREC_F32);
+        ggml_tensor * kq_lp_raw = ggml_mul_mat(ctx0, k_lp_p, q_perm);
+        ggml_mul_mat_set_prec(kq_lp_raw, GGML_PREC_F32);
+        ggml_tensor * kq_lp = ggml_cast(ctx0, kq_lp_raw, GGML_TYPE_F32);
+        ggml_tensor * kq_hp_raw = ggml_mul_mat(ctx0, k_hp_p, q_perm);
+        ggml_tensor * kq_hp = ggml_cast(ctx0, kq_hp_raw, GGML_TYPE_F32);
 
         ggml_tensor * kq_all = ggml_concat(ctx0, kq_lp, kq_hp, 0);
-        ggml_tensor * combined_mask = ggml_concat(ctx0, lp_kq_mask_f32, hp_kq_mask_f32, 0);
+        ggml_tensor * combined_mask = ggml_concat(ctx0,
+            ggml_cast(ctx0, lp_kq_mask_f32, GGML_TYPE_F32),
+            ggml_cast(ctx0, hp_kq_mask_f32, GGML_TYPE_F32), 0);
 
         kq_all = ggml_soft_max_ext(ctx0, kq_all, combined_mask, kq_scale, hparams.f_max_alibi_bias);
         cb(kq_all, "kq_soft_max", il);

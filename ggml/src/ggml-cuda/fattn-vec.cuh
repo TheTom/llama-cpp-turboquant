@@ -301,7 +301,7 @@ static __global__ void flash_attn_ext_vec(
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
         // Calculate KQ tile and keep track of new maximum KQ values:
-        float KQ_reg[ncols]; // KQ in registers.
+        float KQ_reg[ncols] = {0.0f}; // KQ in registers.
 
         float KQ_max_new[ncols];
 #pragma unroll
@@ -409,8 +409,10 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
 #pragma unroll
-        for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
-            const int k = threadIdx.y*WARP_SIZE + k0 * (nthreads_V == WARP_SIZE ? (nthreads / nthreads_V) : 1) + threadIdx.x / nthreads_V;
+        for (int k0 = 0; k0 < (V_is_turbo ? WARP_SIZE : nthreads_KQ); k0 += V_cols_per_iter) {
+            const int k = V_is_turbo
+                ? (threadIdx.y*WARP_SIZE + k0 * (nthreads_V == WARP_SIZE ? (nthreads / nthreads_V) : 1) + threadIdx.x / nthreads_V)
+                : k0;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
@@ -445,14 +447,14 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
                     dequantize_V(V + k*nb21, tmp_f,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                        2*i_VKQ_0 + (threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
                     dequantize_V(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                        2*i_VKQ_0 + (threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
