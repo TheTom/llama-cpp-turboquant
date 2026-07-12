@@ -2036,7 +2036,7 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 
     if (attn_rot_k) {
         const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
-        int nrot;
+        int nrot = 64;  // Default: 64 (empirically best for q2_0 + HP buffer)
         if (LLAMA_ATTN_ROT_K_NROT) {
             nrot = atoi(LLAMA_ATTN_ROT_K_NROT);
             // nrot=0 means auto-detect largest power-of-2 dividing head_dim
@@ -2045,11 +2045,6 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
                 do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
                 nrot /= 2;
             }
-        } else {
-            // Default: largest power-of-2 dividing head_dim (full head rotation)
-            nrot = 64;
-            do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
-            nrot /= 2;
         }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
@@ -2065,7 +2060,7 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 
     if (attn_rot_v) {
         const char * LLAMA_ATTN_ROT_V_NROT = getenv("LLAMA_ATTN_ROT_V_NROT");
-        int nrot;
+        int nrot = 64;  // Default: 64 (empirically best)
         if (LLAMA_ATTN_ROT_V_NROT) {
             nrot = atoi(LLAMA_ATTN_ROT_V_NROT);
             // nrot=0 means auto-detect largest power-of-2 dividing head_dim
@@ -2074,11 +2069,6 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
                 do { nrot *= 2; } while (hparams.n_embd_head_v(0) % nrot == 0);
                 nrot /= 2;
             }
-        } else {
-            // Default: largest power-of-2 dividing head_dim (full head rotation)
-            nrot = 64;
-            do { nrot *= 2; } while (hparams.n_embd_head_v(0) % nrot == 0);
-            nrot /= 2;
         }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
@@ -2088,6 +2078,7 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 
     return res;
 }
+
 
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
