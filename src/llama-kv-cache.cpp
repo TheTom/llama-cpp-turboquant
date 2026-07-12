@@ -1779,11 +1779,16 @@ ggml_tensor * llama_kv_cache::build_input_hp_batch_idxs(ggml_context * ctx, uint
 
 ggml_tensor * llama_kv_cache::build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const {
     if (n_hp_total == 0) return nullptr;
-    
-    const int64_t n_kv = n_hp_total;
-    const int64_t n_tokens = ubatch.n_tokens;
-    
-    return ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tokens, 1);
+    // Must match the LP mask's stream count. The LP mask (build_attn_inp_*) uses
+    // n_stream = kv_unified ? 1 : ubatch.n_seqs_unq, i.e. the number of unique sequences
+    // *in this ubatch* — not the cache-wide n_stream (= n_seq_max). When the ubatch has
+    // fewer sequences than n_seq_max (np>1 graph reservation / partial batches), using
+    // n_seq_max here gave a different dim1/dim3 and broke the LP+HP ggml_concat.
+    const uint32_t ns    = (n_stream == 1) ? 1 : ubatch.n_seqs_unq;
+    const uint32_t n_tps = ubatch.n_tokens / ns;
+    auto * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_hp_total, n_tps, 1, ns);
+    ggml_set_input(t);
+    return t;
 }
 
 void llama_kv_cache::set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -1818,30 +1823,33 @@ void llama_kv_cache::set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubat
 
 void llama_kv_cache::set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     if (n_hp_total == 0 || dst == nullptr) return;
-    
+
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    
-    const int64_t n_hp_kv = dst->ne[0];
-    const int64_t n_tokens = dst->ne[1];
-    
-    float * dst_data = (float *)dst->data;
-    
-    // Initialize mask to -inf (masked out)
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    float * data = (float *) dst->data;
+
+    // match build_input_hp_kq_mask: stream count = unique sequences in this ubatch
+    const uint32_t ns    = (n_stream == 1) ? 1 : ubatch->n_seqs_unq;
+    const uint32_t n_tps = ubatch->n_tokens / ns;
+    const int64_t n_hp   = dst->ne[0];
+
+    // Initialize to -inf
     for (int64_t i = 0; i < ggml_nelements(dst); ++i) {
-        dst_data[i] = -INFINITY;
+        data[i] = -INFINITY;
     }
-    
-    // For each HP position, unmask if it exists in the HP buffer
-    for (uint32_t s = 0; s < n_stream; ++s) {
+
+    // For each stream, unmask occupied HP positions
+    for (uint32_t s = 0; s < ns; ++s) {
         for (uint32_t hp_slot = 0; hp_slot < n_hp_total; ++hp_slot) {
             if (!v_hp_cells[s].is_empty(hp_slot)) {
-                // This HP slot is occupied, unmask for all tokens
-                for (int64_t t = 0; t < n_tokens; ++t) {
-                    dst_data[hp_slot + t * n_hp_kv] = 0.0f;
+                for (uint32_t t = 0; t < n_tps; ++t) {
+                    data[hp_slot + t * n_hp + s * n_hp * n_tps] = 0.0f;
                 }
             }
         }
     }
+
+    GGML_UNUSED(causal_attn);
 }
 
 void llama_kv_cache::zero_hp_in_lp_mask(ggml_tensor * lp_mask) const {

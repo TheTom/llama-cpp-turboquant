@@ -1276,6 +1276,33 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 576) {
                 return false;
             }
+            // OSCAR fused mixed-precision (two-tier KV) flash decoding
+            if (((const int32_t *) op->op_params)[4] == 1) {
+                const int64_t D = op->src[0]->ne[0];
+                if ((D != 128 && D != 256 && D != 512) || op->src[2]->ne[0] != D) {
+                    return false;
+                }
+                if (op->src[1]->type != GGML_TYPE_Q2_0 || op->src[2]->type != GGML_TYPE_Q2_0) {
+                    return false;
+                }
+                if (!op->src[5] || !op->src[6] ||
+                    op->src[5]->type != GGML_TYPE_F16 || op->src[6]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (op->src[7] && op->src[7]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                {
+                    const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+                    if (!(e && atoi(e))) {
+                        return false;
+                    }
+                }
+                return has_simdgroup_reduction;
+            }
             if (op->src[1]->type != op->src[2]->type) {
                 // Allow asymmetric K/V for supported mixed pairs:
                 // - turbo x turbo (any combination)
@@ -1373,6 +1400,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                                 return false;
                         }
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
+                        switch (op->type) {
+                            case GGML_TYPE_F32:
+                            case GGML_TYPE_F16:
+                                return true;
+                            default:
+                                return false;
+                        }
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -1415,6 +1450,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_TURBO3_0:
                     case GGML_TYPE_TURBO4_0:
                         return true;
+                    case GGML_TYPE_Q2_0:
+                        {
+                            // OSCAR INT2 encode on Metal is only correct on the calibrated-
+                            // rotation path (no in-quant Hadamard) and needs full 128-wide
+                            // groups (one per head vector); otherwise fall back to CPU.
+                            const char * e = getenv("LLAMA_KV_NO_HADAMARD");
+                            return (e && atoi(e)) && (op->ne[0] % 128 == 0);
+                        }
                     default:
                         return false;
                 };
