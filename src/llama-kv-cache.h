@@ -240,6 +240,7 @@ public:
     void set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void zero_hp_in_lp_mask(ggml_tensor * lp_mask) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -486,6 +487,7 @@ public:
 
     void set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void zero_hp_in_lp_mask(ggml_tensor * lp_mask) const;
     void set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;

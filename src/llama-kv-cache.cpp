@@ -1844,6 +1844,41 @@ void llama_kv_cache::set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
+void llama_kv_cache::zero_hp_in_lp_mask(ggml_tensor * lp_mask) const {
+    if (n_hp_total == 0 || lp_mask == nullptr) return;
+
+    GGML_ASSERT(lp_mask->type == GGML_TYPE_F32 || lp_mask->type == GGML_TYPE_F16);
+
+    const int64_t n_kv   = lp_mask->ne[0];
+    const int64_t n_tokens = lp_mask->ne[1];
+
+    if (lp_mask->type == GGML_TYPE_F32) {
+        float * dst_data = (float *)lp_mask->data;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & hp_set = hp_positions[s];
+            for (llama_pos pos : hp_set) {
+                if (pos < n_kv) {
+                    for (int64_t t = 0; t < n_tokens; ++t) {
+                        dst_data[pos + t * n_kv] = -INFINITY;
+                    }
+                }
+            }
+        }
+    } else {
+        ggml_fp16_t * dst_data = (ggml_fp16_t *)lp_mask->data;
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & hp_set = hp_positions[s];
+            for (llama_pos pos : hp_set) {
+                if (pos < n_kv) {
+                    for (int64_t t = 0; t < n_tokens; ++t) {
+                        dst_data[pos + t * n_kv] = neg_inf;
+                    }
+                }
+            }
+        }
+    }
+}
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -2000,21 +2035,20 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
-        // for K, mirroring V's choice. Master defaults to the largest power-of-2
-        // that divides head_dim, but the upstream comment hypothesizes smaller
-        // tiles preserve more local structure → less PPL hit on sensitive models
-        // (gemma-4 26B-A4B reportedly regresses with the largest tile).
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
         const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
-        int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
-
-        // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
-        if (nrot == 0) {
+        int nrot;
+        if (LLAMA_ATTN_ROT_K_NROT) {
+            nrot = atoi(LLAMA_ATTN_ROT_K_NROT);
+            // nrot=0 means auto-detect largest power-of-2 dividing head_dim
+            if (nrot == 0) {
+                nrot = 64;
+                do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
+                nrot /= 2;
+            }
+        } else {
+            // Default: largest power-of-2 dividing head_dim (full head rotation)
             nrot = 64;
-            do {
-                nrot *= 2;
-            } while (n_embd_head_k_all % nrot == 0);
+            do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
             nrot /= 2;
         }
 
@@ -2030,13 +2064,22 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_v) {
-        int nrot = 64;
-        // using smaller rotation matrices for V seems beneficial
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
-        //do {
-        //    nrot *= 2;
-        //} while (hparams.n_embd_head_v() % nrot == 0);
-        //nrot /= 2;
+        const char * LLAMA_ATTN_ROT_V_NROT = getenv("LLAMA_ATTN_ROT_V_NROT");
+        int nrot;
+        if (LLAMA_ATTN_ROT_V_NROT) {
+            nrot = atoi(LLAMA_ATTN_ROT_V_NROT);
+            // nrot=0 means auto-detect largest power-of-2 dividing head_dim
+            if (nrot == 0) {
+                nrot = 64;
+                do { nrot *= 2; } while (hparams.n_embd_head_v(0) % nrot == 0);
+                nrot /= 2;
+            }
+        } else {
+            // Default: largest power-of-2 dividing head_dim (full head rotation)
+            nrot = 64;
+            do { nrot *= 2; } while (hparams.n_embd_head_v(0) % nrot == 0);
+            nrot /= 2;
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -2045,6 +2088,7 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 
     return res;
 }
+
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
@@ -3337,4 +3381,8 @@ void llama_kv_cache_context::set_input_hp_batch_idxs(ggml_tensor * dst, const ll
 
 void llama_kv_cache_context::set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_hp_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::zero_hp_in_lp_mask(ggml_tensor * lp_mask) const {
+    kv->zero_hp_in_lp_mask(lp_mask);
 }
