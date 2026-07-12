@@ -174,10 +174,10 @@ static __global__ void flash_attn_ext_vec(
 #else
     __align__(16) float2 Q_reg[ncols][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}}; // May be only partially initialized.
 #endif // V_DOT2_F32_F16_AVAILABLE
-    int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
-    float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
+    constexpr int q_i32_n = 1 > D/(sizeof(int)*nthreads_KQ_for_dot) ? 1 : D/(sizeof(int)*nthreads_KQ_for_dot);
+    int    Q_i32[ncols][q_i32_n];
+    float2 Q_ds[ncols][q_i32_n];
 
-    ggml_cuda_pdl_sync();
     if constexpr (Q_q8_1) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
@@ -223,11 +223,11 @@ static __global__ void flash_attn_ext_vec(
             float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
 
 #pragma unroll
-            for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_KQ) {
-                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+            for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_KQ_for_dot) {
+                const int i = i0 + (nthreads_KQ_for_dot == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ_for_dot);
 
-                Q_i32[j][i0/nthreads_KQ] = tmp_q_i32[i];
-                Q_ds[j][i0/nthreads_KQ]  = tmp_q_ds[i/QI8_1];
+                Q_i32[j][i0/nthreads_KQ_for_dot] = tmp_q_i32[i];
+                Q_ds[j][i0/nthreads_KQ_for_dot]  = tmp_q_ds[i/QI8_1];
             }
         }
 

@@ -559,7 +559,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
-    // q2_0 KV: force VEC kernel before dimension switch may reject D=512
+    // q2_0 KV: use VEC kernel which has inline q2_0 dequant (the TILE/MMA
+    // kernel has no q2_0 -> f16 converter and would crash). V loop now
+    // correctly covers all nthreads positions (fix: upstream threadIdx.y
+    // stride), so D=512 works despite nthreads_KQ < nthreads.
     if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0) {
         return BEST_FATTN_KERNEL_VEC;
     }

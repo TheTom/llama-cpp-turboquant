@@ -612,9 +612,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (hp_kq_mask && hp_kq_mask->buffer) {
         mctx->get_base()->set_input_hp_kq_mask(hp_kq_mask, ubatch, cparams.causal_attn);
         // Prevent double-counting: exclude HP positions from LP attention
-        //if (self_kq_mask && self_kq_mask->buffer) {
-        //    mctx->get_base()->zero_hp_in_lp_mask(self_kq_mask);
-        //}
+        if (self_kq_mask && self_kq_mask->buffer) {
+            mctx->get_base()->zero_hp_in_lp_mask(self_kq_mask);
+        }
     }
     if (hp_k_idxs_swa && hp_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_hp_k_idxs(hp_k_idxs_swa, ubatch);
@@ -625,9 +625,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (hp_kq_mask_swa && hp_kq_mask_swa->buffer) {
         mctx->get_swa()->set_input_hp_kq_mask(hp_kq_mask_swa, ubatch, cparams.causal_attn);
         // Prevent double-counting: exclude HP positions from LP attention
-        //if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        //    mctx->get_swa()->zero_hp_in_lp_mask(self_kq_mask_swa);
-        //}
+        if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
+            mctx->get_swa()->zero_hp_in_lp_mask(self_kq_mask_swa);
+        }
     }
 }
 
