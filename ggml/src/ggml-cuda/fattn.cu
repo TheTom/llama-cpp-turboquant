@@ -559,6 +559,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
+    // q2_0 KV: force VEC kernel before dimension switch may reject D=512
+    if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     switch (K->ne[0]) {
         case  40:
         case  64:
@@ -637,14 +642,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (is_turbo(V->type) && V->ne[0] % 64 != 0)) {
             return BEST_FATTN_KERNEL_NONE;
         }
-    }
-
-    // OSCAR INT2 q2_0 KV cache: only the vector flash-attn kernel (which we ported
-    // with the q2_0 dequant / KQ-dot) supports this type. Force it regardless of
-    // head dimensions / tensor-core heuristics (which would otherwise pick MMA-F16 and
-    // crash). Mirrors how the Metal backend routes q2_0 to its vec kernel.
-    if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0) {
-        return BEST_FATTN_KERNEL_VEC;
     }
 
     if (mask && mask->ne[2] != 1) {
