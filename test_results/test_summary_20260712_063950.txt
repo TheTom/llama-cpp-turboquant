@@ -1,0 +1,14 @@
+#|Name|Tag|Actual cache|Rotation|HP|Output
+--|----|---|------------|--------|---|------
+1|"Full baseline"|f16_f16_no_rot_no_clip_no_hp||||timeout: failed to execute process: No such file or directory (os error 2) 
+2|"V quant only"|f16_q2_0_rot_v=1_no_clip_no_hp||||timeout: failed to execute process: No such file or directory (os error 2) 
+3|"K quant full pipe"|q2_0_f16_rot_both_clip=0.96_hp=64+256||||timeout: failed to execute process: No such file or directory (os error 2) 
+4|"K quant no rot"|q2_0_f16_no_rot_clip=0.96_hp=64+256||||timeout: failed to execute process: No such file or directory (os error 2) 
+5|"K quant no clip"|q2_0_f16_rot_both_no_clip_hp=64+256||||timeout: failed to execute process: No such file or directory (os error 2) 
+6|"K quant no hp"|q2_0_f16_rot_both_clip=0.96_no_hp||||timeout: failed to execute process: No such file or directory (os error 2) 
+7|"K quant with hadamard"|q2_0_f16_rot_both_clip=0.96_hp=64+256 +hadamard||||timeout: failed to execute process: No such file or directory (os error 2) 
+8|"Full q2_0 full pipe"|q2_0_q2_0_rot_both_clip=0.96_hp=64+256||||timeout: failed to execute process: No such file or directory (os error 2) 
+9|"Full q2_0 no clip"|q2_0_q2_0_rot_both_no_clip_hp=64+256||||timeout: failed to execute process: No such file or directory (os error 2) 
+10|"f16 with rotation"|f16_f16_rot_both_no_clip_no_hp||||timeout: failed to execute process: No such file or directory (os error 2) 
+11|"Full q2_0 no hp"|q2_0_q2_0_rot_both_clip=0.96_no_hp||||timeout: failed to execute process: No such file or directory (os error 2) 
+12|"Full q2_0 no rot"|q2_0_q2_0_no_rot_clip=0.96_hp=64+256||||timeout: failed to execute process: No such file or directory (os error 2) 

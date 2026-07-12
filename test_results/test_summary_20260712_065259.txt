@@ -1,0 +1,13 @@
+#|Name|Tag|Cache|Rotation|HP|Output
+--|----|---|-----|--------|---|------
+1|"f16 baseline GPU"|f16_f16_no_rot|||| | <|channel><|image> and townships bât<audio|>1之ouched동หลากหลาย이다<image|><audio|> or11thorn<unuse
+2|"V q2_0 GPU"|f16_q2_0_rot_v=1|||| | <unused49><unused49><unused49><unused49><unused49><unused49><unused49><unused49><unused49><unus
+3|"f16 with rot GPU"|f16_f16_rot_both|||| | <|channel> and and<audio|> выпа1 &&<unused49><unused49><unused49><unused49><unused49><unused49>
+4|"K q2_0 full pipe CPU"|q2_0_f16_rot_both_clip=0.96_hp=64+256|||| |-\|/-\|/-\|/-\|/-\|/ assistant assistant assistant assistant 
+5|"K q2_0 no rot CPU"|q2_0_f16_no_rot_clip=0.96_hp=64+256|||| |-\|/-\|/-\|/-\|/-\|/ assistant assistant assistant assistant 
+6|"K q2_0 no clip CPU"|q2_0_f16_rot_both_hp=64+256|||| |-\|/-\|/-\|/-\|/-\|/ <|im.start|> <|im.start|> <|im.start|> <|im.start|> 
+7|"K q2_0 no HP CPU"|q2_0_f16_rot_both_clip=0.96|||| |-\|/-\|/-\|/-\|/- <|channel>thought<|channel>thought<|channel><|channel><|chann
+8|"K q2_0 +hadamard CPU"|q2_0_f16_rot_both_clip=0.96_hp=64+256+hadamard|||| |-\|/-\|/-\|/-\|/-\|/-\|/- What is 2+2?<|im.start|>user What is 2+2?<|im
+9|"Full q2_0 full pipe CPU"|q2_0_q2_0_rot_both_clip=0.96_hp=64+256|||| |-\|/-\|/-\|/-\|/-\|/ <|im.assistant|> <|im.assistant|> <|im.assistant|> <|im
+10|"Full q2_0 no clip CPU"|q2_0_q2_0_rot_both_hp=64+256|||| |-\|/-\|/-\|/-\|/-\|/ <|im.next|> <|im.next|> <|im.next|> <|im.next|> 
+11|"Full q2_0 no rot CPU"|q2_0_q2_0_no_rot_clip=0.96_hp=64+256|||| |-\|/-\|/-\|/-\|/-\|/ user #|im||||||||||||||||||||||||||||||||||||||||||||| 

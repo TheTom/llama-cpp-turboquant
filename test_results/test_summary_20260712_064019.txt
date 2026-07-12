@@ -1,0 +1,1 @@
+#|Name|Tag|Actual cache|Rotation|HP|Output

@@ -357,7 +357,9 @@ static __global__ void flash_attn_ext_vec(
                     }
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
-                    sum = warp_reduce_sum<nthreads_KQ>(sum);
+                    // vec_dot uses nthreads_KQ_for_dot threads per position.
+                    // warp_reduce_sum reduces within each position's thread group.
+                    sum = warp_reduce_sum<nthreads_KQ_for_dot>(sum);
                 }
 
                 if (use_logit_softcap) {
@@ -370,9 +372,6 @@ static __global__ void flash_attn_ext_vec(
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
-                if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
-                    KQ_reg[j] = sum;
-                }
             }
         }
 
@@ -412,7 +411,7 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < (V_is_turbo ? WARP_SIZE : nthreads_KQ); k0 += V_cols_per_iter) {
             const int k = V_is_turbo
                 ? (threadIdx.y*WARP_SIZE + k0 * (nthreads_V == WARP_SIZE ? (nthreads / nthreads_V) : 1) + threadIdx.x / nthreads_V)
-                : k0;
+                : (k0 + threadIdx.x / nthreads_V);
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
@@ -421,8 +420,10 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (V_is_turbo) {
                     const float kq_val = __shfl_sync(0xFFFFFFFF, KQ_reg[j], k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V));
                     KQ_k[j] = make_half2(__float2half(kq_val), __float2half(kq_val));
-                } else {
+                } else if (k < nthreads_KQ) {
                     KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
+                } else {
+                    KQ_k[j] = make_half2(__float2half(0.0f), __float2half(0.0f));
                 }
             }
 
