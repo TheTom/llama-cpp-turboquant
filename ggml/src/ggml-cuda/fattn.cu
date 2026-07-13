@@ -567,6 +567,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_VEC;
     }
 
+    // Blackwell (sm_120, RTX 5090): flash attention (VEC and MMA both) produces
+    // incorrect attention values on this architecture with current CUDA toolchain.
+    // Fall back to standard matmul (automatically used when NONE is returned).
+    // Q2_0 KV is exempted (it has no standard-matmul dequant converter).
+    if (blackwell_mma_available(cc)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     switch (K->ne[0]) {
         case  40:
         case  64:
