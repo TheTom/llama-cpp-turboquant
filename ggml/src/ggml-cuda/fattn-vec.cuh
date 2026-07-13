@@ -199,7 +199,7 @@ static __global__ void flash_attn_ext_vec(
                 const int i = i0 + (nthreads_KQ_for_dot == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ_for_dot);
 
                 Q_i32[j][i0/nthreads_KQ_for_dot] = tmp_q_i32[i];
-                Q_ds[j][i0/nthreads_KQ_for_dot]  = tmp_q_ds[i0/nthreads_KQ_for_dot];
+                Q_ds[j][i0/nthreads_KQ_for_dot]  = tmp_q_ds[i0/QI8_1 + threadIdx.x / QI8_1];
             }
         }
 
