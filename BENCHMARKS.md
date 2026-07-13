@@ -62,10 +62,41 @@ Where `[TYPE]` is `q4_0`, `q2_0`, or `turbo2`.
 - Total system memory savings are modest (3.8%) because the Q8_0 model weights (~13 GB) dominate
 - Output quality is preserved across all three formats
 
+## GPU Benchmarks (RTX 5090, `-ngl 99 -fa on`, 256k context)
+
+Test command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-cli \
+    -m /mnt/storage/models/google/gemma-4-12b-it-Q8_0-rot-kv.gguf \
+    -ngl 99 -fa on -c 262144 \
+    --cache-type-k [TYPE] --cache-type-v [TYPE] \
+    --chat-template-file models/templates/google-gemma-4-31B-it.jinja \
+    -p "What is the capital of France?" -n 80 --temp 0 --single-turn
+```
+
+| KV type | Output quality | Prompt t/s | Gen t/s | VRAM (MiB) | Status |
+|---|---|---|---|---|---|
+| `f16/f16` | Correct ("The capital of France is Paris") | ~694 | ~95 | — | Working |
+| `turbo2/turbo2` | Correct ("The capital of France is **Paris**.") | ~608 | ~88 | ~15,018 | Working |
+| `q4_0/q4_0` | Broken (`<|channel>thought` garbage) | ~609 | ~91 | ~15,570 | Broken |
+| `q2_0/q2_0` | Correct ("The capital of France is Paris.") | ~8.8 | ~1.3 | ~14,778 | **Working** |
+
+VRAM measured with `nvidia-smi dmon` during the run. The Q8_0 model weights
+(~13 GB) are included in this figure.
+
 ## Notes
 
-- CPU-only test (`-ngl 0`). GPU path with q2_0 flash attention is still under development.
-- GPU with f16 K+V and `-fa on` achieves **~682 t/s prompt / ~95 t/s generation** on RTX 5090.
+- CPU-only test (`-ngl 0`).
+- GPU with f16 K+V and `-fa on` achieves **~694 t/s prompt / ~95 t/s generation** on RTX 5090.
+- GPU with turbo2 K+V and `-fa on` achieves **~608 t/s prompt / ~88 t/s generation** on RTX 5090.
+- GPU with q2_0 K+V and `-fa on` now works on RTX 5090 after adding the missing
+  Hadamard transform to the CUDA `set_rows` write kernel and fixing the mask
+  indexing in the custom q2_0 flash-attention kernel. It is functionally correct
+  but much slower than f16/turbo2 (**~8.8 t/s prompt / ~1.3 t/s generation**)
+  because the q2_0 FA kernel is a simple single-warp implementation.
+- `q4_0/q4_0` remains broken on GPU (garbage output) and is not the OSCAR/INT2
+  focus.
 - The Q8_0 model weights are ~13 GB regardless of cache format.
 - Turbo2 block size: 32 elements, 10 bytes/block (2 bytes norm + 8 bytes 2-bit indices). Effective rate: 2.5 bits/element.
 - Q2_0 block size: 32 elements, 12 bytes/block (4 bytes scales + 8 bytes 2-bit indices). Effective rate: 3 bits/element.

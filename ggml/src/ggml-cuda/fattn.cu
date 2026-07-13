@@ -1,3 +1,5 @@
+#include "fattn-q2_0.cuh"
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -488,11 +490,55 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ABORT("fatal error");
 }
 
+static void ggml_cuda_flash_attn_ext_q2_0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * Q = dst->src[0];
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+
+    const ggml_type type_K = K->type;
+    const ggml_type type_V = V->type;
+
+    const int D = Q->ne[0];
+
+#define DISPATCH_Q2_0(DIM)                                                                 \
+    switch (type_K) {                                                                      \
+        case GGML_TYPE_Q2_0:                                                               \
+            switch (type_V) {                                                              \
+                case GGML_TYPE_Q2_0: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0>(ctx, dst); return; \
+                case GGML_TYPE_F16:  ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_0, GGML_TYPE_F16> (ctx, dst); return; \
+                case GGML_TYPE_Q8_0: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_0, GGML_TYPE_Q8_0>(ctx, dst); return; \
+                default: break;                                                            \
+            }                                                                              \
+            break;                                                                         \
+        case GGML_TYPE_F16:                                                                \
+            if (type_V == GGML_TYPE_Q2_0) {                                                \
+                ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_F16,  GGML_TYPE_Q2_0>(ctx, dst); return; \
+            }                                                                              \
+            break;                                                                         \
+        case GGML_TYPE_Q8_0:                                                               \
+            if (type_V == GGML_TYPE_Q2_0) {                                                \
+                ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0>(ctx, dst); return; \
+            }                                                                              \
+            break;                                                                         \
+        default: break;                                                                    \
+    }
+
+    if (D ==  64) { DISPATCH_Q2_0( 64); }
+    if (D == 128) { DISPATCH_Q2_0(128); }
+    if (D == 256) { DISPATCH_Q2_0(256); }
+    if (D == 512) { DISPATCH_Q2_0(512); }
+
+#undef DISPATCH_Q2_0
+
+    GGML_ABORT("fatal error");
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
+    BEST_FATTN_KERNEL_Q2_0     =  50,
     BEST_FATTN_KERNEL_VEC      = 100,
+    BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
@@ -559,10 +605,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
-    // q2_0 KV: use VEC kernel which has inline q2_0 dequant (the TILE/MMA
-    // kernel has no q2_0 -> f16 converter and would crash). V loop now
-    // correctly covers all nthreads positions (fix: upstream threadIdx.y
-    // stride), so D=512 works despite nthreads_KQ < nthreads.
+    // q2_0 KV: use dedicated Q2_0 kernel (pure f32 non-vec). The VEC path
+    // is broken on Blackwell (produces attention collapse).
+    if ((K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0)
+        && (K->type == GGML_TYPE_Q2_0 || K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0)
+        && (V->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0)) {
+        const int D = K->ne[0];
+        if (D == 64 || D == 128 || D == 256 || D == 512) {
+            return BEST_FATTN_KERNEL_Q2_0;
+        }
+        // Unsupported head dim: fall through to VEC (may be broken)
+    }
+    // Other mixed q2_0 types: VEC path (may be broken on Blackwell)
     if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0) {
         return BEST_FATTN_KERNEL_VEC;
     }
@@ -838,6 +892,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_Q2_0:
+            ggml_cuda_flash_attn_ext_q2_0(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);

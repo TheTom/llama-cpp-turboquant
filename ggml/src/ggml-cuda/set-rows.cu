@@ -1251,6 +1251,24 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
 
 // ---- OSCAR q2_0 (INT2) SET_ROWS write kernel ----
+
+// In-place Hadamard transform used by the q2_0 FA dequant path.
+// Must be applied during encoding so quant/dequant are matched.
+static __device__ __forceinline__ void q2_0_hadamard_inplace(float * x, int n) {
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += h << 1) {
+            for (int j = i; j < i + h; ++j) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float s = rsqrtf((float)n);
+    for (int i = 0; i < n; ++i) x[i] *= s;
+}
+
 // Quantizes an f32 K/V row into q2_0 using the calibrated OSCAR encode:
 // per-128-group mean, optional outlier clip (clip_ratio percentile),
 // per-32-block sigma, and 2-bit Lloyd-Max packing.
@@ -1274,8 +1292,13 @@ static __global__ void set_rows_cuda_q2_0(
 
     const idx_t i1 = *((const idx_t *) (src1 + i10*nb10 + i11*nb11 + i12*nb12));
 
-    block_q2_0 * dst_row = (block_q2_0 *) (dst + (uint64_t)i1*nb1 + i02*nb2 + i03*nb3);
+    // cpy_k/cpy_v merge (n_embd_head, n_kv_heads) into dim 0 before set_rows,
+    // so src0 is [n_embd_gqa, n_tokens] and i01 is the token/row index.
+    // Use the same dst addressing as the generic set_rows kernel.
     const float * src_row = (const float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+    block_q2_0 * dst_row  = (block_q2_0 *) (dst + (uint64_t)i1*nb1 + i02*nb2 + i03*nb3);
+
+
 
     const int ngrp = nk0 / 4;  // 128-wide groups per row (4 blocks of 32)
 
@@ -1304,6 +1327,10 @@ static __global__ void set_rows_cuda_q2_0(
 
         const float mean = sh_mean;
         for (int k = 0; k < 4; ++k) sh[t * 4 + k] -= mean;
+        __syncthreads();
+
+        // Apply the same Hadamard transform the FA dequant path uses.
+        q2_0_hadamard_inplace(sh, 128);
         __syncthreads();
 
         // OSCAR outlier clip: threshold = clip_ratio percentile over the 128 group,
