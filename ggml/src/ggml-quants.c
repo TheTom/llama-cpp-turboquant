@@ -528,6 +528,45 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// Pre-Hadamard dequant: decode Lloyd-Max centroids * sigma + mean.
+// No inverse Hadamard because values are stored post-transform.
+void dequantize_row_q2_preh(const block_q2_preh * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK2_0 == 0);
+    const int nb = k / QK2_0;
+
+    const int had_n  = (k >= q2_0_had_size()) ? q2_0_had_size() : QK2_0;
+    const int had_nb = had_n / QK2_0;
+
+    float tmp[Q2_0_HAD_SIZE];
+
+    for (int ig = 0; ig < nb; ig += had_nb) {
+        const int actual_nb = (ig + had_nb <= nb) ? had_nb : (nb - ig);
+        const int actual_n  = actual_nb * QK2_0;
+
+        // Mean was subtracted before OWHT during quantization; stored in first block's m field.
+        const float mean = GGML_FP16_TO_FP32(x[ig].m);
+
+        // Decode all blocks using Lloyd-Max centroids * sigma, add mean directly
+        // Skip inverse Hadamard — values are stored post-transform.
+        for (int ib = 0; ib < actual_nb; ib++) {
+            const float sigma = GGML_FP16_TO_FP32(x[ig + ib].d);
+            float * blk = tmp + ib * QK2_0;
+            for (int j = 0; j < QK2_0 / 4; j++) {
+                const uint8_t packed = x[ig + ib].qs[j];
+                for (int b = 0; b < 4; b++) {
+                    blk[j*4 + b] = kQ2_0_LM_centroids[(packed >> (2 * b)) & 0x03] * sigma;
+                }
+            }
+        }
+        for (int j = 0; j < actual_n; j++) tmp[j] += mean;
+        memcpy(y + ig * QK2_0, tmp, actual_n * sizeof(float));
+    }
+}
+// Pre-Hadamard quantize reuses q2_0 encode (already produces post-Hadamard values).
+void quantize_row_q2_preh_ref(const float * GGML_RESTRICT x, block_q2_preh * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q2_0_ref(x, (block_q2_0 *)y, k);
+}
+
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK2_0 == 0);
     const int nb = k / QK2_0;
@@ -603,6 +642,56 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     (void)imatrix;
     quantize_row_q2_0_ref(src, (block_q2_0 *) dst, nrows * n_per_row);
     return nrows * sizeof(block_q2_0) * (n_per_row / QK2_0);
+}
+void dequantize_row_oscar2(const block_oscar2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_OSCAR2 == 0);
+    const int nb = k / QK_OSCAR2;
+    for (int ib = 0; ib < nb; ib++) {
+        const float d = GGML_FP16_TO_FP32(x[ib].d);
+        const float m = GGML_FP16_TO_FP32(x[ib].m);
+        for (int j = 0; j < QK_OSCAR2 / 4; j++) {
+            const uint8_t packed = x[ib].qs[j];
+            for (int b = 0; b < 4; b++) {
+                const int code = (packed >> (2 * b)) & 0x03;
+                y[ib * QK_OSCAR2 + j * 4 + b] = (float)code * d + m;
+            }
+        }
+    }
+}
+
+void quantize_row_oscar2_ref(const float * GGML_RESTRICT x, block_oscar2 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_OSCAR2 == 0);
+    const int nb = k / QK_OSCAR2;
+    for (int ib = 0; ib < nb; ib++) {
+        const float * vec = x + ib * QK_OSCAR2;
+        // Find min/max
+        float vmin = vec[0], vmax = vec[0];
+        for (int j = 1; j < QK_OSCAR2; j++) {
+            if (vec[j] < vmin) vmin = vec[j];
+            if (vec[j] > vmax) vmax = vec[j];
+        }
+        const float scale = (vmax - vmin) / 3.0f;
+        const float inv_scale = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
+        y[ib].d = GGML_FP32_TO_FP16(scale);
+        y[ib].m = GGML_FP32_TO_FP16(vmin);
+        for (int j = 0; j < QK_OSCAR2 / 4; j++) {
+            uint8_t packed = 0;
+            for (int b = 0; b < 4; b++) {
+                float val = vec[j * 4 + b];
+                int code = (int)((val - vmin) * inv_scale + 0.5f);
+                if (code < 0) code = 0;
+                if (code > 3) code = 3;
+                packed |= (uint8_t)(code << (2 * b));
+            }
+            y[ib].qs[j] = packed;
+        }
+    }
+}
+
+size_t quantize_oscar2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * GGML_RESTRICT imatrix) {
+    (void)imatrix;
+    quantize_row_oscar2_ref(src, (block_oscar2 *) dst, nrows * n_per_row);
+    return nrows * sizeof(block_oscar2) * (n_per_row / QK_OSCAR2);
 }
 
 void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

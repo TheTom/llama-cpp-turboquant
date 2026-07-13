@@ -285,6 +285,19 @@ typedef struct {
     uint8_t qs[QK2_0 / 4]; // 4 packed 2-bit values per byte [0..3]
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == 2 * sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+// Pre-Hadamard q2_0: same packed layout, but stored values are post-Hadamard
+// so dequant skips the inverse transform. KV-cache only, not for model weights.
+typedef block_q2_0 block_q2_preh;
+
+// OSCAR2: per-head_dim (128) min-max asymmetric 2-bit quantization
+// Layout: [int2_codes(32B) | scale_fp16(2B) | zero_fp16(2B)] = 36 bytes per 128 elements
+#define QK_OSCAR2 128
+typedef struct {
+    uint8_t    qs[QK_OSCAR2 / 4];   // 32 bytes: 4 two-bit codes per byte
+    ggml_half  d;                    // scale (fp16)
+    ggml_half  m;                    // zero point / vmin (fp16)
+} block_oscar2;
+static_assert(sizeof(block_oscar2) == QK_OSCAR2/4 + 2*sizeof(ggml_half), "wrong oscar2 block size");
 
 // TurboQuant 3-bit MSE-only: 3-bit PolarQuant indices (no QJL)
 // Storage block size = 32 (matches q4_0 for optimal GPU parallelism)

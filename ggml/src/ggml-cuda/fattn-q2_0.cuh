@@ -54,6 +54,29 @@ static __device__ __forceinline__ void dequant_row_q2_0(
     }
 }
 
+// Pre-Hadamard single-threaded dequant: decode + add mean, no inverse Hadamard.
+static __device__ __forceinline__ void dequant_row_q2_0_preh(
+    const block_q2_preh * blk, int D, float * buf) {
+    constexpr int HAD = 128;
+    constexpr int HAD_BLK = HAD / QK2_0; // 4
+    const int ng = D / HAD;
+
+    for (int ig = 0; ig < ng; ++ig) {
+        const int base = ig * HAD_BLK;
+        const float mean = __half2float(blk[base].m);
+
+        for (int ib = 0; ib < HAD_BLK && (base + ib) * QK2_0 < D; ++ib) {
+            const int bidx = base + ib;
+            const float sigma = __half2float(blk[bidx].d);
+            constexpr float c[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+            for (int j = 0; j < QK2_0; ++j) {
+                uint8_t code = (blk[bidx].qs[j/4] >> (2*(j%4))) & 0x03;
+                buf[bidx * QK2_0 + j] = sigma * c[code] + mean;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 128-thread cooperative helpers
 // ---------------------------------------------------------------------------
@@ -116,8 +139,35 @@ static __device__ __forceinline__ void dequant_row_q2_0_parallel(
             if (elem >= D) break;
             buf[elem] += mean;
         }
-        __syncthreads();
     }
+    __syncthreads();
+}
+
+// Cooperative pre-Hadamard dequant: decode + add mean in one pass, no inverse Hadamard.
+static __device__ __forceinline__ void dequant_row_q2_0_parallel_preh(
+    const block_q2_preh * blk, int D, float * buf) {
+    constexpr int HAD = 128;
+    constexpr int nthreads = 128;
+    const int ng = D / HAD;
+    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+
+    for (int ig = 0; ig < ng; ++ig) {
+        const int group_base = ig * HAD;
+        const int base_blk = group_base / QK2_0;
+        const float mean = __half2float(blk[base_blk].m);
+
+        for (int off = 0; off < HAD; off += nthreads) {
+            const int elem = group_base + off + tid;
+            if (elem >= D) break;
+            const int ib    = elem / QK2_0;
+            const int j     = elem % QK2_0;
+            const float sigma = __half2float(blk[ib].d);
+            constexpr float c[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+            uint8_t code = (blk[ib].qs[j/4] >> (2*(j%4))) & 0x03;
+            buf[elem] = sigma * c[code] + mean;
+        }
+    }
+    __syncthreads();
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +342,15 @@ static __global__ void flash_attn_ext_q2_0(
                     }
                     __syncwarp();
                 }
+            } else if constexpr (type_K == GGML_TYPE_Q2_PREH) {
+                if constexpr (nwarps_k > 1) {
+                    dequant_row_q2_0_parallel_preh((const block_q2_preh *)(K + i_kv * nb11), D, s_buf);
+                } else {
+                    if (tid == 0) {
+                        dequant_row_q2_0_preh((const block_q2_preh *)(K + i_kv * nb11), D, s_buf);
+                    }
+                    __syncwarp();
+                }
             } else {
                 if (tid == 0) {
                     if constexpr (type_K == GGML_TYPE_F16) {
@@ -347,14 +406,22 @@ static __global__ void flash_attn_ext_q2_0(
 
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
-
-                // ---- V dequant ----
+            // ---- V dequant ----
                 if constexpr (type_V == GGML_TYPE_Q2_0) {
                     if constexpr (nwarps_k > 1) {
                         dequant_row_q2_0_parallel((const block_q2_0 *)(V + i_kv * nb21), D, s_buf + D);
                     } else {
                         if (tid == 0) {
                             dequant_row_q2_0((const block_q2_0 *)(V + i_kv * nb21), D, s_buf + D);
+                        }
+                        __syncwarp();
+                    }
+                } else if constexpr (type_V == GGML_TYPE_Q2_PREH) {
+                    if constexpr (nwarps_k > 1) {
+                        dequant_row_q2_0_parallel_preh((const block_q2_preh *)(V + i_kv * nb21), D, s_buf + D);
+                    } else {
+                        if (tid == 0) {
+                            dequant_row_q2_0_preh((const block_q2_preh *)(V + i_kv * nb21), D, s_buf + D);
                         }
                         __syncwarp();
                     }

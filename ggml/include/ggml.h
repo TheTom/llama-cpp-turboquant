@@ -435,7 +435,9 @@ extern "C" {
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_Q2_0    = 47, // OSCAR 2-bit KV cache: Lloyd-Max, block_size=32
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_Q2_PREH = 48, // EXPERIMENTAL - V dequant has unresolved issue; do not use with --cache-type-v q2_preh
+        GGML_TYPE_OSCAR2  = 49, // OSCAR INT2: per-head_dim min-max asymmetric quant, no Hadamard
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision

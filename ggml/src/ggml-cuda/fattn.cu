@@ -480,12 +480,29 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q2_0, GGML_TYPE_F16)
 
+    // OSCAR2 KV cache types (VEC fallback path)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_OSCAR2)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_OSCAR2)
+
+    // D=512 (Gemma4) OSCAR2 VEC combinatorics
+    FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,    GGML_TYPE_OSCAR2)
+    FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0,   GGML_TYPE_OSCAR2)
+    FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0)
+
     // D=512 (Gemma4) Q2_0 VEC combinatorics
     FATTN_VEC_CASE(512, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0)
     FATTN_VEC_CASE(512, GGML_TYPE_F16,  GGML_TYPE_Q2_0)
     FATTN_VEC_CASE(512, GGML_TYPE_Q2_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0)
     FATTN_VEC_CASE(512, GGML_TYPE_Q2_0, GGML_TYPE_Q8_0)
+
+    // Q2_PREH KV cache types (VEC fallback path) — VEC kernel doesn't support Q2_PREH vec_dot_KQ,
+    // so these instantiations are omitted. Unsupported head dims will hit a compile-time error.
 
     GGML_ABORT("fatal error");
 }
@@ -505,8 +522,18 @@ static void ggml_cuda_flash_attn_ext_q2_0(ggml_backend_cuda_context & ctx, ggml_
         case GGML_TYPE_Q2_0:                                                               \
             switch (type_V) {                                                              \
                 case GGML_TYPE_Q2_0: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0>(ctx, dst); return; \
+                case GGML_TYPE_Q2_PREH: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_0, GGML_TYPE_Q2_PREH>(ctx, dst); return; \
                 case GGML_TYPE_F16:  ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_0, GGML_TYPE_F16> (ctx, dst); return; \
                 case GGML_TYPE_Q8_0: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_0, GGML_TYPE_Q8_0>(ctx, dst); return; \
+                default: break;                                                            \
+            }                                                                              \
+            break;                                                                         \
+        case GGML_TYPE_Q2_PREH:                                                            \
+            switch (type_V) {                                                              \
+                case GGML_TYPE_Q2_0: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_PREH, GGML_TYPE_Q2_0>(ctx, dst); return; \
+                case GGML_TYPE_Q2_PREH: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_PREH, GGML_TYPE_Q2_PREH>(ctx, dst); return; \
+                case GGML_TYPE_F16:  ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_PREH, GGML_TYPE_F16> (ctx, dst); return; \
+                case GGML_TYPE_Q8_0: ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q2_PREH, GGML_TYPE_Q8_0>(ctx, dst); return; \
                 default: break;                                                            \
             }                                                                              \
             break;                                                                         \
@@ -514,10 +541,16 @@ static void ggml_cuda_flash_attn_ext_q2_0(ggml_backend_cuda_context & ctx, ggml_
             if (type_V == GGML_TYPE_Q2_0) {                                                \
                 ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_F16,  GGML_TYPE_Q2_0>(ctx, dst); return; \
             }                                                                              \
+            if (type_V == GGML_TYPE_Q2_PREH) {                                             \
+                ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_F16,  GGML_TYPE_Q2_PREH>(ctx, dst); return; \
+            }                                                                              \
             break;                                                                         \
         case GGML_TYPE_Q8_0:                                                               \
             if (type_V == GGML_TYPE_Q2_0) {                                                \
                 ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0>(ctx, dst); return; \
+            }                                                                              \
+            if (type_V == GGML_TYPE_Q2_PREH) {                                             \
+                ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q8_0, GGML_TYPE_Q2_PREH>(ctx, dst); return; \
             }                                                                              \
             break;                                                                         \
         default: break;                                                                    \
@@ -559,6 +592,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q2_0:
             return true;
+        case GGML_TYPE_OSCAR2:
+            return true;
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
@@ -589,6 +624,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
+    const int cc = ggml_cuda_info().devices[device].cc;
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
@@ -603,21 +639,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
-    const int cc = ggml_cuda_info().devices[device].cc;
-
-    // q2_0 KV: use dedicated Q2_0 kernel (pure f32 non-vec). The VEC path
+    // q2_0 / q2_preh KV: use dedicated Q2_0 kernel (pure f32 non-vec). The VEC path
     // is broken on Blackwell (produces attention collapse).
-    if ((K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0)
-        && (K->type == GGML_TYPE_Q2_0 || K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0)
-        && (V->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0)) {
+    if ((K->type == GGML_TYPE_Q2_0 || K->type == GGML_TYPE_Q2_PREH || V->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_PREH)
+        && (K->type == GGML_TYPE_Q2_0 || K->type == GGML_TYPE_Q2_PREH || K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0)
+        && (V->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_PREH || V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0)) {
         const int D = K->ne[0];
         if (D == 64 || D == 128 || D == 256 || D == 512) {
             return BEST_FATTN_KERNEL_Q2_0;
         }
-        // Unsupported head dim: fall through to VEC (may be broken)
+        // Unsupported head dim for Q2_PREH: VEC doesn't support this type, so fall through to NONE.
+        if (K->type == GGML_TYPE_Q2_PREH || V->type == GGML_TYPE_Q2_PREH) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // For Q2_0 unsupported head dim: fall through to VEC (may be broken on Blackwell)
     }
     // Other mixed q2_0 types: VEC path (may be broken on Blackwell)
     if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
+    // OSCAR2 KV: use VEC path (vec_dot + dequant support added)
+    if (K->type == GGML_TYPE_OSCAR2 || V->type == GGML_TYPE_OSCAR2) {
         return BEST_FATTN_KERNEL_VEC;
     }
 
@@ -942,3 +985,26 @@ template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_F16,  GGML_TYPE_Q
 template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_Q2_0, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_Q2_0, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
+
+// OSCAR2 VEC instantiations
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_Q8_0, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_Q8_0, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_Q8_0, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
+// D=512 (Gemma4 head_dim) OSCAR2 VEC instances:
+template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_F16,    GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_Q8_0,   GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
+template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);

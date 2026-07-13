@@ -1397,6 +1397,104 @@ static __global__ void set_rows_cuda_q2_0(
     }
 }
 
+// OSCAR2 set-rows: per-vector (128-dim) min-max asymmetric INT2 quantize + scatter.
+// 128 threads per block, one per element. No rotation (done separately as GEMM).
+template <typename idx_t>
+static __global__ void set_rows_cuda_oscar2(
+        const char * src0, const char * src1, char * dst,
+        const int32_t ne01, const int32_t ne11, const int32_t ne12,
+        const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12,
+        const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3,
+        const int32_t nk0) {
+
+    const int32_t i03 = blockIdx.z;
+    const int32_t i02 = blockIdx.y;
+    const int32_t i01 = blockIdx.x;
+    if (i01 >= ne01) return;
+
+    const int32_t i12 = i03 % ne12;
+    const int32_t i11 = i02 % ne11;
+    const int32_t i10 = i01;
+
+    const idx_t i1 = *((const idx_t *) (src1 + i10*nb10 + i11*nb11 + i12*nb12));
+
+    const float * src_row = (const float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+    block_oscar2 * dst_row = (block_oscar2 *) (dst + (uint64_t)i1*nb1 + i02*nb2 + i03*nb3);
+
+    const unsigned t = threadIdx.x; // 0..127, one per element
+
+    __shared__ float sh_min[4];  // one per warp
+    __shared__ float sh_max[4];
+    __shared__ uint8_t sh_codes[QK_OSCAR2];
+
+    for (int iv = 0; iv < nk0; ++iv) {
+        const float val = src_row[iv * QK_OSCAR2 + t];
+
+        // Intra-warp reduction for min and max (warp shuffle)
+        float vmin = val, vmax = val;
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) {
+            const float other_min = __shfl_xor_sync(0xFFFFFFFF, vmin, s, 32);
+            const float other_max = __shfl_xor_sync(0xFFFFFFFF, vmax, s, 32);
+            vmin = fminf(vmin, other_min);
+            vmax = fmaxf(vmax, other_max);
+        }
+
+        // Store warp results to shared
+        if (t % 32 == 0) {
+            sh_min[t / 32] = vmin;
+            sh_max[t / 32] = vmax;
+        }
+        __syncthreads();
+
+        // Cross-warp reduction (threads 0-3 in first warp)
+        if (t < 4) {
+            vmin = sh_min[t];
+            vmax = sh_max[t];
+            #pragma unroll
+            for (int s = 2; s > 0; s >>= 1) {
+                const float other_min = __shfl_xor_sync(0x0F, vmin, s, 4);
+                const float other_max = __shfl_xor_sync(0x0F, vmax, s, 4);
+                vmin = fminf(vmin, other_min);
+                vmax = fmaxf(vmax, other_max);
+            }
+        }
+        if (t == 0) {
+            sh_min[0] = vmin;
+            sh_max[0] = vmax;
+        }
+        __syncthreads();
+
+        const float vmin_final = sh_min[0];
+        const float vmax_final = sh_max[0];
+        const float scale      = (vmax_final - vmin_final) / 3.0f;
+        const float inv_s      = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
+
+        // Quantize to 2-bit
+        int code = (int)((val - vmin_final) * inv_s + 0.5f);
+        if (code < 0) code = 0;
+        if (code > 3) code = 3;
+        sh_codes[t] = (uint8_t)code;
+        __syncthreads();
+
+        // Pack: groups of 4 threads pack one byte
+        if (t < QK_OSCAR2 / 4) {
+            const int base = t * 4;
+            dst_row[iv].qs[t] = sh_codes[base]
+                | (uint8_t)(sh_codes[base + 1] << 2)
+                | (uint8_t)(sh_codes[base + 2] << 4)
+                | (uint8_t)(sh_codes[base + 3] << 6);
+        }
+
+        if (t == 0) {
+            dst_row[iv].d = __float2half(scale);
+            dst_row[iv].m = __float2half(vmin_final);
+        }
+        __syncthreads();
+    }
+}
+
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1436,6 +1534,36 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 ne01, ne11, ne12,
                 nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
                 nk0, clip_ratio);
+        }
+        GGML_ASSERT(cudaGetLastError() == cudaSuccess);
+        return;
+    }
+
+    if (dst->type == GGML_TYPE_OSCAR2) {
+        GGML_TENSOR_BINARY_OP_LOCALS(src0, src1, dst);
+
+        const int32_t nk0 = (int32_t)(ne00 / ggml_blck_size(GGML_TYPE_OSCAR2));
+        cudaStream_t stream = ctx.stream();
+
+        const dim3 grid_size(ne01, ne02, ne03);
+        const dim3 block_size(128, 1, 1);
+
+        const char * src0_d = (const char *) src0->data;
+        const char * src1_d = (const char *) src1->data;
+        char       * dst_d  = (char *)       dst->data;
+
+        if (src1->type == GGML_TYPE_I64) {
+            set_rows_cuda_oscar2<int64_t><<<grid_size, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d,
+                ne01, ne11, ne12,
+                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
+                nk0);
+        } else {
+            set_rows_cuda_oscar2<int32_t><<<grid_size, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d,
+                ne01, ne11, ne12,
+                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
+                nk0);
         }
         GGML_ASSERT(cudaGetLastError() == cudaSuccess);
         return;
