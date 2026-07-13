@@ -68,3 +68,34 @@ GPU VEC kernel fixes applied (committed `88c3081ce`):
 
 KQ_reg assignment restored (committed `e4537b059`) — critical upstream line
 that was accidentally dropped.
+
+## GPU Blackwell (RTX 5090) Status
+
+**Root cause: flash attention broken on Blackwell (sm_120).**
+
+Both VEC and MMA flash attention kernels produce incorrect attention values
+on RTX 5090 with CUDA 13.3. Diagnosed via:
+- VulnLLM-R-7B (D=128): MMA produces garbled output ("statementnot");
+  q2_0 VEC produces all-'2' repetition
+- Gemma-4 12B (D=256/512): VEC/MMA both produce `<|channel>` garbage
+
+**Fix applied** (commit `aa3256799`): flash attention returns NONE on Blackwell,
+falling back to standard matmul (identical to `-fa off`).
+
+### Working GPU config (Blackwell):
+
+```bash
+./build/bin/llama-cli \
+    -m /mnt/storage/models/google/gemma-4-12b-it-Q8_0-rot-kv.gguf \
+    -ngl 99 -fa off -c 1024 \
+    --cache-type-k f16 --cache-type-v f16 \
+    --chat-template-file models/templates/google-gemma-4-31B-it.jinja \
+    -p "What is 2+2?" -n 100 --temp 0 --single-turn
+```
+
+**Output:** `2 + 2 = 4` at ~90 tok/s generation.
+
+### Unresolved (needs upstream NVIDIA/CUDA fix):
+- Flash attention (VEC/MMA) on Blackwell sm_120
+- HP buffer precision degradation on all architectures
+- GPU HP buffer segfault (`set_input_hp_k_idxs`)
