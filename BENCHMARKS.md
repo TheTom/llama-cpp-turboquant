@@ -69,3 +69,23 @@ Where `[TYPE]` is `q4_0`, `q2_0`, or `turbo2`.
 - The Q8_0 model weights are ~13 GB regardless of cache format.
 - Turbo2 block size: 32 elements, 10 bytes/block (2 bytes norm + 8 bytes 2-bit indices). Effective rate: 2.5 bits/element.
 - Q2_0 block size: 32 elements, 12 bytes/block (4 bytes scales + 8 bytes 2-bit indices). Effective rate: 3 bits/element.
+
+## Bit Efficiency: Why q2_0 is only 33% smaller than q4_0
+
+Going from 4-bit (q4_0) to 2-bit (q2_0) cuts payload in half, but the cache shrinks only 33%. Reason: **metadata overhead**.
+
+| Format | Payload | Scales/block | Block size | Bytes/block | Bits/element |
+|---|---|---|---|---|---|
+| f16 | 16-bit | — | — | — | **16** |
+| q4_0 | 4-bit indices | 1 half (2 B) | 32 | 18 | **4.5** |
+| q2_0 | 2-bit indices | 2 halves (4 B) | 32 | 12 | **3.0** |
+| turbo2 | 2-bit indices | 1 half (2 B) | 32 | 10 | **2.5** |
+
+The overhead per element:
+- **q4_0**: 2 B scale / 32 = 0.5 bits/elt overhead → 4 + 0.5 = 4.5 bits/elt
+- **q2_0**: 4 B scales / 32 = 1.0 bits/elt overhead → 2 + 1.0 = 3.0 bits/elt
+- **turbo2**: 2 B scale / 32 = 0.5 bits/elt overhead → 2 + 0.5 = 2.5 bits/elt
+
+**q2_0 stores two scales** (`d` and `dmin` — min-half subtraction). That doubles the metadata cost vs q4_0 (two halves vs one). At 2-bit payload the overhead is proportionally much larger: 1/3 of every q2_0 byte is scale, vs 1/9 for q4_0.
+
+**turbo2** drops the second scale (PolarQuant — single norm, symmetric centroids), matching q4_0's 0.5 bits/elt overhead. Result: true 2-bit effective rate at 2.5 bits/elt, which is 44% smaller than q4_0 — matching the 4.5→2.5 ratio.
