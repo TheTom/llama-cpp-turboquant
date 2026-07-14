@@ -1040,22 +1040,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     flush_injection(seq_id);
                 }
-
-                // after checkpoint restoration the cache positions may have been
-                // rolled back; if so, clear stale stash entries
-                if (m_use_deferred) {
-                    auto & stash = stashed[seq_id];
-                    if (!stash.empty()) {
-                        const int32_t n_chunk_stash = n_chunk;
-                        const llama_pos first_pos = batch_in.pos[i_batch_beg[seq_id] + offset];
-                        const llama_pos last_stash_pos = stash.back().pos;
-                        // if the batch starts at or before the last stashed position,
-                        // the sequence was rolled back — clear the stale stash
-                        if (first_pos <= last_stash_pos) {
-                            stash.clear();
-                        }
-                    }
-                }
             }
         }
 
