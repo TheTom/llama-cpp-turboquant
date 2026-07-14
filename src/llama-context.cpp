@@ -2213,9 +2213,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     std::fill(output_ids.begin(), output_ids.end(), -1);
 
     this->n_outputs = 0;
-
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
-
     return n_outputs_max;
 }
 

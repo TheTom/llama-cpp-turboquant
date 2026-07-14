@@ -51,7 +51,17 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    // Max outputs needed per sequence based on declared speculative types
+    uint32_t n_max = (uint32_t) common_speculative_n_max(&params.speculative);
+
+    // Also account for draft modes enabled by flags (--dflash, --eagle3) that aren't
+    // yet in the speculative types list at this point (they are added later during
+    // common_speculative_init, after the target context is created)
+    if (params.speculative.draft.dflash || params.speculative.draft.eagle3) {
+        n_max = std::max(n_max, (uint32_t) std::max(0, params.speculative.draft.n_max));
+    }
+
+    const uint32_t n_outputs_per_seq = 1 + n_max;
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
