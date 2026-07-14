@@ -866,7 +866,7 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     const int     j0   = i0 % QK_TURBO4;
     const float   norm = __half2float(x[ib].norm);
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
 
     if constexpr (ne == 4) {
         // j0 is always a multiple of 4 from the VEC kernel access pattern.
@@ -896,6 +896,55 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
             ((float2 *) dst)[1] = make_float2(
                 TURBO_CENTROIDS_4BIT[idx2] * norm,
                 TURBO_CENTROIDS_4BIT[idx3] * norm);
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported type");
+        }
+    } else if constexpr (ne == 8) {
+        // j0 is always a multiple of 8 from the VEC kernel access pattern.
+        // 8 consecutive elements span 4 qs bytes: j0/2 .. j0/2+3.
+        const uint8_t qs_byte0 = x[ib].qs[j0 / 2];
+        const uint8_t qs_byte1 = x[ib].qs[j0 / 2 + 1];
+        const uint8_t qs_byte2 = x[ib].qs[j0 / 2 + 2];
+        const uint8_t qs_byte3 = x[ib].qs[j0 / 2 + 3];
+
+        const uint8_t idx0 = (qs_byte0 >> 0) & 0xF;
+        const uint8_t idx1 = (qs_byte0 >> 4) & 0xF;
+        const uint8_t idx2 = (qs_byte1 >> 0) & 0xF;
+        const uint8_t idx3 = (qs_byte1 >> 4) & 0xF;
+        const uint8_t idx4 = (qs_byte2 >> 0) & 0xF;
+        const uint8_t idx5 = (qs_byte2 >> 4) & 0xF;
+        const uint8_t idx6 = (qs_byte3 >> 0) & 0xF;
+        const uint8_t idx7 = (qs_byte3 >> 4) & 0xF;
+
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+            ((half2 *) dst)[0] = make_half2(
+                __float2half(TURBO_CENTROIDS_4BIT[idx0] * norm),
+                __float2half(TURBO_CENTROIDS_4BIT[idx1] * norm));
+            ((half2 *) dst)[1] = make_half2(
+                __float2half(TURBO_CENTROIDS_4BIT[idx2] * norm),
+                __float2half(TURBO_CENTROIDS_4BIT[idx3] * norm));
+            ((half2 *) dst)[2] = make_half2(
+                __float2half(TURBO_CENTROIDS_4BIT[idx4] * norm),
+                __float2half(TURBO_CENTROIDS_4BIT[idx5] * norm));
+            ((half2 *) dst)[3] = make_half2(
+                __float2half(TURBO_CENTROIDS_4BIT[idx6] * norm),
+                __float2half(TURBO_CENTROIDS_4BIT[idx7] * norm));
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+            ((float2 *) dst)[0] = make_float2(
+                TURBO_CENTROIDS_4BIT[idx0] * norm,
+                TURBO_CENTROIDS_4BIT[idx1] * norm);
+            ((float2 *) dst)[1] = make_float2(
+                TURBO_CENTROIDS_4BIT[idx2] * norm,
+                TURBO_CENTROIDS_4BIT[idx3] * norm);
+            ((float2 *) dst)[2] = make_float2(
+                TURBO_CENTROIDS_4BIT[idx4] * norm,
+                TURBO_CENTROIDS_4BIT[idx5] * norm);
+            ((float2 *) dst)[3] = make_float2(
+                TURBO_CENTROIDS_4BIT[idx6] * norm,
+                TURBO_CENTROIDS_4BIT[idx7] * norm);
         } else {
             static_assert(std::is_same_v<T, void>, "unsupported type");
         }

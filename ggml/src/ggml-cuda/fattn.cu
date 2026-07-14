@@ -753,6 +753,36 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+struct ggml_cuda_flash_attn_ext_f16_extra_data {
+    half     * K_f16;     // f16 copy of K inside dst buffer, or nullptr
+    half     * V_f16;     // f16 copy of V inside dst buffer, or nullptr
+    uintptr_t end;        // one past the last byte of the dst allocation
+};
+
+// Compute intra-buffer pointers for f16 K/V copies needed by TILE/WMMA/MMA kernels.
+// The output tensor's buffer is sized to hold dst output + optional f16 K + optional f16 V
+// in a single contiguous region.  Runtime code may use these pointers or pool allocations;
+// the extra reserved space ensures the buffer is large enough in either case.
+static ggml_cuda_flash_attn_ext_f16_extra_data
+ggml_cuda_flash_attn_ext_get_f16_extra_data(const ggml_tensor * dst, bool need_f16_K, bool need_f16_V) {
+    uintptr_t base = (uintptr_t) dst->data;
+    uintptr_t pos  = base + ggml_nbytes(dst);
+
+    half * K_f16 = nullptr;
+    half * V_f16 = nullptr;
+
+    if (need_f16_K) {
+        K_f16 = (half *) pos;
+        pos  += (size_t) ggml_nelements(dst->src[1]) * sizeof(half);
+    }
+    if (need_f16_V) {
+        V_f16 = (half *) pos;
+        pos  += (size_t) ggml_nelements(dst->src[2]) * sizeof(half);
+    }
+
+    return {K_f16, V_f16, pos};
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
