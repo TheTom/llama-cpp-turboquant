@@ -107,6 +107,7 @@ llama_context::llama_context(
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
+
         }
     }
 
@@ -2212,9 +2213,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     std::fill(output_ids.begin(), output_ids.end(), -1);
 
     this->n_outputs = 0;
-
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
-
     return n_outputs_max;
 }
 
