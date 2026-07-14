@@ -1134,7 +1134,34 @@ json oaicompat_chat_params_parse(
 
     // Reasoning budget: pass parameters through to sampling layer
     {
-        int reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
+        int reasoning_budget = -1;
+        bool got_from_kwargs = false;
+
+        auto kw_it = inputs.chat_template_kwargs.find("thinking_budget");
+        if (kw_it != inputs.chat_template_kwargs.end()) {
+            try {
+                // values in chat_template_kwargs are stored as .dump()'d JSON strings
+                json thinking_budget_json = json::parse(kw_it->second);
+                if (thinking_budget_json.is_number_integer()) {
+                    reasoning_budget = thinking_budget_json.get<int>();
+                    got_from_kwargs = true;
+                } else if (thinking_budget_json.is_string()) {
+                    // handles "123" (string containing an int)
+                    size_t pos = 0;
+                    reasoning_budget = std::stoi(thinking_budget_json.get<std::string>(), &pos);
+                    got_from_kwargs = true;
+                }
+                // any other type (bool, object, array, null) -> leave got_from_kwargs = false
+            } catch (...) {
+                // parse/conversion failed -> fall back to body param below
+                got_from_kwargs = false;
+            }
+        }
+
+        if (!got_from_kwargs) {
+            reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
+        }
+
         if (reasoning_budget == -1) {
             reasoning_budget = opt.reasoning_budget;
         }
