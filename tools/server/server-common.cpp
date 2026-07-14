@@ -1138,6 +1138,7 @@ json oaicompat_chat_params_parse(
         bool got_from_effort = false;
     
         static const std::unordered_map<std::string, int> reasoning_effort_map = {
+            {"none", 0},
             {"minimal", 128},
             {"low", 256},
             {"medium", 512},
