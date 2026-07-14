@@ -180,20 +180,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
+        res->t_layer_inp[il] = inpL;
 
-        // DFlash: Extract intermediate layer features from target model
-        if (dflash && cparams.dflash_extract_enabled && !dflash->extract_layer_indices.empty()) {
-            static const char * dflash_extract_names[] = {
-                "dflash_extract_0", "dflash_extract_1", "dflash_extract_2",
-                "dflash_extract_3", "dflash_extract_4"
-            };
-            for (size_t i = 0; i < dflash->extract_layer_indices.size() && i < 5; ++i) {
-                if (dflash->extract_layer_indices[i] == il) {
-                    cb(inpL, dflash_extract_names[i], il);
-                    break;
-                }
-            }
-        }
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
