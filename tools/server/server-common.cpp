@@ -1136,28 +1136,59 @@ json oaicompat_chat_params_parse(
     {
         int reasoning_budget = -1;
         bool got_from_kwargs = false;
-
-        auto kw_it = inputs.chat_template_kwargs.find("thinking_budget");
-        if (kw_it != inputs.chat_template_kwargs.end()) {
+    
+        static const std::unordered_map<std::string, int> reasoning_effort_map = {
+            {"minimal", 128},
+            {"low", 256},
+            {"medium", 512},
+            {"high", 2048},
+            {"xhigh", 8192},
+            {"max", 16384},
+        };
+    
+        // Priority 1: reasoning_effort -> mapped token budget
+        auto effort_it = inputs.chat_template_kwargs.find("reasoning_effort");
+        if (effort_it != inputs.chat_template_kwargs.end()) {
             try {
                 // values in chat_template_kwargs are stored as .dump()'d JSON strings
-                json thinking_budget_json = json::parse(kw_it->second);
-                if (thinking_budget_json.is_number_integer()) {
-                    reasoning_budget = thinking_budget_json.get<int>();
-                    got_from_kwargs = true;
-                } else if (thinking_budget_json.is_string()) {
-                    // handles "123" (string containing an int)
-                    size_t pos = 0;
-                    reasoning_budget = std::stoi(thinking_budget_json.get<std::string>(), &pos);
-                    got_from_kwargs = true;
+                json reasoning_effort_json = json::parse(effort_it->second);
+                if (reasoning_effort_json.is_string()) {
+                    auto map_it = reasoning_effort_map.find(reasoning_effort_json.get<std::string>());
+                    if (map_it != reasoning_effort_map.end()) {
+                        reasoning_budget = map_it->second;
+                        got_from_kwargs = true;
+                    }
+                    // unrecognized effort string -> leave got_from_kwargs = false, fall through
                 }
-                // any other type (bool, object, array, null) -> leave got_from_kwargs = false
+                // any other type -> leave got_from_kwargs = false, fall through
             } catch (...) {
-                // parse/conversion failed -> fall back to body param below
                 got_from_kwargs = false;
             }
         }
-
+    
+        // Priority 2: thinking_budget (explicit token count), only if reasoning_effort didn't resolve
+        if (!got_from_kwargs) {
+            auto kw_it = inputs.chat_template_kwargs.find("thinking_budget");
+            if (kw_it != inputs.chat_template_kwargs.end()) {
+                try {
+                    json thinking_budget_json = json::parse(kw_it->second);
+                    if (thinking_budget_json.is_number_integer()) {
+                        reasoning_budget = thinking_budget_json.get<int>();
+                        got_from_kwargs = true;
+                    } else if (thinking_budget_json.is_string()) {
+                        // handles "123" (string containing an int)
+                        size_t pos = 0;
+                        reasoning_budget = std::stoi(thinking_budget_json.get<std::string>(), &pos);
+                        got_from_kwargs = true;
+                    }
+                    // any other type (bool, object, array, null) -> leave got_from_kwargs = false
+                } catch (...) {
+                    // parse/conversion failed -> fall back to body param below
+                    got_from_kwargs = false;
+                }
+            }
+        }
+    
         if (!got_from_kwargs) {
             reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
         }
