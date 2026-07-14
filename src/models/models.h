@@ -434,6 +434,28 @@ struct llama_model_qwen : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+struct llm_build_eagle3_encode : public llm_graph_context {
+    llm_build_eagle3_encode(const llama_model & model, const llm_graph_params & params);
+private:
+    ggml_tensor * build_inp_embd() const;
+};
+
+struct llm_build_eagle3_decode : public llm_graph_context {
+    llm_build_eagle3_decode(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_dflash_encode : public llm_graph_context {
+    llm_build_dflash_encode(const llama_model & model, const llm_graph_params & params);
+private:
+    ggml_tensor * build_inp_embd() const;
+};
+
+struct llm_build_dflash_decode : public llm_graph_context {
+    llm_build_dflash_decode(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_ernie4_5 : public llm_graph_context {
+    llm_build_ernie4_5(const llama_model & model, const llm_graph_params & params);
 };
 
 
