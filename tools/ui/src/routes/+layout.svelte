@@ -343,7 +343,7 @@
 				/>
 			{/if}
 
-			<Sidebar.Inset class="flex flex-1 flex-col overflow-hidden">
+			<Sidebar.Inset class="flex flex-1 flex-col overflow-hidden max-h-dvh">
 				{@render children?.()}
 			</Sidebar.Inset>
 		</div>
