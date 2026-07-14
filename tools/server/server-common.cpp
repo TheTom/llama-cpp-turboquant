@@ -1135,7 +1135,7 @@ json oaicompat_chat_params_parse(
     // Reasoning budget: pass parameters through to sampling layer
     {
         int reasoning_budget = -1;
-        bool got_from_kwargs = false;
+        bool got_from_effort = false;
     
         static const std::unordered_map<std::string, int> reasoning_effort_map = {
             {"minimal", 128},
@@ -1146,57 +1146,64 @@ json oaicompat_chat_params_parse(
             {"max", 16384},
         };
     
-        // Priority 1: reasoning_effort -> mapped token budget
-        auto effort_it = inputs.chat_template_kwargs.find("reasoning_effort");
-        if (effort_it != inputs.chat_template_kwargs.end()) {
-            try {
-                // values in chat_template_kwargs are stored as .dump()'d JSON strings
-                json reasoning_effort_json = json::parse(effort_it->second);
-                if (reasoning_effort_json.is_string()) {
-                    auto map_it = reasoning_effort_map.find(reasoning_effort_json.get<std::string>());
-                    if (map_it != reasoning_effort_map.end()) {
-                        reasoning_budget = map_it->second;
-                        got_from_kwargs = true;
-                    }
-                    // unrecognized effort string -> leave got_from_kwargs = false, fall through
-                }
-                // any other type -> leave got_from_kwargs = false, fall through
-            } catch (...) {
-                got_from_kwargs = false;
+        // Priority 1: body.reasoning.effort, then body.reasoning_effort -> mapped token budget
+        std::string effort_str;
+        bool found_effort_field = false;
+    
+        if (body.contains("reasoning") && body.at("reasoning").is_object()) {
+            auto effort_val = json_value(body.at("reasoning"), "effort", std::string());
+            if (!effort_val.empty()) {
+                effort_str = effort_val;
+                found_effort_field = true;
+            }
+        }
+        if (!found_effort_field) {
+            auto effort_val = json_value(body, "reasoning_effort", std::string());
+            if (!effort_val.empty()) {
+                effort_str = effort_val;
+                found_effort_field = true;
             }
         }
     
-        // Priority 2: thinking_budget (explicit token count), only if reasoning_effort didn't resolve
-        if (!got_from_kwargs) {
+        if (found_effort_field) {
+            auto map_it = reasoning_effort_map.find(effort_str);
+            if (map_it != reasoning_effort_map.end()) {
+                reasoning_budget = map_it->second;
+                got_from_effort = true;
+            }
+            // unrecognized effort string -> leave got_from_effort = false, fall through
+        }
+    
+        // Priority 2: thinking_budget (from chat_template_kwargs), only if effort didn't resolve
+        if (!got_from_effort) {
             auto kw_it = inputs.chat_template_kwargs.find("thinking_budget");
             if (kw_it != inputs.chat_template_kwargs.end()) {
                 try {
+                    // values in chat_template_kwargs are stored as .dump()'d JSON strings
                     json thinking_budget_json = json::parse(kw_it->second);
                     if (thinking_budget_json.is_number_integer()) {
                         reasoning_budget = thinking_budget_json.get<int>();
-                        got_from_kwargs = true;
+                        got_from_effort = true;
                     } else if (thinking_budget_json.is_string()) {
                         // handles "123" (string containing an int)
                         size_t pos = 0;
                         reasoning_budget = std::stoi(thinking_budget_json.get<std::string>(), &pos);
-                        got_from_kwargs = true;
+                        got_from_effort = true;
                     }
-                    // any other type (bool, object, array, null) -> leave got_from_kwargs = false
+                    // any other type (bool, object, array, null) -> leave got_from_effort = false
                 } catch (...) {
                     // parse/conversion failed -> fall back to body param below
-                    got_from_kwargs = false;
+                    got_from_effort = false;
                 }
             }
         }
     
-        if (!got_from_kwargs) {
+        if (!got_from_effort) {
             reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
         }
-
         if (reasoning_budget == -1) {
             reasoning_budget = opt.reasoning_budget;
         }
-
         if (!chat_params.thinking_end_tag.empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
