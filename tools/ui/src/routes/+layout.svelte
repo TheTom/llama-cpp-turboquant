@@ -327,11 +327,6 @@
 		onConfirm={handleTitleUpdateConfirm}
 		onCancel={handleTitleUpdateCancel}
 	/>
-
-	<DialogMcpServerRecommendations
-			open={mcpRecommendations.open}
-			onOpenChange={mcpRecommendations.handleOpenChange}
-		/>
 </Tooltip.Provider>
 
 <!-- PWA update prompt + version -->
