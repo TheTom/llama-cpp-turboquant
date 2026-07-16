@@ -327,9 +327,9 @@
 	/>
 
 	<DialogMcpServerRecommendations
-		open={mcpRecommendations.open}
-		onOpenChange={mcpRecommendations.handleOpenChange}
-	/>
+			open={mcpRecommendations.open}
+			onOpenChange={mcpRecommendations.handleOpenChange}
+		/>
 </Tooltip.Provider>
 
 <!-- PWA update prompt + version -->

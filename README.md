@@ -62,6 +62,7 @@ All turbo formats use Walsh-Hadamard rotation followed by polar codebook quantiz
 | **CUDA** (NVIDIA) | `dp4a` for `TQ4_1S`, warp-cooperative dequant (16× less compute per block), multi-token / multi-GPU | Yes — turbo VEC FA (+9% decode); mixed `f16/bf16 + q8_0` without `GGML_CUDA_FA_ALL_QUANTS` | Load-time `TQ4_1S → q8_0` conversion path |
 | **HIP / ROCm** (AMD) | Portable `ggml_cuda_dp4a`; scalar half path for `TQ4_1S` on AMD | Yes — VEC FA forced for quantized KV; pool bypass for FA f16 temp buffers | RDNA3 (gfx1100), RDNA4, CDNA3 (MI300X / gfx942), CDNA4 (MI355X / gfx950). [cross-engine-mi300x](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/cross-engine-mi300x.md) |
 | **Vulkan** | `TQ4_1S` weights, `SET_ROWS` for `turbo2`/`turbo4` | coopmat flash attention with `turbo3` KV | Compute-shader path; nix-buildable |
+| **SYCL** (Intel) | `SET_ROWS` for `turbo2`/`turbo3`/`turbo4`, WHT rotation (group 64+128) | VEC FA for all turbo K/V combos (D=64-512) | Intel Arc (A380, B70), oneAPI 2025.2+; cross-turbo K/V combos supported |
 
 ### Model-family support
 
@@ -84,14 +85,14 @@ All turbo formats use Walsh-Hadamard rotation followed by polar codebook quantiz
 
 ### Prebuilt binaries
 
-The latest TurboQuant+ prebuilds are published on the [TurboQuant+ tqp-v0.2.0 release](https://github.com/TheTom/llama-cpp-turboquant/releases/tag/tqp-v0.2.0). This release includes the PR #197 turbo KV work plus the Apple Silicon Metal startup-crash fix from PR #200.
+The latest TurboQuant+ prebuilds are published on the [TurboQuant+ tqp-v0.3.0 release](https://github.com/TheTom/llama-cpp-turboquant/releases/tag/tqp-v0.3.0). This release adds DFlash speculative decoding, server slot save/restore across restarts, the Vulkan turbo4 layout resync, the sm_60/P100 FAST_FP16 carve-out, and 16 upstream P0/P1 fixes on top of the PR #197 turbo KV work.
 
 | Platform | Download | Notes |
 |---|---|---|
-| Linux x64 | [turboquant-plus-tqp-v0.2.0-linux-x64-cpu.tar.gz](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.2.0/turboquant-plus-tqp-v0.2.0-linux-x64-cpu.tar.gz) | CPU build with portable x64 CPU variants |
-| Linux x64 Vulkan | [turboquant-plus-tqp-v0.2.0-linux-x64-vulkan.tar.gz](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.2.0/turboquant-plus-tqp-v0.2.0-linux-x64-vulkan.tar.gz) | Vulkan build with CPU fallback variants |
-| macOS Apple Silicon | [turboquant-plus-tqp-v0.2.0-macos-arm64-metal.tar.gz](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.2.0/turboquant-plus-tqp-v0.2.0-macos-arm64-metal.tar.gz) | Metal build for arm64 Macs |
-| Windows x64 NVIDIA | [turboquant-plus-tqp-v0.2.0-windows-x64-cuda12.4.zip](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.2.0/turboquant-plus-tqp-v0.2.0-windows-x64-cuda12.4.zip) | CUDA 12.4 build with CUDA runtime DLLs bundled |
+| Linux x64 | [turboquant-plus-tqp-v0.3.0-linux-x64-cpu.tar.gz](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.3.0/turboquant-plus-tqp-v0.3.0-linux-x64-cpu.tar.gz) | CPU build with portable x64 CPU variants |
+| Linux x64 Vulkan | [turboquant-plus-tqp-v0.3.0-linux-x64-vulkan.tar.gz](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.3.0/turboquant-plus-tqp-v0.3.0-linux-x64-vulkan.tar.gz) | Vulkan build with CPU fallback variants |
+| macOS Apple Silicon | [turboquant-plus-tqp-v0.3.0-macos-arm64-metal.tar.gz](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.3.0/turboquant-plus-tqp-v0.3.0-macos-arm64-metal.tar.gz) | Metal build for arm64 Macs |
+| Windows x64 NVIDIA | [turboquant-plus-tqp-v0.3.0-windows-x64-cuda12.4.zip](https://github.com/TheTom/llama-cpp-turboquant/releases/download/tqp-v0.3.0/turboquant-plus-tqp-v0.3.0-windows-x64-cuda12.4.zip) | CUDA 12.4 build with CUDA runtime DLLs bundled |
 
 For ROCm/HIP or custom CUDA architectures, build from source with the flags below.
 
@@ -111,6 +112,11 @@ cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_ARCHITECTURES="gfx1100;gfx942;gfx950" &
 
 # Vulkan
 cmake -B build -DGGML_VULKAN=ON && cmake --build build -j
+
+# Intel SYCL (oneAPI)
+source /opt/intel/oneapi/setvars.sh
+cmake -B build -DGGML_SYCL=ON -DGGML_SYCL_F16=ON \
+  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx && cmake --build build -j
 ```
 
 ## Usage
