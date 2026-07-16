@@ -3793,14 +3793,14 @@ private:
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
 
-                    if (slot.prompt_checkpoint_restored || (!slot.prompt.checkpoints.empty() && near_prompt_end)) {
-                        return;
-                    }
-                }
-
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
+
+                if (slot.prompt_checkpoint_restored || (!slot.prompt.checkpoints.empty() && near_prompt_end)) {
+                    return;
+                }
+            }
             });
         }
     }
