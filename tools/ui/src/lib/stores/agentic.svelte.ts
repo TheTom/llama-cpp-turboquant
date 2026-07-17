@@ -31,7 +31,12 @@ import { SvelteMap } from 'svelte/reactivity';
 import { ToolsService } from '$lib/services/tools.service';
 import { SandboxService } from '$lib/services/sandbox.service';
 import { isAbortError } from '$lib/utils';
-import { DEFAULT_AGENTIC_CONFIG, NEWLINE_SEPARATOR } from '$lib/constants';
+import {
+	CODING_AGENT_SYSTEM_PROMPT,
+	CODING_AGENT_SYSTEM_PROMPT_MARKER,
+	DEFAULT_AGENTIC_CONFIG,
+	NEWLINE_SEPARATOR
+} from '$lib/constants';
 import {
 	IMAGE_MIME_TO_EXTENSION,
 	DATA_URI_BASE64_REGEX,
@@ -285,11 +290,43 @@ class AgenticStore {
 		const hasTools =
 			mcpStore.hasEnabledServers(perChatOverrides) ||
 			toolsStore.builtinTools.length > 0 ||
+			toolsStore.frontendTools.length > 0 ||
 			toolsStore.customTools.length > 0;
 		return {
 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,
 			maxTurns,
 			maxToolPreviewLines
+		};
+	}
+
+	private ensureCodingAgentSystemPrompt(messages: ApiChatMessageData[]): void {
+		const systemIndex = messages.findIndex((msg) => msg.role === MessageRole.SYSTEM);
+		if (systemIndex === -1) {
+			messages.unshift({
+				role: MessageRole.SYSTEM,
+				content: CODING_AGENT_SYSTEM_PROMPT
+			});
+			return;
+		}
+
+		const current = messages[systemIndex];
+		const content =
+			typeof current.content === 'string'
+				? current.content
+				: current.content
+						.filter(
+							(part): part is Extract<ApiChatMessageContentPart, { type: ContentPartType.TEXT }> =>
+								part.type === ContentPartType.TEXT && typeof part.text === 'string'
+						)
+						.map((part) => part.text)
+						.join('\n');
+		if (content.includes(CODING_AGENT_SYSTEM_PROMPT_MARKER)) {
+			return;
+		}
+
+		messages[systemIndex] = {
+			...current,
+			content: `${content.trim()}\n\n${CODING_AGENT_SYSTEM_PROMPT}`.trim()
 		};
 	}
 
@@ -427,13 +464,15 @@ class AgenticStore {
 					return msg as ApiChatMessageData;
 				})
 			)
-		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
+		).filter((msg: { role: MessageRole; content: string | ApiChatMessageContentPart[] }) => {
 			if (msg.role === MessageRole.SYSTEM) {
 				const content = typeof msg.content === 'string' ? msg.content : '';
 				return content.trim().length > 0;
 			}
 			return true;
 		});
+
+		this.ensureCodingAgentSystemPrompt(normalizedMessages);
 
 		this.updateSession(conversationId, {
 			isRunning: true,

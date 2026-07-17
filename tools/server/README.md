@@ -196,7 +196,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--ui-config-file PATH` | JSON file that provides default UI settings (overrides UI defaults)<br/>(env: LLAMA_ARG_UI_CONFIG_FILE) |
 | `--webui-mcp-proxy, --no-webui-mcp-proxy` | [DEPRECATED: use --ui-mcp-proxy/--no-ui-mcp-proxy] experimental: whether to enable MCP CORS proxy<br/>(env: LLAMA_ARG_WEBUI_MCP_PROXY) |
 | `--ui-mcp-proxy, --no-ui-mcp-proxy` | experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments (default: disabled)<br/>(env: LLAMA_ARG_UI_MCP_PROXY) |
-| `--tools TOOL1,TOOL2,...` | experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)<br/>specify "all" to enable all tools<br/>available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, apply_diff, get_datetime<br/>(env: LLAMA_ARG_TOOLS) |
+| `--tools TOOL1,TOOL2,...` | experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)<br/>specify "all" to enable all tools<br/>available tools: read_file, file_glob_search, grep_search, web_search, fetch_url, exec_shell_command, run_python, write_file, edit_file, git_status, git_diff, git_log, git_show, git_blame, apply_diff, get_datetime<br/>(env: LLAMA_ARG_TOOLS) |
 | `--webui, --no-webui` | [DEPRECATED: use --ui/--no-ui] whether to enable the Web UI<br/>(env: LLAMA_ARG_WEBUI) |
 | `--ui, --no-ui` | whether to enable the Web UI (default: enabled)<br/>(env: LLAMA_ARG_UI) |
 | `--embedding, --embeddings` | restrict to only support embedding use case; use only with dedicated embedding models (default: disabled)<br/>(env: LLAMA_ARG_EMBEDDINGS) |
@@ -329,9 +329,25 @@ For more details, please refer to [multimodal documentation](../../docs/multimod
 
 ### Built-in tools support
 
-The server includes a set of built-in tools that enable the LLM to access the local file system directly from the Web UI.
+The server includes a set of built-in tools that enable the LLM to access the local file system, inspect Git repositories, and retrieve web content directly from the Web UI.
 
 To use this feature, start the server with `--tools all`. You can also enable only specific tools by passing a comma-separated list: `--tools name1,name2,...`. Run `--help` for the full list of available tool names.
+
+`web_search` uses a SearXNG instance at `http://localhost:9090` by default. Set `SEARXNG_URL` to use a different instance. The instance must allow JSON responses through its `search.formats` setting.
+
+```bash
+SEARXNG_URL=http://localhost:9090 llama-server \
+    --tools web_search,fetch_url,git_status,git_diff,git_log,git_show,git_blame,exec_shell_command,run_python,read_file,file_glob_search,grep_search,write_file,edit_file,apply_diff
+```
+
+Recommended curated sets:
+- Research: `web_search,fetch_url`
+- Code inspection: `read_file,file_glob_search,grep_search,git_status,git_diff,git_log,git_show,git_blame`
+- Coding agent: add `write_file,edit_file,apply_diff,exec_shell_command,run_python`
+
+`exec_shell_command` supports `shell=bash|powershell|cmd|sh|auto`. `run_python` executes a Python snippet (`code`) or script file (`path`).
+
+`fetch_url` accepts only public HTTP and HTTPS URLs and limits redirects and response sizes. Local, private, link-local, and reserved network addresses are rejected.
 
 ## Build
 

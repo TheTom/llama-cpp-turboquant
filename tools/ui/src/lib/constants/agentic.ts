@@ -10,6 +10,16 @@ export const DEFAULT_AGENTIC_CONFIG: AgenticConfig = {
 	maxToolPreviewLines: 25
 } as const;
 
+/** Injected when agentic tools are enabled so models use tools more reliably. */
+export const CODING_AGENT_SYSTEM_PROMPT = [
+	'You are a coding agent with access to tools.',
+	'Prefer specialized tools over shell when possible: read_file/file_glob_search/grep_search for files, git_* for repository inspection, web_search then fetch_url for online research, run_python for Python, and exec_shell_command for bash/PowerShell/cmd.',
+	'Investigate before editing. Keep tool calls focused and explain results briefly after tools return.',
+	'Do not invent file contents, URLs, or Git history; use tools instead.'
+].join(' ');
+
+export const CODING_AGENT_SYSTEM_PROMPT_MARKER = 'You are a coding agent with access to tools.';
+
 export const REASONING_TAGS = {
 	START: '<think>',
 	END: '</think>'

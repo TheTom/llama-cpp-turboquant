@@ -233,31 +233,21 @@ class ToolsStore {
 
 	/**
 	 * Enabled tool definitions for sending to the LLM.
-	 * MCP tools keep their normalized schemas from mcpStore.
-	 * The API identifies tools by name, so a name is sent at most once.
+	 * Resolve by concrete entry key so a disabled built-in does not shadow an
+	 * enabled MCP/custom tool with the same function name.
+	 * Priority order follows allTools: builtin, frontend, MCP, custom.
 	 */
 	getEnabledToolsForLLM(): OpenAIToolDefinition[] {
-		const enabledNames = new SvelteSet<string>();
-		for (const entry of this.allTools) {
-			if (!this._disabledTools.has(entry.key)) {
-				enabledNames.add(entry.definition.function.name);
-			}
-		}
-
 		const result: OpenAIToolDefinition[] = [];
 		const seen = new SvelteSet<string>();
 
-		const take = (def: OpenAIToolDefinition) => {
-			const name = def.function.name;
-			if (!enabledNames.has(name) || seen.has(name)) return;
+		for (const entry of this.allTools) {
+			if (this._disabledTools.has(entry.key)) continue;
+			const name = entry.definition.function.name;
+			if (seen.has(name)) continue;
 			seen.add(name);
-			result.push(def);
-		};
-
-		for (const def of this._builtinTools) take(def);
-		for (const def of this.frontendTools) take(def);
-		for (const def of mcpStore.getToolDefinitionsForLLM()) take(def);
-		for (const def of this.customTools) take(def);
+			result.push(entry.definition);
+		}
 
 		return result;
 	}
@@ -345,12 +335,15 @@ class ToolsStore {
 		return result;
 	}
 
-	/** First canonical entry matching a tool name, runtime tool calls resolve by name */
+	/** Prefer an enabled entry for a tool name; fall back to the first match */
 	private findEntryByName(toolName: string): ToolEntry | null {
+		let fallback: ToolEntry | null = null;
 		for (const entry of this.allTools) {
-			if (entry.definition.function.name === toolName) return entry;
+			if (entry.definition.function.name !== toolName) continue;
+			if (!fallback) fallback = entry;
+			if (!this._disabledTools.has(entry.key)) return entry;
 		}
-		return null;
+		return fallback;
 	}
 
 	/** Determine the source of a tool by its name */

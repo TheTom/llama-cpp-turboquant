@@ -1,16 +1,37 @@
 #include "server-tools.h"
 
+#include "download.h"
+#include "http.h"
+
 #include <sheredom/subprocess.h>
 
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <sstream>
 #include <thread>
 #include <chrono>
 #include <atomic>
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <cstdlib>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#endif
+
+#ifdef _WIN32
+extern char ** _environ;
+#else
+extern char ** environ;
+#endif
 
 namespace fs = std::filesystem;
 
@@ -37,7 +58,8 @@ struct run_proc_result {
 static run_proc_result run_process(
         const std::vector<std::string> & args,
         size_t max_output,
-        int timeout_secs) {
+        int timeout_secs,
+        const std::vector<std::string> * environment = nullptr) {
     run_proc_result res;
 
     subprocess_s proc;
@@ -45,10 +67,19 @@ static run_proc_result run_process(
 
     int options = subprocess_option_no_window
                 | subprocess_option_combined_stdout_stderr
-                | subprocess_option_inherit_environment
                 | subprocess_option_search_user_path;
+    if (environment == nullptr) {
+        options |= subprocess_option_inherit_environment;
+    }
 
-    if (subprocess_create(argv.data(), options, &proc) != 0) {
+    std::vector<char *> envp;
+    if (environment != nullptr) {
+        envp = to_cstr_vec(*environment);
+    }
+    const int create_result = environment == nullptr
+        ? subprocess_create(argv.data(), options, &proc)
+        : subprocess_create_ex(argv.data(), options, envp.data(), &proc);
+    if (create_result != 0) {
         res.output = "failed to spawn process";
         return res;
     }
@@ -100,6 +131,231 @@ static run_proc_result run_process(
         res.output += "\n[output truncated]";
     }
     return res;
+}
+
+static std::vector<std::string> sanitized_git_environment() {
+    std::vector<std::string> result;
+#ifdef _WIN32
+    char ** current = _environ;
+#else
+    char ** current = environ;
+#endif
+    for (; current != nullptr && *current != nullptr; ++current) {
+        const std::string entry(*current);
+        const size_t separator = entry.find('=');
+        std::string key = entry.substr(0, separator);
+#ifdef _WIN32
+        std::transform(key.begin(), key.end(), key.begin(),
+            [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+#endif
+        if (key.rfind("GIT_", 0) != 0) {
+            result.push_back(entry);
+        }
+    }
+    result.push_back("GIT_OPTIONAL_LOCKS=0");
+    result.push_back("GIT_TERMINAL_PROMPT=0");
+#ifdef _WIN32
+    std::sort(result.begin(), result.end());
+#endif
+    return result;
+}
+
+static std::string url_encode(const std::string & value) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(value.size());
+    for (unsigned char c : value) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            result.push_back(static_cast<char>(c));
+        } else {
+            result.push_back('%');
+            result.push_back(hex[c >> 4]);
+            result.push_back(hex[c & 0x0f]);
+        }
+    }
+    return result;
+}
+
+static bool is_blocked_ipv4(uint32_t address) {
+    const uint32_t ip = ntohl(address);
+    return (ip >> 24) == 0 ||
+           (ip >> 24) == 10 ||
+           (ip >> 22) == 0x0191 ||       // 100.64.0.0/10
+           (ip >> 24) == 127 ||
+           (ip >> 16) == 0xa9fe ||       // 169.254.0.0/16
+           (ip >> 20) == 0x0ac1 ||       // 172.16.0.0/12
+           (ip >>  8) == 0xc00000 ||      // 192.0.0.0/24
+           (ip >>  8) == 0xc00002 ||      // 192.0.2.0/24
+           (ip >> 16) == 0xc0a8 ||       // 192.168.0.0/16
+           (ip & 0xfffe0000) == 0xc6120000 || // 198.18.0.0/15
+           (ip >>  8) == 0xc63364 ||      // 198.51.100.0/24
+           (ip >>  8) == 0xcb0071 ||      // 203.0.113.0/24
+           (ip >> 28) >= 0x0e;           // multicast and reserved
+}
+
+static bool is_blocked_address(const sockaddr * address) {
+    if (address->sa_family == AF_INET) {
+        const auto * ipv4 = reinterpret_cast<const sockaddr_in *>(address);
+        return is_blocked_ipv4(ipv4->sin_addr.s_addr);
+    }
+    if (address->sa_family == AF_INET6) {
+        const auto * ipv6 = reinterpret_cast<const sockaddr_in6 *>(address);
+        const auto & bytes = ipv6->sin6_addr.s6_addr;
+        if (IN6_IS_ADDR_UNSPECIFIED(&ipv6->sin6_addr) ||
+            IN6_IS_ADDR_LOOPBACK(&ipv6->sin6_addr) ||
+            IN6_IS_ADDR_LINKLOCAL(&ipv6->sin6_addr) ||
+            IN6_IS_ADDR_MULTICAST(&ipv6->sin6_addr) ||
+            (bytes[0] & 0xfe) == 0xfc) {
+            return true;
+        }
+        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr)) {
+            uint32_t mapped;
+            std::memcpy(&mapped, bytes + 12, sizeof(mapped));
+            return is_blocked_ipv4(mapped);
+        }
+    }
+    return false;
+}
+
+static std::string normalize_http_url(std::string url) {
+    const size_t fragment = url.find('#');
+    if (fragment != std::string::npos) {
+        url.resize(fragment);
+    }
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos) {
+        throw std::invalid_argument("URL must include http:// or https://");
+    }
+    const size_t authority = scheme + 3;
+    const size_t slash = url.find('/', authority);
+    const size_t query = url.find('?', authority);
+    const size_t authority_end = std::min(
+        slash == std::string::npos ? url.size() : slash,
+        query == std::string::npos ? url.size() : query);
+    if (url.substr(authority, authority_end - authority).find('@') != std::string::npos) {
+        throw std::invalid_argument("URL credentials are not allowed");
+    }
+    if (slash == std::string::npos || (query != std::string::npos && query < slash)) {
+        url.insert(authority_end, "/");
+    }
+    return url;
+}
+
+static void validate_public_url(const std::string & url) {
+    const auto normalized = normalize_http_url(url);
+    const auto parts = common_http_parse_url(normalized);
+    if (parts.scheme != "http" && parts.scheme != "https") {
+        throw std::invalid_argument("only HTTP and HTTPS URLs are supported");
+    }
+
+    addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo * addresses = nullptr;
+    const int rc = getaddrinfo(parts.host.c_str(), nullptr, &hints, &addresses);
+    if (rc != 0 || addresses == nullptr) {
+        throw std::runtime_error("cannot resolve URL host");
+    }
+
+    bool blocked = false;
+    for (addrinfo * current = addresses; current != nullptr; current = current->ai_next) {
+        if (is_blocked_address(current->ai_addr)) {
+            blocked = true;
+            break;
+        }
+    }
+    freeaddrinfo(addresses);
+    if (blocked) {
+        throw std::invalid_argument("URL resolves to a private or reserved address");
+    }
+}
+
+static std::string resolve_redirect_url(const std::string & current, const std::string & location) {
+    if (location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0) {
+        return location;
+    }
+    const auto parts = common_http_parse_url(current);
+    const std::string origin = parts.scheme + "://" + parts.host +
+        ((parts.scheme == "http" && parts.port == 80) || (parts.scheme == "https" && parts.port == 443)
+            ? "" : ":" + std::to_string(parts.port));
+    if (!location.empty() && location[0] == '/') {
+        return origin + location;
+    }
+    const size_t last_slash = parts.path.rfind('/');
+    return origin + (last_slash == std::string::npos ? "/" : parts.path.substr(0, last_slash + 1)) + location;
+}
+
+struct http_fetch_result {
+    std::string url;
+    std::string body;
+    std::string content_type;
+    int status = 0;
+    bool truncated = false;
+};
+
+static http_fetch_result fetch_public_url(std::string url, size_t max_size, int timeout_secs) {
+    static constexpr int max_redirects = 5;
+
+    for (int redirect = 0; redirect <= max_redirects; ++redirect) {
+        url = normalize_http_url(url);
+        validate_public_url(url);
+        auto [client, parts] = common_http_client(url);
+        client.set_follow_location(false);
+        client.set_connection_timeout(timeout_secs, 0);
+        client.set_read_timeout(timeout_secs, 0);
+        client.set_write_timeout(timeout_secs, 0);
+
+        http_fetch_result result;
+        result.url = url;
+        httplib::Headers headers = {
+            {"Accept", "text/html, text/plain, application/json, application/xml;q=0.9, */*;q=0.1"},
+        };
+        auto response = client.Get(
+            parts.path,
+            headers,
+            [&](const httplib::Response & res) {
+                result.status = res.status;
+                result.content_type = res.get_header_value("Content-Type");
+                return true;
+            },
+            [&](const char * data, size_t length) {
+                const size_t remaining = max_size - result.body.size();
+                if (length > remaining) {
+                    result.body.append(data, remaining);
+                    result.truncated = true;
+                    return false;
+                }
+                result.body.append(data, length);
+                return true;
+            });
+
+        if (!response && !result.truncated) {
+            throw std::runtime_error("HTTP request failed");
+        }
+        if (result.status >= 300 && result.status < 400 && response && response->has_header("Location")) {
+            if (redirect == max_redirects) {
+                throw std::runtime_error("too many HTTP redirects");
+            }
+            url = resolve_redirect_url(url, response->get_header_value("Location"));
+            continue;
+        }
+        if (result.status < 200 || result.status >= 300) {
+            throw std::runtime_error("HTTP request returned status " + std::to_string(result.status));
+        }
+
+        std::string content_type = result.content_type;
+        std::transform(content_type.begin(), content_type.end(), content_type.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!content_type.empty() &&
+            content_type.rfind("text/", 0) != 0 &&
+            content_type.find("json") == std::string::npos &&
+            content_type.find("xml") == std::string::npos &&
+            content_type.find("javascript") == std::string::npos) {
+            throw std::runtime_error("unsupported content type: " + result.content_type);
+        }
+        return result;
+    }
+    throw std::runtime_error("too many HTTP redirects");
 }
 
 json server_tool::to_json() {
@@ -359,11 +615,209 @@ struct server_tool_grep_search : server_tool {
 };
 
 //
+// web_search: search the web through a SearXNG instance
+//
+
+static constexpr size_t SERVER_TOOL_WEB_SEARCH_MAX_RESPONSE_SIZE = 256 * 1024;
+static constexpr int    SERVER_TOOL_WEB_SEARCH_MAX_RESULTS       = 20;
+
+struct server_tool_web_search : server_tool {
+    server_tool_web_search() {
+        name = "web_search";
+        display_name = "Web search";
+        permission_write = false;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "Search the public web for current or external information via SearXNG. "
+                    "Returns titles, URLs, and snippets. After choosing a useful URL, call fetch_url to read the page. "
+                    "Do not use for local files or Git history."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"query",      {{"type", "string"},  {"description", "Search query"}}},
+                        {"count",      {{"type", "integer"}, {"minimum", 1}, {"maximum", 20}, {"description", "Maximum number of results (default 10, max 20)"}}},
+                        {"categories", {{"type", "string"},  {"description", "Comma-separated SearXNG categories (default: general)"}}},
+                        {"language",   {{"type", "string"},  {"description", "Search language (default: all)"}}},
+                        {"safesearch", {{"type", "integer"}, {"enum", json::array({0, 1, 2})}, {"description", "Safe search level: 0, 1, or 2 (default: 1)"}}},
+                    }},
+                    {"required", json::array({"query"})},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        const std::string query = params.at("query").get<std::string>();
+        if (query.empty()) {
+            return {{"error", "query must not be empty"}};
+        }
+
+        const int count = std::clamp(
+            json_value(params, "count", 10), 1, SERVER_TOOL_WEB_SEARCH_MAX_RESULTS);
+        const int safesearch = std::clamp(json_value(params, "safesearch", 1), 0, 2);
+        const std::string categories = json_value(params, "categories", std::string("general"));
+        const std::string language = json_value(params, "language", std::string("all"));
+        const char * configured_url = std::getenv("SEARXNG_URL");
+        std::string base_url = configured_url && configured_url[0]
+            ? configured_url : "http://localhost:9090";
+        while (!base_url.empty() && base_url.back() == '/') {
+            base_url.pop_back();
+        }
+        try {
+            const auto parts = common_http_parse_url(normalize_http_url(base_url));
+            if (parts.scheme != "http" && parts.scheme != "https") {
+                return {{"error", "SEARXNG_URL must use HTTP or HTTPS"}};
+            }
+        } catch (const std::exception & e) {
+            return {{"error", std::string("invalid SEARXNG_URL: ") + e.what()}};
+        }
+
+        const std::string url = base_url + "/search?format=json&q=" + url_encode(query) +
+            "&categories=" + url_encode(categories) +
+            "&language=" + url_encode(language) +
+            "&safesearch=" + std::to_string(safesearch);
+
+        try {
+            common_remote_params remote_params;
+            remote_params.timeout = 10;
+            remote_params.max_size = SERVER_TOOL_WEB_SEARCH_MAX_RESPONSE_SIZE;
+            remote_params.headers.push_back({"Accept", "application/json"});
+            const auto [status, body] = common_remote_get_content(url, remote_params);
+            if (status < 200 || status >= 300) {
+                return {{"error", "SearXNG returned HTTP status " + std::to_string(status)}};
+            }
+
+            const json response = json::parse(body.begin(), body.end());
+            if (!response.contains("results") || !response["results"].is_array()) {
+                return {{"error", "SearXNG response does not contain a results array"}};
+            }
+
+            std::ostringstream output;
+            int emitted = 0;
+            for (const auto & item : response["results"]) {
+                if (emitted >= count) {
+                    break;
+                }
+                const std::string item_url = item.value("url", "");
+                if (item_url.empty()) {
+                    continue;
+                }
+                output << emitted + 1 << ". " << item.value("title", item_url) << "\n"
+                       << "URL: " << item_url << "\n";
+                const std::string content = item.value("content", "");
+                if (!content.empty()) {
+                    output << content << "\n";
+                }
+                output << "\n";
+                emitted++;
+            }
+            if (emitted == 0) {
+                output << "No results found.\n";
+            }
+            return {{"plain_text_response", output.str()}};
+        } catch (const std::exception & e) {
+            return {{"error", std::string("web search failed: ") + e.what()}};
+        }
+    }
+};
+
+//
+// fetch_url: fetch bounded public HTTP(S) text content
+//
+
+static constexpr size_t SERVER_TOOL_FETCH_URL_DEFAULT_MAX_SIZE = 64 * 1024;
+static constexpr size_t SERVER_TOOL_FETCH_URL_MAX_SIZE         = 256 * 1024;
+
+struct server_tool_fetch_url : server_tool {
+    server_tool_fetch_url() {
+        name = "fetch_url";
+        display_name = "Fetch URL";
+        permission_write = false;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "Read textual content from a known public HTTP or HTTPS URL. "
+                    "This does not search the web; use web_search when the URL is unknown. "
+                    "Private, loopback, and link-local addresses are blocked."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"url",             {{"type", "string"},  {"description", "Public HTTP or HTTPS URL"}}},
+                        {"max_output_size", {{"type", "integer"}, {"minimum", 1}, {"maximum", 262144}, {"description", "Maximum response size in bytes (default 65536, max 262144)"}}},
+                        {"timeout",         {{"type", "integer"}, {"minimum", 1}, {"maximum", 30}, {"description", "Timeout in seconds (default 10, max 30)"}}},
+                    }},
+                    {"required", json::array({"url"})},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        const std::string url = params.at("url").get<std::string>();
+        const size_t max_size = static_cast<size_t>(std::clamp(
+            json_value(params, "max_output_size", static_cast<int>(SERVER_TOOL_FETCH_URL_DEFAULT_MAX_SIZE)),
+            1, static_cast<int>(SERVER_TOOL_FETCH_URL_MAX_SIZE)));
+        const int timeout = std::clamp(json_value(params, "timeout", 10), 1, 30);
+
+        try {
+            const auto result = fetch_public_url(url, max_size, timeout);
+            std::ostringstream output;
+            output << "URL: " << result.url << "\n"
+                   << "Content-Type: " << (result.content_type.empty() ? "unknown" : result.content_type) << "\n\n"
+                   << result.body;
+            if (result.truncated) {
+                output << "\n[output truncated]";
+            }
+            return {{"plain_text_response", output.str()}};
+        } catch (const std::exception & e) {
+            return {{"error", std::string("fetch failed: ") + e.what()}};
+        }
+    }
+};
+
+//
 // exec_shell_command: run an arbitrary shell command
 //
 
-static constexpr size_t SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE = 16 * 1024; // 16 KB
-static constexpr int    SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT     = 60;        // seconds
+static constexpr size_t SERVER_TOOL_EXEC_SHELL_COMMAND_DEFAULT_OUTPUT_SIZE = 64 * 1024;
+static constexpr size_t SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE     = 256 * 1024;
+static constexpr int    SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT         = 60;
+
+static std::vector<std::string> build_shell_args(const std::string & shell, const std::string & command) {
+#ifdef _WIN32
+    if (shell == "powershell" || shell == "pwsh") {
+        return {"powershell", "-NoProfile", "-NonInteractive", "-Command", command};
+    }
+    if (shell == "bash") {
+        return {"bash", "-lc", command};
+    }
+    return {"cmd", "/c", command};
+#else
+    if (shell == "powershell" || shell == "pwsh") {
+        return {"pwsh", "-NoProfile", "-NonInteractive", "-Command", command};
+    }
+    if (shell == "cmd") {
+        return {"cmd.exe", "/c", command};
+    }
+    if (shell == "bash") {
+        return {"bash", "-lc", command};
+    }
+    return {"sh", "-c", command};
+#endif
+}
 
 struct server_tool_exec_shell_command : server_tool {
     server_tool_exec_shell_command() {
@@ -377,35 +831,56 @@ struct server_tool_exec_shell_command : server_tool {
             {"type", "function"},
             {"function", {
                 {"name", name},
-                {"description", "Execute a shell command and return its output (stdout and stderr combined)."},
+                {"description",
+                    "Run a terminal command and return combined stdout/stderr. "
+                    "Prefer dedicated tools for file edits and Git inspection when available. "
+                    "Use shell=bash for Bash, shell=powershell for PowerShell, or omit shell for the platform default."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"command",         {{"type", "string"},  {"description", "Shell command to execute"}}},
-                        {"timeout",         {{"type", "integer"}, {"description", string_format("Timeout in seconds (default 10, max %d)", SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT)}}},
-                        {"max_output_size", {{"type", "integer"}, {"description", string_format("Maximum output size in bytes (default %zu)", SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE)}}},
+                        {"command", {{"type", "string"}, {"description", "Shell command to execute"}}},
+                        {"shell", {
+                            {"type", "string"},
+                            {"enum", json::array({"auto", "bash", "powershell", "cmd", "sh"})},
+                            {"description", "Shell to use (default: auto)"},
+                        }},
+                        {"timeout", {
+                            {"type", "integer"},
+                            {"minimum", 1},
+                            {"maximum", SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT},
+                            {"description", string_format("Timeout in seconds (default 10, max %d)", SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT)},
+                        }},
+                        {"max_output_size", {
+                            {"type", "integer"},
+                            {"minimum", 1},
+                            {"maximum", (int) SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE},
+                            {"description", string_format("Maximum output size in bytes (default %zu)", SERVER_TOOL_EXEC_SHELL_COMMAND_DEFAULT_OUTPUT_SIZE)},
+                        }},
                     }},
                     {"required", json::array({"command"})},
+                    {"additionalProperties", false},
                 }},
             }},
         };
     }
 
     json invoke(json params) override {
-        std::string command   = params.at("command").get<std::string>();
-        int    timeout        = json_value(params, "timeout",         10);
-        size_t max_output     = (size_t) json_value(params, "max_output_size", (int) SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE);
+        const std::string command = params.at("command").get<std::string>();
+        std::string shell = json_value(params, "shell", std::string("auto"));
+        int timeout = std::clamp(json_value(params, "timeout", 10), 1, SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT);
+        size_t max_output = static_cast<size_t>(std::clamp(
+            json_value(params, "max_output_size", (int) SERVER_TOOL_EXEC_SHELL_COMMAND_DEFAULT_OUTPUT_SIZE),
+            1, (int) SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE));
 
-        timeout    = std::min(timeout,    SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT);
-        max_output = std::min(max_output, SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE);
-
+        if (shell == "auto") {
 #ifdef _WIN32
-        std::vector<std::string> args = {"cmd", "/c", command};
+            shell = "cmd";
 #else
-        std::vector<std::string> args = {"sh", "-c", command};
+            shell = "sh";
 #endif
+        }
 
-        auto res = run_process(args, max_output, timeout);
+        auto res = run_process(build_shell_args(shell, command), max_output, timeout);
 
         std::string text_output = res.output;
         text_output += string_format("\n[exit code: %d]", res.exit_code);
@@ -413,6 +888,140 @@ struct server_tool_exec_shell_command : server_tool {
             text_output += " [exit due to timed out]";
         }
 
+        return {{"plain_text_response", text_output}};
+    }
+};
+
+//
+// run_python: execute a Python snippet or script file
+//
+
+static constexpr size_t SERVER_TOOL_RUN_PYTHON_DEFAULT_OUTPUT_SIZE = 64 * 1024;
+static constexpr size_t SERVER_TOOL_RUN_PYTHON_MAX_OUTPUT_SIZE     = 256 * 1024;
+static constexpr int    SERVER_TOOL_RUN_PYTHON_MAX_TIMEOUT         = 60;
+
+struct server_tool_run_python : server_tool {
+    server_tool_run_python() {
+        name = "run_python";
+        display_name = "Run Python";
+        permission_write = true;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "Execute Python code or a Python script file and return combined stdout/stderr. "
+                    "Provide either code or path. Prefer this over wrapping python in exec_shell_command."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"code", {
+                            {"type", "string"},
+                            {"description", "Python source to execute (mutually exclusive with path)"},
+                        }},
+                        {"path", {
+                            {"type", "string"},
+                            {"description", "Path to a .py file to execute (mutually exclusive with code)"},
+                        }},
+                        {"args", {
+                            {"type", "array"},
+                            {"items", {{"type", "string"}}},
+                            {"description", "Optional argv passed to the script after the script path"},
+                        }},
+                        {"timeout", {
+                            {"type", "integer"},
+                            {"minimum", 1},
+                            {"maximum", SERVER_TOOL_RUN_PYTHON_MAX_TIMEOUT},
+                            {"description", string_format("Timeout in seconds (default 30, max %d)", SERVER_TOOL_RUN_PYTHON_MAX_TIMEOUT)},
+                        }},
+                        {"max_output_size", {
+                            {"type", "integer"},
+                            {"minimum", 1},
+                            {"maximum", (int) SERVER_TOOL_RUN_PYTHON_MAX_OUTPUT_SIZE},
+                            {"description", string_format("Maximum output size in bytes (default %zu)", SERVER_TOOL_RUN_PYTHON_DEFAULT_OUTPUT_SIZE)},
+                        }},
+                    }},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        const std::string code = json_value(params, "code", std::string());
+        const std::string path = json_value(params, "path", std::string());
+        if (code.empty() == path.empty()) {
+            return {{"error", "provide exactly one of \"code\" or \"path\""}};
+        }
+
+        int timeout = std::clamp(json_value(params, "timeout", 30), 1, SERVER_TOOL_RUN_PYTHON_MAX_TIMEOUT);
+        size_t max_output = static_cast<size_t>(std::clamp(
+            json_value(params, "max_output_size", (int) SERVER_TOOL_RUN_PYTHON_DEFAULT_OUTPUT_SIZE),
+            1, (int) SERVER_TOOL_RUN_PYTHON_MAX_OUTPUT_SIZE));
+
+        std::string script_path = path;
+        std::string tmp_path;
+        if (!code.empty()) {
+            static std::atomic<int> counter{0};
+            tmp_path = (fs::temp_directory_path() /
+                ("llama_python_" + std::to_string(++counter) + ".py")).string();
+            {
+                std::ofstream f(tmp_path, std::ios::binary);
+                if (!f) {
+                    return {{"error", "failed to create temporary Python file"}};
+                }
+                f << code;
+            }
+            script_path = tmp_path;
+        }
+
+        std::vector<std::string> args = {
+#ifdef _WIN32
+            "python",
+#else
+            "python3",
+#endif
+            script_path,
+        };
+        if (params.contains("args") && params["args"].is_array()) {
+            for (const auto & arg : params["args"]) {
+                if (!arg.is_string()) {
+                    if (!tmp_path.empty()) {
+                        std::error_code ec;
+                        fs::remove(tmp_path, ec);
+                    }
+                    return {{"error", "args must be an array of strings"}};
+                }
+                args.push_back(arg.get<std::string>());
+            }
+        }
+
+        auto res = run_process(args, max_output, timeout);
+#ifdef _WIN32
+        if (res.exit_code != 0 && res.output.find("failed to spawn process") != std::string::npos) {
+            args[0] = "py";
+            res = run_process(args, max_output, timeout);
+        }
+#else
+        if (res.exit_code != 0 && res.output.find("failed to spawn process") != std::string::npos) {
+            args[0] = "python";
+            res = run_process(args, max_output, timeout);
+        }
+#endif
+
+        if (!tmp_path.empty()) {
+            std::error_code ec;
+            fs::remove(tmp_path, ec);
+        }
+
+        std::string text_output = res.output;
+        text_output += string_format("\n[exit code: %d]", res.exit_code);
+        if (res.timed_out) {
+            text_output += " [exit due to timed out]";
+        }
         return {{"plain_text_response", text_output}};
     }
 };
@@ -643,6 +1252,251 @@ struct server_tool_edit_file : server_tool {
 };
 
 //
+// read-only Git tools
+//
+
+static constexpr size_t SERVER_TOOL_GIT_MAX_OUTPUT_SIZE = 64 * 1024;
+static constexpr int    SERVER_TOOL_GIT_TIMEOUT         = 30;
+
+static json run_git_tool(const std::string & repo_path, std::vector<std::string> args) {
+    std::vector<std::string> command = {
+        "git", "--no-pager", "-c", "core.pager=cat", "-c", "core.fsmonitor=false",
+        "-c", "color.ui=false",
+        "-C", repo_path,
+    };
+    command.insert(command.end(), args.begin(), args.end());
+
+    const auto environment = sanitized_git_environment();
+    const auto result = run_process(
+        command, SERVER_TOOL_GIT_MAX_OUTPUT_SIZE, SERVER_TOOL_GIT_TIMEOUT, &environment);
+    if (result.timed_out) {
+        return {{"error", "git command timed out"}};
+    }
+    if (result.exit_code != 0) {
+        return {{"error", "git command failed (exit " + std::to_string(result.exit_code) + "): " + result.output}};
+    }
+    return {{"plain_text_response", result.output.empty() ? "(no output)\n" : result.output}};
+}
+
+static bool invalid_revision(const std::string & revision) {
+    return revision.empty() || revision[0] == '-';
+}
+
+struct server_tool_git_status : server_tool {
+    server_tool_git_status() {
+        name = "git_status";
+        display_name = "Git status";
+        permission_write = false;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "Inspect modified, staged, and untracked files without changing the repository. "
+                    "Prefer this over exec_shell_command for git status."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"repo_path", {{"type", "string"}, {"description", "Repository path (default: current directory)"}}},
+                    }},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        return run_git_tool(json_value(params, "repo_path", std::string(".")),
+            {"status", "--short", "--branch", "--untracked-files=all"});
+    }
+};
+
+struct server_tool_git_diff : server_tool {
+    server_tool_git_diff() {
+        name = "git_diff";
+        display_name = "Git diff";
+        permission_write = false;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "Show Git working-tree or staged diffs. With staged=false (default), only unstaged changes are returned. "
+                    "Prefer this over shelling out to git diff."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"repo_path", {{"type", "string"},  {"description", "Repository path (default: current directory)"}}},
+                        {"staged",    {{"type", "boolean"}, {"description", "If true, show staged changes only (default: false)"}}},
+                        {"path",      {{"type", "string"},  {"description", "Optional path filter; values starting with '-' are treated as paths after --"}}},
+                    }},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        std::vector<std::string> args = {"diff", "--no-ext-diff", "--no-textconv"};
+        if (json_value(params, "staged", false)) {
+            args.push_back("--cached");
+        }
+        const std::string path = json_value(params, "path", std::string());
+        if (!path.empty()) {
+            args.push_back("--");
+            args.push_back(path);
+        }
+        return run_git_tool(json_value(params, "repo_path", std::string(".")), std::move(args));
+    }
+};
+
+struct server_tool_git_log : server_tool {
+    server_tool_git_log() {
+        name = "git_log";
+        display_name = "Git log";
+        permission_write = false;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "List recent commits, optionally filtered by path. Prefer this over shelling out to git log."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"repo_path", {{"type", "string"},  {"description", "Repository path (default: current directory)"}}},
+                        {"max_count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 100}, {"description", "Maximum commits (default 20, max 100)"}}},
+                        {"path",      {{"type", "string"},  {"description", "Optional path filter"}}},
+                    }},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        const int max_count = std::clamp(json_value(params, "max_count", 20), 1, 100);
+        std::vector<std::string> args = {
+            "log", "--date=iso-strict", "--format=%H%nAuthor: %an <%ae>%nDate: %ad%nSubject: %s%n",
+            "--max-count=" + std::to_string(max_count),
+        };
+        const std::string path = json_value(params, "path", std::string());
+        if (!path.empty()) {
+            args.push_back("--");
+            args.push_back(path);
+        }
+        return run_git_tool(json_value(params, "repo_path", std::string(".")), std::move(args));
+    }
+};
+
+struct server_tool_git_show : server_tool {
+    server_tool_git_show() {
+        name = "git_show";
+        display_name = "Git show";
+        permission_write = false;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "Show a commit (message and patch) or the contents of a file at a revision. "
+                    "Provide path to read a file at that revision; omit path to inspect the commit itself."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"repo_path", {{"type", "string"}, {"description", "Repository path (default: current directory)"}}},
+                        {"revision",  {{"type", "string"}, {"description", "Revision to show (default: HEAD); must not begin with '-'"}}},
+                        {"path",      {{"type", "string"}, {"description", "Optional file path at the revision"}}},
+                    }},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        const std::string revision = json_value(params, "revision", std::string("HEAD"));
+        if (invalid_revision(revision)) {
+            return {{"error", "revision must not be empty or begin with '-'"}};
+        }
+        const std::string path = json_value(params, "path", std::string());
+        std::vector<std::string> args;
+        if (path.empty()) {
+            args = {"show", "--no-ext-diff", "--no-textconv", "--format=fuller", revision};
+        } else {
+            args = {"show", "--no-ext-diff", "--no-textconv", revision + ":" + path};
+        }
+        return run_git_tool(json_value(params, "repo_path", std::string(".")), std::move(args));
+    }
+};
+
+struct server_tool_git_blame : server_tool {
+    server_tool_git_blame() {
+        name = "git_blame";
+        display_name = "Git blame";
+        permission_write = false;
+    }
+
+    json get_definition() override {
+        return {
+            {"type", "function"},
+            {"function", {
+                {"name", name},
+                {"description",
+                    "Identify the commit and author responsible for each line in a file. "
+                    "Use start_line/end_line together to limit the range."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"repo_path", {{"type", "string"},  {"description", "Repository path (default: current directory)"}}},
+                        {"path",      {{"type", "string"},  {"description", "File path"}}},
+                        {"revision",  {{"type", "string"},  {"description", "Revision to blame (default: HEAD); must not begin with '-'"}}},
+                        {"start_line",{{"type", "integer"}, {"minimum", 1}, {"description", "Optional first line, 1-based"}}},
+                        {"end_line",  {{"type", "integer"}, {"minimum", 1}, {"description", "Optional last line, 1-based"}}},
+                    }},
+                    {"required", json::array({"path"})},
+                    {"additionalProperties", false},
+                }},
+            }},
+        };
+    }
+
+    json invoke(json params) override {
+        const std::string revision = json_value(params, "revision", std::string("HEAD"));
+        if (invalid_revision(revision)) {
+            return {{"error", "revision must not be empty or begin with '-'"}};
+        }
+        const int start_line = json_value(params, "start_line", 0);
+        const int end_line = json_value(params, "end_line", 0);
+        if ((start_line == 0) != (end_line == 0) || start_line < 0 || end_line < start_line) {
+            return {{"error", "start_line and end_line must be provided together as a valid range"}};
+        }
+
+        std::vector<std::string> args = {"blame", "--date=iso-strict"};
+        if (start_line > 0) {
+            args.push_back("-L");
+            args.push_back(std::to_string(start_line) + "," + std::to_string(end_line));
+        }
+        args.push_back(revision);
+        args.push_back("--");
+        args.push_back(params.at("path").get<std::string>());
+        return run_git_tool(json_value(params, "repo_path", std::string(".")), std::move(args));
+    }
+};
+
+//
 // apply_diff: apply a unified diff via git apply
 //
 
@@ -736,9 +1590,17 @@ static std::vector<std::unique_ptr<server_tool>> build_tools() {
     tools.push_back(std::make_unique<server_tool_read_file>());
     tools.push_back(std::make_unique<server_tool_file_glob_search>());
     tools.push_back(std::make_unique<server_tool_grep_search>());
+    tools.push_back(std::make_unique<server_tool_web_search>());
+    tools.push_back(std::make_unique<server_tool_fetch_url>());
     tools.push_back(std::make_unique<server_tool_exec_shell_command>());
+    tools.push_back(std::make_unique<server_tool_run_python>());
     tools.push_back(std::make_unique<server_tool_write_file>());
     tools.push_back(std::make_unique<server_tool_edit_file>());
+    tools.push_back(std::make_unique<server_tool_git_status>());
+    tools.push_back(std::make_unique<server_tool_git_diff>());
+    tools.push_back(std::make_unique<server_tool_git_log>());
+    tools.push_back(std::make_unique<server_tool_git_show>());
+    tools.push_back(std::make_unique<server_tool_git_blame>());
     tools.push_back(std::make_unique<server_tool_apply_diff>());
     tools.push_back(std::make_unique<server_tool_get_datetime>());
     return tools;

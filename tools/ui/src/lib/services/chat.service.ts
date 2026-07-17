@@ -233,7 +233,8 @@ export class ChatService {
 			}),
 			stream,
 			return_progress: stream ? true : undefined,
-			tools: tools && tools.length > 0 ? tools : undefined
+			tools: tools && tools.length > 0 ? tools : undefined,
+			parallel_tool_calls: tools && tools.length > 0 ? false : undefined
 		};
 
 		// Include model in request if provided (required in ROUTER mode)

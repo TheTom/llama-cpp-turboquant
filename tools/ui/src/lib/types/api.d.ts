@@ -220,6 +220,7 @@ export interface ApiChatCompletionRequest {
 	model?: string;
 	return_progress?: boolean;
 	tools?: ApiChatCompletionTool[];
+	parallel_tool_calls?: boolean;
 	// Reasoning parameters
 	reasoning_format?: string;
 	// Generation parameters
