@@ -202,8 +202,6 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(dst->type  == src0->type);
-    GGML_ASSERT(!ggml_is_quantized(src0->type));
-    GGML_ASSERT(ggml_blck_size(src0->type) == 1);
 
     if (ggml_is_quantized(src0->type)) {
         if (dim == 3) {
