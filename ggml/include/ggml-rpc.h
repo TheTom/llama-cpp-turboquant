@@ -11,9 +11,8 @@ extern "C" {
 #define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
-// 98 = upstream 97 + the fork's GGML_OP_TURBO_WHT. Bumped patch version because
-// adding an op shifts the GGML_OP enum used in the RPC wire protocol.
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+// 102 = upstream 97 + TURBO_WHT + LIGHTNING_INDEXER + DSV4_HC_COMB + DSV4_HC_PRE + DSV4_HC_POST
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

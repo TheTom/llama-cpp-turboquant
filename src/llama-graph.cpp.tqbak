@@ -593,36 +593,25 @@ static void dsv4_set_kq_mask(
         return;
     }
 
-    GGML_ASSERT(dst->ne[0] == plan.n_kv);
-    GGML_ASSERT(dst->ne[1] == (int64_t) n_tokens / n_stream);
+    GGML_ASSERT(dst->ne[0] == (int64_t) n_tokens);
+    GGML_ASSERT(dst->ne[1] == plan.n_kv);
     GGML_ASSERT(dst->ne[2] == n_stream);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
-    GGML_ASSERT(n_stream > 0);
-    GGML_ASSERT(n_tokens%n_stream == 0);
 
-    if (dst->type == GGML_TYPE_F32) {
-        float * data = (float *) dst->data;
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne10 = dst->ne[1];
 
-        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            const int32_t n_visible = plan.n_visible[i / (n_tokens / n_stream)];
+    std::vector<float> data(ne0 * ne10 * 2);
 
-            for (int64_t j = 0; j < dst->ne[0]; ++j) {
-                data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
-            }
-        }
-    } else if (dst->type == GGML_TYPE_F16) {
-        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
-        const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
-        const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
-
-        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            const int32_t n_visible = plan.n_visible[i / (n_tokens / n_stream)];
-
-            for (int64_t j = 0; j < dst->ne[0]; ++j) {
-                data[i*dst->ne[0] + j] = j < n_visible ? fp16_zero : fp16_ninf;
-            }
+    for (int64_t i10 = 0; i10 < ne10; i10++) {
+        for (int64_t i00 = 0; i00 < ne0; i00++) {
+            const float val = (int32_t) i10 < plan.n_visible[(int64_t) i00] ? 0.0f : -INFINITY;
+            data[i10 * ne0 + i00] = val;
+            // duplicated for prefill-with-min cache at ne2=2
+            data[ne0 * ne10 + i10 * ne0 + i00] = val;
         }
     }
+
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(float));
 }
 
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
@@ -677,17 +666,19 @@ static bool dsv4_can_reuse_kq_mask(
         uint32_t n_tokens,
         int64_t n_stream) {
     if (plan.n_kv == 0) {
-        return t == nullptr;
+        return true;
     }
 
-    GGML_ASSERT(n_stream > 0);
+    if (t == nullptr) {
+        return false;
+    }
 
-    return t != nullptr &&
-           t->ne[0] == plan.n_kv &&
-           t->ne[1] == (int64_t) n_tokens/n_stream &&
-           t->ne[2] == 1 &&
-           t->ne[3] == n_stream;
+    return t->ne[0] == (int64_t) n_tokens
+        && t->ne[1] == plan.n_kv
+        && t->ne[2] == n_stream
+        && plan.n_visible.size() == n_tokens;
 }
+
 static bool dsv4_can_reuse_comp_input(
         const llm_graph_input_dsv4::comp_input & inp,
         const llama_kv_cache_dsv4_context::comp_plan & plan,
@@ -741,16 +732,15 @@ static bool dsv4_can_reuse_raw_kq_mask(
         return true;
     }
 
-    GGML_ASSERT(n_stream > 0);
+    if (kq_mask == nullptr) {
+        return false;
+    }
 
-    bool res = true;
+    if (kq_mask->ne[0] == n_tokens && kq_mask->ne[1] == (int64_t) n_kv && kq_mask->ne[2] == n_stream) {
+        return true;
+    }
 
-    res &= (kq_mask->ne[0] == n_kv);
-    res &= (kq_mask->ne[1] == n_tokens/n_stream);
-    res &= (kq_mask->ne[2] == 1);
-    res &= (kq_mask->ne[3] == n_stream);
-
-    return res;
+    return false;
 }
 
 static ggml_tensor * dsv4_build_input_1d(
@@ -777,11 +767,6 @@ static void dsv4_build_comp_inputs(
         const llama_cparams & cparams,
         int64_t n_stream) {
     inp.state_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_pos.size(), std::string("dsv4_") + name + "_state_pos");
-    inp.state_persist_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_src_idxs.size(), std::string("dsv4_") + name + "_state_persist_src_idxs");
-    inp.state_persist_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_dst_idxs.size(), std::string("dsv4_") + name + "_state_persist_dst_idxs");
-    inp.state_read_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_read_idxs.size(), std::string("dsv4_") + name + "_state_read_idxs");
-    inp.state_write_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs.size(), std::string("dsv4_") + name + "_state_write_idxs");
-    inp.state_write_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_write_pos.size(), std::string("dsv4_") + name + "_state_write_pos");
     if (plan.n_kv > 0) {
         const int64_t n_tokens = (int64_t) plan.n_visible.size();
 
@@ -864,6 +849,7 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
 
     return res;
 }
+
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -1221,7 +1207,6 @@ void llm_graph_result::reset() {
     params = {};
 
     inputs.clear();
-    fused_nodes.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1288,13 +1273,31 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
+        if (debug > 1) {
+            LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
+        }
+
         return false;
+    }
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: checking compatibility of %d inputs:\n", __func__, (int) inputs.size());
     }
 
     bool res = true;
 
     for (auto & input : inputs) {
-        res = res && input->can_reuse(params);
+        const bool cur = input->can_reuse(params);
+
+        if (debug > 1) {
+            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+        }
+
+        res = res && cur;
+    }
+
+    if (debug > 0) {
+        LLAMA_LOG_DEBUG("%s: can reuse graph = %d\n", __func__, res);
     }
 
     return res;
@@ -1404,19 +1407,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
-          ggml_tensor * ids,
-          ggml_tensor * w_s) const {
+          ggml_tensor * ids) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
-
-    if (w_s) {
-        const int64_t n_expert = w_s->ne[0];
-        const int64_t n_tokens = cur->ne[2];
-        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
-        res = ggml_mul(ctx0, res, s);
-    }
-
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
