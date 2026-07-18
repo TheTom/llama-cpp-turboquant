@@ -4,29 +4,21 @@
 #include "llama-kv-cache-iswa.h"
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
-
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
-        throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
+    // Load target layer IDs (accept both #219 enum name and tip/upstream TARGET_LAYERS;
+    // both map to the same GGUF key pattern "%s.target_layers").
+    if (!ml.get_arr(LLM_KV_DFLASH_TARGET_LAYER_IDS, target_layer_ids, false) &&
+        !ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
+        throw std::runtime_error("DFlash model requires 'target_layers' / target_layer_ids in GGUF metadata");
     }
-
-    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
+    hparams.n_embd_inp_enc_impl = (uint32_t)target_layer_ids.size() * hparams.n_embd;
 
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [", __func__);
     for (size_t i = 0; i < target_layer_ids.size(); ++i) {
-        LLAMA_LOG_INFO("%d%s", target_layer_ids[i], i + 1 < target_layer_ids.size() ? ", " : "");
+        LLAMA_LOG_INFO("%s%d", i > 0 ? ", " : "", target_layer_ids[i]);
     }
     LLAMA_LOG_INFO("]\n");
-
-    // optional interleaved sliding-window attention with per-layer pattern array.
-    // DFlash has a single rope, so the SWA rope == main rope.
-    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
-        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
-        hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
-        hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
-    }
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -37,8 +29,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
-    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
-    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0);
+    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -54,29 +46,19 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd,   n_ff }, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {   n_ff, n_embd }, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd,   n_ff }, 0);
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
-    switch (params.gtype) {
-        case LLM_GRAPH_TYPE_ENCODER:
-            return std::make_unique<graph<true>>(*this, params);
-        case LLM_GRAPH_TYPE_DEFAULT:
-        case LLM_GRAPH_TYPE_DECODER:
-            return std::make_unique<graph<false>>(*this, params);
-        default:
-            GGML_ABORT("invalid graph type");
-    };
-}
+// DFlash Encoder: processes target model features through feature fusion layer
+template <bool is_enc>
+ggml_tensor * llama_model_dflash::graph<is_enc>::build_inp_embd_enc() const {
+    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
-template <>
-ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
-    auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
-
-    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
+    auto inp_target = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
     ggml_set_input(inp_target->embd);
 
     ggml_tensor * cur = inp_target->embd;
@@ -87,7 +69,6 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     return cur;
 }
 
-// DFlash Encoder: processes target model features through feature fusion layer
 template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
@@ -128,7 +109,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
-    // KV cache injection
+    // KV cache injection (embd batch)
     if (ubatch.embd) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
@@ -159,7 +140,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cb(Vcur, "Vcur_injected", il);
 
             if (use_iswa) {
-                // route each layer's K/V to its sub-cache: SWA layers -> sliding cache, full -> dense
                 const bool    is_swa = hparams.is_swa(il);
                 const auto  * kv     = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
                 ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
@@ -178,12 +158,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
+    // Token batch: noise-block diffusion
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
-
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
         tok_embd = model_other->tok_embd;
     }
@@ -274,3 +254,14 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_build_forward_expand(gf, cur);
 }
+
+std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_ENCODER) {
+        return std::make_unique<graph<true>>(*this, params);
+    } else {
+        return std::make_unique<graph<false>>(*this, params);
+    }
+}
+
+template struct llama_model_dflash::graph<true>;
+template struct llama_model_dflash::graph<false>;

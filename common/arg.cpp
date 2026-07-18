@@ -3600,6 +3600,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--eagle3"},
+        "use EAGLE3 speculative decoding with the draft model",
+        [](common_params & params) {
+            params.speculative.draft.eagle3 = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--dflash"},
+        "use DFlash speculative decoding with the draft model",
+        [](common_params & params) {
+            params.speculative.draft.dflash = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-cd", "--ctx-size-draft"}, "N",
+        string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.draft.n_ctx),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CTX"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
