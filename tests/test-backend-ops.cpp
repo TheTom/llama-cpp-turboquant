@@ -6538,6 +6538,44 @@ struct test_turbo_wht_roundtrip : public test_case {
     }
 };
 
+// GGML_OP_DSV4_HC_COMB
+struct test_dsv4_hc_comb : public test_case {
+    const int64_t n_tokens;
+    const int n_iter;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, n_iter);
+    }
+
+    double max_nmse_err() override {
+        return 5e-5;
+    }
+
+    test_dsv4_hc_comb(int64_t n_tokens = 4, int n_iter = 3)
+        : n_tokens(n_tokens), n_iter(n_iter) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t DSV4_HC = 4;
+        constexpr int64_t hc_mix_dim = (2 + DSV4_HC) * DSV4_HC; // 24
+
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_mix_dim, n_tokens);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_mix_dim);
+
+        ggml_set_param(mixes);
+        ggml_set_param(scale);
+        ggml_set_param(base);
+
+        ggml_set_name(mixes, "mixes");
+        ggml_set_name(scale, "scale");
+        ggml_set_name(base,  "base");
+
+        ggml_tensor * out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, 1e-6f, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Test SET_ROWS with turbo3 destination, then dequantize and compare.
 // This validates the full quantization pipeline: f32 -> WHT -> PolarQuant -> turbo3
 // followed by dequantization: turbo3 -> f32. The round-trip error should be bounded.
@@ -9349,6 +9387,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t hd : {128, 256, 512}) {
         for (int64_t nh : {1, 4, 8}) {
             test_cases.emplace_back(new test_turbo_wht_roundtrip(hd, nh));
+        }
+    }
+
+    // DSV4_HC_COMB tests
+    for (int64_t nt : {1, 2, 4, 8, 64}) {
+        for (int ni : {1, 3, 5}) {
+            test_cases.emplace_back(new test_dsv4_hc_comb(nt, ni));
         }
     }
 
