@@ -407,6 +407,19 @@ struct llama_hparams {
 
 
     bool use_mrope() const;
+
+    // EAGLE3 draft model
+    std::array<int, 3> eagle3_extract_layers = {0, 0, 0};
+    uint32_t eagle3_target_hidden_size    = 0;
+    bool     eagle3_norm_before_residual  = false;
+
+    // DFlash draft model
+    uint32_t dflash_block_size              = 16;
+    uint32_t dflash_mask_token_id           = 0;
+
+
+
+
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");

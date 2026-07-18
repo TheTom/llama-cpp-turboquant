@@ -62,6 +62,7 @@ All turbo formats use Walsh-Hadamard rotation followed by polar codebook quantiz
 | **CUDA** (NVIDIA) | `dp4a` for `TQ4_1S`, warp-cooperative dequant (16× less compute per block), multi-token / multi-GPU | Yes — turbo VEC FA (+9% decode); mixed `f16/bf16 + q8_0` without `GGML_CUDA_FA_ALL_QUANTS` | Load-time `TQ4_1S → q8_0` conversion path |
 | **HIP / ROCm** (AMD) | Portable `ggml_cuda_dp4a`; scalar half path for `TQ4_1S` on AMD | Yes — VEC FA forced for quantized KV; pool bypass for FA f16 temp buffers | RDNA3 (gfx1100), RDNA4, CDNA3 (MI300X / gfx942), CDNA4 (MI355X / gfx950). [cross-engine-mi300x](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/cross-engine-mi300x.md) |
 | **Vulkan** | `TQ4_1S` weights, `SET_ROWS` for `turbo2`/`turbo4` | coopmat flash attention with `turbo3` KV | Compute-shader path; nix-buildable |
+| **SYCL** (Intel) | `SET_ROWS` for `turbo2`/`turbo3`/`turbo4`, WHT rotation (group 64+128) | VEC FA for all turbo K/V combos (D=64-512) | Intel Arc (A380, B70), oneAPI 2025.2+; cross-turbo K/V combos supported |
 
 ### Model-family support
 
@@ -111,6 +112,11 @@ cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_ARCHITECTURES="gfx1100;gfx942;gfx950" &
 
 # Vulkan
 cmake -B build -DGGML_VULKAN=ON && cmake --build build -j
+
+# Intel SYCL (oneAPI)
+source /opt/intel/oneapi/setvars.sh
+cmake -B build -DGGML_SYCL=ON -DGGML_SYCL_F16=ON \
+  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx && cmake --build build -j
 ```
 
 ## Usage

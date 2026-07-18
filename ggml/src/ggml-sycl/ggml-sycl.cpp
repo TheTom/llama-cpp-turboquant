@@ -70,6 +70,7 @@
 #include "ggml-sycl/diag.hpp"
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
+#include "ggml-sycl/turbo-wht.hpp"
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
@@ -4805,6 +4806,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_sycl_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_TURBO_WHT:
+            ggml_sycl_turbo_wht(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5342,9 +5346,18 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 
         case GGML_OP_SET_ROWS:
             {
+                if (op->src[0]->nb[0] != sizeof(float)) {
+                    return false;
+                }
+                if ((op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0)
+                    && op->src[0]->ne[0] % 128 != 0) {
+                    return false;
+                }
                 return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                          op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
-                         op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                         op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL ||
+                         op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) &&
+                        op->src[0]->type == GGML_TYPE_F32 &&
                         (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32));
             }
             break;
@@ -5542,6 +5555,18 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_sycl_flash_attn_ext_supported(device, op);
+        case GGML_OP_TURBO_WHT:
+            {
+                const ggml_tensor * scale = op->src[1];
+                int group_size = 0;
+                memcpy(&group_size, op->op_params + sizeof(int), sizeof(int));
+                return op->src[0]->type == GGML_TYPE_F32
+                    && op->type == GGML_TYPE_F32
+                    && ggml_is_contiguous(op->src[0])
+                    && ggml_is_contiguous(op)
+                    && (scale == nullptr || (scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale)))
+                    && (group_size == 128 || group_size == 64);
+            }
         default:
             return false;
     }
