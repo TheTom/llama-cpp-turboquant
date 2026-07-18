@@ -753,69 +753,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-struct ggml_cuda_flash_attn_ext_f16_extra_data {
-    half     * K_f16;     // f16 copy of K inside dst buffer, or nullptr
-    half     * V_f16;     // f16 copy of V inside dst buffer, or nullptr
-    uintptr_t end;        // one past the last byte of the dst allocation
-};
-
-// Compute intra-buffer pointers for f16 K/V copies needed by TILE/WMMA/MMA kernels.
-// The output tensor's buffer is sized to hold dst output + optional f16 K + optional f16 V
-// in a single contiguous region.  Runtime code may use these pointers or pool allocations;
-// the extra reserved space ensures the buffer is large enough in either case.
-static ggml_cuda_flash_attn_ext_f16_extra_data
-ggml_cuda_flash_attn_ext_get_f16_extra_data(const ggml_tensor * dst, bool need_f16_K, bool need_f16_V) {
-    uintptr_t base = (uintptr_t) dst->data;
-    uintptr_t pos  = base + ggml_nbytes(dst);
-
-    half * K_f16 = nullptr;
-    half * V_f16 = nullptr;
-
-    if (need_f16_K) {
-        K_f16 = (half *) pos;
-        pos  += (size_t) ggml_nelements(dst->src[1]) * sizeof(half);
-    }
-    if (need_f16_V) {
-        V_f16 = (half *) pos;
-        pos  += (size_t) ggml_nelements(dst->src[2]) * sizeof(half);
-    }
-
-    return {K_f16, V_f16, pos};
-}
-
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_UNUSED(device);
 
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-
-    GGML_ASSERT(K != nullptr);
-    GGML_ASSERT(V != nullptr);
-
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
-
-    bool need_f16_K = false;
-    bool need_f16_V = false;
-
-    switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_WMMA_F16:
-        case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
-            break;
-        case BEST_FATTN_KERNEL_VEC:
-            need_f16_K = K->type == GGML_TYPE_F32;
-            need_f16_V = V->type == GGML_TYPE_F32;
-            break;
-        case BEST_FATTN_KERNEL_NONE:
-            break;
-    }
-
-    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
-
-    return f16_extra.end - (uintptr_t) dst->data;
+    // K/V f16 scratch (when a kernel needs it) is allocated from the CUDA pool, or on
+    // HIP a raw cudaMalloc/cudaFree, inside launch_fattn -- not reserved past the end
+    // of dst's own buffer -- so dst needs exactly its own output bytes.
+    return ggml_nbytes(dst);
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

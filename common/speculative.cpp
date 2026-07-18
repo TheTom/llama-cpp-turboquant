@@ -1022,7 +1022,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         StashedG sg;
                         sg.pos = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                        sg.data.assign(inp_g + (size_t) i * n_embd_dec, inp_g + (size_t) (i + 1) * n_embd_dec);
+                        sg.data.resize(n_embd_dec);
+                        std::copy(inp_g + (size_t) i * n_embd_dec, inp_g + (size_t) (i + 1) * n_embd_dec, sg.data.begin());
                         stash.push_back(std::move(sg));
                     }
                     // auto-flush to prevent unbounded accumulation
@@ -1035,7 +1036,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         StashedG sg;
                         sg.pos = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                        sg.data.assign(inp_g + (size_t) i * n_embd_dec, inp_g + (size_t) (i + 1) * n_embd_dec);
+                        sg.data.resize(n_embd_dec);
+                        std::copy(inp_g + (size_t) i * n_embd_dec, inp_g + (size_t) (i + 1) * n_embd_dec, sg.data.begin());
                         stash.push_back(std::move(sg));
                     }
                     flush_injection(seq_id);
@@ -1077,7 +1079,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         if (m_use_deferred) {
             // flush all stashed KV injections before drafting
-            for (llama_seq_id seq_id = 0; seq_id < n_seq; ++seq_id) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (dparams[seq_id].drafting) {
                     flush_injection(seq_id);
                 }
