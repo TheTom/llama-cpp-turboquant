@@ -24,6 +24,53 @@ set(STAMP_FILE   "${UI_BINARY_DIR}/.ui-stamp")
 set(UI_CPP       "${UI_BINARY_DIR}/ui.cpp")
 set(UI_H         "${UI_BINARY_DIR}/ui.h")
 
+# A dist directory is only usable if it holds the COMPLETE asset set that
+# llama-ui-embed requires. A partial dist -- e.g. an npm PWA-assets build that
+# died in the native `sharp` step (common on Termux / very new Node), leaving
+# only index.html -- must not be trusted, or llama-ui-embed aborts the whole
+# build with "missing required asset(s): loading.html ...". Treat an incomplete
+# dist as unusable so provisioning falls through to the HF download instead of
+# hard-failing. Mirrors the required-asset list in tools/ui/embed.cpp.
+function(dist_is_complete dir out_var)
+    set(${out_var} FALSE PARENT_SCOPE)
+    if(NOT EXISTS "${dir}/index.html")
+        return()
+    endif()
+    file(GLOB_RECURSE _files RELATIVE "${dir}" "${dir}/*")
+    set(_have_loading    FALSE)
+    set(_have_manifest   FALSE)
+    set(_have_sw         FALSE)
+    set(_have_build      FALSE)
+    set(_have_version    FALSE)
+    set(_have_bundle_js  FALSE)
+    set(_have_bundle_css FALSE)
+    set(_have_workbox    FALSE)
+    foreach(_f ${_files})
+        get_filename_component(_b "${_f}" NAME)
+        if(_b STREQUAL "loading.html")
+            set(_have_loading TRUE)
+        elseif(_b STREQUAL "manifest.webmanifest")
+            set(_have_manifest TRUE)
+        elseif(_b STREQUAL "sw.js")
+            set(_have_sw TRUE)
+        elseif(_b STREQUAL "build.json")
+            set(_have_build TRUE)
+        elseif(_b STREQUAL "version.json")
+            set(_have_version TRUE)
+        elseif(_b MATCHES "^bundle.*\\.js$")
+            set(_have_bundle_js TRUE)
+        elseif(_b MATCHES "^bundle.*\\.css$")
+            set(_have_bundle_css TRUE)
+        elseif(_b MATCHES "^workbox.*\\.js$")
+            set(_have_workbox TRUE)
+        endif()
+    endforeach()
+    if(_have_loading AND _have_manifest AND _have_sw AND _have_build AND _have_version
+       AND _have_bundle_js AND _have_bundle_css AND _have_workbox)
+        set(${out_var} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
 function(npm_build_should_skip out_var)
     set(${out_var} FALSE PARENT_SCOPE)
 
@@ -271,9 +318,15 @@ endfunction()
 # 1. Priority 1: pre-built assets supplied in tools/ui/dist
 # ---------------------------------------------------------------------------
 if(EXISTS "${SRC_DIST_DIR}/index.html")
-    message(STATUS "UI: using pre-built assets from ${SRC_DIST_DIR}")
-    emit_files("${SRC_DIST_DIR}")
-    return()
+    dist_is_complete("${SRC_DIST_DIR}" SRC_DIST_OK)
+    if(SRC_DIST_OK)
+        message(STATUS "UI: using pre-built assets from ${SRC_DIST_DIR}")
+        emit_files("${SRC_DIST_DIR}")
+        return()
+    else()
+        message(STATUS "UI: ${SRC_DIST_DIR} has index.html but is missing required assets "
+                       "(partial or failed UI build); ignoring it and trying npm/HF instead")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -305,10 +358,7 @@ if(NOT provisioned AND HF_ENABLED)
         endif()
     endif()
 
-    set(have_assets FALSE)
-    if(EXISTS "${DIST_DIR}/index.html")
-        set(have_assets TRUE)
-    endif()
+    dist_is_complete("${DIST_DIR}" have_assets)
     if(stamp_ok AND have_assets)
         message(STATUS "UI: HF stamp '${stamped}' matches version, skipping HF fetch")
         set(provisioned TRUE)
@@ -328,8 +378,18 @@ endif()
 # 4. Fallback: warn about stale or missing assets, then emit whatever we have
 # ---------------------------------------------------------------------------
 if(NOT provisioned)
-    if(EXISTS "${DIST_DIR}/index.html")
-        message(WARNING "UI: provisioning failed; embedding stale assets from ${DIST_DIR}")
+    dist_is_complete("${DIST_DIR}" DIST_COMPLETE)
+    if(DIST_COMPLETE)
+        message(WARNING "UI: provisioning failed; embedding stale (but complete) assets from ${DIST_DIR}")
+    elseif(EXISTS "${DIST_DIR}/index.html")
+        # A partial dist would make llama-ui-embed abort the build. Drop it so we
+        # degrade to a no-embedded-UI binary with a clear message instead.
+        message(WARNING "UI: provisioning failed and ${DIST_DIR} is incomplete; "
+                        "building WITHOUT an embedded UI. For an offline build, extract a "
+                        "complete pre-built UI (from a llama.cpp release at "
+                        "https://github.com/ggml-org/llama.cpp/releases) into tools/ui/dist, "
+                        "or configure with -DBUILD_UI=OFF to always use the HF-downloaded UI.")
+        file(REMOVE_RECURSE "${DIST_DIR}")
     else()
         message(WARNING "UI: no assets available - building without an embedded UI. "
                         "In a disconnected environment, download the pre-built UI "
