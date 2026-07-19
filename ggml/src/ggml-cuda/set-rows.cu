@@ -1431,50 +1431,60 @@ static __global__ void set_rows_cuda_oscar2(
     for (int iv = 0; iv < nk0; ++iv) {
         const float val = src_row[iv * QK_OSCAR2 + t];
 
-        // Intra-warp reduction for sum and sum-of-squares (for RMS-based scale).
-        // RMS is robust to outliers — unlike min-max which breaks with extreme values.
-        float sum_v = val, sum_sq_v = val * val;
+        // Intra-warp reduction for min and max (warp shuffle)
+        float vmin = val, vmax = val;
         #pragma unroll
         for (int s = 16; s > 0; s >>= 1) {
-            sum_v    += __shfl_xor_sync(0xFFFFFFFF, sum_v, s, 32);
-            sum_sq_v += __shfl_xor_sync(0xFFFFFFFF, sum_sq_v, s, 32);
+            const float other_min = __shfl_xor_sync(0xFFFFFFFF, vmin, s, 32);
+            const float other_max = __shfl_xor_sync(0xFFFFFFFF, vmax, s, 32);
+            vmin = fminf(vmin, other_min);
+            vmax = fmaxf(vmax, other_max);
         }
-        if (t % 32 == 0) {
-            sh_min[t / 32] = sum_v;
-            sh_max[t / 32] = sum_sq_v;
-        }
-        __syncthreads();
-        // Cross-warp reduction (threads 0-3)
-        float total_sum = 0.0f, total_sum_sq = 0.0f;
-        if (t < 4) {
-            total_sum = sh_min[t];
-            total_sum_sq = sh_max[t];
-        }
-        #pragma unroll
-        for (int s = 2; s > 0; s >>= 1) {
-            total_sum    += __shfl_xor_sync(0x0F, total_sum, s, 4);
-            total_sum_sq += __shfl_xor_sync(0x0F, total_sum_sq, s, 4);
-        }
-        if (t == 0) { sh_min[0] = total_sum; sh_max[0] = total_sum_sq; }
-        __syncthreads();
-        total_sum    = __shfl_sync(0xFFFFFFFF, sh_min[0], 0, 32);
-        total_sum_sq = __shfl_sync(0xFFFFFFFF, sh_max[0], 0, 32);
 
-        // RMS-based scale with q2_0-like tight coverage: d = rms * k, m = mean - 1.5*k*rms.
-        // Using k=0.149 gives codes at [-0.224, -0.075, +0.075, +0.224] * rms.
-        // This is similar to q2_0's centroid range (±0.133*rms) but with equally-spaced
-        // linear codes (required by block_oscar2 format: val = code*d + m).
-        const float inv_n     = 1.0f / (float)QK_OSCAR2;
-        const float mean      = total_sum * inv_n;
-        const float rms       = sqrtf(fmaxf(0.0f, total_sum_sq * inv_n - mean * mean));
-        const float min_rms   = 1e-10f;
-        const float k_scale   = 0.149f; // match q2_0's effective range
-        const float scale     = fmaxf(rms * k_scale, min_rms);
-        const float m_val     = mean - 1.5f * scale;
-        const float inv_s     = 1.0f / scale;
+        // Store warp results to shared
+        if (t % 32 == 0) {
+            sh_min[t / 32] = vmin;
+            sh_max[t / 32] = vmax;
+        }
+        __syncthreads();
+
+        // Cross-warp reduction (threads 0-3 in first warp)
+        if (t < 4) {
+            vmin = sh_min[t];
+            vmax = sh_max[t];
+            #pragma unroll
+            for (int s = 2; s > 0; s >>= 1) {
+                const float other_min = __shfl_xor_sync(0x0F, vmin, s, 4);
+                const float other_max = __shfl_xor_sync(0x0F, vmax, s, 4);
+                vmin = fminf(vmin, other_min);
+                vmax = fmaxf(vmax, other_max);
+            }
+        }
+        if (t == 0) {
+            sh_min[0] = vmin;
+            sh_max[0] = vmax;
+        }
+        __syncthreads();
+
+        // Outlier-robust min/max: clamp when min-max range is outlier-stretched.
+        // 2-bit min-max quantization is very sensitive to per-block outliers — a single
+        // extreme value stretches d = (max-min)/3 → all 4 codes spread across a huge
+        // range, losing precision for the 95% of typical-valued elements.
+        // Fix: clamp raw min/max to mean ± 1.5 (max_scale=1.0) so d ≤ 1.0.
+        // Outlier values (>1.5σ from mean) are clipped to code 0/3 (harmless).
+        const float raw_min    = sh_min[0];
+        const float raw_max    = sh_max[0];
+        const float mid        = (raw_min + raw_max) * 0.5f;
+        const float raw_scale  = (raw_max - raw_min) / 3.0f;
+        const float max_scale  = 1.0f;
+        const float half_range = fminf(raw_scale, max_scale) * 3.0f * 0.5f;
+        const float vmin_final = mid - half_range;
+        const float vmax_final = mid + half_range;
+        const float scale      = (vmax_final - vmin_final) / 3.0f;
+        const float inv_s      = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
 
         // Quantize to 2-bit
-        int code = (int)((val - m_val) * inv_s + 0.5f);
+        int code = (int)((val - vmin_final) * inv_s + 0.5f);
         if (code < 0) code = 0;
         if (code > 3) code = 3;
         sh_codes[t] = (uint8_t)code;
@@ -1488,11 +1498,11 @@ static __global__ void set_rows_cuda_oscar2(
                 | (uint8_t)(sh_codes[base + 2] << 4)
                 | (uint8_t)(sh_codes[base + 3] << 6);
         }
+
         if (t == 0) {
             dst_row[iv].d = __float2half(scale);
-            dst_row[iv].m = __float2half(m_val);
+            dst_row[iv].m = __float2half(vmin_final);
         }
-
         __syncthreads();
     }
 }
