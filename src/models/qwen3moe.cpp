@@ -112,13 +112,38 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
 
+            // OSCAR calibrated rotation (post-RoPE): rotate Q and K by the same
+            // per-layer orthogonal M so Q'·K' == Q·K, but K' quantizes far better.
+            if (model.layers[il].attn_k_rot) {
+                Qcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Qcur);
+                Kcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Kcur);
+                cb(Qcur, "Qcur_rot", il);
+                cb(Kcur, "Kcur_rot", il);
+            }
+
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            if (model.layers[il].attn_v_rot) {
+                // OSCAR V rotation: store V' = V@M_v (quantizes well), undo M_v^T on
+                // the attention output before W_o (V isn't paired with Q, so explicit undo).
+                Vcur = ggml_mul_mat(ctx0, model.layers[il].attn_v_rot, Vcur);
+                cb(Vcur, "Vcur_rot", il);
+                cur = build_attn(inp_attn,
+                        nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                // cur is [n_embd_head*n_head, n_tokens]; undo M_v^T per head, then W_o
+                ggml_tensor * Mv = ggml_cont(ctx0, ggml_transpose(ctx0, model.layers[il].attn_v_rot));
+                cur = ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, cur->ne[1]);
+                cur = ggml_mul_mat(ctx0, Mv, cur);
+                cur = ggml_cont_2d(ctx0, cur, n_embd_head * n_head, cur->ne[2]);
+                cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+            } else {
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
