@@ -1958,6 +1958,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+// Sliding window: set GGML_KV_WINDOW=N to attend to only the last N tokens (default 0 = off).
+// Loaded once into constant memory for fast device-side access.
+static __constant__ int GGML_CUDA_KV_WINDOW = 0;
+
+static int ggml_cuda_kv_window_init() {
+    const char * s = getenv("GGML_KV_WINDOW");
+    int w = s ? atoi(s) : 0;
+    if (w > 0) {
+        cudaMemcpyToSymbol(GGML_CUDA_KV_WINDOW, &w, sizeof(w));
+    }
+    return w;
+}
+static int ggml_cuda_kv_window() {
+    static int w = ggml_cuda_kv_window_init();
+    return w;
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view,
     ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
@@ -2051,7 +2068,16 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_V = V_is_K_view ? stride_K : (is_turbo_kv ? nb21 : nb21 / sizeof(half2));
 
-    const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
+    // Sliding window: GGML_KV_WINDOW env var caps tokens attended to and offsets K/V pointers.
+    const int window = GGML_CUDA_KV_WINDOW;
+    int windowed_ne11 = ne11;
+    int window_offset_tokens = 0;
+    if (window > 0 && windowed_ne11 > window) {
+        window_offset_tokens = windowed_ne11 - window;
+        windowed_ne11 = window;
+    }
+    const int64_t window_offset_bytes = (int64_t)window_offset_tokens * nb11;
+    const int iter_k     = (windowed_ne11 + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
 
@@ -2077,12 +2103,12 @@ static __global__ void flash_attn_ext_f16(
         const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
-        const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
+        const half2  * K_h2   = (const half2  *) ((const char *)(K + nb13*sequence + nb12*z_KV) + window_offset_bytes);
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
-        const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+        const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) ((const char *)(V + nb23*sequence + nb22*z_KV) + window_offset_bytes);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
@@ -2123,12 +2149,12 @@ static __global__ void flash_attn_ext_f16(
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
-    const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
+        const half2  * K_h2   = (const half2  *) ((const char *)(K + nb13*sequence + nb12*z_KV) + window_offset_bytes);
     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
-    const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+        const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) ((const char *)(V + nb23*sequence + nb22*z_KV) + window_offset_bytes);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
@@ -2161,6 +2187,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
+    ggml_cuda_kv_window();
 
     constexpr int ncols = ncols1 * ncols2;
 
