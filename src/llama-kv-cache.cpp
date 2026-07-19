@@ -1596,25 +1596,25 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     auto * k = layers[ikv].k;
 
     const uint64_t kv_size      = get_size();
+
+    // For KV-sharing layers (map_layer_ids[il] != il), k->ne[0] reflects the
+    // base layer's n_embd_k_gqa (which may differ from hparams.n_embd_k_gqa(il)
+    // when head_count_kv varies per layer, e.g. Gemma-4). Use the cache
+    // tensor's actual dimension as the authoritative value.
     const uint64_t n_embd_k_gqa = k->ne[0];
 
-    // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    if (k_is_turbo) {
-        assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
-    } else {
-        assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
-    }
-
-    // Use padded head_dim for turbo types so the full padded data is returned
     const uint32_t head_k = hparams.n_embd_head_k(il);
+    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
     const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
+
+    // Derive the effective number of KV heads from the cache tensor.
+    const int32_t n_head_kv_eff = (int32_t)(n_embd_k_gqa / head_k_eff);
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
-            head_k_eff, hparams.n_head_kv(il), n_kv, ns,
+            head_k_eff, n_head_kv_eff, n_kv, ns,
             ggml_row_size(k->type, head_k_eff),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
@@ -1627,10 +1627,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     auto * v = layers[ikv].v;
 
     const uint64_t kv_size      = get_size();
+    // Use cache tensor's actual n_embd_v_gqa (authoritative for KV-sharing layers)
     const uint64_t n_embd_v_gqa = v->ne[0];
-
-    // [TAG_V_CACHE_VARIABLE] — for turbo-padded V, cache may be larger
-    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     // Use padded head_dim for turbo types
     const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
@@ -1638,12 +1636,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
 
+    // Derive the effective number of KV heads from the cache tensor allocation.
+    const int32_t n_head_kv_eff = (int32_t)(n_embd_v_gqa / head_v_eff);
+
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                head_v_eff, hparams.n_head_kv(il), n_kv, ns,
+                head_v_eff, n_head_kv_eff, n_kv, ns,
                 ggml_row_size(v->type, head_v_eff),                      // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                    // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),            // v->nb[3]
@@ -1652,7 +1653,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), head_v_eff, ns,
+            n_kv, n_head_kv_eff, head_v_eff, ns,
             ggml_row_size(v->type, kv_size*head_v_eff),              // v->nb[1]
             ggml_row_size(v->type, kv_size),                         // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),            // v->nb[3]
