@@ -105,6 +105,16 @@ static __global__ void flash_attn_ext_oscar2(
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
+    // Pre-compute per-element block/byte/sub indices (constant per thread, avoids re-computation)
+    int ib[nelems], by[nelems], sub[nelems];
+    #pragma unroll
+    for (int e = 0; e < nelems; ++e) {
+        const int elem  = tid + e * nthreads;
+        ib[e]           = elem / QK_OSCAR2;
+        by[e]           = (elem % QK_OSCAR2) / 4;
+        sub[e]          = (elem % QK_OSCAR2) % 4;
+    }
+
     // Load Q into registers
     float Q_reg[ncols][nelems];
     #pragma unroll
@@ -140,21 +150,22 @@ static __global__ void flash_attn_ext_oscar2(
             const block_oscar2 * K_blk = (const block_oscar2 *)(K + i_kv * nb11);
             const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
-            // ---- On-the-fly K dequant + dot product ----
+            // ---- On-the-fly K dequant + dot product (with cached d/m per block) ----
             float KQ_val[ncols] = {0.0f};
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum = 0.0f;
+                int prev_ib_k = -1;
+                float d_k = 0.0f, m_k = 0.0f;
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) {
-                    const int elem  = tid + e * nthreads;
-                    const int ib    = elem / QK_OSCAR2;
-                    const int by    = (elem % QK_OSCAR2) / 4;
-                    const int sub   = (elem % QK_OSCAR2) % 4;
-                    const uint8_t code = (K_blk[ib].qs[by] >> (2 * sub)) & 0x03;
-                    const float d   = __half2float(K_blk[ib].d);
-                    const float m   = __half2float(K_blk[ib].m);
-                    sum += ((float)code * d + m) * Q_reg[j][e];
+                    if (ib[e] != prev_ib_k) {
+                        d_k = __half2float(K_blk[ib[e]].d);
+                        m_k = __half2float(K_blk[ib[e]].m);
+                        prev_ib_k = ib[e];
+                    }
+                    const uint8_t code = (K_blk[ib[e]].qs[by[e]] >> (2 * sub[e])) & 0x03;
+                    sum += ((float)code * d_k + m_k) * Q_reg[j][e];
                 }
                 KQ_val[j] = sum;
             }
@@ -162,7 +173,6 @@ static __global__ void flash_attn_ext_oscar2(
             // ---- Score and online softmax ----
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                // Reduce partial KQ sum to get full score
                 float full_kq;
                 if constexpr (nwarps_k > 1) {
                     float warp_sum = warp_reduce_sum(KQ_val[j]);
@@ -183,8 +193,6 @@ static __global__ void flash_attn_ext_oscar2(
                 if (maskh && (ncols == 1 || ic0 + j < (int)ne01.z))
                     full_kq += slope * __half2float(maskh[j*ne11 + i_kv]);
 
-                // Online softmax: rn = max(prev_max, full_kq + offset)
-                // All threads have the same full_kq after reduction, so rn is uniform.
                 const float rn = fmaxf(KQ_max[j], full_kq + FATTN_KQ_MAX_OFFSET);
                 const float ks = expf(KQ_max[j] - rn);
                 KQ_max[j] = rn;
@@ -194,17 +202,13 @@ static __global__ void flash_attn_ext_oscar2(
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
 
-                // ---- On-the-fly V dequant + VKQ accumulation ----
+                // ---- On-the-fly V dequant + VKQ accumulation (using pre-computed indices) ----
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) {
-                    const int elem  = tid + e * nthreads;
-                    const int ib    = elem / QK_OSCAR2;
-                    const int by    = (elem % QK_OSCAR2) / 4;
-                    const int sub   = (elem % QK_OSCAR2) % 4;
-                    const uint8_t code = (V_blk[ib].qs[by] >> (2 * sub)) & 0x03;
-                    const float d   = __half2float(V_blk[ib].d);
-                    const float m   = __half2float(V_blk[ib].m);
-                    VKQ[j][e] += ke * ((float)code * d + m);
+                    const uint8_t code = (V_blk[ib[e]].qs[by[e]] >> (2 * sub[e])) & 0x03;
+                    const float d_v = __half2float(V_blk[ib[e]].d);
+                    const float m_v = __half2float(V_blk[ib[e]].m);
+                    VKQ[j][e] += ke * ((float)code * d_v + m_v);
                 }
             }
 
