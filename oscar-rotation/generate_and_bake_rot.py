@@ -34,41 +34,71 @@ sys.path.insert(0, str(TQ_GGUF))
 
 
 def read_model_config(path: str) -> dict:
-    """Read GGUF metadata to extract architecture parameters."""
+    """Read GGUF metadata to extract architecture parameters.
+
+    Returns per-layer head dimensions (Gemma-4 SWA can have variable head dim).
+    """
     import gguf
+    import numpy as np
     r = gguf.GGUFReader(path)
     arch = r.get_field("general.architecture").parts[-1].tobytes().decode()
     n_layers = int(r.get_field(f"{arch}.block_count").parts[-1])
     n_head = int(r.get_field(f"{arch}.attention.head_count").parts[-1])
+    n_head_kv = int(r.get_field(f"{arch}.attention.head_count_kv").parts[-1])
 
-    # Find head_dim from a Q projection weight
-    head_dim = None
+    # Derive per-layer head dimensions from attn_q weight shapes.
+    # Gemma-4 SWA can have variable head_dim per layer; this is authoritative.
+    q_shapes = {}
     for t in r.tensors:
-        if any(k in t.name for k in ["q_proj.weight", "attn_q.weight"]):
-            head_dim = t.shape[1] // n_head
-            break
-    if head_dim is None:
-        raise ValueError("Could not determine head_dim (no q_proj/attn_q tensor found)")
+        if ".attn_q.weight" in t.name or ".q_proj.weight" in t.name:
+            parts = t.name.split(".")
+            # blk.N.attn_q.weight -> N
+            try:
+                idx = parts.index("blk")
+                layer = int(parts[idx + 1])
+                q_shapes[layer] = t.shape[-1]
+            except (ValueError, IndexError):
+                pass
 
-    return {"arch": arch, "n_layers": n_layers, "n_head": n_head, "head_dim": int(head_dim)}
+    if not q_shapes:
+        raise ValueError("Could not find any attn_q/q_proj tensors")
+
+    per_layer_hd = {}
+    for layer, qdim in q_shapes.items():
+        per_layer_hd[layer] = qdim // n_head
+
+    return {
+        "arch": arch,
+        "n_layers": n_layers,
+        "n_head": n_head,
+        "n_head_kv": n_head_kv,
+        "per_layer_head_dim": per_layer_hd,
+    }
 
 
 def generate_hadamard(cfg: dict, output_dir: str):
     """Generate Hadamard rotation .pt files compatible with export_rot_kv_gguf.py."""
-    hd = cfg["head_dim"]
     nl = cfg["n_layers"]
-    assert hd & (hd - 1) == 0, f"head_dim={hd} must be power of 2 for Hadamard"
+    per_layer_hd = cfg["per_layer_head_dim"]
 
-    # Build normalized Hadamard matrix
-    h = torch.tensor([[1.0]], dtype=torch.float64)
-    while h.shape[0] < hd:
-        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
-    h = h / math.sqrt(hd)
-    h = h.float()
-    err = (h @ h.T - torch.eye(hd)).abs().max().item()
-    print(f"Hadamard orthogonality error: {err:.2e}")
+    # Unique head dims across all layers
+    unique_hd = sorted(set(per_layer_hd.values()))
+    for hd in unique_hd:
+        assert hd & (hd - 1) == 0, f"head_dim={hd} must be power of 2 for Hadamard"
 
-    eigvals = torch.ones(hd, dtype=torch.float32)
+    # Cache: generate each unique-sized Hadamard once
+    had_cache = {}
+    for hd in unique_hd:
+        h = torch.tensor([[1.0]], dtype=torch.float64)
+        while h.shape[0] < hd:
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+        h = h / math.sqrt(hd)
+        h = h.float()
+        err = (h @ h.T - torch.eye(hd)).abs().max().item()
+        print(f"  Hadamard {hd}x{hd} orthogonality error: {err:.2e}")
+        had_cache[hd] = h
+
+    eigvals_cache = {hd: torch.ones(hd, dtype=torch.float32) for hd in unique_hd}
 
     for target in ("k", "v"):
         result = {
@@ -78,10 +108,11 @@ def generate_hadamard(cfg: dict, output_dir: str):
             "layers": {},
         }
         for layer_id in range(nl):
+            hd = per_layer_hd.get(layer_id, unique_hd[0])
             result["layers"][layer_id] = {
                 "layer_id": layer_id,
-                "rotation": h.clone(),
-                "eigenvalues": eigvals.clone(),
+                "rotation": had_cache[hd].clone(),
+                "eigenvalues": eigvals_cache[hd].clone(),
             }
         # Save with both our canonical name AND the name export_rot_kv expects
         path = Path(output_dir) / f"{target}_rotation_hadamard.pt"
@@ -115,11 +146,16 @@ def main():
     if args.method == "hadamard":
         print(f"Reading model: {base_path.name}")
         cfg = read_model_config(str(base_path))
-        print(f"  Architecture: {cfg['arch']}")
-        print(f"  Layers: {cfg['n_layers']}, Head dim: {cfg['head_dim']}")
+        per_layer_hd = cfg["per_layer_head_dim"]
+        # Summarize per-layer head dim distribution
+        hd_counts = {}
+        for hd in per_layer_hd.values():
+            hd_counts[hd] = hd_counts.get(hd, 0) + 1
+        hd_summary = ", ".join(f"{n} layers: {hd}x{hd}" for hd, n in sorted(hd_counts.items()))
+        print(f"  Architecture: {cfg['arch']}, {cfg['n_layers']} layers, {cfg['n_head']} heads")
+        print(f"  Per-layer head dim: {hd_summary}")
         print(f"  Generating Hadamard rotation...")
         generate_hadamard(cfg, str(rot_dir))
-
     elif args.method == "calibrated":
         if not args.dump_path:
             print("ERROR: --dump-path is required for --method calibrated")
@@ -128,13 +164,15 @@ def main():
         try:
             from compute_kv_rotation import write_hadamard_rotation, main as compute_main
             cfg = read_model_config(str(base_path))
+            # Use the first layer's head dim as the canonical head dim for the paper script
+            first_hd = list(cfg["per_layer_head_dim"].values())[0]
             # Run the paper's compute script via its main
             import subprocess
             cmd = [
                 sys.executable, str(PAPER_ROT / "compute_kv_rotation.py"),
                 "--method", "qqt_sst",
                 "--dump-path", args.dump_path,
-                "--head-dim", str(cfg["head_dim"]),
+                "--head-dim", str(first_hd),
                 "--composition", "r_h_pbr",
                 "--output-dir", str(rot_dir),
             ]
