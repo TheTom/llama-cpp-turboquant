@@ -29,11 +29,19 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     constexpr int ncols = ncols1 * ncols2;
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
-    const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
+    int        nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
+
+    // For long contexts (many KV tiles), increase nbatch_fa to reduce tile iterations.
+    // This improves tensor-core utilization and reduces tile-loading overhead.
+    const ggml_tensor * K = dst->src[1];
+    const int n_kv = K->ne[1];
+    while (nbatch_fa < 256 && n_kv / nbatch_fa > 256) {
+        nbatch_fa *= 2;
+    }
 
     // turbo path is always single-stage synchronous (nstages forced to 0 in the kernel).
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
