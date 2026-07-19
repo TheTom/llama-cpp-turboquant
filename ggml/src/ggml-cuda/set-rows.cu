@@ -1466,8 +1466,20 @@ static __global__ void set_rows_cuda_oscar2(
         }
         __syncthreads();
 
-        const float vmin_final = sh_min[0];
-        const float vmax_final = sh_max[0];
+        // Outlier-robust min/max: clamp when min-max range is outlier-stretched.
+        // 2-bit min-max quantization is very sensitive to per-block outliers — a single
+        // extreme value stretches d = (max-min)/3 → all 4 codes spread across a huge
+        // range, losing precision for the 95% of typical-valued elements.
+        // Fix: clamp raw min/max to mean ± 1.5 (max_scale=1.0) so d ≤ 1.0.
+        // Outlier values (>1.5σ from mean) are clipped to code 0/3 (harmless).
+        const float raw_min    = sh_min[0];
+        const float raw_max    = sh_max[0];
+        const float mid        = (raw_min + raw_max) * 0.5f;
+        const float raw_scale  = (raw_max - raw_min) / 3.0f;
+        const float max_scale  = 1.0f;
+        const float half_range = fminf(raw_scale, max_scale) * 3.0f * 0.5f;
+        const float vmin_final = mid - half_range;
+        const float vmax_final = mid + half_range;
         const float scale      = (vmax_final - vmin_final) / 3.0f;
         const float inv_s      = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
 
