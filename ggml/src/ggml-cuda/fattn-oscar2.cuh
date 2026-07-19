@@ -94,10 +94,7 @@ static __global__ void flash_attn_ext_oscar2(
     const int ic0 = blockIdx.x * ncols;
     const int sequence = blockIdx.z / ne02;
     const int head     = blockIdx.z - sequence * ne02;
-    // gqa_ratio = n_head / n_head_kv. Compute from cache dimensions (ne12=ne02/ne12 is wrong
-    // when n_stream=1 but n_head_kv>1, as n_stream != n_head_kv for unified caches).
-    const int n_head_kv = ne10 / ne00;
-    const int gqa_ratio = n_head_kv > 0 ? ne02 / n_head_kv : 1;
+    const int gqa_ratio = ne02 / ne12; // n_head / n_head_kv (ne12 = n_head_kv after permute)
 
     const char * Q = Q_ptr + nb03*sequence + nb02*head + nb01*ic0;
     const char * K = K_ptr + nb13*sequence + nb12*(head / gqa_ratio) + blockIdx.y * nthreads * nb11;
