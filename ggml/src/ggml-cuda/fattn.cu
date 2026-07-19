@@ -553,6 +553,10 @@ static void ggml_cuda_flash_attn_ext_q2_0(ggml_backend_cuda_context & ctx, ggml_
             if (type_V == GGML_TYPE_Q2_PREH) {                                             \
                 ggml_cuda_flash_attn_ext_q2_0_case<DIM, GGML_TYPE_Q8_0, GGML_TYPE_Q2_PREH>(ctx, dst); return; \
             }                                                                              \
+    }
+    if (D ==  64) { DISPATCH_Q2_0( 64); }
+    if (D == 128) { DISPATCH_Q2_0(128); }
+    if (D == 256) { DISPATCH_Q2_0(256); }
     if (D == 512) { DISPATCH_Q2_0(512); }
 
 #undef DISPATCH_Q2_0
@@ -813,11 +817,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_BLACKWELL && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_BLACKWELL) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
@@ -827,7 +831,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     }
                 }
             }
-            if (!gqa_opt_applies && Q->ne[1] == 1) {
+            if (!gqa_opt_applies && Q->ne[1] == 1 && cc < GGML_CUDA_CC_BLACKWELL) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
