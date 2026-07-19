@@ -105,14 +105,22 @@ static __global__ void flash_attn_ext_oscar2(
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
-    // Pre-compute per-element block/byte/sub indices (constant per thread, avoids re-computation)
-    int ib[nelems], by[nelems], sub[nelems];
+    // Block-unrolled K/V dequant: each thread handles D/32 elements.
+    // For D >= 128, elements span nblocks = D/128 oscar2 blocks with 4 elements/block.
+    // For D < 128, fall back to the original element-by-element loop.
+    constexpr bool use_block_unroll = (D >= 128);
+    constexpr int nblocks = use_block_unroll ? D / QK_OSCAR2 : 1;
+    constexpr int elems_per_block = use_block_unroll ? 4 : nelems;
+    constexpr int d_per_block  = QK_OSCAR2;
+
+    // Pre-compute byte offset and bit-shift within qs[] (per-block, same for all blocks)
+    int by_blk[elems_per_block];
+    int shift_blk[elems_per_block];
     #pragma unroll
-    for (int e = 0; e < nelems; ++e) {
-        const int elem  = tid + e * nthreads;
-        ib[e]           = elem / QK_OSCAR2;
-        by[e]           = (elem % QK_OSCAR2) / 4;
-        sub[e]          = (elem % QK_OSCAR2) % 4;
+    for (int e = 0; e < elems_per_block; ++e) {
+        const int off = tid + e * nthreads;
+        by_blk[e]    = off / 4;
+        shift_blk[e] = (off & 3) * 2;
     }
 
     // Load Q into registers
@@ -150,22 +158,27 @@ static __global__ void flash_attn_ext_oscar2(
             const block_oscar2 * K_blk = (const block_oscar2 *)(K + i_kv * nb11);
             const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
-            // ---- On-the-fly K dequant + dot product (with cached d/m per block) ----
+            // ---- K dequant + dot product ----
             float KQ_val[ncols] = {0.0f};
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum = 0.0f;
-                int prev_ib_k = -1;
-                float d_k = 0.0f, m_k = 0.0f;
                 #pragma unroll
-                for (int e = 0; e < nelems; ++e) {
-                    if (ib[e] != prev_ib_k) {
-                        d_k = __half2float(K_blk[ib[e]].d);
-                        m_k = __half2float(K_blk[ib[e]].m);
-                        prev_ib_k = ib[e];
+                for (int b = 0; b < nblocks; ++b) {
+                    const float d_k = __half2float(K_blk[b].d);
+                    const float m_k = __half2float(K_blk[b].m);
+                    #pragma unroll
+                    for (int e = 0; e < elems_per_block; ++e) {
+                        const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                        sum += (fmaf((float)code, d_k, m_k)) * Q_reg[j][b * elems_per_block + e];
                     }
-                    const uint8_t code = (K_blk[ib[e]].qs[by[e]] >> (2 * sub[e])) & 0x03;
-                    sum += ((float)code * d_k + m_k) * Q_reg[j][e];
+                }
+                // Handle D < 128 (partial block)
+                if constexpr (!use_block_unroll) {
+                    for (int e = 0; e < nelems; ++e) {
+                        const uint8_t code = (K_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                        sum += (fmaf((float)code, __half2float(K_blk[0].d), __half2float(K_blk[0].m))) * Q_reg[j][e];
+                    }
                 }
                 KQ_val[j] = sum;
             }
@@ -202,19 +215,29 @@ static __global__ void flash_attn_ext_oscar2(
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
 
-                // ---- On-the-fly V dequant + VKQ accumulation (using pre-computed indices) ----
-                #pragma unroll
-                for (int e = 0; e < nelems; ++e) {
-                    const uint8_t code = (V_blk[ib[e]].qs[by[e]] >> (2 * sub[e])) & 0x03;
-                    const float d_v = __half2float(V_blk[ib[e]].d);
-                    const float m_v = __half2float(V_blk[ib[e]].m);
-                    VKQ[j][e] += ke * ((float)code * d_v + m_v);
+                // ---- V dequant + VKQ accumulation ----
+                if constexpr (use_block_unroll) {
+                    #pragma unroll
+                    for (int b = 0; b < nblocks; ++b) {
+                        const float d_v = __half2float(V_blk[b].d);
+                        const float m_v = __half2float(V_blk[b].m);
+                        #pragma unroll
+                        for (int e = 0; e < elems_per_block; ++e) {
+                            const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                            VKQ[j][b * elems_per_block + e] += ke * fmaf((float)code, d_v, m_v);
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (int e = 0; e < nelems; ++e) {
+                        const uint8_t code = (V_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                        VKQ[j][e] += ke * fmaf((float)code, __half2float(V_blk[0].d), __half2float(V_blk[0].m));
+                    }
                 }
             }
 
         }
     }
-
     // Write results
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
