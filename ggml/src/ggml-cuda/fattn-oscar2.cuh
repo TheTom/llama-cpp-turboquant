@@ -79,15 +79,17 @@ static __global__ void flash_attn_ext_oscar2(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 
 #ifdef FLASH_ATTN_AVAILABLE
-    constexpr int nwarps_k = D >= QK_OSCAR2 ? 4 : 1;
+    // OPTIMIZED: use 1 warp (32 threads) instead of 4 warps (128 threads).
+    // Each thread handles D/32 elements. No cross-warp __syncthreads needed.
+    constexpr int nwarps_k = 1;
     constexpr int nthreads = nwarps_k * WARP_SIZE;
     static_assert(D % nthreads == 0, "D not divisible by nthreads");
     constexpr int nelems = D / nthreads;
 
     const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
 
-    __shared__ float s_buf[2 * D]; // [0..D-1]: K, [D..2D-1]: V
-    __shared__ float s_red[32];    // cross-warp reduction
+    // Shared memory for cross-warp reduction only (no K/V s_buf)
+    __shared__ float s_red[32];
 
     const int ic0 = blockIdx.x * ncols;
     const int sequence = blockIdx.z / ne02;
@@ -135,49 +137,66 @@ static __global__ void flash_attn_ext_oscar2(
         for (int i_kv = 0; i_kv < nthreads; ++i_kv) {
             if (kv_base + i_kv >= k_VKQ_max) break;
 
-            // ---- K dequant (OSCAR2 only) ----
             const block_oscar2 * K_blk = (const block_oscar2 *)(K + i_kv * nb11);
-            if constexpr (nwarps_k > 1) {
-                dequant_row_oscar2_parallel(K_blk, D, s_buf);
-            } else {
-                if (tid == 0) {
-                    dequant_row_oscar2(K_blk, D, s_buf);
-                }
-                __syncwarp();
-            }
+            const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
-            // ---- KQ dot product ----
+            // ---- On-the-fly K dequant + dot product ----
             float KQ_val[ncols] = {0.0f};
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum = 0.0f;
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) {
-                    sum += s_buf[tid + e * nthreads] * Q_reg[j][e];
+                    const int elem  = tid + e * nthreads;
+                    const int ib    = elem / QK_OSCAR2;
+                    const int by    = (elem % QK_OSCAR2) / 4;
+                    const int sub   = (elem % QK_OSCAR2) % 4;
+                    const uint8_t code = (K_blk[ib].qs[by] >> (2 * sub)) & 0x03;
+                    const float d   = __half2float(K_blk[ib].d);
+                    const float m   = __half2float(K_blk[ib].m);
+                    sum += ((float)code * d + m) * Q_reg[j][e];
                 }
                 KQ_val[j] = sum;
             }
 
+            // ---- Score and online softmax ----
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float full_kq;
+                // Combined warp-level sum and max
+                float kq_part = KQ_val[j];
+                float mx_part = kq_part + FATTN_KQ_MAX_OFFSET + KQ_max[j];
                 if constexpr (nwarps_k > 1) {
-                    full_kq = block_reduce_sum_broadcast(KQ_val[j], s_red);
+                    kq_part = warp_reduce_sum(kq_part);
+                    mx_part = warp_reduce_max(mx_part);
+                    if (threadIdx.x == 0) {
+                        s_red[threadIdx.y * 2]     = kq_part;
+                        s_red[threadIdx.y * 2 + 1] = mx_part;
+                    }
+                    __syncthreads();
+                    if (threadIdx.y == 0) {
+                        float cross_sum = threadIdx.x < nwarps_k ? s_red[threadIdx.x * 2]     : 0.0f;
+                        float cross_mx  = threadIdx.x < nwarps_k ? s_red[threadIdx.x * 2 + 1] : -FLT_MAX/2;
+                        cross_sum = warp_reduce_sum(cross_sum);
+                        cross_mx  = warp_reduce_max(cross_mx);
+                        if (threadIdx.x == 0) {
+                            s_red[0] = cross_sum;
+                            s_red[1] = cross_mx;
+                        }
+                    }
+                    __syncthreads();
+                    kq_part = s_red[0];
+                    mx_part = s_red[1];
                 } else {
-                    full_kq = warp_reduce_sum(KQ_val[j]);
+                    kq_part = warp_reduce_sum(kq_part);
+                    mx_part = warp_reduce_max(mx_part);
                 }
 
+                float full_kq = kq_part;
                 if (use_logit_softcap) full_kq = logit_softcap * tanhf(full_kq);
                 if (maskh && (ncols == 1 || ic0 + j < (int)ne01.z))
                     full_kq += slope * __half2float(maskh[j*ne11 + i_kv]);
 
-                const float nm = fmaxf(KQ_max[j], full_kq + FATTN_KQ_MAX_OFFSET);
-                float rn;
-                if constexpr (nwarps_k > 1) {
-                    rn = block_reduce_max_broadcast(nm, s_red);
-                } else {
-                    rn = warp_reduce_max(nm);
-                }
+                const float rn = mx_part;
                 const float ks = expf(KQ_max[j] - rn);
                 KQ_max[j] = rn;
                 const float ke = expf(full_kq - KQ_max[j]);
@@ -186,20 +205,17 @@ static __global__ void flash_attn_ext_oscar2(
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
 
-                // ---- V dequant (OSCAR2 only) ----
-                const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
-                if constexpr (nwarps_k > 1) {
-                    dequant_row_oscar2_parallel(V_blk, D, s_buf + D);
-                } else {
-                    if (tid == 0) {
-                        dequant_row_oscar2(V_blk, D, s_buf + D);
-                    }
-                    __syncwarp();
-                }
-
+                // ---- On-the-fly V dequant + VKQ accumulation ----
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) {
-                    VKQ[j][e] += ke * s_buf[D + tid + e * nthreads];
+                    const int elem  = tid + e * nthreads;
+                    const int ib    = elem / QK_OSCAR2;
+                    const int by    = (elem % QK_OSCAR2) / 4;
+                    const int sub   = (elem % QK_OSCAR2) % 4;
+                    const uint8_t code = (V_blk[ib].qs[by] >> (2 * sub)) & 0x03;
+                    const float d   = __half2float(V_blk[ib].d);
+                    const float m   = __half2float(V_blk[ib].m);
+                    VKQ[j][e] += ke * ((float)code * d + m);
                 }
             }
         }
@@ -237,7 +253,6 @@ static __global__ void flash_attn_ext_oscar2(
 // ---------------------------------------------------------------------------
 // Host-side launcher
 // ---------------------------------------------------------------------------
-
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -246,10 +261,10 @@ void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    constexpr size_t nbytes = 2 * D * sizeof(float);
-
-    // nwarps = 4 for D >= QK_OSCAR2 (128), 1 for smaller D
-    constexpr int nwarps = D >= QK_OSCAR2 ? 4 : 1;
+    // Shared memory: just s_red[32] = 128 bytes (no K/V s_buf)
+    constexpr size_t nbytes = 0; // no dynamic shared memory needed
+    // OPTIMIZED: always 1 warp (was: D >= QK_OSCAR2 ? 4 : 1)
+    constexpr int nwarps = 1;
 
     const int nbatch_fa = dst->src[1]->ne[1];
 
