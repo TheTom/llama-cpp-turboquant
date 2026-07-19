@@ -6678,6 +6678,66 @@ struct test_set_rows_turbo4 : public test_case {
     }
 };
 
+// Test SET_ROWS with oscar2 destination, then dequantize and compare.
+// No Hadamard, no rotation — just asymmetric INT2 quantize + fp16 scale/zero.
+// This validates the full quantize/dequant pipeline for the OSCAR2 KV cache type.
+struct test_set_rows_oscar2 : public test_case {
+    const ggml_type type_idx;
+    const int64_t ne0; // head dim (must be multiple of QK_OSCAR2=128)
+    const int64_t ne1; // rows in dst
+    const int r;       // rows to write
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_idx, ne0, ne1, r);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SET_ROWS_OSCAR2";
+    }
+
+    test_set_rows_oscar2(ggml_type type_idx = GGML_TYPE_I32,
+            int64_t ne0 = 128, int64_t ne1 = 16, int r = 4)
+        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // dst: the oscar2 KV cache buffer
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_OSCAR2, ne0, ne1);
+        ggml_set_name(dst, "dst");
+
+        // src: f32 values to quantize into the cache
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
+        ggml_set_name(src, "src");
+
+        // row indices
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, type_idx, r);
+        ggml_set_name(row_idxs, "row_idxs");
+
+        // SET_ROWS: quantize and store f32 -> oscar2
+        ggml_tensor * result = ggml_set_rows(ctx, dst, src, row_idxs);
+        ggml_set_name(result, "result");
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) continue;
+                init_set_rows_row_ids(t, ne1);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        // INT2 quantization introduces ~17% relative error per element for
+        // uniform data. The NMSE bound accounts for this plus any layout
+        // mismatch which would produce errors orders of magnitude larger.
+        return 0.5;
+    }
+};
+
 // Test SET_ROWS with TQ4_1S destination (weight quantization), then dequantize and compare.
 // Validates: f32 -> WHT forward -> 16-centroid quantize -> nibble pack -> SET_ROWS
 // followed by: GET_ROWS/CPY -> WHT inverse -> f32 dequant. Round-trip error is bounded.
@@ -9403,6 +9463,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows_turbo4(GGML_TYPE_I32, 256, 2048, 512));
     test_cases.emplace_back(new test_set_rows_turbo4(GGML_TYPE_I32, 512, 1024, 256));
 
+    // SET_ROWS with oscar2 destination: quantize then dequant round-trip
+    // Minimal test: layout mismatch produces garbage even at the smallest size.
+    for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+        for (int64_t ne0 : {128, 256, 512}) {
+            for (int r : {1, 4}) {
+                test_cases.emplace_back(new test_set_rows_oscar2(idx_type, ne0, 16, r));
+            }
+        }
+    }
+    // Large tensor (realistic cache stride at 4 kv_heads)
+    test_cases.emplace_back(new test_set_rows_oscar2(GGML_TYPE_I32, 128, 4096, 1024));
+    test_cases.emplace_back(new test_set_rows_oscar2(GGML_TYPE_I32, 256, 2048, 512));
+    test_cases.emplace_back(new test_set_rows_oscar2(GGML_TYPE_I32, 512, 1024, 256));
+
     // SET_ROWS with TQ4_1S destination: quantize then dequant round-trip
     for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
         for (int64_t ne0 : {32, 64, 128, 256}) {
@@ -9484,6 +9558,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // LLAMA_KV_NO_HADAMARD=1 so both skip the in-quant Hadamard).
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
+
+    // OSCAR2 KV cache: asymmetric INT2 with no Hadamard.
+    // Head dim 128 = one oscar2 block per vector.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    // Head dim 256 = two oscar2 blocks per vector (Gemma-4).
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    // Head dim 512 = four oscar2 blocks per vector (Gemma-4 large).
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -9772,6 +9856,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // OSCAR INT2 KV cache (q2_0): head size 128 = one 128-wide mean group per head.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
+
+    // OSCAR2 KV cache: asymmetric INT2, no Hadamard.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
