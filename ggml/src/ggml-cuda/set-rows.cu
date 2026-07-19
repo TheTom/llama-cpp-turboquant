@@ -1424,55 +1424,66 @@ static __global__ void set_rows_cuda_oscar2(
 
     const unsigned t = threadIdx.x; // 0..127, one per element
 
-    __shared__ float sh_min[4];  // one per warp
-    __shared__ float sh_max[4];
+    // Shared memory for Hadamard pipeline: values, warp sums
+    __shared__ float sh_vals[QK_OSCAR2];
+    __shared__ float sh_wsum[8];  // [0..3] = warp sums, [4..7] = warp sum-sqs 
     __shared__ uint8_t sh_codes[QK_OSCAR2];
 
     for (int iv = 0; iv < nk0; ++iv) {
-        const float val = src_row[iv * QK_OSCAR2 + t];
-
-        // Intra-warp reduction for min and max (warp shuffle)
-        float vmin = val, vmax = val;
-        #pragma unroll
-        for (int s = 16; s > 0; s >>= 1) {
-            const float other_min = __shfl_xor_sync(0xFFFFFFFF, vmin, s, 32);
-            const float other_max = __shfl_xor_sync(0xFFFFFFFF, vmax, s, 32);
-            vmin = fminf(vmin, other_min);
-            vmax = fmaxf(vmax, other_max);
-        }
-
-        // Store warp results to shared
-        if (t % 32 == 0) {
-            sh_min[t / 32] = vmin;
-            sh_max[t / 32] = vmax;
-        }
+        // Load into shared, compute mean, subtract, apply Hadamard, compute RMS
+        sh_vals[t] = src_row[iv * QK_OSCAR2 + t];
         __syncthreads();
 
-        // Cross-warp reduction (threads 0-3 in first warp)
-        if (t < 4) {
-            vmin = sh_min[t];
-            vmax = sh_max[t];
-            #pragma unroll
-            for (int s = 2; s > 0; s >>= 1) {
-                const float other_min = __shfl_xor_sync(0x0F, vmin, s, 4);
-                const float other_max = __shfl_xor_sync(0x0F, vmax, s, 4);
-                vmin = fminf(vmin, other_min);
-                vmax = fmaxf(vmax, other_max);
+        // Mean via warp + cross-warp sum
+        float s = sh_vals[t];
+        for (int k = 16; k > 0; k >>= 1) s += __shfl_xor_sync(0xFFFFFFFF, s, k, 32);
+        if (t % 32 == 0) sh_wsum[t / 32] = s;
+        __syncthreads();
+        float total = (t < 4) ? sh_wsum[t] : 0.0f;
+        for (int k = 2; k > 0; k >>= 1) total += __shfl_xor_sync(0x0F, total, k, 4);
+        total = __shfl_sync(0xFFFFFFFF, total, 0, 32);
+        const float mean = total / (float)QK_OSCAR2;
+
+        // Subtract mean, forward Hadamard, normalize
+        sh_vals[t] -= mean;
+        __syncthreads();
+        for (int h = 1; h < QK_OSCAR2; h <<= 1) {
+            if (!(t & h)) {
+                const float a = sh_vals[t];
+                const float b = sh_vals[t + h];
+                sh_vals[t]     = a + b;
+                sh_vals[t + h] = a - b;
             }
+            __syncthreads();
         }
-        if (t == 0) {
-            sh_min[0] = vmin;
-            sh_max[0] = vmax;
-        }
+        const float s_had = rsqrtf((float)QK_OSCAR2);
+        sh_vals[t] *= s_had;
         __syncthreads();
 
-        const float vmin_final = sh_min[0];
-        const float vmax_final = sh_max[0];
-        const float scale      = (vmax_final - vmin_final) / 3.0f;
-        const float inv_s      = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
+        // Compute RMS of Hadamard values (zero-centered after mean subtract)
+        const float hv = sh_vals[t];
+        s = hv;
+        float sq = hv * hv;
+        for (int k = 16; k > 0; k >>= 1) {
+            s  += __shfl_xor_sync(0xFFFFFFFF, s, k, 32);
+            sq += __shfl_xor_sync(0xFFFFFFFF, sq, k, 32);
+        }
+        if (t % 32 == 0) { sh_wsum[t / 32] = s; sh_wsum[4 + t / 32] = sq; }
+        __syncthreads();
+        float total_sq = 0.0f;
+        total = 0.0f;
+        if (t < 4) { for (int i = 0; i < 4; ++i) { total += sh_wsum[i]; total_sq += sh_wsum[4 + i]; } }
+        total    = __shfl_sync(0xFFFFFFFF, total, 0, 32);
+        total_sq = __shfl_sync(0xFFFFFFFF, total_sq, 0, 32);
+        const float rms_val = sqrtf(fmaxf(0.0f, total_sq / (float)QK_OSCAR2 - 
+            (total / (float)QK_OSCAR2) * (total / (float)QK_OSCAR2)));
+        const float k_scale = 1.0f;
+        const float d_val   = fmaxf(rms_val * k_scale, 1e-10f);
+        const float m_val   = mean - 1.5f * d_val;
+        const float inv_d   = 1.0f / d_val;
 
-        // Quantize to 2-bit
-        int code = (int)((val - vmin_final) * inv_s + 0.5f);
+        // Quantize Hadamard values: code = clamp(round(hv/d + 1.5), 0, 3)
+        int code = (int)((hv + 1.5f * d_val) * inv_d + 0.5f);
         if (code < 0) code = 0;
         if (code > 3) code = 3;
         sh_codes[t] = (uint8_t)code;
@@ -1488,8 +1499,8 @@ static __global__ void set_rows_cuda_oscar2(
         }
 
         if (t == 0) {
-            dst_row[iv].d = __float2half(scale);
-            dst_row[iv].m = __float2half(vmin_final);
+            dst_row[iv].d = __float2half(d_val);
+            dst_row[iv].m = __float2half(m_val);
         }
         __syncthreads();
     }

@@ -51,6 +51,38 @@ static __device__ __forceinline__ void dequant_row_oscar2_parallel(
     }
 }
 // ---------------------------------------------------------------------------
+// 32-thread inverse Hadamard on 128 elements (shared memory).
+// Thread tid owns elements [tid, tid+32, tid+64, tid+96].
+// Condition: if (!(i & h)) process pair (i, i+h). Must sync before/after call.
+// ---------------------------------------------------------------------------
+static __device__ void hadamard_inverse_128_32w(float * sh, int tid) {
+    #pragma unroll
+    for (int h = 64; h > 0; h >>= 1) {
+        const int i0 = tid;
+        const int i1 = tid + 32;
+        const int i2 = tid + 64;
+        const int i3 = tid + 96;
+        // Read with bounds check to avoid out-of-bounds access
+        const float a0 = sh[i0];
+        const float b0 = (i0 + h < 128) ? sh[i0 + h] : 0.0f;
+        const float a1 = sh[i1];
+        const float b1 = (i1 + h < 128) ? sh[i1 + h] : 0.0f;
+        const float a2 = sh[i2];
+        const float b2 = (i2 + h < 128) ? sh[i2 + h] : 0.0f;
+        const float a3 = sh[i3];
+        const float b3 = (i3 + h < 128) ? sh[i3 + h] : 0.0f;
+        if (!(i0 & h) && i0 + h < 128) { sh[i0] = a0 + b0; sh[i0 + h] = a0 - b0; }
+        if (!(i1 & h) && i1 + h < 128) { sh[i1] = a1 + b1; sh[i1 + h] = a1 - b1; }
+        if (!(i2 & h) && i2 + h < 128) { sh[i2] = a2 + b2; sh[i2 + h] = a2 - b2; }
+        if (!(i3 & h) && i3 + h < 128) { sh[i3] = a3 + b3; sh[i3 + h] = a3 - b3; }
+        __syncthreads();
+    }
+    constexpr float s = 0.08838834764f; // 1/sqrt(128)
+    sh[tid]      *= s;  sh[tid + 32] *= s;
+    sh[tid + 64] *= s;  sh[tid + 96] *= s;
+    __syncthreads();
+}
+// ---------------------------------------------------------------------------
 // Main kernel
 // ---------------------------------------------------------------------------
 
@@ -88,6 +120,8 @@ static __global__ void flash_attn_ext_oscar2(
 
     const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
 
+    // Shared memory for K/V inverse Hadamard buffer (128 floats)
+    __shared__ float sh_val_had[QK_OSCAR2];
     // Shared memory for cross-warp reduction only (no K/V s_buf)
     __shared__ float s_red[32];
 
@@ -158,19 +192,32 @@ static __global__ void flash_attn_ext_oscar2(
             const block_oscar2 * K_blk = (const block_oscar2 *)(K + i_kv * nb11);
             const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
-            // ---- K dequant + dot product ----
+            // ---- K dequant + dot product (with inv-Hadamard test) ----
             float KQ_val[ncols] = {0.0f};
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum = 0.0f;
-                #pragma unroll
-                for (int b = 0; b < nblocks; ++b) {
-                    const float d_k = __half2float(K_blk[b].d);
-                    const float m_k = __half2float(K_blk[b].m);
+                if constexpr (use_block_unroll) {
                     #pragma unroll
-                    for (int e = 0; e < elems_per_block; ++e) {
-                        const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        sum += (fmaf((float)code, d_k, m_k)) * Q_reg[j][b * elems_per_block + e];
+                    for (int b = 0; b < nblocks; ++b) {
+                        const float d_k = __half2float(K_blk[b].d);
+                        const float m_k = __half2float(K_blk[b].m);
+                        #pragma unroll
+                        for (int e = 0; e < elems_per_block; ++e) {
+                            const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                            sh_val_had[tid + e * nthreads] = fmaf((float)code, d_k, m_k);
+                        }
+                        __syncthreads();
+                        hadamard_inverse_128_32w(sh_val_had, tid);
+                        #pragma unroll
+                        for (int e = 0; e < elems_per_block; ++e) {
+                            sum += sh_val_had[tid + e * nthreads] * Q_reg[j][b * elems_per_block + e];
+                        }
+                    }
+                } else {
+                    for (int e = 0; e < nelems; ++e) {
+                        const uint8_t code = (K_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                        sum += (fmaf((float)code, __half2float(K_blk[0].d), __half2float(K_blk[0].m))) * Q_reg[j][e];
                     }
                 }
                 // Handle D < 128 (partial block)
@@ -215,16 +262,25 @@ static __global__ void flash_attn_ext_oscar2(
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
 
-                // ---- V dequant + VKQ accumulation ----
+                // ---- V dequant + inv-Hadamard + VKQ ----
                 if constexpr (use_block_unroll) {
                     #pragma unroll
                     for (int b = 0; b < nblocks; ++b) {
                         const float d_v = __half2float(V_blk[b].d);
                         const float m_v = __half2float(V_blk[b].m);
+                        const float mean_v = m_v + 1.5f * d_v;
                         #pragma unroll
                         for (int e = 0; e < elems_per_block; ++e) {
+                            const int ti = tid + e * nthreads;
                             const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                            VKQ[j][b * elems_per_block + e] += ke * fmaf((float)code, d_v, m_v);
+                            sh_val_had[ti] = fmaf((float)code, d_v, m_v) - mean_v;
+                        }
+                        __syncthreads();
+                        hadamard_inverse_128_32w(sh_val_had, tid);
+                        #pragma unroll
+                        for (int e = 0; e < elems_per_block; ++e) {
+                            const int ti = tid + e * nthreads;
+                            VKQ[j][b * elems_per_block + e] += ke * (sh_val_had[ti] + mean_v);
                         }
                     }
                 } else {
