@@ -215,3 +215,31 @@ template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);
 }
+
+static __device__ void quantize_f32_oscar2_block(const float * __restrict__ x, block_oscar2 * __restrict__ y) {
+    float vmin = FLT_MAX, vmax = -FLT_MAX;
+    for (int j = 0; j < QK_OSCAR2; ++j) {
+        const float v = x[j];
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    const float scale = (vmax - vmin) / 3.0f;
+    const float inv_s = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
+    y->d = __float2half(scale);
+    y->m = __float2half(vmin);
+    for (int j = 0; j < QK_OSCAR2 / 4; ++j) {
+        uint8_t packed = 0;
+        for (int b = 0; b < 4; ++b) {
+            const float val = x[j * 4 + b];
+            int code = (int)((val - vmin) * inv_s + 0.5f);
+            if (code < 0) code = 0;
+            if (code > 3) code = 3;
+            packed |= (uint8_t)(code << (2 * b));
+        }
+        y->qs[j] = packed;
+    }
+}
+
+static __device__ void cpy_blck_f32_oscar2(const char * cxi, char * cdsti) {
+    quantize_f32_oscar2_block((const float *)cxi, (block_oscar2 *)cdsti);
+}
