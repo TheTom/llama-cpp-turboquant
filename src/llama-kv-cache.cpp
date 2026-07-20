@@ -340,6 +340,7 @@ llama_kv_cache::llama_kv_cache(
         //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
         //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
         //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
@@ -419,6 +420,14 @@ llama_kv_cache::llama_kv_cache(
                 LLAMA_LOG_INFO("%s: turbo zero-padding V head_dim %u -> %u (cache %u -> %u)\n",
                                __func__, n_embd_head_v, padded_head_v, n_embd_v_gqa, n_embd_v_gqa_eff);
             }
+        }
+
+        // [OSCAR FIX] For models with SWA (different head dims per layer, e.g. Gemma-4),
+        // the oscar2 Hadamard pipeline produces wrong results. Fall back to f16.
+        // Single-head-dim models (e.g. Qwen) continue using oscar2.
+        if ((layer_type_k == GGML_TYPE_OSCAR2 || layer_type_v == GGML_TYPE_OSCAR2) && n_swa > 0) {
+            if (layer_type_k == GGML_TYPE_OSCAR2) layer_type_k = GGML_TYPE_F16;
+            if (layer_type_v == GGML_TYPE_OSCAR2) layer_type_v = GGML_TYPE_F16;
         }
 
         { static bool once = false; if (!once) { once = true; fprintf(stderr, "[OSCAR] KV cache dtype: K=%s V=%s (n_embd_k_gqa=%d, kv_size=%d)\n", ggml_type_name(layer_type_k), ggml_type_name(layer_type_v), (int) n_embd_k_gqa_eff, (int) kv_size); fflush(stderr); } }

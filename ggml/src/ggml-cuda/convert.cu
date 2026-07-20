@@ -813,6 +813,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_tq4_1s_warp_cuda<half>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
             return dequantize_block_cont_cuda<QK_TQ3_0, QR_TQ3_1S, dequantize_tq3_1s>;
+        case GGML_TYPE_OSCAR2:
+            return dequantize_block_cont_cuda<QK_OSCAR2, 1, dequantize_oscar2>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:

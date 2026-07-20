@@ -293,6 +293,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
         info.devices[id].warp_size = 32;
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
+        // Some CUDA 13.3 / Blackwell driver versions return garbage (e.g., 0x100000001).
+        // Validate and clamp to a safe default.
+        if (info.devices[id].smpbo < 1024 || info.devices[id].smpbo > 256*1024) {
+            info.devices[id].smpbo = 48*1024; // safe fallback: 48 KB
+        }
         info.devices[id].cc = GGML_CUDA_CC_OFFSET_MTHREADS + prop.major * 0x100;
         info.devices[id].cc += prop.minor * 0x10;
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
@@ -300,6 +305,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       (size_t)(prop.totalGlobalMem / (1024 * 1024)));
 #else
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
+        // Some CUDA 13.3 / Blackwell driver versions return garbage (e.g., 0x100000001).
+        // Validate and clamp to a safe default.
+        if (info.devices[id].smpbo < 1024 || info.devices[id].smpbo > 256*1024) {
+            info.devices[id].smpbo = 48*1024; // safe fallback: 48 KB
+        }
         info.devices[id].cc = 100*prop.major + 10*prop.minor;
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",

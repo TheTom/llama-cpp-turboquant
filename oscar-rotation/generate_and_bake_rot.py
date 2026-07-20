@@ -42,9 +42,9 @@ def read_model_config(path: str) -> dict:
     import numpy as np
     r = gguf.GGUFReader(path)
     arch = r.get_field("general.architecture").parts[-1].tobytes().decode()
-    n_layers = int(r.get_field(f"{arch}.block_count").parts[-1])
-    n_head = int(r.get_field(f"{arch}.attention.head_count").parts[-1])
-    n_head_kv = int(r.get_field(f"{arch}.attention.head_count_kv").parts[-1])
+    n_layers = int(r.get_field(f"{arch}.block_count").parts[-1].item())
+    n_head = int(r.get_field(f"{arch}.attention.head_count").parts[-1].item())
+    n_head_kv = int(r.get_field(f"{arch}.attention.head_count_kv").parts[-1].item())
 
     # Derive per-layer head dimensions from attn_q weight shapes.
     # Gemma-4 SWA can have variable head_dim per layer; this is authoritative.
