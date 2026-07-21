@@ -1,5 +1,4 @@
 #include "fattn-q2_0.cuh"
-#include "fattn-oscar2.cuh"
 
 #include "common.cuh"
 #include "fattn-common.cuh"
@@ -564,54 +563,10 @@ static void ggml_cuda_flash_attn_ext_q2_0(ggml_backend_cuda_context & ctx, ggml_
     GGML_ABORT("fatal error");
 }
 
-static void ggml_cuda_flash_attn_ext_oscar2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_tensor * Q = dst->src[0];
-    ggml_tensor * K = dst->src[1];
-    ggml_tensor * V = dst->src[2];
-
-    const int32_t D = Q->ne[0];
-
-    // Dispatch by head dim and KV types (always OSCAR2)
-#define DISPATCH_OSCAR2(DIM)                                                        \
-    switch (type_K) {                                                               \
-        case GGML_TYPE_OSCAR2:                                                      \
-            switch (type_V) {                                                       \
-                case GGML_TYPE_OSCAR2: ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return; \
-                case GGML_TYPE_F16:  ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_F16> (ctx, dst); return; \
-                case GGML_TYPE_Q8_0: ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ctx, dst); return; \
-                default: break;                                                     \
-            }                                                                       \
-            break;                                                                  \
-        case GGML_TYPE_F16:                                                         \
-            if (type_V == GGML_TYPE_OSCAR2) {                                       \
-                ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ctx, dst); return; \
-            }                                                                       \
-            break;                                                                  \
-        case GGML_TYPE_Q8_0:                                                        \
-            if (type_V == GGML_TYPE_OSCAR2) {                                       \
-                ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_Q8_0, GGML_TYPE_OSCAR2>(ctx, dst); return; \
-            }                                                                       \
-            break;                                                                  \
-        default: break;                                                             \
-    }
-
-    ggml_type type_K = K->type;
-    ggml_type type_V = V->type;
-
-    if (D == 64)  { DISPATCH_OSCAR2(64);  }
-    if (D == 128) { DISPATCH_OSCAR2(128); }
-    if (D == 256) { DISPATCH_OSCAR2(256); }
-    if (D == 512) { DISPATCH_OSCAR2(512); }
-
-#undef DISPATCH_OSCAR2
-
-    GGML_ABORT("fatal error");
-}
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_OSCAR2   =  40,
     BEST_FATTN_KERNEL_Q2_0     =  50,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_TILE     = 200,
@@ -701,17 +656,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type == GGML_TYPE_Q2_0 || V->type == GGML_TYPE_Q2_0) {
         return BEST_FATTN_KERNEL_VEC;
     }
-    // OSCAR2 KV: dedicated OSCAR2 kernel for D=64/128/256; D=512 uses TILE (converts to f16 on-the-fly)
+    // P3: Dedicated scalar flash_attn_ext_oscar2 kernel retired.
+    // Decode (K==V, D in {128,256,512}) is handled by the MMA turbo gate above.
+    // All remaining oscar2 cases (prefill, mixed types, D=64) use VEC for D<=256
+    // (inline dequant, handles oscar2 natively) or TILE for D>=512 (launch_fattn
+    // performs f16 pre-conversion).
     if (K->type == GGML_TYPE_OSCAR2 || V->type == GGML_TYPE_OSCAR2) {
         const int D = K->ne[0];
-        if (D == 64 || D == 128 || D == 256) {
-            return BEST_FATTN_KERNEL_OSCAR2;
+        if (D <= 256) {
+            return BEST_FATTN_KERNEL_VEC;
         }
-        // D=512: route through TILE kernel which converts OSCAR2 to f16 in launch_fattn
-        if (D == 512) {
-            return BEST_FATTN_KERNEL_TILE;
-        }
-        return BEST_FATTN_KERNEL_NONE;
+        // D >= 512: TILE handles any oscar2 type via f16 pre-conversion
+        return BEST_FATTN_KERNEL_TILE;
     }
     switch (K->ne[0]) {
         case  64:
@@ -829,7 +785,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
-                    if (Q->ne[1] == 1) {
+                    if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
@@ -952,24 +908,40 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool turbo_matched = (K->type == V->type &&
             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_OSCAR2));
-        if (ggml_cuda_turbo_mma_fused() && turbo_matched
+        if (turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
-            if (Q->ne[0] == 128) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
-                    case GGML_TYPE_OSCAR2:  ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
-                    default: break;
+            const bool is_oscar2 = (K->type == GGML_TYPE_OSCAR2);
+            // Scope A: On Blackwell, VEC is 15.8% faster than MMA turbo for D=128 Q->ne[1]==1
+            // and 25.5% faster for Q->ne[1]==2. Skip MMA turbo for oscar2 small-batch decode
+            // and fall through to the best-kernel selector (which will pick VEC for D<=256).
+            // D=512 skip_mma exception: fallback for D=512 is TILE (not VEC), so the
+            // optimized MMA turbo load tile is preferred over the f16-converting TILE path.
+            const bool skip_mma = (is_oscar2 && cc >= GGML_CUDA_CC_BLACKWELL && Q->ne[1] <= 2 && Q->ne[0] != 512);
+            // P3: For oscar2 K==V, MMA turbo is always the default (no env gate).
+            //      For other turbo types, respect the GGML_TURBO_MMA_FUSED env gate.
+            if (!skip_mma && (is_oscar2 || ggml_cuda_turbo_mma_fused())) {
+                if (Q->ne[0] == 128) {
+                    switch (K->type) {
+                        case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
+                        case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                        case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
+                        case GGML_TYPE_OSCAR2:  ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
+                        default: break;
+                    }
                 }
-            }
-            if (Q->ne[0] == 256) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    // oscar2 at D=256: MMA tensor-core path should benefit from on-the-fly dequant to f16 tiles
-                    case GGML_TYPE_OSCAR2:  ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
-                    default: break;
+                if (Q->ne[0] == 256) {
+                    switch (K->type) {
+                        case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
+                        // oscar2 at D=256: MMA tensor-core path should benefit from on-the-fly dequant to f16 tiles
+                        case GGML_TYPE_OSCAR2:  ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
+                        default: break;
+                    }
+                }
+                if (Q->ne[0] == 512) {
+                    switch (K->type) {
+                        case GGML_TYPE_OSCAR2:  ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
+                        default: break;
+                    }
                 }
             }
         }
@@ -978,9 +950,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
-        case BEST_FATTN_KERNEL_OSCAR2:
-            ggml_cuda_flash_attn_ext_oscar2(ctx, dst);
-            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
@@ -1057,20 +1026,3 @@ template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_OSCAR2, GGML_TYPE
 template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_Q8_0,   GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
 
-// OSCAR2 dedicated kernel template instantiations
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);

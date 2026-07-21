@@ -1,0 +1,7 @@
+// This file has been hand-created (turbo4 MMA decode instance). Do NOT run generate_cu_files.py
+// over it — that script deletes all *.cu including the turbo VEC instances.
+
+#include "../fattn-mma-f16.cuh"
+#include "../fattn-mma-turbo.cuh"
+
+DECL_FATTN_MMA_TURBO_CASE(512, 512, 2, 8, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2);

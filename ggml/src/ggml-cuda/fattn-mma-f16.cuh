@@ -78,7 +78,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256, 128, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 256, 256, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1,  32, 128, 128, 128, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  32, 288, 256, 128, 1, false);
@@ -105,7 +105,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32,  96,  64, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32,  96,  64, 128, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 256, 256, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1,  32, 128, 128, 128, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  32,  96,  64, 128, 1, false);
@@ -124,7 +124,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256,  64, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128,  64, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1,  32, 128, 128,  64, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  32, 288, 256,  64, 1, false);
@@ -182,7 +182,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 256, 256, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 2,  32, 128, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
@@ -243,7 +243,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 256, 1,  64, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 256, 1,  64, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 1,  64, 128, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 1,  64, 256, 256, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1,  64, 128, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 256, 1,  64, 128, 128, 128, 1, true);
@@ -583,11 +583,15 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
 }
 // oscar2 (asymmetric INT2) tile loader. 2-bit linear quantization: val = code * d + m.
 // block_oscar2: qs[32] (4 codes/byte) + fp16 d (scale) + fp16 m (zero point).
+// Inner loop batches by QK_OSCAR2/2=64 half2 block to hoist d,m loading: each oscar2
+// block's d (scale) and m (zero point) are loaded once instead of once per element
+// pair. For D=512 (4 blocks/row), this reduces global d,m reads from 256 to 4 per row.
 template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int block_half2 = QK_OSCAR2 / 2; // 64 half2 elements per oscar2 block
     const int tid = threadIdx.y * warp_size + threadIdx.x;
     #pragma unroll
     for (int row = tid; row < nbatch_fa; row += nthreads) {
@@ -596,24 +600,98 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
             continue;
         }
         const char * row_ptr = KV_raw + (int64_t)row * stride_bytes;
-        for (int c = 0; c < D2; ++c) {
-            const int col   = col_offset + c;
-            const int elem0 = col * 2;
-            const int ib    = elem0 / QK_OSCAR2;
-            const int j0    = elem0 % QK_OSCAR2;
+        // Batch by oscar2 block: hoist d (scale) and m (zero-point) loading.
+        // D2 = 256 (D=512), 128 (D=256), 64 (D=128) → 4, 2, 1 blocks respectively.
+        for (int blk_c = 0; blk_c < D2; blk_c += block_half2) {
+            const int ib = (col_offset + blk_c) * 2 / QK_OSCAR2;
             const block_oscar2 * blk = (const block_oscar2 *)(row_ptr) + ib;
             const float d_f = __half2float(blk->d);
             const float m_f = __half2float(blk->m);
-            const uint8_t qs_byte = blk->qs[j0 / 4];
-            const int     shift  = (j0 % 4) * 2;
-            const uint8_t code0 = (qs_byte >> shift) & 0x3;
-            const uint8_t code1 = (qs_byte >> (shift + 2)) & 0x3;
-            const half lo = __float2half(fmaf((float)code0, d_f, m_f));
-            const half hi = __float2half(fmaf((float)code1, d_f, m_f));
-            tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            const int blk_limit = min(blk_c + block_half2, D2);
+            #pragma unroll
+            for (int c = blk_c; c < blk_limit; ++c) {
+                const int col = col_offset + c;
+                const int elem0 = col * 2;
+                const int j0 = elem0 % QK_OSCAR2;
+                const uint8_t qs_byte = blk->qs[j0 / 4];
+                const int     shift  = (j0 % 4) * 2;
+                const uint8_t code0 = (qs_byte >> shift) & 0x3;
+                const uint8_t code1 = (qs_byte >> (shift + 2)) & 0x3;
+                const half lo = __float2half(fmaf((float)code0, d_f, m_f));
+                const half hi = __float2half(fmaf((float)code1, d_f, m_f));
+                tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            }
         }
     }
 }
+
+#ifdef CP_ASYNC_AVAILABLE
+// oscar2 cp.async pipeline: bulk-copy raw 36-byte blocks to shared memory via cp.async,
+// then dequantize from shared memory. 36-byte blocks are not 16-byte aligned individually,
+// so we copy ceil(raw_bytes_per_row/16)*16 bytes per row. The shared-memory raw buffer is
+// at tile_oscar2_raw (nbytes_shared_total includes room for it on the host side).
+template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int D2, const int stride_bytes, const int col_offset, const int i_sup,
+        char * const __restrict__ tile_oscar2_raw) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int block_half2 = QK_OSCAR2 / 2; // 64 half2 per oscar2 block
+
+    // Raw oscar2 block data layout. cp.async copies 16-byte aligned chunks.
+    const int nblocks_per_row     = (D2 * 2 + QK_OSCAR2 - 1) / QK_OSCAR2; // ceil(D/128)
+    const int raw_bytes_per_row   = nblocks_per_row * (int)sizeof(block_oscar2);
+    const int cp_chunks_per_row   = (raw_bytes_per_row + 15) / 16;
+    const int cp_bytes_per_row    = cp_chunks_per_row * 16;
+
+    const unsigned int sh_raw_32 = ggml_cuda_cvta_generic_to_shared(tile_oscar2_raw);
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+
+    // Stage 1: cp.async bulk copy raw oscar2 blocks from global to shared memory.
+    // Only copy rows < i_sup (OOB check: copy 0 rows when row >= i_sup).
+    const int ncopy_rows = oob_check ? min(i_sup, nbatch_fa) : nbatch_fa;
+    // All threads participate in the 16-byte-chunk copy.
+#pragma unroll
+    for (int chunk = tid; chunk < cp_chunks_per_row * ncopy_rows; chunk += nthreads) {
+        const int r = chunk / cp_chunks_per_row;
+        const int c = chunk % cp_chunks_per_row;
+        const char * src = KV_raw + (int64_t)r * stride_bytes + c * 16;
+        cp_async_cg_16<64>(sh_raw_32 + r * cp_bytes_per_row + c * 16, src);
+    }
+
+    cp_async_wait_all();
+    // Stage 2: Dequantize from shared memory. Use the generic pointer tile_oscar2_raw
+    // (NOT the cvta-converted 32-bit address sh_raw_32) for normal shared memory reads.
+#pragma unroll
+    for (int row = tid; row < nbatch_fa; row += nthreads) {
+        if (oob_check && row >= i_sup) {
+            for (int c = 0; c < D2; ++c) tile_KV[row*stride_tile + c] = make_half2(0.0f, 0.0f);
+            continue;
+        }
+        const char * row_ptr = tile_oscar2_raw + row * cp_bytes_per_row;
+        for (int blk_c = 0; blk_c < D2; blk_c += block_half2) {
+            const int ib = (col_offset + blk_c) * 2 / QK_OSCAR2;
+            const block_oscar2 * blk = (const block_oscar2 *)(row_ptr) + ib;
+            const float d_f = __half2float(blk->d);
+            const float m_f = __half2float(blk->m);
+            const int blk_limit = min(blk_c + block_half2, D2);
+#pragma unroll
+            for (int c = blk_c; c < blk_limit; ++c) {
+                const int col = col_offset + c;
+                const int elem0 = col * 2;
+                const int j0 = elem0 % QK_OSCAR2;
+                const uint8_t qs_byte = blk->qs[j0 / 4];
+                const int     shift  = (j0 % 4) * 2;
+                const uint8_t code0 = (qs_byte >> shift) & 0x3;
+                const uint8_t code1 = (qs_byte >> (shift + 2)) & 0x3;
+                const half lo = __float2half(fmaf((float)code0, d_f, m_f));
+                const half hi = __float2half(fmaf((float)code1, d_f, m_f));
+                tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+            }
+        }
+    }
+}
+#endif // CP_ASYNC_AVAILABLE
 
 // turbo2 (2-bit PolarQuant) tile loader. Plain 2-bit indices (qs, 4/byte), no signs.
 static __constant__ float TURBO_CENTROIDS_2BIT_FATTN[4] = {
@@ -789,6 +867,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
 
+#if defined(CP_ASYNC_AVAILABLE)
+    // Raw oscar2 block buffer for cp.async pipeline (positioned after tile_mask at end of shared memory).
+    // Only used within is_turbo_kv path (nstages==0 guaranteed).
+    // NOTE: mask allocation uses sizeof(half2) stride per column, matching host-side nbytes_shared_mask.
+    constexpr size_t mask_bytes = (size_t)ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+    char * tile_oscar2_raw = (char *)tile_mask + mask_bytes;
+#endif
+
     if constexpr (nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
@@ -831,8 +917,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo2_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else {
+#if defined(CP_ASYNC_AVAILABLE)
+                flash_attn_ext_oscar2_load_tile_cp_async<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
+                    (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup, tile_oscar2_raw);
+#else
                 flash_attn_ext_oscar2_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
+#endif
             }
             __syncthreads();
         } else if constexpr (nstages <= 1) {
@@ -1206,8 +1297,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo2_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             } else {
+#if defined(CP_ASYNC_AVAILABLE)
+                flash_attn_ext_oscar2_load_tile_cp_async<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                    (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup, tile_oscar2_raw);
+#else
                 flash_attn_ext_oscar2_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+#endif
             }
             __syncthreads();
         } else if constexpr (nstages <= 1) {

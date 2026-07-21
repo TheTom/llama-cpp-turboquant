@@ -95,7 +95,7 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0) ? 4 : 2*cpy_ne) : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
-    constexpr int nthreads_KQ_for_dot = (type_K == GGML_TYPE_Q2_0 || type_K == GGML_TYPE_OSCAR2) ? nthreads_V : nthreads_KQ;
+    constexpr int nthreads_KQ_for_dot = (type_K == GGML_TYPE_Q2_0) ? nthreads_V : nthreads_KQ;
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ_for_dot>();
     constexpr bool Q_q8_1 = !K_is_unquantized;
 #ifdef V_DOT2_F32_F16_AVAILABLE
