@@ -103,8 +103,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128, 128, 1, false);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32,  96,  64, 128, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32,  96,  64, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 256, 256, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1,  32, 128, 128, 128, 1, false);
 
@@ -644,24 +644,24 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
     const int cp_chunks_per_row   = (raw_bytes_per_row + 15) / 16;
     const int cp_bytes_per_row    = cp_chunks_per_row * 16;
 
-    const unsigned int sh_raw_32 = ggml_cuda_cvta_generic_to_shared(tile_oscar2_raw);
     const int tid = threadIdx.y * warp_size + threadIdx.x;
 
-    // Stage 1: cp.async bulk copy raw oscar2 blocks from global to shared memory.
-    // Only copy rows < i_sup (OOB check: copy 0 rows when row >= i_sup).
+    // Stage 1: Copy raw oscar2 blocks from global to shared memory.
+    // NOTE: oscar2 row pitch is not guaranteed 16B-aligned, use 4B loads.
     const int ncopy_rows = oob_check ? min(i_sup, nbatch_fa) : nbatch_fa;
-    // All threads participate in the 16-byte-chunk copy.
-#pragma unroll
-    for (int chunk = tid; chunk < cp_chunks_per_row * ncopy_rows; chunk += nthreads) {
-        const int r = chunk / cp_chunks_per_row;
-        const int c = chunk % cp_chunks_per_row;
-        const char * src = KV_raw + (int64_t)r * stride_bytes + c * 16;
-        cp_async_cg_16<64>(sh_raw_32 + r * cp_bytes_per_row + c * 16, src);
+    const int total_copy_ints = (cp_bytes_per_row * ncopy_rows) / 4;
+    for (int off = tid; off < total_copy_ints; off += nthreads) {
+        const int byte_off = off * 4;
+        const int r = byte_off / cp_bytes_per_row;
+        const int c = byte_off % cp_bytes_per_row;
+        reinterpret_cast<int *>(tile_oscar2_raw)[off] =
+            reinterpret_cast<const int *>(KV_raw)[(int64_t)r * stride_bytes / 4 + c / 4];
     }
+    __syncthreads();
 
-    cp_async_wait_all();
-    // Stage 2: Dequantize from shared memory. Use the generic pointer tile_oscar2_raw
-    // (NOT the cvta-converted 32-bit address sh_raw_32) for normal shared memory reads.
+    // Stage 2: Dequantize all rows in parallel from shared memory.
+    // No inverse Hadamard: rotation (R*H*P) is applied in-graph to both Q and
+    // K/V, so the dot product is rotation-invariant: Q' · K' = Q · K.
 #pragma unroll
     for (int row = tid; row < nbatch_fa; row += nthreads) {
         if (oob_check && row >= i_sup) {

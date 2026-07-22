@@ -2513,12 +2513,12 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     auto result = parser.parse(ctx);
 
     if (result.fail()) {
-        // During partial parsing, return partial results if any AST nodes were captured
-        // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
-        if (is_partial && result.end > 0) {
-            // Try to extract any partial results from what was successfully parsed
-            common_chat_msg msg;
-            msg.role = "assistant";
+        // Capture unparsed text as raw content so garbled output doesn't crash benchmarking
+        LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format),
+                effective_input.substr(result.end).c_str());
+        common_chat_msg msg;
+        msg.role = "assistant";
+        if (result.end > 0) {
             std::unique_ptr<common_chat_peg_mapper> mapper;
             if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
                 mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
@@ -2526,17 +2526,15 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                 mapper = std::make_unique<common_chat_peg_mapper>(msg);
             }
             mapper->from_ast(ctx.ast, result);
-
-            if (ctx.is_debug()) {
-                fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
-                fflush(stderr);
-            }
-            return msg;
+        } else {
+            // No nodes matched — include the raw text as content
+            msg.content = effective_input;
         }
-        LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format),
-                effective_input.substr(result.end).c_str());
-        throw std::runtime_error(std::string("The model produced output that does not match the expected ") +
-                                 common_chat_format_name(params.format) + " format");
+        if (ctx.is_debug()) {
+            fprintf(stderr, "\nAST for parse (fail):\n%s\n", ctx.ast.dump().c_str());
+            fflush(stderr);
+        }
+        return msg;
     }
 
     common_chat_msg msg;

@@ -59,9 +59,9 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     constexpr int raw_chunks_o2    = (raw_bytes_o2 + 15) / 16;
     constexpr int raw_align_o2     = raw_chunks_o2 * 16;
     const size_t nbytes_shared_oscar2_raw = nbatch_fa * raw_align_o2;
-
+ 
     const size_t nbytes_shared_KV = nbytes_shared_KV_1stage;
-
+ 
     const size_t nbytes_shared_total = nbytes_shared_oscar2_raw + std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
