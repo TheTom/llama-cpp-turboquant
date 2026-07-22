@@ -601,16 +601,23 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
         }
         const char * row_ptr = KV_raw + (int64_t)row * stride_bytes;
         // Batch by oscar2 block: hoist d (scale) and m (zero-point) loading.
-        // D2 = 256 (D=512), 128 (D=256), 64 (D=128) → 4, 2, 1 blocks respectively.
+        // For each 128-element block: dequant to local half2 buffer, apply inverse
+        // Hadamard (butterfly on half2 values), then write to tile shared memory.
+        // Inverse Hadamard is REQUIRED because set_rows_cuda_oscar2 applies forward
+        // Hadamard before quantization. The scalar kernel (fattn-oscar2.cuh) also
+        // applies it after dequant via hadamard_inverse_128_32w.
         for (int blk_c = 0; blk_c < D2; blk_c += block_half2) {
+            half2 local_buf[QK_OSCAR2 / 2]; // 64 half2 in registers per block
             const int ib = (col_offset + blk_c) * 2 / QK_OSCAR2;
             const block_oscar2 * blk = (const block_oscar2 *)(row_ptr) + ib;
             const float d_f = __half2float(blk->d);
             const float m_f = __half2float(blk->m);
             const int blk_limit = min(blk_c + block_half2, D2);
+            const int ncols_this_block = blk_limit - blk_c;
+            // Stage 1: Dequant to local half2 buffer
             #pragma unroll
-            for (int c = blk_c; c < blk_limit; ++c) {
-                const int col = col_offset + c;
+            for (int c = 0; c < ncols_this_block; ++c) {
+                const int col = col_offset + blk_c + c;
                 const int elem0 = col * 2;
                 const int j0 = elem0 % QK_OSCAR2;
                 const uint8_t qs_byte = blk->qs[j0 / 4];
@@ -619,7 +626,43 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
                 const uint8_t code1 = (qs_byte >> (shift + 2)) & 0x3;
                 const half lo = __float2half(fmaf((float)code0, d_f, m_f));
                 const half hi = __float2half(fmaf((float)code1, d_f, m_f));
-                tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+                local_buf[c] = __halves2half2(lo, hi);
+            }
+            // Pad remainder with zeros if partial block
+            #pragma unroll
+            for (int c = ncols_this_block; c < block_half2; ++c) {
+                local_buf[c] = make_half2(0.0f, 0.0f);
+            }
+            // Stage 2: Inverse Hadamard butterfly on 64 half2 = 128 float elements.
+            // Inverse Hadamard is REQUIRED because set_rows_cuda_oscar2 applies forward
+            // Hadamard before quantization (same as the scalar FA kernel does).
+            // Compact non-unrolled loops to minimize register pressure and I-cache usage.
+            for (int h_h2 = 32; h_h2 > 0; h_h2 >>= 1) {
+                for (int c = 0; c < block_half2; c += h_h2 * 2) {
+                    for (int j = c; j < c + h_h2; ++j) {
+                        const half2 a = local_buf[j];
+                        const half2 b = local_buf[j + h_h2];
+                        local_buf[j]        = __hadd2(a, b);
+                        local_buf[j + h_h2] = __hsub2(a, b);
+                    }
+                }
+            }
+            // h=1: within each half2 (x+y, x-y)
+            for (int c = 0; c < block_half2; ++c) {
+                const half2 v = local_buf[c];
+                local_buf[c] = __halves2half2(
+                    __hadd(__low2half(v), __high2half(v)),
+                    __hsub(__low2half(v), __high2half(v)));
+            }
+            // Scale by 1/sqrt(128)
+            const half2 scale_h2 = __halves2half2(__float2half(0.08838834764f), __float2half(0.08838834764f));
+            for (int c = 0; c < block_half2; ++c) {
+                local_buf[c] = __hmul2(local_buf[c], scale_h2);
+            }
+            // Stage 3: Write to tile shared memory
+            #pragma unroll
+            for (int c = 0; c < ncols_this_block; ++c) {
+                tile_KV[row*stride_tile + blk_c + c] = local_buf[c];
             }
         }
     }
@@ -659,9 +702,9 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
     }
     __syncthreads();
 
-    // Stage 2: Dequantize all rows in parallel from shared memory.
-    // No inverse Hadamard: rotation (R*H*P) is applied in-graph to both Q and
-    // K/V, so the dot product is rotation-invariant: Q' · K' = Q · K.
+    // Stage 2: Dequantize all rows in parallel from shared memory, then apply
+    // inverse Hadamard. Required because set_rows_cuda_oscar2 applies forward
+    // Hadamard before quantization to spread energy.
 #pragma unroll
     for (int row = tid; row < nbatch_fa; row += nthreads) {
         if (oob_check && row >= i_sup) {
@@ -670,14 +713,17 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
         }
         const char * row_ptr = tile_oscar2_raw + row * cp_bytes_per_row;
         for (int blk_c = 0; blk_c < D2; blk_c += block_half2) {
+            half2 local_buf[QK_OSCAR2 / 2]; // 64 half2 in registers
             const int ib = (col_offset + blk_c) * 2 / QK_OSCAR2;
             const block_oscar2 * blk = (const block_oscar2 *)(row_ptr) + ib;
             const float d_f = __half2float(blk->d);
             const float m_f = __half2float(blk->m);
             const int blk_limit = min(blk_c + block_half2, D2);
+            const int ncols_this_block = blk_limit - blk_c;
+            // Stage 2a: Dequant to local half2 buffer
 #pragma unroll
-            for (int c = blk_c; c < blk_limit; ++c) {
-                const int col = col_offset + c;
+            for (int c = 0; c < ncols_this_block; ++c) {
+                const int col = col_offset + blk_c + c;
                 const int elem0 = col * 2;
                 const int j0 = elem0 % QK_OSCAR2;
                 const uint8_t qs_byte = blk->qs[j0 / 4];
@@ -686,7 +732,36 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
                 const uint8_t code1 = (qs_byte >> (shift + 2)) & 0x3;
                 const half lo = __float2half(fmaf((float)code0, d_f, m_f));
                 const half hi = __float2half(fmaf((float)code1, d_f, m_f));
-                tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+                local_buf[c] = __halves2half2(lo, hi);
+            }
+            // Pad remainder with zeros if partial block
+#pragma unroll
+            for (int c = ncols_this_block; c < block_half2; ++c) {
+                local_buf[c] = make_half2(0.0f, 0.0f);
+            }
+            // Stage 2b: Inverse Hadamard butterfly on 64 half2 = 128 float elements.
+            // Compact non-unrolled loops for register/I-cache efficiency.
+            for (int h_h2 = 32; h_h2 > 0; h_h2 >>= 1) {
+                for (int c = 0; c < block_half2; c += h_h2 * 2) {
+                    for (int j = c; j < c + h_h2; ++j) {
+                        const half2 a = local_buf[j];
+                        const half2 b = local_buf[j + h_h2];
+                        local_buf[j]        = __hadd2(a, b);
+                        local_buf[j + h_h2] = __hsub2(a, b);
+                    }
+                }
+            }
+            // h=1: within each half2 (x+y, x-y)
+            for (int c = 0; c < block_half2; ++c) {
+                const half2 v = local_buf[c];
+                local_buf[c] = __halves2half2(
+                    __hadd(__low2half(v), __high2half(v)),
+                    __hsub(__low2half(v), __high2half(v)));
+            }
+            // Scale by 1/sqrt(128)
+            const half2 scale_h2 = __halves2half2(__float2half(0.08838834764f), __float2half(0.08838834764f));
+            for (int c = 0; c < block_half2; ++c) {
+                local_buf[c] = __hmul2(local_buf[c], scale_h2);
             }
         }
     }
