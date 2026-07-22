@@ -679,10 +679,11 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
     }
 }
 
-#ifdef CP_ASYNC_AVAILABLE
-// oscar2 cp.async pipeline: bulk-copy raw 36-byte blocks to shared memory via cp.async,
-// then dequantize from shared memory. 36-byte blocks are not 16-byte aligned individually,
-// so we copy ceil(raw_bytes_per_row/16)*16 bytes per row. The shared-memory raw buffer is
+// oscar2 tile loader (shared-memory intermediate buffer variant).
+// Thread-cooperative copy of raw 36-byte blocks to shared memory via int4 stores,
+// then parallel dequantize + inverse Hadamard from shared memory.
+// 36-byte blocks are not 16-byte aligned individually, so we copy
+// ceil(raw_bytes_per_row/16)*16 bytes per row. The shared-memory raw buffer is
 // at tile_oscar2_raw (nbytes_shared_total includes room for it on the host side).
 template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
@@ -776,7 +777,6 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
         }
     }
 }
-#endif // CP_ASYNC_AVAILABLE
 
 // turbo2 (2-bit PolarQuant) tile loader. Plain 2-bit indices (qs, 4/byte), no signs.
 static __constant__ float TURBO_CENTROIDS_2BIT_FATTN[4] = {
@@ -952,13 +952,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
 
-#if defined(CP_ASYNC_AVAILABLE)
-    // Raw oscar2 block buffer for cp.async pipeline (positioned after tile_mask at end of shared memory).
-    // Only used within is_turbo_kv path (nstages==0 guaranteed).
-    // NOTE: mask allocation uses sizeof(half2) stride per column, matching host-side nbytes_shared_mask.
+    // Raw oscar2 block buffer positioned after tile_mask at end of shared memory.
+    // Always allocated in host-side nbytes_shared_total. The vectorized load tile
+    // (flash_attn_ext_oscar2_load_tile_cp_async) reads raw blocks here first, then
+    // dequants from shared memory. The synchronous load tile reads global directly
+    // instead. Both paths produce identical f16 tiles in tile_KV.
     constexpr size_t mask_bytes = (size_t)ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
     char * tile_oscar2_raw = (char *)tile_mask + mask_bytes;
-#endif
 
     if constexpr (nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
