@@ -610,6 +610,8 @@ static void ggml_cuda_flash_attn_ext_oscar2(ggml_backend_cuda_context & ctx, ggm
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
+    // OSCAR2 = 40: lower than VEC to prevent accidental override, but
+    // selected directly by type-gate (not by max-score competition).
     BEST_FATTN_KERNEL_OSCAR2   =  40,
     BEST_FATTN_KERNEL_Q2_0     =  50,
     BEST_FATTN_KERNEL_VEC      = 100,

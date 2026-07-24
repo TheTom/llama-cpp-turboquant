@@ -148,7 +148,6 @@ static __global__ void flash_attn_ext_oscar2(
     constexpr bool use_block_unroll = (D >= 128);
     constexpr int nblocks = use_block_unroll ? D / QK_OSCAR2 : 1;
     constexpr int elems_per_block = use_block_unroll ? 4 : nelems;
-    constexpr int d_per_block  = QK_OSCAR2;
 
     // Pre-compute byte offset and bit-shift within qs[] (per-block, same for all blocks)
     int by_blk[elems_per_block]   = {};
