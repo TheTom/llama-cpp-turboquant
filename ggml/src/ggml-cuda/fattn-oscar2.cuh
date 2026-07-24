@@ -59,29 +59,23 @@ static __device__ __forceinline__ void dequant_row_oscar2_parallel(
 }
 // ---------------------------------------------------------------------------
 // 32-thread inverse Hadamard on 128 elements (shared memory).
-// Thread tid owns elements [tid, tid+32, tid+64, tid+96].
-// Condition: if (!(i & h)) process pair (i, i+h). Must sync before/after call.
+// Each thread owns 4 elements: tid, tid+32, tid+64, tid+96.
+// The butterfly condition !(idx & h) ensures each pair is updated by exactly
+// one writer (the lower-index thread). Must sync before/after call.
 // ---------------------------------------------------------------------------
 static __device__ void hadamard_inverse_128_32w(float * sh, int tid) {
     #pragma unroll
     for (int h = 64; h > 0; h >>= 1) {
-        const int i0 = tid;
-        const int i1 = tid + 32;
-        const int i2 = tid + 64;
-        const int i3 = tid + 96;
-        // Read with bounds check to avoid out-of-bounds access
-        const float a0 = sh[i0];
-        const float b0 = (i0 + h < 128) ? sh[i0 + h] : 0.0f;
-        const float a1 = sh[i1];
-        const float b1 = (i1 + h < 128) ? sh[i1 + h] : 0.0f;
-        const float a2 = sh[i2];
-        const float b2 = (i2 + h < 128) ? sh[i2 + h] : 0.0f;
-        const float a3 = sh[i3];
-        const float b3 = (i3 + h < 128) ? sh[i3 + h] : 0.0f;
-        if (!(i0 & h) && i0 + h < 128) { sh[i0] = a0 + b0; sh[i0 + h] = a0 - b0; }
-        if (!(i1 & h) && i1 + h < 128) { sh[i1] = a1 + b1; sh[i1 + h] = a1 - b1; }
-        if (!(i2 & h) && i2 + h < 128) { sh[i2] = a2 + b2; sh[i2 + h] = a2 - b2; }
-        if (!(i3 & h) && i3 + h < 128) { sh[i3] = a3 + b3; sh[i3 + h] = a3 - b3; }
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int idx = tid + k * 32;
+            if (idx < 128 && !(idx & h)) {
+                const float a = sh[idx];
+                const float b = sh[idx + h];
+                sh[idx]     = a + b;
+                sh[idx + h] = a - b;
+            }
+        }
         __syncthreads();
     }
     constexpr float s = 0.08838834764f; // 1/sqrt(128)
@@ -157,8 +151,8 @@ static __global__ void flash_attn_ext_oscar2(
     constexpr int d_per_block  = QK_OSCAR2;
 
     // Pre-compute byte offset and bit-shift within qs[] (per-block, same for all blocks)
-    int by_blk[elems_per_block];
-    int shift_blk[elems_per_block];
+    int by_blk[elems_per_block]   = {};
+    int shift_blk[elems_per_block] = {};
     #pragma unroll
     for (int e = 0; e < elems_per_block; ++e) {
         const int off = tid + e * nthreads;
@@ -187,7 +181,8 @@ static __global__ void flash_attn_ext_oscar2(
         for (int e = 0; e < nelems; ++e) VKQ[j][e] = 0.0f;
     }
 
-    const int k_VKQ_max = KV_max_ptr ? KV_max_ptr[sequence*gridDim.x + blockIdx.x] : ne11;
+    const int k_VKQ_max_raw = KV_max_ptr ? KV_max_ptr[sequence*gridDim.x + blockIdx.x] : ne11;
+    const int k_VKQ_max = min(k_VKQ_max_raw, ne11);  // clamp to K row length
 
     for (int kv_base = blockIdx.y * nthreads; kv_base < k_VKQ_max;
          kv_base += gridDim.y * nthreads,

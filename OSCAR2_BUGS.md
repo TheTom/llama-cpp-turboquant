@@ -531,6 +531,53 @@ not a bug — the carve-out stays.
 The HP buffer itself (lines 441-444) uses F16 by design — "High Precision" sink
 and recent tokens are always stored at full precision for output quality.
 
+### F11. B5 — rewrote hadamard_inverse_128_32w to cleaner 4-pair-per-thread form
+
+`ggml/src/ggml-cuda/fattn-oscar2.cuh`: replaced the fragile per-element bounds-check
+pattern with a concise 4-pair-per-thread loop:
+
+```cpp
+for (int k = 0; k < 4; ++k) {
+    const int idx = tid + k * 32;
+    if (idx < 128 && !(idx & h)) {
+        const float a = sh[idx];
+        const float b = sh[idx + h];
+        sh[idx]     = a + b;
+        sh[idx + h] = a - b;
+    }
+}
+```
+
+Each butterfly edge is updated by exactly one writer (the lower-index thread),
+and the `idx < 128` guard correctly handles boundary threads without silently
+zeroing reads. No functional change — the transform is identical — but the
+control flow is provably correct by inspection.
+
+### F12. B13 — added k_VKQ_max clamp to ne11
+
+`ggml/src/ggml-cuda/fattn-oscar2.cuh`: changed `k_VKQ_max` from a single
+ternary to a clamped value:
+```cpp
+const int k_VKQ_max_raw = KV_max_ptr ? KV_max_ptr[sequence*gridDim.x + blockIdx.x] : ne11;
+const int k_VKQ_max = min(k_VKQ_max_raw, ne11);
+```
+Prevents out-of-bounds K/V access when `KV_max_ptr` returns a value larger
+than the K row length.
+
+### F13. B10 — moved type_K/type_V before DISPATCH_OSCAR2 macro
+
+`ggml/src/ggml-cuda/fattn.cu`: moved `const ggml_type type_K = K->type;` and
+`type_V` declarations above the `#define DISPATCH_OSCAR2(DIM)` macro so the
+variable-references in the macro body are not forward-referencing. Matches
+the q2_0 dispatch pattern (which also declares types first).
+
+### F14. B8 — defensive initialization of by_blk[] and shift_blk[]
+
+`ggml/src/ggml-cuda/fattn-oscar2.cuh`: changed `int by_blk[elems_per_block];`
+and `int shift_blk[elems_per_block];` to `= {}`. The arrays are fully filled
+by the unrolled loop below, but zero-initialization guards against future
+refactors that make the loop conditional.
+
 ---
 
 ## Gap analysis: OSCAR paper vs llama-cpp-turboquant

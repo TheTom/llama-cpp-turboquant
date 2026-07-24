@@ -572,6 +572,9 @@ static void ggml_cuda_flash_attn_ext_oscar2(ggml_backend_cuda_context & ctx, ggm
 
     const int32_t D = Q->ne[0];
 
+    const ggml_type type_K = K->type;
+    const ggml_type type_V = V->type;
+
 #define DISPATCH_OSCAR2(DIM)                                                        \
     switch (type_K) {                                                               \
         case GGML_TYPE_OSCAR2:                                                      \
@@ -594,9 +597,6 @@ static void ggml_cuda_flash_attn_ext_oscar2(ggml_backend_cuda_context & ctx, ggm
             break;                                                                  \
         default: break;                                                             \
     }
-
-    ggml_type type_K = K->type;
-    ggml_type type_V = V->type;
 
     if (D == 128) { DISPATCH_OSCAR2(128); }
     if (D == 256) { DISPATCH_OSCAR2(256); }
