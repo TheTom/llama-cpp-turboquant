@@ -1030,7 +1030,7 @@ and rotation matrices loaded from GGUF are separate from the quant type.
 **Severity**: HIGH — gap between what the paper achieves and what this
 repo delivers under the OSCAR name.
 
-#### G4. Lloyd-Max centroids in oscar2 — MISSING (HIGH)
+#### G4. Lloyd-Max centroids in oscar2 — IMPLEMENTED ✅
 
 `oscar2` uses `val = code * d + m` with uniform min-max quantization:
 

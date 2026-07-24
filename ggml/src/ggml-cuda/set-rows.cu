@@ -1479,13 +1479,17 @@ static __global__ void set_rows_cuda_oscar2(
             (total / (float)QK_OSCAR2) * (total / (float)QK_OSCAR2)));
         const float k_scale = 1.0f;
         const float d_val   = fmaxf(rms_val * k_scale, 1e-10f);
-        const float m_val   = mean - 1.5f * d_val;
+        const float m_val   = mean;
         const float inv_d   = 1.0f / d_val;
 
-        // Quantize Hadamard values: code = clamp(round(hv/d + 1.5), 0, 3)
-        int code = (int)((hv + 1.5f * d_val) * inv_d + 0.5f);
-        if (code < 0) code = 0;
-        if (code > 3) code = 3;
+        // Lloyd-Max quantization: match OSCAR2_LM_CENTROIDS {-0.9816,-0.4528,0.4528,0.9816}.
+        // Decision boundaries are midpoints between consecutive centroids.
+        const float vs = hv * inv_d;
+        int code;
+        if      (vs < -0.7172f) code = 0;
+        else if (vs <  0.0f)   code = 1;
+        else if (vs <  0.7172f) code = 2;
+        else                    code = 3;
         sh_codes[t] = (uint8_t)code;
         __syncthreads();
 
