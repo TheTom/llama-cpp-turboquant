@@ -985,7 +985,7 @@ against the `oscar2` / `q2_0` implementation in this repo.
 
 ### What the OSCAR paper does that this repo does NOT do
 
-#### G1. Spectral covariance rotation (R) — MISSING (HIGH)
+#### G1. Spectral covariance rotation (R) — IMPLEMENTED (HIGH)
 
 The paper computes **per-layer calibrated rotations** from actual Q/K/V
 activations dumped on a small calibration set:
@@ -1018,7 +1018,7 @@ Applied in three paths:
 
 **Severity**: RESOLVED.
 
-#### G3. Full R·H·P_br composition — MISSING (HIGH)
+#### G3. Full R·H·P_br composition — IMPLEMENTED (HIGH)
 
 The paper applies the composition `R_K = U_Q · H_d · P_br` (rotation ×
 Hadamard × bit-reversal). The `compute_kv_rotation.py` script supports 9
@@ -1048,7 +1048,7 @@ But `oscar2` (which has the "OSCAR" name) does not.
 **Severity**: HIGH — `oscar2` should either use Lloyd-Max or be renamed
 since it's not the OSCAR method.
 
-#### G5. Absorb V rotation — MISSING (MEDIUM)
+#### G5. Absorb V rotation — IMPLEMENTED (MEDIUM)
 
 The paper absorbs `R_V` into the output projection weight `W_o` so the
 rotation costs zero at runtime: `W_o' = R_V · W_o`. This eliminates an
