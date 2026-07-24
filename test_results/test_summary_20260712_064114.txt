@@ -1,7 +1,0 @@
-#|Name|Tag|Actual cache|Rotation|HP|Output
---|----|---|------------|--------|---|------
-1|"Full baseline"|f16_f16_no_rot||||> > > > > > > > > > [0m 
-2|"V quant only"|f16_q2_0_rot_v=1||||> > > > > > > > > > [0m 
-3|"K quant full pipe"|q2_0_f16_rot_both_clip=0.96_hp=64+256||||Loading model... |-\|/-\|/-\[OSCAR] KV cache dtype: K=q2_0 V=f16 (n_embd_k_gqa=512, kv_size=16384) |/-\|
-4|"K quant no rot"|q2_0_f16_no_rot_clip=0.96_hp=64+256||||Loading model... |-\|/-\|/-\[OSCAR] KV cache dtype: K=q2_0 V=f16 (n_embd_k_gqa=512, kv_size=16384) |/-\|
-5|"K quant no clip"|q2_0_f16_rot_both_hp=64+256||||Loading model... |-\|/-\|/-\[OSCAR] KV cache dtype: K=q2_0 V=f16 (n_embd_k_gqa=512, kv_size=16384) |/-\|

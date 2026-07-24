@@ -1,7 +1,0 @@
-#|Name|Tag|Cache|Rotation|HP|Output
---|----|---|-----|--------|---|------
-1|"f16 baseline"|f16_f16_no_rot|||||-\|/-\|/-\|/-\|/-\|/ 2 + 2 = 4 
-2|"V q2_0 only"|f16_q2_0_rot_v=1|||||-\|/-\|/-\|/-\|/-\|/  orIY)(- flankednie coincided afterwardC쿼éi ücretsiz subsequently<image|> li
-3|"f16 + rot (no effect)"|f16_f16_rot_both|||||-\|/-\|/-\|/-\|/-\|/ 2 + 2 = 4 
-4|"K q2_0 full pipe"|q2_0_f16_rot_both_clip=0.96_hp=64+256|||||-\|/-\|/-\|/-\|/-\|/-\ What is _ <- - - - - - - - - 
-5|"K q2_0 NO_HADAMARD"|q2_0_f16_rot_both_clip=0.96_hp=64+256_no_had|||||-\|/-\|/-\|/-\|/-\|/-\| <>|turn>model <# <|turn>model <|turn>model <# <# # <| | # 
