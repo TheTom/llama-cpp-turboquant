@@ -504,6 +504,169 @@ Last reviewed commit: `origin/oscar` @ `791ca44f4432b0b5730e44a6394bed5621dd01d6
 
 ---
 
+## Gap analysis: OSCAR paper vs llama-cpp-turboquant
+
+Compared the original OSCAR paper (arXiv:2605.17757) and its reference
+implementation at https://github.com/FutureMLS-Lab/OSCAR (main + branches)
+against the `oscar2` / `q2_0` implementation in this repo.
+
+### What the OSCAR paper does that this repo does NOT do
+
+#### G1. Spectral covariance rotation (R) — MISSING (HIGH)
+
+The paper computes **per-layer calibrated rotations** from actual Q/K/V
+activations dumped on a small calibration set:
+
+* `compute_qqt()` — GQA-aware Q-covariance: for each KV head `h`, groups
+the `gqa_ratio` query heads, computes `Q_g^T Q_g / n_tokens`, averages
+across KV heads, eigendecomposes to obtain `R_K = U_Q`.
+* `compute_sst()` — Score-weighted V-covariance: computes attention
+weights `w = K_h @ Q_g^T Q_g * K_h`, weight-normalizes, then computes
+`(V_h * sqrt(w))^T (V_h * sqrt(w)) / n_tokens` and eigendecomposes to
+obtain `R_V = U_S`.
+
+This repo's `oscar2` type uses NO rotation at all. The `q2_0` type uses
+a fixed Hadamard matrix (data-free). Neither implements the
+calibration-driven spectral rotation that gives OSCAR its name.
+
+**Severity**: HIGH — this is the core innovation of the OSCAR paper.
+
+#### G2. Bit-reversal permutation P_br — MISSING (HIGH)
+
+The paper applies a bit-reversal permutation after Hadamard to interleave
+high-variance and low-variance channels evenly across quant groups:
+
+```python
+def make_br_perm_matrix(eigenvalues):
+    sorted_idx = argsort(eigenvalues, descending=True)
+    br = bit_reversal_perm(d)  # e.g. [0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15]
+    perm[br[i]] = sorted_idx[i]  # interleaved eigenvalue-sorted order
+    return eye(d)[perm]
+```
+
+This ensures no single INT2 quant group concentrates outliers. Not
+implemented anywhere in this repo.
+
+**Severity**: HIGH — directly contributes to the 2-bit quality gap.
+
+#### G3. Full R·H·P_br composition — MISSING (HIGH)
+
+The paper applies the composition `R_K = U_Q · H_d · P_br` (rotation ×
+Hadamard × bit-reversal). The `compute_kv_rotation.py` script supports 9
+compositions; the validated best is `r_h_pbr` (R · H · P).
+
+This repo's `oscar2` uses NO transform. `q2_0` uses only H (Hadamard),
+and rotation matrices loaded from GGUF are separate from the quant type.
+
+**Severity**: HIGH — gap between what the paper achieves and what this
+repo delivers under the OSCAR name.
+
+#### G4. Lloyd-Max centroids in oscar2 — MISSING (HIGH)
+
+`oscar2` uses `val = code * d + m` with uniform min-max quantization:
+
+```c
+scale = (vmax - vmin) / 3.0f;  // uniform grid 0,1,2,3
+code = round((val - vmin) / scale);
+// reconstruct: code * d + m
+```
+
+The OSCAR paper uses Lloyd-Max centroids (optimal non-uniform levels
+for the activation distribution). `q2_0` already implements Lloyd-Max
+with `kQ2_0_LM_centroids[4] = {-0.9816, -0.4528, 0.4528, 0.9816}`.
+But `oscar2` (which has the "OSCAR" name) does not.
+
+**Severity**: HIGH — `oscar2` should either use Lloyd-Max or be renamed
+since it's not the OSCAR method.
+
+#### G5. Absorb V rotation — MISSING (MEDIUM)
+
+The paper absorbs `R_V` into the output projection weight `W_o` so the
+rotation costs zero at runtime: `W_o' = R_V · W_o`. This eliminates an
+explicit V-rotation kernel and reduces latency. `LLAMA_ATTN_ROT_V_OVERRIDE`
+hints at this but the actual absorb optimization is not implemented.
+
+**Severity**: MEDIUM — performance optimization, not correctness.
+
+#### G6. Calibration pipeline — MISSING (MEDIUM)
+
+The OSCAR repo has a full 3-phase pipeline:
+1. `save_qkv_<model>.sh` — dump Q/K/V tensors
+2. `compute_rotation.sh` — fit rotations via eigendecomposition
+3. `eval_gpqa.sh` — evaluate quality
+
+This repo has `oscar-rotation/generate_hadamard_rot.py` for data-free
+Hadamard, and `oscar-rotation/export_rot_kv_gguf.py` for baking rotations
+into GGUF. But the full calibration pipeline (dump → fit → eval) is
+missing.
+
+**Severity**: MEDIUM — needed to produce calibrated rotations for new models.
+
+#### G7. Uresidual mode — MISSING (LOW)
+
+The paper has a `uresidual` method that:
+1. Applies a reference rotation to K/V
+2. Simulates INT2 quant/dequant errors
+3. Eigendecomposes the error covariance
+4. Computes a second-pass residual rotation that aligns error directions
+with the Q/V covariance
+
+Not in this repo.
+
+**Severity**: LOW — refinement over the base rotation; the base rotation
+provides most of the benefit.
+
+### What the `zhongzhu/llamacpp` branch has that this fork may not
+
+Based on the OSCAR README and web research, the official `zhongzhu/llamacpp`
+branch (at FutureMLS-Lab/OSCAR, not giveen/llama-cpp-turboquant) includes:
+
+1. **Fused mixed-precision FA kernel for Apple Metal** — runs INT2 decode
+at ~15× faster on MacBook M5 Max.
+2. **Pre-built *-rot-kv.gguf files** on Hugging Face for Qwen3-4B/8B/32B
+and Gemma-4-12B.
+3. **Proper R·H·P_br rotation matrices baked into GGUF** via
+`export_rot_kv_gguf.py`.
+4. **Fully working HP sink buffer** with `LLAMA_KV_HP_SINK` / `LLAMA_KV_HP_RECENT`.
+5. **Working outlier clipping** via `LLAMA_KV_CLIP_RATIO`.
+
+This fork (`giveen/llama-cpp-turboquant`) has some of these
+(HP sink, clipping env vars, export script) but OSCAR-PORT-STATUS.md
+confirms the HP sink is not yet wired for OSCAR2, rotation matrices for
+Gemma-4-12B fall back to identity, and the dedicated FA kernel produces
+incoherent output.
+
+### What this fork has that OSCAR doesn't
+
+1. **CUDA FA kernel for oscar2** (`fattn-oscar2.cuh`) — a CUDA
+implementation that the paper's llama.cpp branch may not have (the paper
+focuses on SGLang + Metal).
+2. **oscar2 as a distinct GGML type** (type 49) — the paper uses `q2_0`
+within SGLang/llama.cpp. oscar2 is a simpler variant (min-max, no
+Hadamard, no rotation) that may be useful for ablation studies.
+3. **q2_preh type** — pre-Hadamard variant not in the upstream OSCAR repos.
+4. **TurboQuant types** (turbo2_0, turbo3_0, turbo4_0) — separate
+quantization family.
+
+### Recommendation
+
+1. **Rename or clearly document `oscar2`**: It's a basic INT2 per-head-dim
+min-max quantizer, not the full OSCAR algorithm. Call it `int2_linear` or
+document that it's "OSCAR-compatible storage format without rotation".
+2. **Implement bit-reversal permutation P_br**: This is ~20 lines of
+Python/CUDA and directly improves quant quality. Can be added to both
+`q2_0` (with Hadamard) and oscar2 transforms.
+3. **Wire up calibrated rotations**: The export script exists
+(`export_rot_kv_gguf.py`). Ensure the rotation matrices are loaded from
+GGUF and applied before quantization in the KV cache path.
+4. **Sync with `zhongzhu/llamacpp`**: The official OSCAR llama.cpp
+branch may have additional fixes and the Metal kernel. Consider diffing
+against it.
+5. **Complete the HP sink buffer wiring** for oscar2 (documented as
+missing in OSCAR-PORT-STATUS.md).
+
+---
+
 ## Recent field status — TurboQuant oscar branch (`6c3822c6f`, `rebuild_tq.sh` build)
 
 - Build path: rebuilt with `/mnt/storage/llama-server/rebuild_tq.sh`; fresh artifacts under `/mnt/storage/Projects/turboquant/build` dated `2026-07-23 20:02 MDT`.
