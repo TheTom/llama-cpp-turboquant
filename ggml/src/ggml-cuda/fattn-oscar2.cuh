@@ -135,7 +135,11 @@ static __global__ void flash_attn_ext_oscar2(
         shift_blk[e] = (off & 3) * 2;
     }
 
-    // Load Q into registers
+    // Load Q into registers and rotate each 128-element block into the
+    // P_br(H) domain in which oscar2 stores K and V. Because H and P_br are
+    // both orthogonal and self-inverse, dot(Q,K) is preserved when both
+    // operands live in the same transformed domain. This lets the inner loop
+    // skip the per-token inverse Hadamard/P_br on K and V.
     float Q_reg[ncols][nelems];
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
@@ -144,16 +148,39 @@ static __global__ void flash_attn_ext_oscar2(
         for (int e = 0; e < nelems; ++e) {
             Q_reg[j][e] = Q_j[tid + e * nthreads] * scale;
         }
+        // In-place transform: Q_reg[j] <- P_br(H * Q_reg[j])
+        #pragma unroll
+        for (int b = 0; b < nblocks; ++b) {
+            #pragma unroll
+            for (int e = 0; e < elems_per_block; ++e) {
+                sh_val_had[tid + e * nthreads] = Q_reg[j][b * elems_per_block + e];
+            }
+            __syncwarp();
+            hadamard_inverse_128_32w(sh_val_had, tid);
+            // P_br permutation (self-inverse)
+            { float _pbr[elems_per_block];
+              for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
+              for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
+            __syncwarp();
+            #pragma unroll
+            for (int e = 0; e < elems_per_block; ++e) {
+                Q_reg[j][b * elems_per_block + e] = sh_val_had[tid + e * nthreads];
+            }
+            __syncwarp();
+        }
     }
 
     float KQ_max[ncols], KQ_sum[ncols];
     float VKQ[ncols][nelems];
+    float VKQ_mean[ncols][nblocks];
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
         KQ_max[j] = -FLT_MAX/2;
         KQ_sum[j] = 0.0f;
         #pragma unroll
         for (int e = 0; e < nelems; ++e) VKQ[j][e] = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < nblocks; ++b) VKQ_mean[j][b] = 0.0f;
     }
 
     const int k_VKQ_max_raw = KV_max_ptr ? KV_max_ptr[sequence*gridDim.x + blockIdx.x] : ne11;
@@ -172,32 +199,20 @@ static __global__ void flash_attn_ext_oscar2(
             // INVARIANT: nb11 == nblocks * sizeof(block_oscar2) so K_blk[b] stays within the row
             const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
-            // ---- K dequant + dot product (with inv-Hadamard test) ----
+            // ---- K dequant + dot product (K already lives in P_br(H) domain) ----
             float KQ_val[ncols] = {0.0f};
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum = 0.0f;
-                if constexpr (use_block_unroll) {
+                #pragma unroll
+                for (int b = 0; b < nblocks; ++b) {
+                    const float d_k = __half2float(K_blk[b].d);
+                    const float m_k = __half2float(K_blk[b].m);
                     #pragma unroll
-                    for (int b = 0; b < nblocks; ++b) {
-                        const float d_k = __half2float(K_blk[b].d);
-                        const float m_k = __half2float(K_blk[b].m);
-                        #pragma unroll
-                        for (int e = 0; e < elems_per_block; ++e) {
-                            const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                            sh_val_had[tid + e * nthreads] = OSCAR2_CENTROIDS_DEV[code] * d_k + m_k;
-                        }
-                        __syncwarp();
-                        // P_br: reorder dequantized values from bit-reversal to natural order
-                        { float _pbr[elems_per_block];
-                          for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
-                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
-                        __syncwarp();
-                        hadamard_inverse_128_32w(sh_val_had, tid);
-                        #pragma unroll
-                        for (int e = 0; e < elems_per_block; ++e) {
-                            sum += sh_val_had[tid + e * nthreads] * Q_reg[j][b * elems_per_block + e];
-                        }
+                    for (int e = 0; e < elems_per_block; ++e) {
+                        const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_k + m_k;
+                        sum += val * Q_reg[j][b * elems_per_block + e];
                     }
                 }
                 KQ_val[j] = sum;
@@ -235,38 +250,29 @@ static __global__ void flash_attn_ext_oscar2(
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
 
-                // ---- V dequant + inv-Hadamard + VKQ ----
-                if constexpr (use_block_unroll) {
+                // ---- V dequant + accumulate in P_br(H) domain ----
+                // Keep the mean separate so the final output semantics match
+                // the original kernel (inv-Hadamard applied to centered value,
+                // then mean added back).
+                #pragma unroll
+                for (int b = 0; b < nblocks; ++b) {
+                    const float d_v = __half2float(V_blk[b].d);
+                    const float m_v = __half2float(V_blk[b].m);
+                    VKQ_mean[j][b] += ke * m_v;
                     #pragma unroll
-                    for (int b = 0; b < nblocks; ++b) {
-                        const float d_v = __half2float(V_blk[b].d);
-                        const float m_v = __half2float(V_blk[b].m);
-                        const float mean_v = m_v;  // mean is stored directly in m field
-                        #pragma unroll
-                        for (int e = 0; e < elems_per_block; ++e) {
-                            const int ti = tid + e * nthreads;
-                            const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                            sh_val_had[ti] = OSCAR2_CENTROIDS_DEV[code] * d_v + m_v - mean_v;
-                        }
-                        __syncwarp();
-                        // P_br: reorder dequantized values from bit-reversal to natural order
-                        { float _pbr[elems_per_block];
-                          for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
-                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
-                        __syncwarp();
-                        hadamard_inverse_128_32w(sh_val_had, tid);
-                        #pragma unroll
-                        for (int e = 0; e < elems_per_block; ++e) {
-                            const int ti = tid + e * nthreads;
-                            VKQ[j][b * elems_per_block + e] += ke * (sh_val_had[ti] + mean_v);
-                        }
+                    for (int e = 0; e < elems_per_block; ++e) {
+                        const int ti = tid + e * nthreads;
+                        const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
+                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_v; // centered value in P_br(H) domain
+                        VKQ[j][b * elems_per_block + e] += ke * val;
                     }
                 }
             }
 
         }
     }
-    // Write results
+    // Write results: inverse-transform each 128-element block from P_br(H)
+    // domain back to natural domain, then add the accumulated per-block mean.
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
         if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
@@ -276,13 +282,28 @@ static __global__ void flash_attn_ext_oscar2(
             dst_meta_ptr[mi] = make_float2(KQ_max[j], KQ_sum[j]);
         }
         #pragma unroll
-        for (int e = 0; e < nelems; ++e) {
-            int di = tid + e * nthreads;
-            float val = VKQ[j][e] * iks;
-            if (gridDim.y == 1)
-                dst_ptr[(((sequence * (int)ne01.z + ic0 + j) * ne02 + head)) * D + di] = val;
-            else
-                dst_ptr[(((sequence * (int)ne01.z + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y) * D + di] = val;
+        for (int b = 0; b < nblocks; ++b) {
+            #pragma unroll
+            for (int e = 0; e < elems_per_block; ++e) {
+                sh_val_had[tid + e * nthreads] = VKQ[j][b * elems_per_block + e] * iks;
+            }
+            __syncwarp();
+            // P_br permutation (self-inverse)
+            { float _pbr[elems_per_block];
+              for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
+              for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
+            __syncwarp();
+            hadamard_inverse_128_32w(sh_val_had, tid);
+            #pragma unroll
+            for (int e = 0; e < elems_per_block; ++e) {
+                int di = tid + e * nthreads + b * QK_OSCAR2;
+                float val = sh_val_had[tid + e * nthreads] + VKQ_mean[j][b] * iks;
+                if (gridDim.y == 1)
+                    dst_ptr[(((sequence * (int)ne01.z + ic0 + j) * ne02 + head)) * D + di] = val;
+                else
+                    dst_ptr[(((sequence * (int)ne01.z + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y) * D + di] = val;
+            }
+            __syncwarp();
         }
     }
 #else
