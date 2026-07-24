@@ -23,10 +23,12 @@ Usage:
 import argparse, os, sys, torch, math
 from pathlib import Path
 
-# Add the paper repo to path for compute_kv_rotation imports
+# Legacy: add the paper repo to path for compute_kv_rotation imports (fallback only)
 PAPER_ROT = Path("/mnt/storage/Projects/oscar-paper/rotation")
 if PAPER_ROT.exists():
     sys.path.insert(0, str(PAPER_ROT))
+# The primary calibrated pipeline uses our self-contained
+# calibrate_rotation.py + llama-oscar-calib (no external repo needed).
 
 # Add our gguf-py for GGUF reading
 TQ_GGUF = Path(__file__).parent.parent / "gguf-py"
@@ -157,16 +159,59 @@ def main():
         print(f"  Generating Hadamard rotation...")
         generate_hadamard(cfg, str(rot_dir))
     elif args.method == "calibrated":
-        if not args.dump_path:
-            print("ERROR: --dump-path is required for --method calibrated")
-            sys.exit(1)
-        # Use the paper's compute_kv_rotation.py
-        try:
-            from compute_kv_rotation import write_hadamard_rotation, main as compute_main
-            cfg = read_model_config(str(base_path))
-            # Use the first layer's head dim as the canonical head dim for the paper script
-            first_hd = list(cfg["per_layer_head_dim"].values())[0]
-            # Run the paper's compute script via its main
+        # Self-contained calibrated rotation pipeline (G1+G3).
+        # Step 1: llama-oscar-calib dumps Q/V covariances from model activations.
+        # Step 2: calibrate_rotation.py eigendecomposes and composes R·H·P_br.
+        cfg = read_model_config(str(base_path))
+        per_layer_hd = cfg["per_layer_head_dim"]
+        first_hd = list(per_layer_hd.values())[0]
+        unique_hd = sorted(set(per_layer_hd.values()))
+        if len(unique_hd) > 1:
+            print(f"WARNING: mixed head dims {unique_hd}; calibration uses first={first_hd}")
+
+        cov_dir = str(rot_dir / "covariances")
+        os.makedirs(cov_dir, exist_ok=True)
+
+        # Step 1: Run llama-oscar-calib to dump covariances.
+        import shutil
+        calib_bin = shutil.which("llama-oscar-calib")
+        if not calib_bin:
+            # Try build/bin relative to repo root.
+            repo_root = Path(__file__).parent.parent
+            candidate = repo_root / "build" / "bin" / "llama-oscar-calib"
+            if candidate.exists():
+                calib_bin = str(candidate)
+
+        if calib_bin:
+            import subprocess
+            calib_text = args.dump_path if args.dump_path else ""
+            calib_cmd = [
+                calib_bin,
+                "-m", str(base_path),
+                "-o", cov_dir,
+            ]
+            if calib_text:
+                # --dump-path doubles as calibration text file in the new pipeline.
+                if os.path.isfile(calib_text):
+                    calib_cmd += ["-f", calib_text]
+                else:
+                    calib_cmd += ["-p", calib_text]
+            else:
+                # Use a default calibration prompt.
+                calib_cmd += ["-p",
+                    "The quick brown fox jumps over the lazy dog. "
+                    "Machine learning is transforming the world. "
+                    "Quantization reduces model size while preserving quality."]
+            print(f"Step 1: Running calibration dump: {' '.join(calib_cmd[:3])}...")
+            subprocess.check_call(calib_cmd)
+        else:
+            print("WARNING: llama-oscar-calib not found. Falling back to external OSCAR repo.")
+            # Legacy path: try the external paper repo.
+            PAPER_ROT = Path("/mnt/storage/Projects/oscar-paper/rotation")
+            if not PAPER_ROT.exists() or not args.dump_path:
+                print("ERROR: llama-oscar-calib not built and no external OSCAR repo.")
+                print("Build with: cmake -B build -DGGML_CUDA=ON && cmake --build build --target llama-oscar-calib")
+                sys.exit(1)
             import subprocess
             cmd = [
                 sys.executable, str(PAPER_ROT / "compute_kv_rotation.py"),
@@ -178,9 +223,23 @@ def main():
             ]
             print(f"Running: {' '.join(cmd)}")
             subprocess.check_call(cmd)
-        except ImportError:
-            print("ERROR: compute_kv_rotation.py not found. Clone FutureMLS-Lab/OSCAR first.")
+
+        # Step 2: Run calibrate_rotation.py to eigendecompose and compose R·H·P_br.
+        calib_py = Path(__file__).parent / "calibrate_rotation.py"
+        if not calib_py.exists():
+            print(f"ERROR: {calib_py} not found")
             sys.exit(1)
+        import subprocess
+        rot_cmd = [
+            sys.executable, str(calib_py),
+            "--cov-dir", cov_dir,
+            "--head-dim", str(first_hd),
+            "--num-layers", str(cfg["n_layers"]),
+            "--output-dir", str(rot_dir),
+            "--composition", "r_h_pbr",
+        ]
+        print(f"Step 2: Computing rotations: {' '.join(rot_cmd[:4])}...")
+        subprocess.check_call(rot_cmd)
 
     # Bake into GGUF
     print(f"\nBaking rotation into GGUF...")
