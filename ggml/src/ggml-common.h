@@ -293,7 +293,20 @@ typedef block_q2_0 block_q2_preh;
 // Layout: [int2_codes(32B) | sigma_fp16(2B) | mean_fp16(2B)] = 36 bytes per 128 elements
 // Dequant: val = OSCAR2_LM_CENTROIDS[code] * sigma + mean
 // Centroids are optimal for N(0,1) with 2-bit/4-level quantization.
+// Pipeline: H (Hadamard) -> P_br (bit-reversal) -> quantize.
+// P_br interleaves high-variance and low-variance channels across quant groups.
 #define QK_OSCAR2 128
+// Bit-reversal permutation P_br for 128 elements (OSCAR paper: R.H.P_br).
+// Applied after Hadamard, before quantization. Self-inverse.
+static const int P_BR_PERM[128] = {
+    0, 64, 32, 96, 16, 80, 48, 112,  8, 72, 40, 104, 24, 88, 56, 120,
+    4, 68, 36, 100, 20, 84, 52, 116, 12, 76, 44, 108, 28, 92, 60, 124,
+    2, 66, 34, 98, 18, 82, 50, 114, 10, 74, 42, 106, 26, 90, 58, 122,
+    6, 70, 38, 102, 22, 86, 54, 118, 14, 78, 46, 110, 30, 94, 62, 126,
+    1, 65, 33, 97, 17, 81, 49, 113,  9, 73, 41, 105, 25, 89, 57, 121,
+    5, 69, 37, 101, 21, 85, 53, 117, 13, 77, 45, 109, 29, 93, 61, 125,
+    3, 67, 35, 99, 19, 83, 51, 115, 11, 75, 43, 107, 27, 91, 59, 123,
+    7, 71, 39, 103, 23, 87, 55, 119, 15, 79, 47, 111, 31, 95, 63, 127};
 typedef struct {
     uint8_t    qs[QK_OSCAR2 / 4];   // 32 bytes: 4 two-bit codes per byte
     ggml_half  d;                    // sigma / std-dev (fp16)

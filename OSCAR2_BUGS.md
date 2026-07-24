@@ -965,23 +965,19 @@ calibration-driven spectral rotation that gives OSCAR its name.
 
 **Severity**: HIGH — this is the core innovation of the OSCAR paper.
 
-#### G2. Bit-reversal permutation P_br — MISSING (HIGH)
+#### G2. Bit-reversal permutation P_br — IMPLEMENTED
 
 The paper applies a bit-reversal permutation after Hadamard to interleave
-high-variance and low-variance channels evenly across quant groups:
+high-variance and low-variance channels evenly across quant groups.
 
-```python
-def make_br_perm_matrix(eigenvalues):
-    sorted_idx = argsort(eigenvalues, descending=True)
-    br = bit_reversal_perm(d)  # e.g. [0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15]
-    perm[br[i]] = sorted_idx[i]  # interleaved eigenvalue-sorted order
-    return eye(d)[perm]
-```
+**Implemented** (commit: P_br). `P_BR_PERM[128]` added to `ggml-common.h`.
+Applied in three paths:
+- `quantize_row_oscar2_ref` / `dequantize_row_oscar2` (CPU, ggml-quants.c)
+- FA kernel K/V dequant + Hadamard inverse (CUDA, fattn-oscar2.cuh)
+- Enabled by default via `LLAMA_KV_OSCAR2_PBR=1` (set to 0 for backward compat
+  with pre-P_br GGUF files)
 
-This ensures no single INT2 quant group concentrates outliers. Not
-implemented anywhere in this repo.
-
-**Severity**: HIGH — directly contributes to the 2-bit quality gap.
+**Severity**: RESOLVED.
 
 #### G3. Full R·H·P_br composition — MISSING (HIGH)
 

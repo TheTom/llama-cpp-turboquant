@@ -212,6 +212,11 @@ static __global__ void flash_attn_ext_oscar2(
                             sh_val_had[tid + e * nthreads] = OSCAR2_LM_CENTROIDS[code] * d_k + m_k;
                         }
                         __syncwarp();
+                        // P_br: reorder dequantized values from bit-reversal to natural order
+                        { float _pbr[4];
+                          for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
+                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_PERM[tid + _e * nthreads]] = _pbr[_e]; }
+                        __syncwarp();
                         hadamard_inverse_128_32w(sh_val_had, tid);
                         #pragma unroll
                         for (int e = 0; e < elems_per_block; ++e) {
@@ -275,6 +280,11 @@ static __global__ void flash_attn_ext_oscar2(
                             const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
                             sh_val_had[ti] = OSCAR2_LM_CENTROIDS[code] * d_v + m_v - mean_v;
                         }
+                        __syncwarp();
+                        // P_br: reorder dequantized values from bit-reversal to natural order
+                        { float _pbr[4];
+                          for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
+                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_PERM[tid + _e * nthreads]] = _pbr[_e]; }
                         __syncwarp();
                         hadamard_inverse_128_32w(sh_val_had, tid);
                         #pragma unroll
