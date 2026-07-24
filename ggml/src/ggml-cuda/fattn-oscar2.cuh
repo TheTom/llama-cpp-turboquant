@@ -12,6 +12,21 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+// Device-side copies of ggml-common.h constants.
+// ggml-common.h declares these as static const, but the CUDA compiler does
+// not make them visible in __device__ code for arrays > ~64 bytes. These
+// __device__ copies ensure the FA kernel can access them.
+static __device__ const float OSCAR2_CENTROIDS_DEV[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+static __device__ const int   P_BR_DEV[128] = {
+    0, 64, 32, 96, 16, 80, 48, 112,  8, 72, 40, 104, 24, 88, 56, 120,
+    4, 68, 36, 100, 20, 84, 52, 116, 12, 76, 44, 108, 28, 92, 60, 124,
+    2, 66, 34, 98, 18, 82, 50, 114, 10, 74, 42, 106, 26, 90, 58, 122,
+    6, 70, 38, 102, 22, 86, 54, 118, 14, 78, 46, 110, 30, 94, 62, 126,
+    1, 65, 33, 97, 17, 81, 49, 113,  9, 73, 41, 105, 25, 89, 57, 121,
+    5, 69, 37, 101, 21, 85, 53, 117, 13, 77, 45, 109, 29, 93, 61, 125,
+    3, 67, 35, 99, 19, 83, 51, 115, 11, 75, 43, 107, 27, 91, 59, 123,
+    7, 71, 39, 103, 23, 87, 55, 119, 15, 79, 47, 111, 31, 95, 63, 127};
+
 // ---------------------------------------------------------------------------
 // Single-threaded helpers (fallback for D < 128)
 // ---------------------------------------------------------------------------
@@ -209,13 +224,13 @@ static __global__ void flash_attn_ext_oscar2(
                         #pragma unroll
                         for (int e = 0; e < elems_per_block; ++e) {
                             const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                            sh_val_had[tid + e * nthreads] = OSCAR2_LM_CENTROIDS[code] * d_k + m_k;
+                            sh_val_had[tid + e * nthreads] = OSCAR2_CENTROIDS_DEV[code] * d_k + m_k;
                         }
                         __syncwarp();
                         // P_br: reorder dequantized values from bit-reversal to natural order
-                        { float _pbr[4];
+                        { float _pbr[elems_per_block];
                           for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
-                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_PERM[tid + _e * nthreads]] = _pbr[_e]; }
+                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
                         __syncwarp();
                         hadamard_inverse_128_32w(sh_val_had, tid);
                         #pragma unroll
@@ -229,7 +244,7 @@ static __global__ void flash_attn_ext_oscar2(
                     const float m_k0 = __half2float(K_blk[0].m);
                     for (int e = 0; e < nelems; ++e) {
                         const uint8_t code = (K_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        sum += (OSCAR2_LM_CENTROIDS[code] * d_k0 + m_k0) * Q_reg[j][e];
+                        sum += (OSCAR2_CENTROIDS_DEV[code] * d_k0 + m_k0) * Q_reg[j][e];
                     }
                 }
                 KQ_val[j] = sum;
@@ -278,13 +293,13 @@ static __global__ void flash_attn_ext_oscar2(
                         for (int e = 0; e < elems_per_block; ++e) {
                             const int ti = tid + e * nthreads;
                             const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                            sh_val_had[ti] = OSCAR2_LM_CENTROIDS[code] * d_v + m_v - mean_v;
+                            sh_val_had[ti] = OSCAR2_CENTROIDS_DEV[code] * d_v + m_v - mean_v;
                         }
                         __syncwarp();
                         // P_br: reorder dequantized values from bit-reversal to natural order
-                        { float _pbr[4];
+                        { float _pbr[elems_per_block];
                           for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
-                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_PERM[tid + _e * nthreads]] = _pbr[_e]; }
+                          for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
                         __syncwarp();
                         hadamard_inverse_128_32w(sh_val_had, tid);
                         #pragma unroll
@@ -299,7 +314,7 @@ static __global__ void flash_attn_ext_oscar2(
                     #pragma unroll
                     for (int e = 0; e < nelems; ++e) {
                         const uint8_t code = (V_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        VKQ[j][e] += ke * (OSCAR2_LM_CENTROIDS[code] * d_v0 + m_v0);
+                        VKQ[j][e] += ke * (OSCAR2_CENTROIDS_DEV[code] * d_v0 + m_v0);
                     }
                 }
             }
