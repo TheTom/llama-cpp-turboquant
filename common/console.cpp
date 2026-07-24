@@ -130,13 +130,18 @@ namespace console {
 #else
         // POSIX-specific console initialization
         if (!simple_io) {
-            struct termios new_termios;
-            tcgetattr(STDIN_FILENO, &initial_state);
-            new_termios = initial_state;
-            new_termios.c_lflag &= ~(ICANON | ECHO);
-            new_termios.c_cc[VMIN] = 1;
-            new_termios.c_cc[VTIME] = 0;
-            tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+            // Only manipulate termios when stdin is actually a terminal.
+            // When stdin is a pipe or file (e.g. piped input), tcgetattr/tcsetattr
+            // would fail with ENOTTY ("Inappropriate ioctl for device").
+            if (isatty(STDIN_FILENO)) {
+                struct termios new_termios;
+                tcgetattr(STDIN_FILENO, &initial_state);
+                new_termios = initial_state;
+                new_termios.c_lflag &= ~(ICANON | ECHO);
+                new_termios.c_cc[VMIN] = 1;
+                new_termios.c_cc[VTIME] = 0;
+                tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+            }
 
             tty = fopen("/dev/tty", "w+");
             if (tty != nullptr) {
@@ -160,7 +165,11 @@ namespace console {
                 fclose(tty);
                 tty = nullptr;
             }
-            tcsetattr(STDIN_FILENO, TCSANOW, &initial_state);
+            // Only restore termios if we successfully saved the initial state,
+            // i.e. when stdin was a terminal during init.
+            if (isatty(STDIN_FILENO)) {
+                tcsetattr(STDIN_FILENO, TCSANOW, &initial_state);
+            }
         }
 #endif
     }

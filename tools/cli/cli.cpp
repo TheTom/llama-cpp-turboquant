@@ -538,6 +538,9 @@ int llama_cli(int argc, char ** argv) {
 
         // skip empty messages
         if (buffer.empty()) {
+            if (feof(stdin)) {
+                break;  // EOF on piped/non-interactive input
+            }
             continue;
         }
 
