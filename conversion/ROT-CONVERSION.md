@@ -47,8 +47,10 @@ All scripts live in `oscar-rotation/`:
 | Script | Purpose |
 |--------|---------|
 | `generate_and_bake_rot.py` | **Recommended** — creates and bakes rotations in one step |
+| `calibrate_rotation.py` | Compute calibrated rotations from covariance dumps (G1/G3/G7) |
 | `generate_hadamard_rot.py` | Standalone Hadamard matrix generator (for inspection/advanced use) |
-| `export_rot_kv_gguf.py` | Bake pre-computed `.pt` rotation files into a GGUF |
+| `export_rot_kv_gguf.py` | Bake pre-computed `.pt` rotation files into a GGUF (G5 absorb-v) |
+| `tools/oscar-calib/` | C++ tool to dump Q/V covariances from model activations |
 
 ## Usage
 
@@ -73,27 +75,88 @@ has SWA layers at 256 and full-attention layers at 512), the script
 auto-detects each layer's head dimension from the weight tensor shapes
 and generates correctly-sized rotations per layer.
 
-### Calibrated rotation (requires QKV dumps)
+### Calibrated rotation (self-contained, highest quality)
 
-Produces higher-quality rotations than Hadamard, but requires running
-the model on calibration data (e.g. GPQA) and dumping QKV tensors.
+Produces higher-quality rotations than Hadamard by computing spectral
+covariance rotations from actual model activations. The full pipeline
+is self-contained (no external OSCAR paper repo needed).
+
+**One-command calibrated pipeline:**
 
 ```bash
+# Build the calibration tool first
+cmake -B build -DGGML_CUDA=ON && cmake --build build --target llama-oscar-calib
+
+# Run calibration + bake in one step
 python3 oscar-rotation/generate_and_bake_rot.py \
     --base /path/to/model.gguf \
     --out /path/to/model-rot-kv.gguf \
     --method calibrated \
-    --dump-path /path/to/qkv_dumps
+    --dump-path /path/to/calibration.txt
 ```
 
-The QKV dump pipeline is in the
-[OSCAR paper repo](https://github.com/FutureMLS-Lab/OSCAR)
-at `rotation/compute_kv_rotation.py`.
+`--dump-path` can be a text file (used as calibration prompt) or a
+directory of QKV dumps from a previous run.
+
+**Step-by-step (for advanced use / debugging):**
+
+```bash
+# Step 1: Dump Q/V covariances from model activations
+./build/bin/llama-oscar-calib -m model.gguf -f calibration.txt -o covariances/
+
+# Step 2: Eigendecompose and compose R·H·P_br
+python3 oscar-rotation/calibrate_rotation.py \
+    --cov-dir covariances/ --head-dim 128 --num-layers 28 \
+    --output-dir rotations/ --composition r_h_pbr
+
+# Step 3: Bake into GGUF (with V rotation absorbed into W_o for zero runtime cost)
+python3 oscar-rotation/export_rot_kv_gguf.py \
+    --base model.gguf --rot-dir rotations/ --out model-rot.gguf --absorb-v
+```
+
+### Uresidual refinement (G7 — iterative quality improvement)
+
+The OSCAR paper's `uresidual` mode refines the base rotation by aligning
+quantization error directions with low-importance Q/V covariance dims.
+This is an iterative process that converges in 1-2 iterations.
+
+```bash
+# Calibrate with 1 uresidual iteration
+python3 oscar-rotation/calibrate_rotation.py \
+    --cov-dir covariances/ --head-dim 128 --num-layers 28 \
+    --output-dir rotations/ --composition r_h_pbr \
+    --uresidual-iters 1
+```
+
+How it works:
+1. Generate synthetic activations from empirical covariance (Cholesky)
+2. Apply current reference rotation
+3. Simulate INT2 quantize/dequantize (per-row, 4 centroids matching oscar2)
+4. Eigendecompose error covariance (largest error variance first)
+5. Project target covariance into rotated space (ascending importance)
+6. Map largest error dims to least important target dims
+7. Update rotation and repeat
+
+`--uresidual-samples N` controls the synthetic sample count (default: 4096).
+
+### Absorbing V rotation into W_o (G5)
+
+The V rotation can be baked into the output projection weight at
+quantization time, eliminating runtime overhead entirely:
+
+```bash
+python3 oscar-rotation/export_rot_kv_gguf.py \
+    --base model.gguf --rot-dir rotations/ --out model-rot.gguf \
+    --absorb-v
+```
+
+When `--absorb-v` is used, `attn_v_rot` tensors are omitted from the
+output GGUF. The rotation is "free" — no runtime cost.
 
 ### Using existing `.pt` rotation files
 
-If you already have rotation `.pt` files (e.g. from the paper repo or
-previous calibration), bake them in directly:
+If you already have rotation `.pt` files (e.g. from a previous
+calibration run), bake them in directly:
 
 ```bash
 python3 oscar-rotation/export_rot_kv_gguf.py \
@@ -104,6 +167,20 @@ python3 oscar-rotation/export_rot_kv_gguf.py \
 
 The `.pt` files should be named `k_rotation_qqt_r_h_pbr.pt` and
 `v_rotation_sst_r_h_pbr.pt` per the paper convention.
+
+### Composition modes
+
+The `--composition` flag controls which transforms are applied:
+
+| Mode | Formula | Notes |
+|------|---------|-------|
+| `r_h_pbr` | R · H · P_br | Default, best quality per OSCAR paper |
+| `r_h` | R · H | Rotation + Hadamard, no bit-reversal |
+| `r_pbr` | R · P_br | Rotation + bit-reversal, no Hadamard |
+| `r` | R only | Pure spectral rotation |
+| `h_pbr` | H · P_br | Data-free Hadamard + bit-reversal |
+| `h` | H only | Data-free Hadamard |
+| `pbr` | P_br only | Bit-reversal permutation only |
 
 ## Running the rotated model
 
