@@ -617,6 +617,39 @@ and `int shift_blk[elems_per_block];` to `= {}`. The arrays are fully filled
 by the unrolled loop below, but zero-initialization guards against future
 refactors that make the loop conditional.
 
+### F15. K1 — Blackwell sm_120 hang: replaced `__syncthreads()` with `__syncwarp()`
+
+`ggml/src/ggml-cuda/fattn-oscar2.cuh`: the dedicated OSCAR2 FA kernel runs with
+exactly one warp (`nwarps_k = 1`, `nthreads = 32`), but used `__syncthreads()`
+in seven places (Hadamard butterfly loop, Hadamard scaling, K/V dequant before
+Hadamard, and the cross-warp reduction path). On Blackwell (sm_120) the
+single-warp kernel deadlocked because the block-level barrier was emitted for
+a launch configuration that the hardware did not expect.
+
+Replaced all seven `__syncthreads()` calls with `__syncwarp()`. Since the
+kernel is single-warp, `__syncwarp()` is the correct primitive and avoids the
+Blackwell-specific block-barrier stall. Also added a comment in the
+`nwarps_k > 1` branch noting it is dead code for the current configuration.
+
+### F16. K2 — VEC path D=512 garbage/NaN: allow D=512 with logit softcap
+
+`ggml/src/ggml-cuda/fattn-vec.cuh`: the VEC fallback kernel had an early
+return for `use_logit_softcap && !(D == 128 || D == 256)`. For Gemma-4 and
+other models with `D == 512` and logit softcapping enabled, the kernel returned
+after `NO_DEVICE_CODE`, leaving `dst` uninitialized and producing attention
+collapse / NaNs.
+
+Changed the gate to:
+```cpp
+if (use_logit_softcap && !(D == 128 || D == 256 || D == 512)) { ... }
+```
+
+Also added the missing `EXTERN_DECL_FATTN_VEC_CASES(512, ...)` declarations
+for F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, and BF16 so the D=512 VEC templates
+are available for linking. The `fattn.cu` dispatch already had explicit
+`FATTN_VEC_CASE(512, ...)` entries for OSCAR2 and Q2_0 combinations; those now
+resolve correctly.
+
 ---
 
 ## Remaining kernel issues — exact fix descriptions
@@ -627,7 +660,7 @@ should be.
 
 ---
 
-### K1. Blackwell sm_120 hang — `__syncthreads()` in single-warp kernel (CRITICAL)
+### K1. Blackwell sm_120 hang — `__syncthreads()` in single-warp kernel (CRITICAL) — RESOLVED (F15)
 
 **Symptom**: `llama-cli --cache-type-k oscar2 --cache-type-v oscar2 --flash-attn on`
 hangs beyond 600s on RTX 5090 (compute capability sm_120). The FA kernel runs
@@ -755,7 +788,7 @@ The run should complete within seconds, not hang.
 
 ---
 
-### K2. VEC path broken for quantized KV at D > 256 (HIGH)
+### K2. VEC path broken for quantized KV at D > 256 (HIGH) — RESOLVED (F16)
 
 **Symptom**: From `OSCAR-PORT-STATUS.md` issue #2. The VEC kernel path
 (`fattn-vec.cuh`) produces garbage (attention collapse / NaN) when D > 256

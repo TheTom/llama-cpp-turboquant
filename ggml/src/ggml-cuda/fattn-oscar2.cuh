@@ -54,7 +54,7 @@ static __device__ __forceinline__ void dequant_row_oscar2_parallel(
             const uint8_t code = (blk[ib].qs[by] >> (2 * sub)) & 0x03;
             buf[ib * QK_OSCAR2 + elem] = centroids[code] * d + m;
         }
-        __syncthreads();
+        __syncwarp();
     }
 }
 // ---------------------------------------------------------------------------
@@ -76,12 +76,12 @@ static __device__ void hadamard_inverse_128_32w(float * sh, int tid) {
                 sh[idx + h] = a - b;
             }
         }
-        __syncthreads();
+        __syncwarp();
     }
     constexpr float s = 0.08838834764f; // 1/sqrt(128)
     sh[tid]      *= s;  sh[tid + 32] *= s;
     sh[tid + 64] *= s;  sh[tid + 96] *= s;
-    __syncthreads();
+    __syncwarp();
 }
 // ---------------------------------------------------------------------------
 // Main kernel
@@ -211,7 +211,7 @@ static __global__ void flash_attn_ext_oscar2(
                             const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
                             sh_val_had[tid + e * nthreads] = OSCAR2_LM_CENTROIDS[code] * d_k + m_k;
                         }
-                        __syncthreads();
+                        __syncwarp();
                         hadamard_inverse_128_32w(sh_val_had, tid);
                         #pragma unroll
                         for (int e = 0; e < elems_per_block; ++e) {
@@ -237,13 +237,13 @@ static __global__ void flash_attn_ext_oscar2(
                 if constexpr (nwarps_k > 1) {
                     float warp_sum = warp_reduce_sum(KQ_val[j]);
                     if (threadIdx.x == 0) { s_red[threadIdx.y] = warp_sum; }
-                    __syncthreads();
+                    __syncwarp();
                     if (threadIdx.y == 0) {
                         float cross = threadIdx.x < nwarps_k ? s_red[threadIdx.x] : 0.0f;
                         cross = warp_reduce_sum(cross);
                         if (threadIdx.x == 0) { s_red[0] = cross; }
                     }
-                    __syncthreads();
+                    __syncwarp();
                     full_kq = s_red[0];
                 } else {
                     full_kq = warp_reduce_sum(KQ_val[j]);
@@ -275,7 +275,7 @@ static __global__ void flash_attn_ext_oscar2(
                             const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
                             sh_val_had[ti] = OSCAR2_LM_CENTROIDS[code] * d_v + m_v - mean_v;
                         }
-                        __syncthreads();
+                        __syncwarp();
                         hadamard_inverse_128_32w(sh_val_had, tid);
                         #pragma unroll
                         for (int e = 0; e < elems_per_block; ++e) {
