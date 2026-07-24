@@ -580,6 +580,262 @@ refactors that make the loop conditional.
 
 ---
 
+## Remaining kernel issues — exact fix descriptions
+
+The following bugs are not yet fixed. Each entry describes the exact change
+needed: what file to edit, what line to find, and what the replacement code
+should be.
+
+---
+
+### K1. Blackwell sm_120 hang — `__syncthreads()` in single-warp kernel (CRITICAL)
+
+**Symptom**: `llama-cli --cache-type-k oscar2 --cache-type-v oscar2 --flash-attn on`
+hangs beyond 600s on RTX 5090 (compute capability sm_120). The FA kernel runs
+with `nwarps_k=1` (32 threads = one warp), but uses `__syncthreads()` in three
+places inside the kernel body and inside `hadamard_inverse_128_32w()`.
+
+**Root cause**: On Blackwell (sm_120), `__syncthreads()` implements true block-level
+synchronisation that requires ALL threads in the thread-block to participate.
+When the kernel is launched with exactly 32 threads (1 warp), `__syncthreads()`
+should be a no-op since all threads always reach it together — BUT on sm_120 the
+compiler may emit a hardware barrier that deadlocks if the warp scheduler issues
+threads in a non-uniform pattern, or if the launch configuration doesn't match
+the hardware's expectation for block-sync granularity.
+
+Secondary cause: the `hadamard_inverse_128_32w()` function uses `__syncthreads()`
+after each butterfly stage, writing to `sh[tid + 32]`, `sh[tid + 64]`,
+`sh[tid + 96]` — indices outside the 0..31 range of the single warp. On
+Blackwell this cross-warp-range write combined with `__syncthreads()` may
+trigger undefined behaviour or a hardware stall.
+
+**Exact fix** (two files):
+
+**File 1**: `ggml/src/ggml-cuda/fattn-oscar2.cuh`, function `hadamard_inverse_128_32w`
+
+Find the three `__syncthreads()` calls inside the function (one at end of
+butterfly loop, one after the `s` scaling). Replace ALL with `__syncwarp()`:
+
+```cpp
+// BEFORE (line ~94):
+        __syncthreads();
+    }
+    constexpr float s = 0.08838834764f;
+    sh[tid]      *= s;  sh[tid + 32] *= s;
+    sh[tid + 64] *= s;  sh[tid + 96] *= s;
+    __syncthreads();
+
+// AFTER:
+        __syncwarp();
+    }
+    constexpr float s = 0.08838834764f;
+    sh[tid]      *= s;  sh[tid + 32] *= s;
+    sh[tid + 64] *= s;  sh[tid + 96] *= s;
+    __syncwarp();
+```
+
+**File 2**: `ggml/src/ggml-cuda/fattn-oscar2.cuh`, main kernel body
+`flash_attn_ext_oscar2`
+
+Replace the two `__syncthreads()` calls in the K and V block-unrolled paths
+(located just before each `hadamard_inverse_128_32w()` call) with `__syncwarp()`:
+
+```cpp
+// K dequant path (line ~228):
+// BEFORE:
+                        }
+                        __syncthreads();
+                        hadamard_inverse_128_32w(sh_val_had, tid);
+
+// AFTER:
+                        }
+                        __syncwarp();
+                        hadamard_inverse_128_32w(sh_val_had, tid);
+
+// V dequant path (line ~267):
+// BEFORE:
+                        }
+                        __syncthreads();
+                        hadamard_inverse_128_32w(sh_val_had, tid);
+
+// AFTER:
+                        }
+                        __syncwarp();
+                        hadamard_inverse_128_32w(sh_val_had, tid);
+```
+
+Also in the cross-warp reduction path (lines ~215-223, `nwarps_k > 1` branch),
+replace `__syncthreads()` with `__syncwarp()` since the kernel is always
+single-warp:
+
+```cpp
+// BEFORE:
+                if constexpr (nwarps_k > 1) {
+                    float warp_sum = warp_reduce_sum(KQ_val[j]);
+                    if (threadIdx.x == 0) { s_red[threadIdx.y] = warp_sum; }
+                    __syncthreads();
+                    if (threadIdx.y == 0) {
+                        float cross = threadIdx.x < nwarps_k ? s_red[threadIdx.x] : 0.0f;
+                        cross = warp_reduce_sum(cross);
+                        if (threadIdx.x == 0) { s_red[0] = cross; }
+                    }
+                    __syncthreads();
+                    full_kq = s_red[0];
+
+// AFTER:
+                if constexpr (nwarps_k > 1) {
+                    // nwarps_k==1 is always true; this branch is dead code.
+                    // Keep for documentation but use __syncwarp() on Blackwell.
+                    float warp_sum = warp_reduce_sum(KQ_val[j]);
+                    if (threadIdx.x == 0) { s_red[threadIdx.y] = warp_sum; }
+                    __syncwarp();
+                    if (threadIdx.y == 0) {
+                        float cross = threadIdx.x < nwarps_k ? s_red[threadIdx.x] : 0.0f;
+                        cross = warp_reduce_sum(cross);
+                        if (threadIdx.x == 0) { s_red[0] = cross; }
+                    }
+                    __syncwarp();
+                    full_kq = s_red[0];
+```
+
+**Rationale**: With `nwarps_k = 1` (WARP_SIZE = 32 threads), `__syncwarp()` is
+the correct synchronisation primitive. It acts as a warp-level barrier that
+preserves the single-warp scheduling assumptions. This is semantically identical
+to `__syncthreads()` on a single-warp kernel but avoids the Blackwell-specific
+block-level barrier emission.
+
+**Validation**: After applying, rebuild on RTX 5090 and run:
+```sh
+cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release -j$(nproc)
+CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-cli \
+  -m models/qwen3.6-27b-q5kxl-hadamard.gguf \
+  -p "2 + 2 = " -n 50 --flash-attn on \
+  --cache-type-k oscar2 --cache-type-v oscar2
+```
+The run should complete within seconds, not hang.
+
+---
+
+### K2. VEC path broken for quantized KV at D > 256 (HIGH)
+
+**Symptom**: From `OSCAR-PORT-STATUS.md` issue #2. The VEC kernel path
+(`fattn-vec.cuh`) produces garbage (attention collapse / NaN) when D > 256
+for quantized KV types including oscar2 and q2_0. This affects Gemma-4
+(D=512) and any model with head_dim > 256 using VEC fallback.
+
+**Root cause**: Unknown — needs investigation. Likely candidates:
+
+1. **Q_ds stride mismatch**: The VEC kernel's `Q_ds` indexing assumes a
+   fixed stride that breaks at D > 256. The `Q_ds` array is indexed as
+   `Q_ds[k_KQ_0/nthreads]` where `nthreads` depends on D, and the array
+   size may be incorrect for D=512.
+2. **Shared memory overflow**: The `Q_q8` and `Q_ds` shared-memory arrays
+   are sized for D <= 256. At D=512 they overflow, corrupting adjacent
+   shared memory.
+3. **Loop bound mismatch**: The outer KQ loop in VEC kernel steps by
+   `nthreads * cpy_ne` but the bounds check doesn't account for D > 256.
+
+**Exact fix**: Debug the VEC kernel path with D=512 oscar2 and compare against
+the CPU reference. The fix location is `ggml/src/ggml-cuda/fattn-vec.cuh`:
+
+```cpp
+// In fattn-vec.cuh, find the template instantiation for D=512 and
+// verify that Q_q8 and Q_ds shared memory arrays are large enough:
+//
+// Current (likely wrong):
+//     __shared__ int   Q_q8[D / sizeof(int)];
+//     __shared__ float Q_ds[D / (sizeof(int) * QI8_1)];
+//
+// For D=512: Q_q8 = 512/4 = 128 ints (OK, fits in 48KB shared mem)
+//             Q_ds = 512/(4*32) = 4 float2 (probably OK)
+//
+// The more likely issue is in the dequantize_V_oscar2 loop bound
+// or the vec_dot_KQ indexing. Insert printf debugging at the
+// VEC entry point for D=512 oscar2 to isolate.
+```
+
+**Minimal reproduction** (add to `run_oscar_tests.sh`):
+```sh
+CUDA_VISIBLE_DEVICES="" LLAMA_KV_FUSED_FA=1 \
+  ./build/bin/llama-cli \
+  --cache-type-k f16 --cache-type-v oscar2 \
+  --chat-template-file models/templates/google-gemma-4-31B-it.jinja \
+  -p "2 + 2 = " -n 50 --flash-attn on \
+  -m /path/to/gemma-4-12b-gguf 2>&1 | tee vec512_oscar2.log
+```
+If the output is incoherent, the VEC path is confirmed broken for D=512.
+
+---
+
+### K3. B9 — remove unused `d_per_block` constant (LOW)
+
+**File**: `ggml/src/ggml-cuda/fattn-oscar2.cuh`, main kernel body
+
+Find the line:
+```cpp
+    constexpr int d_per_block  = QK_OSCAR2;
+```
+
+`d_per_block` is declared but never referenced in the kernel body. It was
+likely a documentation placeholder during development. Delete it:
+
+```cpp
+// DELETE this line:
+    constexpr int d_per_block  = QK_OSCAR2;
+```
+
+This eliminates the unused-variable compiler warning and removes the
+confusion between `d_per_block` (128) and the actual dequant parameter `d`
+(sigma/scale).
+
+---
+
+### K4. B7 — V mean-centering is now correct after F9 (LOW, verify-only)
+
+The V dequant path previously used `mean_v = m_v + 1.5f * d_v` (midpoint of
+a uniform 4-level grid from min to max). After F9 (Lloyd-Max centroids), the
+semantics changed: `d = sigma`, `m = mean`. The current code:
+
+```cpp
+    const float mean_v = m_v;  // mean is stored directly in m field
+    ...
+    sh_val_had[ti] = OSCAR2_LM_CENTROIDS[code] * d_v + m_v - mean_v;
+    //                                              ^^^          ^^^^^
+    //                                          reconstruct    un-center
+```
+
+This simplifies to `centroid * d_v` (mean-centered reconstruction). The
+Hadamard is applied to mean-centered values, then `mean_v` is added back
+after the inverse Hadamard. This is correct.
+
+**No fix needed**. B7 is resolved by F9. Verify by checking the dequant
+output for a D=128 K-cached oscar2 model against the CPU reference.
+
+---
+
+### K5. B12 — kernel ranking intended order (LOW, documentation-only)
+
+`BEST_FATTN_KERNEL_OSCAR2 = 40` is intentionally lower than VEC (100), TILE
+(200), WMMA (300), MMA (400). When K or V is `GGML_TYPE_OSCAR2`, the selector
+returns `BEST_FATTN_KERNEL_OSCAR2` directly — it does NOT compete with other
+kernel types. This is correct: oscar2 values are in Hadamard domain, so
+the f16 MMA/TILE/WMMA kernels (which assume standard-domain values) would
+produce garbage.
+
+The ranking 40 is only relevant if someone writes a second oscar2-compatible
+kernel with a higher priority (e.g. an OSCAR2_MMA kernel at 350). That
+would correctly override the current kernel. The ordering is intentional.
+
+**No fix needed**. Add a comment in `fattn.cu` near the enum:
+
+```cpp
+// OSCAR2 = 40: lower than VEC to prevent accidental override, but
+// selected directly by type-gate (not by max-score competition).
+BEST_FATTN_KERNEL_OSCAR2   =  40,
+```
+
+---
+
 ## Gap analysis: OSCAR paper vs llama-cpp-turboquant
 
 Compared the original OSCAR paper (arXiv:2605.17757) and its reference
