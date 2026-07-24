@@ -1,6 +1,8 @@
 #include "models.h"
 #include "../turbo-rotation-data.h"
 
+#include <cinttypes>
+
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
@@ -91,7 +93,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
                 throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation requires head_dim == 128, got %" PRId64, n_embd_head));
             }
 
-            ggml_context * ctx_fallback = ml.contexts.empty() ? nullptr : ml.contexts[0].get();
+            ggml_context * ctx_fallback = ml->contexts.empty() ? nullptr : ml->contexts[0].get();
             if (!ctx_fallback) {
                 throw std::runtime_error("Gemma-4 OSCAR fallback rotation: no model context available");
             }
