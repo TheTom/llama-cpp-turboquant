@@ -46,7 +46,7 @@ This is a latent inconsistency. A fully-correct Hadamard-domain pipeline would t
 | F1 | Move K/V attention to Hadamard domain: transform Q once, skip per-token inv-Hadamard/P_br | HIGH | implemented in `ggml/src/ggml-cuda/fattn-oscar2.cuh` |
 | F2 | Add multi-column prefill path for oscar2 (ncols=4/8 for large Q->ne[1]) | HIGH | implemented in `ggml/src/ggml-cuda/fattn-oscar2.cuh` |
 | F3 | Route oscar2 decode to existing MMA turbo path | MEDIUM | implemented in `ggml/src/ggml-cuda/fattn.cu` |
-| F4 | Support head_dim ∈ {128,256,512} uniformly, extend beyond 128 where safe | MEDIUM | planned |
+| F4 | Support head_dim ∈ {128,256,512} uniformly | MEDIUM | implemented |
 | F5 | Unify K/V mean handling to the mathematically-correct form | LOW | deferred |
 
 ## Implementation Notes for F1

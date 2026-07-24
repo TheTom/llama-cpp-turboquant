@@ -455,10 +455,10 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // [OSCAR FIX] oscar2 Hadamard + INT2 pipeline currently only supports
-        // head_dim == 128 (the WHT rotation is hardcoded to 128x128 in
-        // turbo_rotation and the InnerQ scale pipeline is hardcoded to 128).
-        // Per-layer override: layers whose head dim is 128 keep oscar2, others
+        // [OSCAR FIX] oscar2 Hadamard + INT2 pipeline processes 128-element blocks.
+        // FA kernel and set_rows already support head_dim in {128, 256, 512}
+        // (they process D/QK_OSCAR2 blocks per head). Per-layer override:
+        // layers whose head dim is a multiple of 128 keep oscar2, others
         // drop to f16. The ISWA cache splits base and swa into separate
         // llama_kv_cache instances; each instance's per-layer check sees only
         // its own subset. The legacy oscar2_safe_for_swa uniform-dim SWA guard
@@ -468,8 +468,8 @@ llama_kv_cache::llama_kv_cache(
         {
             const uint32_t hk = (layer_type_k == GGML_TYPE_OSCAR2) ? hparams.n_embd_head_k(il) : 0;
             const uint32_t hv = (layer_type_v == GGML_TYPE_OSCAR2 && !is_mla) ? hparams.n_embd_head_v(il) : 0;
-            const bool layer_ok_k = (layer_type_k != GGML_TYPE_OSCAR2) || hk == 128;
-            const bool layer_ok_v = (layer_type_v != GGML_TYPE_OSCAR2) || is_mla || hv == 128;
+            const bool layer_ok_k = (layer_type_k != GGML_TYPE_OSCAR2) || (hk % 128 == 0);
+            const bool layer_ok_v = (layer_type_v != GGML_TYPE_OSCAR2) || is_mla || (hv % 128 == 0);
             if (!layer_ok_k) layer_type_k = GGML_TYPE_F16;
             if (!layer_ok_v) layer_type_v = GGML_TYPE_F16;
         }
