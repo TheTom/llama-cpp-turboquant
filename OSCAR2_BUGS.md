@@ -704,7 +704,20 @@ Cohere Command R, DFlash) were being silently downgraded to f16.
 | Gemma-2 (uniform D=256)  | 256      | allowed (was f16) |
 | Gemma-3 (uniform D=128)  | 128      | allowed (was f16) |
 | Cohere Command R (D=128)  | 128      | allowed (was f16) |
-| Gemma-4 (mixed 128+256)   | 128/256  | forced f16 (correct) |
+| Gemma-4 (mixed 128+256)   | 128/256  | oscar2 on D=128 SWA layers, f16 on D=256 dense layers (F19) |
+
+### F19. Mixed-head-dim oscar2 fallback (HIGH)
+
+**What**: Per-layer override in the oscar2 SWA guard so models like Gemma-4 (SWA D=128, dense D=256) use oscar2 on the 128-head layers and f16 on the 256-head layers, instead of forcing the entire cache to f16.
+
+**Status**: **Implemented** in `src/llama-kv-cache.cpp` (~line 458). Each layer's head dim is now checked: layers whose head dim is supported (`n_embd_head_k(il) == 128`) keep `GGML_TYPE_OSCAR2`; layers with an unsupported head dim drop to `GGML_TYPE_F16`. The legacy uniform-dim SWA `oscar2_safe_for_swa` guard is kept as a defense-in-depth backstop.
+
+**Why needed**: Gemma-4's mix of `n_embd_head_k=128` (SWA) and `n_embd_head_k=256` (dense) was previously forcing the entire KV cache to f16 for any model with `n_swa > 0`. Per-layer override lets the 128-head SWA layers actually benefit from oscar2/INT2 quantization while the 256-head dense layers slot to f16 where the FA kernel does not yet handle D>128 cleanly.
+
+**Caveats**:
+
+- The oscar2 FA kernel currently only has a verified specialization for `D == 128`; the per-layer check is restricted to `hk == 128` / `hv == 128` deliberately. Extending the supported head dim set requires first verifying per-D hadamard inverse + dequant paths in `ggml/src/ggml-cuda/fattn-oscar2.cuh`.
+- The ISWA-aware cache (`llama_kv_cache_iswa`) splits base and SWA into separate `llama_kv_cache` instances. Each instance's per-layer pre-scan sees only its own subset, so the base instance (D=256) drops to f16 while the SWA instance (D=128) keeps oscar2 — no global heterogeneity inside a single instance.
 
 ---
 

@@ -111,13 +111,22 @@ Previously, any model with `n_swa > 0` was universally forced to f16 because
 Gemma-4 has mixed head dims (SWA=128, dense=256). Simple SWA models with uniform
 head dim (Gemma-2/3, Cohere Command R, etc.) were effectively blocked from oscar2.
 
-A pre-scan in `src/llama-kv-cache.cpp::llama_kv_cache` now determines whether the
-model has uniform head dim across KV-bearing layers and whether that dim is in
-{128, 256, 512} (the oscar2 FA kernel's supported set). If both yes, oscar2 is
-allowed for SWA models; only mixed-dim models like Gemma-4 fall back to f16.
+A two-tier check in `src/llama-kv-cache.cpp::llama_kv_cache` now resolves this:
+  * Uniform-head-dim SWA models are allowed wholesale (any D in {128, 256, 512}).
+  * Mixed-head-dim models get a per-layer override in the cache constructor:
+    layers whose `n_embd_head_k(il) == 128` keep `GGML_TYPE_OSCAR2`; layers
+    whose head dim is unsupported (e.g. Gemma-4 dense layers at D=256) drop
+    to `GGML_TYPE_F16`. The ISWA-aware cache slots SWA layers into the
+    `swa` sub-cache and dense layers into the `base` sub-cache, so each
+    sub-cache's per-layer check is uniform internally.
 
-Verified compatible: Gemma-2 (uniform D=128 or 256), Gemma-3, Cohere Command R.
-Still forced f16: Gemma-4 (mixed D=128+256).
+The legacy `oscar2_safe_for_swa` pre-scan is left in (for logging and as the
+uniform-dim shortcut), but the redundant global guard inside the per-layer
+block was removed because its filter-agnostic scan would have incorrectly
+flagged every Gemma-4 layer as f16, defeating the per-layer fix.
+
+Verified compatible: Gemma-2 (uniform D=128|256), Gemma-3, Cohere Command R, DFlash.
+Gemma-4: oscar2 on SWA layers (D=128); f16 fallback on dense layers (D=256).
 
 ---
 

@@ -455,12 +455,23 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // [OSCAR FIX] For SWA models with mixed head dims (e.g. Gemma-4: SWA=128, dense=256),
-        // the oscar2 Hadamard pipeline breaks. Fall back to f16 in that case.
-        // SWA models with uniform head dim (Gemma-2/3, Cohere, DFlash, etc.) work with oscar2.
-        if ((layer_type_k == GGML_TYPE_OSCAR2 || layer_type_v == GGML_TYPE_OSCAR2) && n_swa > 0 && !oscar2_safe_for_swa) {
-            if (layer_type_k == GGML_TYPE_OSCAR2) layer_type_k = GGML_TYPE_F16;
-            if (layer_type_v == GGML_TYPE_OSCAR2) layer_type_v = GGML_TYPE_F16;
+        // [OSCAR FIX] oscar2 Hadamard + INT2 pipeline currently only supports
+        // head_dim == 128 (the WHT rotation is hardcoded to 128x128 in
+        // turbo_rotation and the InnerQ scale pipeline is hardcoded to 128).
+        // Per-layer override: layers whose head dim is 128 keep oscar2, others
+        // drop to f16. The ISWA cache splits base and swa into separate
+        // llama_kv_cache instances; each instance's per-layer check sees only
+        // its own subset. The legacy oscar2_safe_for_swa uniform-dim SWA guard
+        // is intentionally NOT called here because its pre-scan ignores the
+        // filter callback and would falsely flag every Gemma-4 layer (mixed
+        // head dims) as f16, defeating the per-layer fix.
+        {
+            const uint32_t hk = (layer_type_k == GGML_TYPE_OSCAR2) ? hparams.n_embd_head_k(il) : 0;
+            const uint32_t hv = (layer_type_v == GGML_TYPE_OSCAR2 && !is_mla) ? hparams.n_embd_head_v(il) : 0;
+            const bool layer_ok_k = (layer_type_k != GGML_TYPE_OSCAR2) || hk == 128;
+            const bool layer_ok_v = (layer_type_v != GGML_TYPE_OSCAR2) || is_mla || hv == 128;
+            if (!layer_ok_k) layer_type_k = GGML_TYPE_F16;
+            if (!layer_ok_v) layer_type_v = GGML_TYPE_F16;
         }
 
         { static bool once = false; if (!once) { once = true; fprintf(stderr, "[OSCAR] KV cache dtype: K=%s V=%s (n_embd_k_gqa=%d, kv_size=%d)\n", ggml_type_name(layer_type_k), ggml_type_name(layer_type_v), (int) n_embd_k_gqa_eff, (int) kv_size); fflush(stderr); } }
