@@ -45,7 +45,7 @@ This is a latent inconsistency. A fully-correct Hadamard-domain pipeline would t
 |---|-----|----------|--------|
 | F1 | Move K/V attention to Hadamard domain: transform Q once, skip per-token inv-Hadamard/P_br | HIGH | implemented in `ggml/src/ggml-cuda/fattn-oscar2.cuh` |
 | F2 | Add multi-column prefill path for oscar2 (ncols=4/8 for large Q->ne[1]) | HIGH | implemented in `ggml/src/ggml-cuda/fattn-oscar2.cuh` |
-| F3 | Add MMA/Tensor-core path for oscar2 decode | MEDIUM | planned |
+| F3 | Route oscar2 decode to existing MMA turbo path | MEDIUM | implemented in `ggml/src/ggml-cuda/fattn.cu` |
 | F4 | Support head_dim ∈ {128,256,512} uniformly, extend beyond 128 where safe | MEDIUM | planned |
 | F5 | Unify K/V mean handling to the mathematically-correct form | LOW | deferred |
 
@@ -69,11 +69,27 @@ Modified `ggml/src/ggml-cuda/fattn-oscar2.cuh` launcher (`ggml_cuda_flash_attn_e
 - Register budget: ncols=8 at D=128 is ~108 regs/thread (~3.5K/block), ncols=4 at D=512 is ~200 regs/thread (~6.4K/block).
 - Expected speedup: prefill should see 2-4x reduction in KV read redundancy.
 
+## Implementation Notes for F3
+
+Modified `ggml/src/ggml-cuda/fattn.cu` turbo MMA gate in `ggml_cuda_flash_attn_ext`:
+- Added `oscar2_mma` check alongside `turbo_matched` in the pre-dispatch gate.
+- For D=128/256/512 with K=oscar2, V=oscar2, Q->ne[1]<=4, and Turing MMA available:
+  routes to `ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2` with OSCAR2 types.
+- D=512 added as oscar2-only dispatch (turbo types don't have D=512 in this gate).
+- Gated behind `ggml_cuda_turbo_mma_fused()` (default ON; GGML_TURBO_MMA_FUSED=0 disables).
+- No new kernel code needed: `fattn-mma-f16.cuh:608` (`flash_attn_ext_oscar2_load_tile`) already
+  dequantizes oscar2 blocks inline AND applies inverse Hadamard during K/V load.
+- `fattn-mma-turbo.cuh` already has `DECL_FATTN_MMA_TURBO_ALL` instantiations for OSCAR2 at
+  D=128, 256, 512 with all ncols1/ncols2 GQA combinations.
+- Mixed types (K=oscar2, V=F16, etc.) still use the scalar kernel (no MMA instantiations).
+- Prefill (Q->ne[1] > 4) still uses the scalar kernel with F1/F2 optimizations.
+
 ## Build/Test Status
 
-- CUDA `nvcc` is not available in this workspace, so F1 and F2 changes could not be compiled here.
+- CUDA `nvcc` is not available in this workspace, so F1/F2/F3 changes could not be compiled here.
 - Next step: build locally with `-DGGML_CUDA=ON` and run a token-identity test against the previous build.
-- F2 changes compile-time instantiates ncols={1,2,4,8} x lsc={true,false} = 8 new kernel variants per D value.
+- F2 compile-time instantiates ncols={1,2,4,8} x lsc={true,false} = 8 new kernel variants per D.
+- F3 routes oscar2 decode (Q->ne[1]<=4) to the existing MMA turbo path (no new kernel variants).
 
 ## Design Notes for F1
 
