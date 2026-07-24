@@ -44,7 +44,7 @@ This is a latent inconsistency. A fully-correct Hadamard-domain pipeline would t
 | # | Fix | Priority | Status |
 |---|-----|----------|--------|
 | F1 | Move K/V attention to Hadamard domain: transform Q once, skip per-token inv-Hadamard/P_br | HIGH | implemented in `ggml/src/ggml-cuda/fattn-oscar2.cuh` |
-| F2 | Add multi-warp prefill path for oscar2 (Q->ne[1] > 1) | HIGH | planned |
+| F2 | Add multi-column prefill path for oscar2 (ncols=4/8 for large Q->ne[1]) | HIGH | implemented in `ggml/src/ggml-cuda/fattn-oscar2.cuh` |
 | F3 | Add MMA/Tensor-core path for oscar2 decode | MEDIUM | planned |
 | F4 | Support head_dim ∈ {128,256,512} uniformly, extend beyond 128 where safe | MEDIUM | planned |
 | F5 | Unify K/V mean handling to the mathematically-correct form | LOW | deferred |
@@ -58,10 +58,22 @@ Modified `ggml/src/ggml-cuda/fattn-oscar2.cuh`:
 - Output: each 128-element block is inverse-transformed once, then the accumulated mean is added.
 - This preserves the exact output semantics of the original kernel while removing the per-token transforms.
 
+## Implementation Notes for F2
+
+Modified `ggml/src/ggml-cuda/fattn-oscar2.cuh` launcher (`ggml_cuda_flash_attn_ext_oscar2_case`):
+- ncols is now dynamically selected based on `Q->ne[1]` (prefill batch size) and head dimension `D`.
+- D<=256: ncols=8 when Q->ne[1]>=8, ncols=4 when Q->ne[1]>=4, ncols=2 otherwise.
+- D=512: ncols=4 when Q->ne[1]>=4, ncols=2 otherwise (capped to avoid register spilling).
+- decode (Q->ne[1]=1): ncols=1 (unchanged).
+- No kernel logic changes needed: the kernel already supports arbitrary ncols via template parameter.
+- Register budget: ncols=8 at D=128 is ~108 regs/thread (~3.5K/block), ncols=4 at D=512 is ~200 regs/thread (~6.4K/block).
+- Expected speedup: prefill should see 2-4x reduction in KV read redundancy.
+
 ## Build/Test Status
 
-- CUDA `nvcc` is not available in this workspace, so the change could not be compiled here.
+- CUDA `nvcc` is not available in this workspace, so F1 and F2 changes could not be compiled here.
 - Next step: build locally with `-DGGML_CUDA=ON` and run a token-identity test against the previous build.
+- F2 changes compile-time instantiates ncols={1,2,4,8} x lsc={true,false} = 8 new kernel variants per D value.
 
 ## Design Notes for F1
 

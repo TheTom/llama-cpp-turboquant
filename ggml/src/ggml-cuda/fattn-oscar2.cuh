@@ -327,33 +327,43 @@ void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    // Shared memory: just s_red[32] = 128 bytes (no K/V s_buf)
-    // dynamic shared memory requested from the launcher (kernel uses only static __shared__)
     constexpr size_t nbytes = 0;
-    // 1 warp: each thread keeps D/32 elements; avoids __syncthreads.
     constexpr int nwarps = 1;
 
     const int nbatch_fa = dst->src[1]->ne[1];
 
-    auto launch = [&](int ncols, bool lsc) {
+    // F2: multi-column prefill. Process more query tokens per block to
+    // reduce redundant KV reads during prefill (large Q->ne[1]).
+    // ncols=8 is safe for D<=256 (~108 regs/thread); cap at ncols=4
+    // for D=512 (~200 regs/thread) to avoid register spilling.
+    int ncols = 1;
+    if (Q->ne[1] > 1) {
+        if constexpr (D <= 256) {
+            ncols = Q->ne[1] >= 8 ? 8 : (Q->ne[1] >= 4 ? 4 : 2);
+        } else {
+            ncols = Q->ne[1] >= 4 ? 4 : 2;
+        }
+    }
+
+    auto launch = [&](int ncols_val, bool lsc) {
         if (lsc) {
-            if (ncols == 1) {
-                fattn_kernel_t k = flash_attn_ext_oscar2<D, 1, true,  type_K, type_V>;
-                launch_fattn<D, 1, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false);
-            } else {
-                fattn_kernel_t k = flash_attn_ext_oscar2<D, 2, true,  type_K, type_V>;
-                launch_fattn<D, 2, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false);
+            switch (ncols_val) {
+                case 1: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 1, true, type_K, type_V>; launch_fattn<D, 1, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 2: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 2, true, type_K, type_V>; launch_fattn<D, 2, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 4: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 4, true, type_K, type_V>; launch_fattn<D, 4, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 8: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 8, true, type_K, type_V>; launch_fattn<D, 8, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                default: GGML_ABORT("unsupported ncols for oscar2 FA"); break;
             }
         } else {
-            if (ncols == 1) {
-                fattn_kernel_t k = flash_attn_ext_oscar2<D, 1, false, type_K, type_V>;
-                launch_fattn<D, 1, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false);
-            } else {
-                fattn_kernel_t k = flash_attn_ext_oscar2<D, 2, false, type_K, type_V>;
-                launch_fattn<D, 2, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false);
+            switch (ncols_val) {
+                case 1: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 1, false, type_K, type_V>; launch_fattn<D, 1, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 2: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 2, false, type_K, type_V>; launch_fattn<D, 2, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 4: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 4, false, type_K, type_V>; launch_fattn<D, 4, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 8: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 8, false, type_K, type_V>; launch_fattn<D, 8, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                default: GGML_ABORT("unsupported ncols for oscar2 FA"); break;
             }
         }
     };
 
-    launch(Q->ne[1] > 1 ? 2 : 1, logit_softcap != 0.0f);
+    launch(ncols, logit_softcap != 0.0f);
 }
