@@ -158,8 +158,7 @@ def main():
                     help="dir with k_rotation_qqt_r_h_pbr.pt and v_rotation_sst_r_h_pbr.pt")
     ap.add_argument("--out", required=True, help="output *-rot-kv.gguf")
     ap.add_argument("--absorb-v", action="store_true",
-                    help="(G5) Absorb V rotation into W_o instead of adding attn_v_rot tensors.
-                          Eliminates per-token V rotation cost at runtime.")
+                    help="""(G5) Absorb V rotation into W_o instead of adding attn_v_rot tensors. Eliminates per-token V rotation cost at runtime.""")
     args = ap.parse_args()
 
     reader = GGUFReader(args.base)
