@@ -1071,7 +1071,7 @@ missing.
 
 **Severity**: MEDIUM — needed to produce calibrated rotations for new models.
 
-#### G7. Uresidual mode — MISSING (LOW)
+#### G7. Uresidual mode — IMPLEMENTED ✅
 
 The paper has a `uresidual` method that:
 1. Applies a reference rotation to K/V
@@ -1080,10 +1080,15 @@ The paper has a `uresidual` method that:
 4. Computes a second-pass residual rotation that aligns error directions
 with the Q/V covariance
 
-Not in this repo.
+Implemented in `oscar-rotation/calibrate_rotation.py`:
+- `--uresidual-iters N` flag (0=disabled, 1-2 recommended)
+- Synthetic activations generated via Cholesky decomposition of empirical covariance
+- INT2 quantization simulation (per-row min/max, 4 centroids matching oscar2)
+- Error covariance eigendecomposition + alignment with Q/V covariance directions
+- Iterative refinement: each iteration recomputes synthetic activations under current rotation
 
 **Severity**: LOW — refinement over the base rotation; the base rotation
-provides most of the benefit.
+provides most of the benefit. **1-2 iterations are sufficient.**
 
 ### What the `zhongzhu/llamacpp` branch has that this fork may not
 

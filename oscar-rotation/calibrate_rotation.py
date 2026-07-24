@@ -238,6 +238,130 @@ def save_rotation(rotations: torch.Tensor, eigenvalues_list: list,
 
 
 # ---------------------------------------------------------------------------
+# G7: Uresidual mode - refine rotation via quantization error alignment
+# ---------------------------------------------------------------------------
+def generate_synthetic_activations(cov: torch.Tensor, n_samples: int = 4096) -> torch.Tensor:
+    """Generate synthetic activations matching a covariance matrix.
+
+    Uses Cholesky decomposition: X = Z @ L^T where L = cholesky(cov)
+    and Z ~ N(0, I). Returns [n_samples, d].
+    """
+    d = cov.shape[0]
+    # Regularize to ensure positive-definite for Cholesky.
+    cov_reg = cov + 1e-6 * torch.eye(d, dtype=cov.dtype)
+    L = torch.linalg.cholesky(cov_reg)
+    Z = torch.randn(n_samples, d, dtype=cov.dtype)
+    return Z @ L.T
+
+
+def simulate_int2_quantize(x: torch.Tensor) -> torch.Tensor:
+    """Simulate oscar2 INT2 quantization and dequantization.
+
+    Per-block (row-wise) quantization with 4 centroids:
+        scale = (max - min) / 3
+        codes = clamp(round((x - min) / scale), 0, 3)
+        x_dequant = codes * scale + min
+
+    Args:
+        x: [n_samples, d] activations.
+
+    Returns:
+        x_dequant: [n_samples, d] dequantized activations.
+    """
+    # Per-row min/max (matches oscar2 block quantization).
+    row_min = x.min(dim=1, keepdim=True).values
+    row_max = x.max(dim=1, keepdim=True).values
+    scale = (row_max - row_min) / 3.0
+    # Avoid division by zero for constant rows.
+    scale = scale.clamp(min=1e-10)
+    codes = torch.clamp(torch.round((x - row_min) / scale), 0, 3)
+    return codes * scale + row_min
+
+
+def compute_uresidual_rotation(
+    cov: torch.Tensor,
+    R_ref: torch.Tensor,
+    n_samples: int = 4096,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """Compute one uresidual refinement step.
+
+    1. Generate synthetic activations from cov.
+    2. Apply R_ref: x_rot = x @ R_ref^T
+    3. Simulate INT2 quantize/dequantize.
+    4. Compute error covariance C_E = E^T E / N.
+    5. Eigendecompose C_E (error directions, descending).
+    6. Project cov into rotated space and eigendecompose (target, ascending).
+    7. R_resid = U_target @ U_error^T  (map largest errors to least important dims).
+    8. Return R_resid @ R_ref.
+
+    Args:
+        cov: [d, d] original covariance (Q^T Q or V^T V).
+        R_ref: [d, d] current reference rotation (orthogonal).
+        n_samples: number of synthetic samples.
+
+    Returns:
+        R_new: [d, d] refined rotation.
+    """
+    d = cov.shape[0]
+
+    # Step 1: Generate synthetic activations.
+    x = generate_synthetic_activations(cov, n_samples).to(device)
+
+    # Step 2: Apply reference rotation (x_rot = x @ R_ref^T, since R is column-orthogonal).
+    x_rot = x @ R_ref.T
+
+    # Step 3: INT2 quantize/dequantize.
+    x_dequant = simulate_int2_quantize(x_rot)
+
+    # Step 4: Error and error covariance.
+    error = x_rot - x_dequant  # [n_samples, d]
+    C_E = (error.T @ error) / n_samples  # [d, d]
+
+    # Step 5: Error directions (largest error variance first).
+    eigvals_err, U_err = torch.linalg.eigh(C_E)
+    idx_err = torch.argsort(eigvals_err, descending=True)
+    U_err = U_err[:, idx_err]
+
+    # Step 6: Project original cov into rotated space, eigendecompose.
+    cov_rot = R_ref @ cov @ R_ref.T
+    eigvals_target, U_target = torch.linalg.eigh(cov_rot)
+    # Ascending: least important (smallest variance) first.
+    idx_target = torch.argsort(eigvals_target, ascending=True)
+    U_target = U_target[:, idx_target]
+
+    # Step 7: R_resid maps largest error dims -> least important target dims.
+    R_resid = U_target @ U_err.T
+    # Ensure orthogonality (should already be, but guard against FP drift).
+    U_check, S_check, Vh_check = torch.linalg.svd(R_resid)
+    R_resid = U_check @ Vh_check
+
+    # Step 8: Compose: new rotation = R_resid @ R_ref.
+    return R_resid @ R_ref
+
+
+def run_uresidual_refinement(
+    cov: torch.Tensor,
+    R_ref: torch.Tensor,
+    n_iters: int,
+    n_samples: int = 4096,
+) -> torch.Tensor:
+    """Run multiple uresidual refinement iterations.
+
+    Each iteration recomputes synthetic activations under the current rotation
+    and refines it by aligning quantization error with low-importance dims.
+    """
+    R = R_ref.clone()
+    for i in range(n_iters):
+        R_new = compute_uresidual_rotation(cov, R, n_samples)
+        orth_err = (R_new @ R_new.T - torch.eye(cov.shape[0])).abs().max().item()
+        if i == 0 or (i + 1) == n_iters:
+            print(f"    uresidual iter {i+1}/{n_iters}: orth err={orth_err:.2e}")
+        R = R_new
+    return R
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -256,6 +380,10 @@ def main():
                     help="Composition of rotation with H and P_br (default: r_h_pbr)")
     ap.add_argument("--prefix", default="",
                     help="Optional prefix for output filenames")
+    ap.add_argument("--uresidual-iters", type=int, default=0,
+                    help="Number of uresidual refinement iterations (0=disabled, 1-2 recommended)")
+    ap.add_argument("--uresidual-samples", type=int, default=4096,
+                    help="Number of synthetic samples for uresidual quantization simulation")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -278,6 +406,11 @@ def main():
     k_eigenvalues = []
     v_eigenvalues = []
 
+    do_uresidual = args.uresidual_iters > 0
+    if do_uresidual:
+        print(f"\nG7 uresidual mode: {args.uresidual_iters} iteration(s), "
+              f"{args.uresidual_samples} synthetic samples")
+
     for layer in range(args.num_layers):
         # K rotation: R_K = eigendecompose(Q^T Q)
         R_K = compute_rotation(q_covs[layer])
@@ -288,6 +421,14 @@ def main():
         R_V = compute_rotation(v_covs[layer])
         v_eig = torch.linalg.eigvalsh(v_covs[layer])
         v_eig_sorted = v_eig.flip(0)
+
+        # G7: Uresidual refinement (before composition with H/P_br).
+        # Aligns quantization error directions with low-importance Q/V dims.
+        if do_uresidual:
+            R_K = run_uresidual_refinement(
+                q_covs[layer], R_K, args.uresidual_iters, args.uresidual_samples)
+            R_V = run_uresidual_refinement(
+                v_covs[layer], R_V, args.uresidual_iters, args.uresidual_samples)
 
         # Compose with H and P_br.
         final_K = compose_rotation(R_K, H, P_br, args.composition)
