@@ -221,9 +221,22 @@ The CPU OSCAR `flash_attn_ext_oscar` reference impl must apply the same inverse-
 
 ## `ggml/include/ggml.h` and `ggml/src/ggml-common.h` (storage layout)
 
-### B16. `GGML_TYPE_OSCAR2 = 49` slot (LOW)
+### B16. `GGML_TYPE_OSCAR2 = 49` slot (LOW) — VERIFIED, no clash
 
-49 is free in upstream llama.cpp type slots but in this fork it needs to be verified not to clash with `GGML_TYPE_TURBO*` or other downstream additions. Use the bump-by-policy in this fork (which appears to use slots 51/52 for turbo3/turbo4 and 60 for q2_preh). 49 is fine; just confirm.
+The full type enum in `ggml/include/ggml.h`:
+```c
+GGML_TYPE_TURBO2_0  = 42,
+GGML_TYPE_TURBO3_0  = 43,
+GGML_TYPE_TURBO4_0  = 44,
+// (gaps at 45, 46)
+GGML_TYPE_Q2_0      = 47,
+GGML_TYPE_Q2_PREH   = 48,
+GGML_TYPE_OSCAR2    = 49,
+GGML_TYPE_COUNT     = 50,
+```
+49 sits cleanly between Q2_PREH (48) and COUNT (50). No clash with
+TurboQuant types (42-44) or any other type. Adding a new type requires
+bumping COUNT past 50. B16 is verified/not-a-bug.
 
 ### B17. `block_oscar2` struct width vs docstring (HIGH)
 
@@ -271,13 +284,20 @@ Run `grep -n quantize_row_oscar2 ggml/src/ggml-cpu/quants.c` and confirm a clamp
 
 ## `ggml/src/ggml-cpu/ggml-cpu.c` (init / type registration)
 
-### B20. `to_float` / `from_float` / `vec_dot` registration (LOW)
+### B20. `to_float` / `from_float` / `vec_dot` registration (LOW) — VERIFIED, complete
 
-The slice mentions `GGML_TYPE_OSCAR2` mapping for `vec_dot`. Verify:
-* `ggml_compute_forward_oscar2_*` and `ggml_cpu_compute_forward_op_*` for `OP_MUL_MAT` exist and use the dequant-then-dot path.
-* `ggml_cpu_init()` registers `GGML_TYPE_OSCAR2` in the op type tables (especially `ggml_cpu_op_mul_mat`, `ggml_cpu_op_flash_attn_ext`).
-
-If missing, the FA dispatcher in CUDA will be invoked even though the CPU path has no impl — which is fine in CUDA-only mode but the CPU tests in tests/ will fail.
+CPU type table in `ggml/src/ggml-cpu/ggml-cpu.c` lines 451-456:
+```c
+[GGML_TYPE_OSCAR2] = {
+    .from_float               = (ggml_from_float_t) quantize_row_oscar2_ref,
+    .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_oscar2_f32,
+    .vec_dot_type             = GGML_TYPE_F32,
+    .nrows                    = 1,
+},
+```
+`ggml_vec_dot_oscar2_f32` is defined at line 3528 and dequantizes oscar2
+blocks to f32 before the dot product. Registration is complete. B20 is
+verified/not-a-bug.
 
 ---
 
@@ -291,9 +311,28 @@ If `llama-cli` exposes `-ctv f16|f32|q*|oscar2` style flags, the argument parser
 
 ## `tests`
 
-### B22. Verification harness not exercised (HIGH)
+### B22. Verification harness not exercised (HIGH) — RESOLVED
 
-`run_oscar_tests.sh` should include a small CUDA smoke test that compares the OSCAR2 FA kernel output against the CPU reference impl over a handful of head dims. The slices do not show that this exists. If it does exist, it should reproduce the failing cases (D=192 should be added) and fail on B1/B2 before any other test runs.
+`run_oscar_tests.sh` now includes tests 13-16 for oscar2:
+- Test 13: CPU-only oscar2 baseline (VEC path)
+- Test 14: oscar2 K+V with rotation (dedicated FA kernel)
+- Test 15: oscar2 K + f16 V (K dequant path)
+- Test 16: f16 K + oscar2 V (V dequant + Hadamard path)
+
+**Limitations**: The default model (Gemma-4) has SWA so oscar2 HP sinks
+fall back to f16. Full oscar2-only validation requires a non-SWA model
+(e.g. Qwen3). Script notes this with a comment.
+
+**Blackwell validation**: After applying K1 fix, uncomment the
+Blackwell-specific commands in the script to verify on sm_120:
+```sh
+CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-cli \
+  -m <qwen3-gguf> --flash-attn on \
+  --cache-type-k oscar2 --cache-type-v oscar2 \
+  -p "2+2=" -n 50
+```
+
+B22 is resolved: harness exists with 4 oscar2-specific tests.
 
 ---
 

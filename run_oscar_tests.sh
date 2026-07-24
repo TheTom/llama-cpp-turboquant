@@ -181,6 +181,43 @@ run_test 12 "K q2_0 interleaved" q2_0 f16 \
 # This test just uses the same template; the interleaved version
 # is in the log file name for reference.
 
+# ================================================================
+# OSCAR2 tests — dedicated FA kernel path (GPU required)
+# ================================================================
+#
+# NOTE: The current MODEL (Gemma-4) has SWA (n_swa > 0) which forces
+# oscar2 to fall back to f16 in HP sink buffers. These tests will run
+# with oscar2 in the main cache but f16 HP sinks.
+#
+# For full oscar2-only testing, use a model without SWA (e.g. Qwen3):
+#   MODEL="/path/to/qwen3-8b-gguf"
+#   TEMPLATE="models/templates/qwen3-instruct.jinja"
+
+# CPU-only oscar2 baseline (VEC path, device 0 disabled)
+run_test 13 "oscar2 baseline (CPU)" oscar2 oscar2
+
+# GPU oscar2 full K+V (dedicated FA kernel if D in {128,256,512})
+run_test 14 "oscar2 K+V FA" oscar2 oscar2 \
+    LLAMA_ATTN_ROT_K_OVERRIDE=1 LLAMA_ATTN_ROT_V_OVERRIDE=1
+
+# GPU oscar2 K only, f16 V (tests K dequant path)
+run_test 15 "oscar2 K=f16 V" oscar2 f16 \
+    LLAMA_ATTN_ROT_K_OVERRIDE=1
+
+# GPU f16 K, oscar2 V (tests V dequant + Hadamard path)
+run_test 16 "f16 K oscar2 V" f16 oscar2 \
+    LLAMA_ATTN_ROT_V_OVERRIDE=1
+#
+# To verify the dedicated FA kernel is actually hit (not VEC fallback),
+# check the log for "OSCAR2 FA" or increase -n to trigger prefilling:
+#   grep -i "oscar2\|fattn" test_results/test_14_oscar2_K\+V_FA.log
+#
+# For Blackwell sm_120 testing, add after applying K1 fix:
+#   CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-cli \
+#     -m <qwen3-gguf> --flash-attn on \
+#     --cache-type-k oscar2 --cache-type-v oscar2 \
+#     -p "2+2=" -n 50
+
 echo ""
 echo "================================================================="
 echo "  All tests complete! $(date)"
