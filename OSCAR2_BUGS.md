@@ -421,6 +421,35 @@ Total: `+28`, `-28` lines.
    resolved (or at least progressed) by F1 alone.
 4. Run the dgx-spark benchmark suite to confirm no performance regression.
 
+## Fixes landed: tools accept `oscar2` type
+
+### F6. `llama-bench` type parsing missing `oscar2`, `q2_0`, `q2_preh`
+
+`tools/llama-bench/llama-bench.cpp`: the local `ggml_type_from_name()` function
+had its own per-string mapping that was missing `oscar2`, `q2_0`, and `q2_preh`.
+Added three entries:
+
+```cpp
+if (s == "q2_0")    { return GGML_TYPE_Q2_0;    }
+if (s == "q2_preh") { return GGML_TYPE_Q2_PREH; }
+if (s == "oscar2")  { return GGML_TYPE_OSCAR2;  }
+```
+
+This allows `llama-bench -ctk oscar2 -ctv oscar2` to work. The other CLI tools
+(`llama-cli`, `llama-server`, `llama-perplexity`) already accept `oscar2`
+through the shared `common/arg.cpp -> kv_cache_type_from_str()` codepath which
+iterates `kv_cache_types` and calls `ggml_type_name()`, while `llama-quantize`
+uses `parse_ggml_type()` which iterates `GGML_TYPE_COUNT` calling
+`ggml_type_name()` — both of these already resolve `GGML_TYPE_OSCAR2` correctly.
+
+### B21 update: CLI mapping is present
+
+`common/arg.cpp` at line 390 already includes `GGML_TYPE_OSCAR2` in the
+`kv_cache_types` vector, and `kv_cache_type_from_str()` resolves it via
+`ggml_type_name(type) == s`. The type name in `ggml.c` is `"oscar2"`.
+The `--cache-type-k oscar2` / `--cache-type-v oscar2` CLI flags are fully
+functional. B21 is downgraded to verified/not-a-bug.
+
 Last reviewed commit: `origin/oscar` @ `791ca44f4432b0b5730e44a6394bed5621dd01d6`.
 
 ---
