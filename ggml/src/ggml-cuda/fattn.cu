@@ -598,7 +598,6 @@ static void ggml_cuda_flash_attn_ext_oscar2(ggml_backend_cuda_context & ctx, ggm
     ggml_type type_K = K->type;
     ggml_type type_V = V->type;
 
-    if (D == 64)  { DISPATCH_OSCAR2(64);  }
     if (D == 128) { DISPATCH_OSCAR2(128); }
     if (D == 256) { DISPATCH_OSCAR2(256); }
     if (D == 512) { DISPATCH_OSCAR2(512); }
@@ -697,12 +696,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
         // For Q2_0 unsupported head dim: fall through to VEC (may be broken on Blackwell)
     }
-    // OSCAR2 KV: dedicated kernel handles all power-of-2 head dims (incl. D=512)
-    // with proper per-128-block inverse Hadamard dequant. TILE/VEC/MMA paths lack
-    // inverse Hadamard and would produce garbage for Hadamard-domain OSCAR2 values.
+    // OSCAR2 KV: dedicated kernel handles head dims divisible by QK_OSCAR2 (128).
+    // D=64 is not supported because QK_OSCAR2=128 and the kernel template enforces
+    // D >= QK_OSCAR2 && D % QK_OSCAR2 == 0 via static_assert; fall through to NONE.
+    // TILE/VEC/MMA paths lack inverse Hadamard and would produce garbage for
+    // Hadamard-domain OSCAR2 values.
     if (K->type == GGML_TYPE_OSCAR2 || V->type == GGML_TYPE_OSCAR2) {
         const int D = K->ne[0];
-        if (D == 64 || D == 128 || D == 256 || D == 512) {
+        if (D == 128 || D == 256 || D == 512) {
             return BEST_FATTN_KERNEL_OSCAR2;
         }
         return BEST_FATTN_KERNEL_NONE;

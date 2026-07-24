@@ -1,8 +1,11 @@
 // OSCAR2 dedicated flash attention kernel
-// Per-128-vector min-max asymmetric INT2 dequant: val = code * d + m
+// Per-128-vector (QK_OSCAR2 = 128) min-max asymmetric INT2 dequant: val = code * d + m
 // No Hadamard transform, no Lloyd-Max centroids.
-// For D >= 128: 128 threads (4 warps), cooperative dequant
-// For D < 128:  32 threads (1 warp), serial dequant (legacy)
+// block_oscar2 layout (ggml-common.h): qs[QK_OSCAR2 / 4] = 32 byte codes
+//                                      + 2 halves (d, m) = 4 bytes
+//                                      total sizeof(block_oscar2) == 36.
+// Main kernel runs as one warp (32 threads, nwarps_k = 1) regardless of D;
+// D % QK_OSCAR2 == 0 is required (gated in ggml_cuda_get_best_fattn_kernel).
 
 #include "common.cuh"
 #include "fattn-common.cuh"
@@ -116,6 +119,8 @@ static __global__ void flash_attn_ext_oscar2(
     constexpr int nwarps_k = 1;
     constexpr int nthreads = nwarps_k * WARP_SIZE;
     static_assert(D % nthreads == 0, "D not divisible by nthreads");
+    static_assert(D >= QK_OSCAR2 && D % QK_OSCAR2 == 0,
+                  "OSCAR2 FA kernel requires D >= 128 and D % QK_OSCAR2 == 0");
     constexpr int nelems = D / nthreads;
 
     const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
@@ -215,13 +220,7 @@ static __global__ void flash_attn_ext_oscar2(
                         }
                     }
                 } else {
-                    for (int e = 0; e < nelems; ++e) {
-                        const uint8_t code = (K_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        sum += (fmaf((float)code, __half2float(K_blk[0].d), __half2float(K_blk[0].m))) * Q_reg[j][e];
-                    }
-                }
-                // Handle D < 128 (partial block)
-                if constexpr (!use_block_unroll) {
+                    // D < QK_OSCAR2 single-block path (use_block_unroll == false).
                     for (int e = 0; e < nelems; ++e) {
                         const uint8_t code = (K_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
                         sum += (fmaf((float)code, __half2float(K_blk[0].d), __half2float(K_blk[0].m))) * Q_reg[j][e];
@@ -250,7 +249,7 @@ static __global__ void flash_attn_ext_oscar2(
                 }
 
                 if (use_logit_softcap) full_kq = logit_softcap * tanhf(full_kq);
-                if (maskh && (ncols == 1 || ic0 + j < (int)ne01.z))
+                if (maskh && (ncols == 1 || ic0 + j < (int)ne01.x))
                     full_kq += slope * __half2float(maskh[j*ne11 + i_kv]);
 
                 const float rn = fmaxf(KQ_max[j], full_kq + FATTN_KQ_MAX_OFFSET);
@@ -297,7 +296,7 @@ static __global__ void flash_attn_ext_oscar2(
     // Write results
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
-        if (ncols > 1 && ic0 + j >= (int)ne01.z) break;
+        if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
         const float iks = gridDim.y == 1 ? 1.0f / KQ_sum[j] : 1.0f;
         if (gridDim.y != 1 && tid == 0) {
             int mi = ((sequence * (int)ne01.z + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y;
