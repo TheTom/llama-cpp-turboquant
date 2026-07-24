@@ -450,6 +450,56 @@ uses `parse_ggml_type()` which iterates `GGML_TYPE_COUNT` calling
 The `--cache-type-k oscar2` / `--cache-type-v oscar2` CLI flags are fully
 functional. B21 is downgraded to verified/not-a-bug.
 
+### B19 update: quantize_row_oscar2_reference is present and correct
+
+`ggml/src/ggml-quants.c` lines 646-693: `quantize_row_oscar2_ref` exists
+with proper code clamping to `[0, 3]`:
+```c
+int code = (int)((val - vmin) * inv_scale + 0.5f);
+if (code < 0) code = 0;
+if (code > 3) code = 3;
+```
+The `dequantize_row_oscar2` function reverses correctly with `code * d + m`.
+B19 is downgraded to verified/not-a-bug.
+
+### F6. `llama-bench` type parsing missing `oscar2`, `q2_0`, `q2_preh`
+
+`tools/llama-bench/llama-bench.cpp`: the local `ggml_type_from_name()` function
+had its own per-string mapping that was missing `oscar2`, `q2_0`, and `q2_preh`.
+Added three entries:
+
+```cpp
+if (s == "q2_0")    { return GGML_TYPE_Q2_0;    }
+if (s == "q2_preh") { return GGML_TYPE_Q2_PREH; }
+if (s == "oscar2")  { return GGML_TYPE_OSCAR2;  }
+```
+
+This allows `llama-bench -ctk oscar2 -ctv oscar2` to work.
+
+### F7. B4 — mask pointer arithmetic uses half-element offsets consistently
+
+`ggml/src/ggml-cuda/fattn-oscar2.cuh`: the mask pointer initialization
+computed byte offsets (`mask_ptr + nb31*ic0 + blockIdx.y * nthreads`) but
+then cast to `const half*` and updated in half-element increments in the
+loop. Changed to consistent half-element arithmetic:
+
+```cpp
+// old: (const half *)(mask_ptr + nb33*... + nb31*ic0 + blockIdx.y * nthreads)
+// new: (const half *)mask_ptr + (nb33/2)*... + (nb31/2)*ic0 + blockIdx.y * nthreads
+```
+
+The `blockIdx.y * nthreads` term and the loop increment `maskh += gridDim.y * nthreads`
+are now in the same units (half elements), avoiding the 2x mismatch when
+sizeof(half) == 2.
+
+### F8. B6 — documented nb11 stride invariant
+
+`ggml/src/ggml-cuda/fattn-oscar2.cuh`: added a comment near `K_blk` declaration
+documenting the invariant that `nb11 == nblocks * sizeof(block_oscar2)` so
+that per-block indexing `K_blk[b]` stays within the row. A full runtime assert
+requires host-side access to strides; the comment serves as a documentation
+anchor until a host-side assert can be placed in the dispatch function.
+
 Last reviewed commit: `origin/oscar` @ `791ca44f4432b0b5730e44a6394bed5621dd01d6`.
 
 ---

@@ -138,7 +138,7 @@ static __global__ void flash_attn_ext_oscar2(
     const char * Q = Q_ptr + nb03*sequence + nb02*head + nb01*ic0;
     const char * K = K_ptr + nb13*sequence + nb12*(head / gqa_ratio) + blockIdx.y * nthreads * nb11;
     const char * V = V_ptr + nb23*sequence + nb22*(head / gqa_ratio) + blockIdx.y * nthreads * nb21;
-    const half * maskh = mask_ptr ? (const half *)(mask_ptr + nb33*(sequence % ne33) + nb31*ic0 + blockIdx.y * nthreads) : nullptr;
+    const half * maskh = mask_ptr ? (const half *)mask_ptr + (nb33/2)*(sequence % ne33) + (nb31/2)*ic0 + blockIdx.y * nthreads : nullptr;
     const float * sinks = sinks_ptr ? (const float *)(sinks_ptr + (sequence*ne02 + head) * 2) : nullptr;
     GGML_UNUSED(sinks);
 
@@ -195,6 +195,7 @@ static __global__ void flash_attn_ext_oscar2(
             if (kv_base + i_kv >= k_VKQ_max) break;
 
             const block_oscar2 * K_blk = (const block_oscar2 *)(K + i_kv * nb11);
+            // INVARIANT: nb11 == nblocks * sizeof(block_oscar2) so K_blk[b] stays within the row
             const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
             // ---- K dequant + dot product (with inv-Hadamard test) ----
