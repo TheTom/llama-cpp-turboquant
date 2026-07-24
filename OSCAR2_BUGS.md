@@ -680,6 +680,32 @@ if (!layer.attn_k_rot || !layer.attn_v_rot) {
 }
 ```
 
+### F18. SWA + OSCAR2 compatibility (HIGH)
+
+The universal `n_swa > 0 -> f16` guard in the llama-kv-cache constructor was
+overly conservative: only Gemma-4 genuinely needs the f16 fallback because
+its SWA layers (head_dim=128) and dense layers (head_dim=256) use different
+Hadamard matrices. Simple SWA models with uniform head dim (Gemma-2/3,
+Cohere Command R, DFlash) were being silently downgraded to f16.
+
+**Changes**:
+- `src/llama-kv-cache.cpp::llama_kv_cache`: added a pre-scan loop BEFORE the
+  main layer loop that determines (a) whether all has_kv layers share a single
+  `n_embd_head_k` value AND a single `n_embd_head_v` value, AND (b) that
+  value is one of {128, 256, 512} (the oscar2 FA kernel's dispatched set).
+  Result is stored in `oscar2_safe_for_swa` (true = oscar2 works for SWA).
+- Same file: the existing oscar2->f16 guard now also requires
+  `!oscar2_safe_for_swa`, so only mixed-head-dim SWA models (Gemma-4) hit it.
+
+**Behavioral matrix**:
+| Model                     | head_dim | oscar2 result |
+|---------------------------|---------:|---------------|
+| Qwen3 (uniform D=128)    | n/a      | allowed (no SWA) |
+| Gemma-2 (uniform D=256)  | 256      | allowed (was f16) |
+| Gemma-3 (uniform D=128)  | 128      | allowed (was f16) |
+| Cohere Command R (D=128)  | 128      | allowed (was f16) |
+| Gemma-4 (mixed 128+256)   | 128/256  | forced f16 (correct) |
+
 ---
 
 ## Remaining kernel issues — exact fix descriptions

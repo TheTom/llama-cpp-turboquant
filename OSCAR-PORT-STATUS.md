@@ -106,6 +106,19 @@ Not implemented for OSCAR2. The HP buffer (f16 fallback for sink+recent tokens)
 is a planned addition to recover quality at long contexts but is not needed for
 correctness at short contexts.
 
+### 5. SWA + OSCAR2 compatibility (HIGH)
+Previously, any model with `n_swa > 0` was universally forced to f16 because
+Gemma-4 has mixed head dims (SWA=128, dense=256). Simple SWA models with uniform
+head dim (Gemma-2/3, Cohere Command R, etc.) were effectively blocked from oscar2.
+
+A pre-scan in `src/llama-kv-cache.cpp::llama_kv_cache` now determines whether the
+model has uniform head dim across KV-bearing layers and whether that dim is in
+{128, 256, 512} (the oscar2 FA kernel's supported set). If both yes, oscar2 is
+allowed for SWA models; only mixed-dim models like Gemma-4 fall back to f16.
+
+Verified compatible: Gemma-2 (uniform D=128 or 256), Gemma-3, Cohere Command R.
+Still forced f16: Gemma-4 (mixed D=128+256).
+
 ---
 
 ## File Inventory

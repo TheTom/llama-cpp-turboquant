@@ -257,6 +257,39 @@ llama_kv_cache::llama_kv_cache(
                 __func__, hparams.n_embd_v_gqa_max());
     }
 
+    // Pre-scan: SWA models with oscar2 mixed-head-dim problem. Only Gemma-4 (SWA=128, dense=256)
+    // genuinely breaks. Simple SWA models (Gemma-2/3, Cohere) with uniform head dim work fine.
+    // Pre-scan determines whether head dims are uniform across all KV-bearing layers and whether
+    // that uniform value is one of the values supported by the oscar2 FA kernel dispatcher
+    // (D in {128, 256, 512}). If both yes, oscar2 is safe for SWA models.
+    bool oscar2_safe_for_swa = false;
+    {
+        int32_t head_k_first = -1;
+        int32_t head_v_first = -1;
+        bool uniform_head = true;
+        bool has_kv_layer = false;
+        for (uint32_t il_pre = 0; il_pre < n_layer; il_pre++) {
+            if (!hparams.has_kv(il_pre)) continue;
+            has_kv_layer = true;
+            const int32_t hk = (int32_t) hparams.n_embd_head_k(il_pre);
+            const int32_t hv = (int32_t) hparams.n_embd_head_v(il_pre);
+            if (head_k_first < 0) head_k_first = hk;
+            if (head_v_first < 0) head_v_first = hv;
+            if (hk != head_k_first || hv != head_v_first) {
+                uniform_head = false;
+                break;
+            }
+        }
+        // oscar2 FA kernel only dispatches D in {128, 256, 512}
+        const bool k_compat = (head_k_first == 128 || head_k_first == 256 || head_k_first == 512);
+        const bool v_compat = (head_v_first == 128 || head_v_first == 256 || head_v_first == 512);
+        oscar2_safe_for_swa = has_kv_layer && uniform_head && k_compat && v_compat;
+        if (n_swa > 0 && (type_k == GGML_TYPE_OSCAR2 || type_v == GGML_TYPE_OSCAR2)) {
+            LLAMA_LOG_INFO("%s: oscar2_safe_for_swa = %d (n_swa=%u, head_k=%d, head_v=%d, uniform=%d)\n",
+                    __func__, oscar2_safe_for_swa, n_swa, head_k_first, head_v_first, uniform_head);
+        }
+    }
+
     const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < n_layer; il++) {
@@ -422,10 +455,10 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // [OSCAR FIX] For models with SWA (different head dims per layer, e.g. Gemma-4),
-        // the oscar2 Hadamard pipeline produces wrong results. Fall back to f16.
-        // Single-head-dim models (e.g. Qwen) continue using oscar2.
-        if ((layer_type_k == GGML_TYPE_OSCAR2 || layer_type_v == GGML_TYPE_OSCAR2) && n_swa > 0) {
+        // [OSCAR FIX] For SWA models with mixed head dims (e.g. Gemma-4: SWA=128, dense=256),
+        // the oscar2 Hadamard pipeline breaks. Fall back to f16 in that case.
+        // SWA models with uniform head dim (Gemma-2/3, Cohere, DFlash, etc.) work with oscar2.
+        if ((layer_type_k == GGML_TYPE_OSCAR2 || layer_type_v == GGML_TYPE_OSCAR2) && n_swa > 0 && !oscar2_safe_for_swa) {
             if (layer_type_k == GGML_TYPE_OSCAR2) layer_type_k = GGML_TYPE_F16;
             if (layer_type_v == GGML_TYPE_OSCAR2) layer_type_v = GGML_TYPE_F16;
         }
