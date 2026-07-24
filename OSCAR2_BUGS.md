@@ -6,7 +6,7 @@ This list supplements the four known issues already in `OSCAR-PORT-STATUS.md`:
 
 1. Dedicated OSCAR2 FA kernel produces incoherent output.
 2. VEC path broken for quantized KV at `D > 256`.
-3. Rotation matrices for Gemma-4-12B fall back to identity.
+3. ~~Rotation matrices for Gemma-4-12B fall back to identity.~~ FIXED (F17)
 4. HP sink buffer not implemented for OSCAR2.
 
 The bugs below were identified by reading the OSCAR2-specific slices of `ggml/src/ggml-cuda/fattn-oscar2.cuh`, `ggml/src/ggml-cuda/fattn.cu`, `ggml/src/ggml-cpu/ops.cpp` (CPU OSCAR reference attention), `ggml/src/ggml-cpu/quants.c`, `ggml/src/ggml-cpu/ggml-cpu.c`, `ggml/include/ggml.h`, and `ggml/src/ggml-common.h` from the `oscar` branch. They are grouped by file and given a severity tag.
@@ -649,6 +649,36 @@ for F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, and BF16 so the D=512 VEC templates
 are available for linking. The `fattn.cu` dispatch already had explicit
 `FATTN_VEC_CASE(512, ...)` entries for OSCAR2 and Q2_0 combinations; those now
 resolve correctly.
+
+### F17. B3 — Gemma-4-12B rotation matrices fall back to Hadamard (HIGH)
+
+`src/models/gemma4.cpp`: `attn_k_rot` and `attn_v_rot` were loaded as
+`TENSOR_NOT_REQUIRED`. When a Gemma-4 GGUF lacked the calibrated rotation
+matrices, the tensors were left as `nullptr`, so the graph applied no
+rotation (identity fallback). Quantized KV caches then produced incoherent
+output because the INT2/Q2_0 quantization assumes an incoherence-reducing
+rotation has been applied.
+
+After creating the two tensors, `load_arch_tensors` now checks whether either
+is missing and creates a fallback 128x128 F32 tensor in the model context,
+backed by a CPU buffer and initialized from the precomputed Hadamard-like
+matrix `TURBO_ROTATION_RT` (`src/turbo-rotation-data.h`). The graph continues
+to apply `attn_k_rot` and `attn_v_rot` exactly as before, so no graph changes
+were required. If `n_embd_head != 128` the fallback cannot be used and the
+function throws a clear error; Gemma-4-12B uses head_dim 128, so this path
+is active for the affected model.
+
+Code added:
+```cpp
+#include "../turbo-rotation-data.h"
+```
+and in the per-layer tensor creation loop:
+```cpp
+if (!layer.attn_k_rot || !layer.attn_v_rot) {
+    if (n_embd_head != 128) { ... throw ... }
+    // create fallback tensor, allocate CPU buffer, copy TURBO_ROTATION_RT
+}
+```
 
 ---
 

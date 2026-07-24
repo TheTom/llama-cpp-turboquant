@@ -1,4 +1,5 @@
 #include "models.h"
+#include "../turbo-rotation-data.h"
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -82,6 +83,43 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
         // OSCAR calibrated K/V rotations (per-layer [head_dim, head_dim]); optional
         layer.attn_k_rot = create_tensor(tn(LLM_TENSOR_ATTN_K_ROT, "weight", i), {n_embd_head, n_embd_head}, TENSOR_NOT_REQUIRED);
         layer.attn_v_rot = create_tensor(tn(LLM_TENSOR_ATTN_V_ROT, "weight", i), {n_embd_head, n_embd_head}, TENSOR_NOT_REQUIRED);
+
+        // Fallback to data-free Hadamard rotation when calibrated rotations are missing.
+        // Running without any rotation (identity) makes quantized KV cache incoherent.
+        if (!layer.attn_k_rot || !layer.attn_v_rot) {
+            if (n_embd_head != 128) {
+                throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation requires head_dim == 128, got %" PRId64, n_embd_head));
+            }
+
+            ggml_context * ctx_fallback = ml.contexts.empty() ? nullptr : ml.contexts[0].get();
+            if (!ctx_fallback) {
+                throw std::runtime_error("Gemma-4 OSCAR fallback rotation: no model context available");
+            }
+
+            auto create_fallback_rot = [&](ggml_tensor *& rot, const char * name) {
+                if (rot != nullptr) return;
+
+                rot = ggml_new_tensor_2d(ctx_fallback, GGML_TYPE_F32, n_embd_head, n_embd_head);
+                if (!rot) {
+                    throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to create %s", name));
+                }
+                ggml_set_name(rot, name);
+
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(rot));
+                if (!buf) {
+                    throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to allocate buffer for %s", name));
+                }
+                if (ggml_backend_buffer_init_tensor(buf, rot) != GGML_STATUS_SUCCESS) {
+                    ggml_backend_buffer_free(buf);
+                    throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to init buffer for %s", name));
+                }
+
+                ggml_backend_tensor_set(rot, TURBO_ROTATION_RT, 0, n_embd_head * n_embd_head * sizeof(float));
+            };
+
+            create_fallback_rot(layer.attn_k_rot, "fallback.attn_k_rot");
+            create_fallback_rot(layer.attn_v_rot, "fallback.attn_v_rot");
+        }
 
         layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
 

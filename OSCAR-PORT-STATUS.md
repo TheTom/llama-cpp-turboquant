@@ -94,9 +94,12 @@ indexing fix was one bug; at least one more remains in the VEC kernel's
 quantized-KV path.
 
 ### 3. Rotation Matrices Not Loaded
-No rotation matrices are available for Gemma-4-12B. The `LLAMA_OSCAR_K_ROTATION_PATH`
-env vars are unimplemented (fallback to identity rotation). This degrades OSCAR2
-quality vs the paper's reported results but should still produce coherent text.
+When a Gemma-4 GGUF lacks the optional calibrated `attn_k_rot`/`attn_v_rot` tensors,
+the model now falls back to the data-free Hadamard matrix from `TURBO_ROTATION_RT`
+(`src/turbo-rotation-data.h`). This replaces the previous identity fallback and
+restores most of the incoherence-reduction benefit for quantized KV caches.
+Calibrated per-layer rotations (from `export_rot_kv_gguf.py`) are still preferred
+when available.
 
 ### 4. HP (High-Precision) Sink Buffer
 Not implemented for OSCAR2. The HP buffer (f16 fallback for sink+recent tokens)
