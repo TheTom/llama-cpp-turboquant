@@ -174,6 +174,7 @@ template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_oscar2(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
     const block_oscar2 * K_o2 = (const block_oscar2 *) K_c;
+    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
     GGML_UNUSED(Q_v);
     float sum = 0.0f;
     #pragma unroll
@@ -191,7 +192,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_oscar2(
             const int ib = by / (QK_OSCAR2 / 4);
             const int  jb  = by % (QK_OSCAR2 / 4);
             const uint8_t code = (K_o2[ib].qs[jb] >> (2 * sub)) & 0x03;
-            const float val = (float)code * __half2float(K_o2[ib].d) + __half2float(K_o2[ib].m);
+            const float val = centroids[code] * __half2float(K_o2[ib].d) + __half2float(K_o2[ib].m);
             const int   qv  = (int)(int8_t)(u >> (8 * b));
             const float q8eff = q8scale * (float)qv - q8off;
             sum += val * q8eff;
@@ -769,6 +770,7 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_oscar2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_oscar2 * x = (const block_oscar2 *) vx;
+    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
     const int64_t ib = i0 / QK_OSCAR2;
     const float d = __half2float(x[ib].d);
     const float m = __half2float(x[ib].m);
@@ -779,7 +781,7 @@ static __device__ __forceinline__ void dequantize_V_oscar2(const void * __restri
         const int     by   = j / 4;
         const int     sub  = j % 4;
         const uint8_t code = (x[ib].qs[by] >> (2 * sub)) & 0x03;
-        const float   val  = (float)code * d + m;
+        const float   val  = centroids[code] * d + m;
         if constexpr (std::is_same_v<T, half>) {
             ((half *) dst)[l] = __float2half(val);
         } else if constexpr (std::is_same_v<T, float>) {

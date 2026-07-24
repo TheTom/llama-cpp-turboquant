@@ -1,8 +1,10 @@
 // OSCAR2 dedicated flash attention kernel
-// Per-128-vector (QK_OSCAR2 = 128) min-max asymmetric INT2 dequant: val = code * d + m
-// No Hadamard transform, no Lloyd-Max centroids.
+// Per-128-vector (QK_OSCAR2 = 128) Lloyd-Max INT2 dequant:
+//   val = OSCAR2_LM_CENTROIDS[code] * sigma + mean
+// Centroids: {-0.9816, -0.4528, 0.4528, 0.9816} for N(0,1).
+// Includes inverse Hadamard transform to recover pre-quantization values.
 // block_oscar2 layout (ggml-common.h): qs[QK_OSCAR2 / 4] = 32 byte codes
-//                                      + 2 halves (d, m) = 4 bytes
+//                                      + 2 halves (sigma, mean) = 4 bytes
 //                                      total sizeof(block_oscar2) == 36.
 // Main kernel runs as one warp (32 threads, nwarps_k = 1) regardless of D;
 // D % QK_OSCAR2 == 0 is required (gated in ggml_cuda_get_best_fattn_kernel).
@@ -16,6 +18,7 @@
 
 static __device__ __forceinline__ void dequant_row_oscar2(
     const block_oscar2 * blk, int D, float * buf) {
+    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
     const int nb = D / QK_OSCAR2;
     for (int ib = 0; ib < nb; ++ib) {
         const float d = __half2float(blk[ib].d);
@@ -24,7 +27,7 @@ static __device__ __forceinline__ void dequant_row_oscar2(
             const int by  = j / 4;
             const int sub = j % 4;
             const uint8_t code = (blk[ib].qs[by] >> (2 * sub)) & 0x03;
-            buf[ib * QK_OSCAR2 + j] = (float)code * d + m;
+            buf[ib * QK_OSCAR2 + j] = centroids[code] * d + m;
         }
     }
 }
@@ -35,6 +38,7 @@ static __device__ __forceinline__ void dequant_row_oscar2(
 
 static __device__ __forceinline__ void dequant_row_oscar2_parallel(
     const block_oscar2 * blk, int D, float * buf) {
+    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
     constexpr int nthreads = 128;
     const int nb = D / QK_OSCAR2;
     const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
@@ -48,7 +52,7 @@ static __device__ __forceinline__ void dequant_row_oscar2_parallel(
             const int by  = elem / 4;
             const int sub = elem % 4;
             const uint8_t code = (blk[ib].qs[by] >> (2 * sub)) & 0x03;
-            buf[ib * QK_OSCAR2 + elem] = (float)code * d + m;
+            buf[ib * QK_OSCAR2 + elem] = centroids[code] * d + m;
         }
         __syncthreads();
     }
@@ -211,7 +215,7 @@ static __global__ void flash_attn_ext_oscar2(
                         #pragma unroll
                         for (int e = 0; e < elems_per_block; ++e) {
                             const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                            sh_val_had[tid + e * nthreads] = fmaf((float)code, d_k, m_k);
+                            sh_val_had[tid + e * nthreads] = OSCAR2_LM_CENTROIDS[code] * d_k + m_k;
                         }
                         __syncthreads();
                         hadamard_inverse_128_32w(sh_val_had, tid);
@@ -222,9 +226,11 @@ static __global__ void flash_attn_ext_oscar2(
                     }
                 } else {
                     // D < QK_OSCAR2 single-block path (use_block_unroll == false).
+                    const float d_k0 = __half2float(K_blk[0].d);
+                    const float m_k0 = __half2float(K_blk[0].m);
                     for (int e = 0; e < nelems; ++e) {
                         const uint8_t code = (K_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        sum += (fmaf((float)code, __half2float(K_blk[0].d), __half2float(K_blk[0].m))) * Q_reg[j][e];
+                        sum += (OSCAR2_LM_CENTROIDS[code] * d_k0 + m_k0) * Q_reg[j][e];
                     }
                 }
                 KQ_val[j] = sum;
@@ -268,12 +274,12 @@ static __global__ void flash_attn_ext_oscar2(
                     for (int b = 0; b < nblocks; ++b) {
                         const float d_v = __half2float(V_blk[b].d);
                         const float m_v = __half2float(V_blk[b].m);
-                        const float mean_v = m_v + 1.5f * d_v;
+                        const float mean_v = m_v;  // mean is stored directly in m field
                         #pragma unroll
                         for (int e = 0; e < elems_per_block; ++e) {
                             const int ti = tid + e * nthreads;
                             const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                            sh_val_had[ti] = fmaf((float)code, d_v, m_v) - mean_v;
+                            sh_val_had[ti] = OSCAR2_LM_CENTROIDS[code] * d_v + m_v - mean_v;
                         }
                         __syncthreads();
                         hadamard_inverse_128_32w(sh_val_had, tid);
@@ -284,10 +290,12 @@ static __global__ void flash_attn_ext_oscar2(
                         }
                     }
                 } else {
+                    const float d_v0 = __half2float(V_blk[0].d);
+                    const float m_v0 = __half2float(V_blk[0].m);
                     #pragma unroll
                     for (int e = 0; e < nelems; ++e) {
                         const uint8_t code = (V_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        VKQ[j][e] += ke * fmaf((float)code, __half2float(V_blk[0].d), __half2float(V_blk[0].m));
+                        VKQ[j][e] += ke * (OSCAR2_LM_CENTROIDS[code] * d_v0 + m_v0);
                     }
                 }
             }

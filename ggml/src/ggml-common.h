@@ -289,15 +289,21 @@ static_assert(sizeof(block_q2_0) == 2 * sizeof(ggml_half) + QK2_0 / 4, "wrong q2
 // so dequant skips the inverse transform. KV-cache only, not for model weights.
 typedef block_q2_0 block_q2_preh;
 
-// OSCAR2: per-head_dim (128) min-max asymmetric 2-bit quantization
-// Layout: [int2_codes(32B) | scale_fp16(2B) | zero_fp16(2B)] = 36 bytes per 128 elements
+// OSCAR2: per-head_dim (128) Lloyd-Max 2-bit quantization
+// Layout: [int2_codes(32B) | sigma_fp16(2B) | mean_fp16(2B)] = 36 bytes per 128 elements
+// Dequant: val = OSCAR2_LM_CENTROIDS[code] * sigma + mean
+// Centroids are optimal for N(0,1) with 2-bit/4-level quantization.
 #define QK_OSCAR2 128
 typedef struct {
     uint8_t    qs[QK_OSCAR2 / 4];   // 32 bytes: 4 two-bit codes per byte
-    ggml_half  d;                    // scale (fp16)
-    ggml_half  m;                    // zero point / vmin (fp16)
+    ggml_half  d;                    // sigma / std-dev (fp16)
+    ggml_half  m;                    // mean (fp16)
 } block_oscar2;
 static_assert(sizeof(block_oscar2) == QK_OSCAR2/4 + 2*sizeof(ggml_half), "wrong oscar2 block size");
+
+// Lloyd-Max centroids for 2-bit quantization of N(0,1)
+// Used by both q2_0 and oscar2 types.
+static const float OSCAR2_LM_CENTROIDS[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
 
 // TurboQuant 3-bit MSE-only: 3-bit PolarQuant indices (no QJL)
 // Storage block size = 32 (matches q4_0 for optimal GPU parallelism)

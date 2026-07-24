@@ -653,7 +653,7 @@ void dequantize_row_oscar2(const block_oscar2 * GGML_RESTRICT x, float * GGML_RE
             const uint8_t packed = x[ib].qs[j];
             for (int b = 0; b < 4; b++) {
                 const int code = (packed >> (2 * b)) & 0x03;
-                y[ib * QK_OSCAR2 + j * 4 + b] = (float)code * d + m;
+                y[ib * QK_OSCAR2 + j * 4 + b] = OSCAR2_LM_CENTROIDS[code] * d + m;
             }
         }
     }
@@ -664,23 +664,30 @@ void quantize_row_oscar2_ref(const float * GGML_RESTRICT x, block_oscar2 * GGML_
     const int nb = k / QK_OSCAR2;
     for (int ib = 0; ib < nb; ib++) {
         const float * vec = x + ib * QK_OSCAR2;
-        // Find min/max
-        float vmin = vec[0], vmax = vec[0];
-        for (int j = 1; j < QK_OSCAR2; j++) {
-            if (vec[j] < vmin) vmin = vec[j];
-            if (vec[j] > vmax) vmax = vec[j];
+        // Compute mean and sigma (standard deviation)
+        float mean = 0.0f;
+        for (int j = 0; j < QK_OSCAR2; j++) mean += vec[j];
+        mean /= QK_OSCAR2;
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_OSCAR2; j++) {
+            float d = vec[j] - mean;
+            sum_sq += d * d;
         }
-        const float scale = (vmax - vmin) / 3.0f;
-        const float inv_scale = (scale > 1e-10f) ? 1.0f / scale : 0.0f;
-        y[ib].d = GGML_FP32_TO_FP16(scale);
-        y[ib].m = GGML_FP32_TO_FP16(vmin);
+        const float sigma = sqrtf(sum_sq / QK_OSCAR2);
+        const float inv_sigma = (sigma > 1e-8f) ? 1.0f / sigma : 0.0f;
+        y[ib].d = GGML_FP32_TO_FP16(sigma);
+        y[ib].m = GGML_FP32_TO_FP16(mean);
         for (int j = 0; j < QK_OSCAR2 / 4; j++) {
             uint8_t packed = 0;
             for (int b = 0; b < 4; b++) {
-                float val = vec[j * 4 + b];
-                int code = (int)((val - vmin) * inv_scale + 0.5f);
-                if (code < 0) code = 0;
-                if (code > 3) code = 3;
+                float val_norm = (vec[j * 4 + b] - mean) * inv_sigma;
+                // Find nearest Lloyd-Max centroid
+                int code = 0;
+                float best = fabsf(val_norm - OSCAR2_LM_CENTROIDS[0]);
+                for (int c = 1; c < 4; c++) {
+                    float err = fabsf(val_norm - OSCAR2_LM_CENTROIDS[c]);
+                    if (err < best) { code = c; best = err; }
+                }
                 packed |= (uint8_t)(code << (2 * b));
             }
             y[ib].qs[j] = packed;

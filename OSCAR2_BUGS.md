@@ -502,6 +502,35 @@ anchor until a host-side assert can be placed in the dispatch function.
 
 Last reviewed commit: `origin/oscar` @ `791ca44f4432b0b5730e44a6394bed5621dd01d6`.
 
+### F9. #4 — Lloyd-Max centroids for oscar2 (high-impact quality fix)
+
+Replaced min-max uniform quantization with Lloyd-Max centroids
+`{-0.9816f, -0.4528f, 0.4528f, 0.9816f}` for N(0,1), matching the OSCAR paper.
+
+**Changes across 4 files (+54/-31 lines):**
+- `ggml-common.h`: Added `OSCAR2_LM_CENTROIDS[4]` table; updated `block_oscar2`
+  comments (d = sigma/std-dev, m = mean, not min/max).
+- `ggml-quants.c`: `quantize_row_oscar2_ref` now computes per-block mean+sigma
+  and maps to nearest centroid; `dequantize_row_oscar2` uses centroid lookup.
+- `fattn-oscar2.cuh`: All dequant paths (single-thread, parallel, FA kernel K/V)
+  use `centroid[code] * d + m`. Fixed V mean-centering: `mean_v = m_v` (mean is
+  stored directly, not computed from min-max midpoint).
+- `fattn-common.cuh`: VEC dot-product and V-dequant functions use centroid lookup.
+
+Storage format (36 bytes/block) unchanged; only d/m semantics change from
+(min,max) to (sigma,mean). No production oscar2 data exists, so in-place change
+is safe.
+
+### F10. #2 — HP sink f16 fallback assessed (no change needed)
+
+`src/llama-kv-cache.cpp:428-431` forces oscar2 to f16 only when `n_swa > 0`
+(Sliding Window Attention models like Gemma-4). The fixed-128 Hadamard transform
+cannot work with variable attention window heads. This is an architectural guard,
+not a bug — the carve-out stays.
+
+The HP buffer itself (lines 441-444) uses F16 by design — "High Precision" sink
+and recent tokens are always stored at full precision for output quality.
+
 ---
 
 ## Gap analysis: OSCAR paper vs llama-cpp-turboquant
