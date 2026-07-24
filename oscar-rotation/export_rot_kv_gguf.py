@@ -1,17 +1,66 @@
 #!/usr/bin/env python3
 """Bake the OSCAR calibrated K/V rotations into a base GGUF.
 
-Produces a *-rot-kv.gguf that contains the per-layer rotation tensors
-(blk.{i}.attn_k_rot.weight / attn_v_rot.weight) which qwen3.cpp applies in-graph.
-The base model's weights are copied through unchanged (no re-quantization).
+Produces a *-rot-kv.gguf that contains per-layer rotation tensors which
+the llama.cpp graph applies at runtime. The base model's weights are copied
+through unchanged (no re-quantization).
 
-Usage:
-    python3 export_rot_kv_gguf.py \
-        --base   /path/to/qwen3-4b-thinking-q4km.gguf \
-        --rot-dir oscar-rotation/qwen3-4b-thinking-2507 \
-        --out    /path/to/qwen3-4b-thinking-q4km-rot-kv.gguf
+==========================================================================
+USAGE
+==========================================================================
 
-Requires: torch, numpy, and the repo's gguf-py (imported relative to this file).
+  # Standard: add attn_k_rot + attn_v_rot tensors to GGUF
+  python3 export_rot_kv_gguf.py \
+      --base model.gguf \
+      --rot-dir rotations/ \
+      --out model-rot.gguf
+
+  # G5 absorb: bake R_V into W_o, drop attn_v_rot (zero V rotation cost)
+  python3 export_rot_kv_gguf.py \
+      --base model.gguf \
+      --rot-dir rotations/ \
+      --out model-rot.gguf \
+      --absorb-v
+
+  # Use pre-existing Hadamard rotations from the qwen3-4b data dir
+  python3 export_rot_kv_gguf.py \
+      --base qwen3-4b-q4km.gguf \
+      --rot-dir oscar-rotation/qwen3-4b-thinking-2507 \
+      --out qwen3-4b-q4km-rot-kv.gguf
+
+==========================================================================
+FLAGS
+==========================================================================
+
+  --base       Base GGUF model (required)
+  --rot-dir    Directory with k_rotation_qqt_r_h_pbr.pt and
+               v_rotation_sst_r_h_pbr.pt (default: qwen3-4b-thinking-2507/)
+  --out        Output GGUF path (required)
+  --absorb-v   (G5) Absorb V rotation into W_o instead of adding
+               attn_v_rot tensors. Eliminates per-token V rotation cost.
+               W_o_new = W_o @ R_V per head.
+
+==========================================================================
+REQUIREMENTS
+==========================================================================
+
+  pip install torch numpy
+  # Also requires the repo's gguf-py (imported relative to this file).
+
+==========================================================================
+OUTPUT
+==========================================================================
+
+  Without --absorb-v:
+    blk.{i}.attn_k_rot.weight  (F32, [d, d])  - applied to K at runtime
+    blk.{i}.attn_v_rot.weight  (F32, [d, d])  - applied to V at runtime
+
+  With --absorb-v:
+    blk.{i}.attn_k_rot.weight  (F32, [d, d])  - applied to K at runtime
+    blk.{i}.attn_output.weight (modified)      - R_V absorbed, no runtime V rot
+
+  Run with: llama-cli -m model-rot.gguf --flash-attn on \
+              --cache-type-k oscar2 --cache-type-v oscar2 ...
 """
 import sys, os, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gguf-py"))

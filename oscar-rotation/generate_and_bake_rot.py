@@ -1,23 +1,70 @@
 #!/usr/bin/env python3
 """Generate and bake rotation matrices into any GGUF model.
 
-Two modes:
-  hadamard (default)  Data-free Hadamard rotation, no calibration needed.
-                      Works for any model with power-of-2 head_dim.
+This is the main entry point for the OSCAR rotation pipeline.
+It handles everything: model config reading, rotation generation (or
+calibration), and GGUF baking in a single command.
 
-  calibrated          Requires QKV dumps from running the model on calibration
-                      data (e.g. GPQA). Run the proper dump pipeline first,
-                      then pass --dump-path.
+========================================================================
+QUICK START
+========================================================================
 
-Usage:
-  # Hadamard (no calibration)
-  python3 generate_and_bake_rot.py \
+  # A) Data-free Hadamard (no calibration, works out of the box)
+  python3 oscar-rotation/generate_and_bake_rot.py \
       --base model.gguf --out model-rot.gguf
 
-  # Calibrated (needs QKV dumps from save_qkv pipeline)
-  python3 generate_and_bake_rot.py \
+  # B) Calibrated rotation (better quality, needs llama-oscar-calib built)
+  python3 oscar-rotation/generate_and_bake_rot.py \
       --base model.gguf --out model-rot.gguf \
-      --method calibrated --dump-path /path/to/qkv_dumps
+      --method calibrated --dump-path calibration.txt
+
+  # C) Use existing rotation files (skip generation)
+  python3 oscar-rotation/generate_and_bake_rot.py \
+      --base model.gguf --out model-rot.gguf \
+      --rot-dir rotations/
+
+========================================================================
+THEN RUN THE MODEL
+========================================================================
+
+  llama-cli -m model-rot.gguf --flash-attn on \
+      --cache-type-k oscar2 --cache-type-v oscar2 \
+      -p "your prompt" -n 100
+
+========================================================================
+FLAGS
+========================================================================
+
+  --base         Base GGUF model (required)
+  --out          Output rotated GGUF (required)
+  --method       'hadamard' (default) or 'calibrated'
+  --dump-path    For calibrated: text file as calibration prompt, or
+                 directory of QKV dumps from legacy OSCAR pipeline
+  --rot-dir      Pre-existing rotation .pt directory (skips generation)
+
+========================================================================
+WHAT IT DOES INTERNALLY
+========================================================================
+
+  hadamard mode:
+    1. Reads model config (arch, layers, head dims) from GGUF metadata
+    2. Generates per-layer Hadamard rotation matrices (.pt files)
+    3. Bakes them into the GGUF as attn_k_rot / attn_v_rot tensors
+
+  calibrated mode:
+    1. Reads model config from GGUF metadata
+    2. Runs llama-oscar-calib to dump Q/V covariances from model
+    3. Runs calibrate_rotation.py to eigendecompose and compose R.H.P_br
+    4. Bakes rotations into the GGUF
+
+========================================================================
+REQUIREMENTS
+========================================================================
+
+  pip install torch numpy
+  # Also requires the repo's gguf-py (imported relative to this file).
+  # For calibrated mode: build llama-oscar-calib first:
+  #   cmake -B build && cmake --build build --target llama-oscar-calib
 """
 
 import argparse, os, sys, torch, math

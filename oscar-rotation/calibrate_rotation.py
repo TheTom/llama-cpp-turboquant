@@ -6,26 +6,80 @@ to produce per-layer rotation matrices R_K and R_V, then composes them with
 Hadamard (H) and bit-reversal permutation (P_br) to produce the final
 R·H·P_br rotation matrices for K and V.
 
-Usage:
-  # Step 1: Run the C++ calibration tool
-  ./llama-oscar-calib -m model.gguf -f calibration.txt -o covariances/
-
-  # Step 2: Run this script to compute rotations
-  python3 calibrate_rotation.py \\
-      --cov-dir covariances/ \\
-      --head-dim 128 \\
-      --num-layers 28 \\
-      --output-dir rotations/ \\
-      --composition r_h_pbr
-
-  # Step 3: Bake into GGUF
-  python3 export_rot_kv_gguf.py \\
-      --base model.gguf \\
-      --rot-dir rotations/ \\
-      --out model-rot.gguf
-
 The output .pt files are compatible with export_rot_kv_gguf.py and
 generate_and_bake_rot.py.
+
+==========================================================================
+END-TO-END USAGE (3 methods)
+==========================================================================
+
+Method A: One-command pipeline (recommended)
+--------------------------------------------
+  python3 oscar-rotation/generate_and_bake_rot.py \
+      --base model.gguf --out model-rot.gguf
+
+  Uses data-free Hadamard rotation. No calibration needed.
+  Works for any model with power-of-2 head_dim (64, 128, 256, 512).
+
+Method B: One-command calibrated pipeline
+------------------------------------------
+  python3 oscar-rotation/generate_and_bake_rot.py \
+      --base model.gguf --out model-rot.gguf \
+      --method calibrated --dump-path calibration.txt
+
+  Requires llama-oscar-calib to be built first:
+    cmake -B build && cmake --build build --target llama-oscar-calib
+
+  --dump-path can be a text file (used as calibration prompt) or a
+  directory of QKV dumps from the legacy OSCAR paper pipeline.
+
+Method C: Step-by-step (for advanced use / debugging)
+------------------------------------------------------
+  # Step 1: Build the calibration tool
+  cmake -B build && cmake --build build --target llama-oscar-calib
+
+  # Step 2: Dump Q/V covariances from model activations
+  ./build/bin/llama-oscar-calib -m model.gguf -f calibration.txt -o covariances/
+
+  # Step 3: Eigendecompose and compose R·H·P_br
+  python3 oscar-rotation/calibrate_rotation.py \
+      --cov-dir covariances/ \
+      --head-dim 128 --num-layers 28 \
+      --output-dir rotations/ --composition r_h_pbr
+
+  # Step 4a: Bake rotations into GGUF (adds attn_k_rot + attn_v_rot tensors)
+  python3 oscar-rotation/export_rot_kv_gguf.py \
+      --base model.gguf --rot-dir rotations/ --out model-rot.gguf
+
+  # Step 4b: OR bake with V rotation absorbed into W_o (G5, zero runtime cost)
+  python3 oscar-rotation/export_rot_kv_gguf.py \
+      --base model.gguf --rot-dir rotations/ --out model-rot.gguf --absorb-v
+
+==========================================================================
+RUNNING THE MODEL WITH ROTATIONS
+==========================================================================
+
+  # With rotation tensors (attn_k_rot + attn_v_rot baked in):
+  llama-cli -m model-rot.gguf --flash-attn on \
+      --cache-type-k oscar2 --cache-type-v oscar2 \
+      -p "prompt" -n 100
+
+  # With absorbed V rotation (--absorb-v was used, no attn_v_rot):
+  llama-cli -m model-rot.gguf --flash-attn on \
+      --cache-type-k oscar2 --cache-type-v oscar2 \
+      -p "prompt" -n 100
+
+==========================================================================
+COMPOSITION MODES (--composition)
+==========================================================================
+
+  r_h_pbr  R · H · P_br  (default, best quality per OSCAR paper)
+  r_h      R · H          (rotation + Hadamard, no bit-reversal)
+  r_pbr    R · P_br       (rotation + bit-reversal, no Hadamard)
+  r        R only          (pure spectral rotation)
+  h_pbr    H · P_br       (data-free Hadamard + bit-reversal)
+  h        H only          (data-free Hadamard)
+  pbr      P_br only       (bit-reversal permutation only)
 """
 
 import argparse
