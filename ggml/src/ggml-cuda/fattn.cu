@@ -1053,19 +1053,15 @@ template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_Q8_0,   GGML_TYPE
 template void ggml_cuda_flash_attn_ext_vec_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
 
 // OSCAR2 dedicated kernel (scalar, with inverse Hadamard) template instantiations
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_F16>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ggml_backend_cuda_context &, ggml_tensor *);
-template void ggml_cuda_flash_attn_ext_oscar2_case< 64, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<128, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<256, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
 template void ggml_cuda_flash_attn_ext_oscar2_case<512, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ggml_backend_cuda_context &, ggml_tensor *);
