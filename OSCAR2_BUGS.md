@@ -422,3 +422,16 @@ Total: `+28`, `-28` lines.
 4. Run the dgx-spark benchmark suite to confirm no performance regression.
 
 Last reviewed commit: `origin/oscar` @ `791ca44f4432b0b5730e44a6394bed5621dd01d6`.
+
+---
+
+## Recent field status — TurboQuant oscar branch (`6c3822c6f`, `rebuild_tq.sh` build)
+
+- Build path: rebuilt with `/mnt/storage/llama-server/rebuild_tq.sh`; fresh artifacts under `/mnt/storage/Projects/turboquant/build` dated `2026-07-23 20:02 MDT`.
+- Verified fixes F1–F5 are reflected in the tree; only code change relative to `791ca44f` is `ggml/src/ggml-cuda/fattn-mma-f16.cuh`, which removes the unused F16 MMA OSCAR2 raw staging pointer; the OSCAR2 FA path itself was not changed in this delta.
+
+- Exact benchmark target: `/mnt/storage/models/qwen3.6-27b-q5kxl-hadamard.gguf`, config `-p 0 -ngl 999 -t 64 -n 64 -fa on -ctk oscar2 -ctv oscar2`.
+- Blocker: `build/bin/llama-bench` rejects `-ctk oscar2` with `error: invalid parameter for argument: -ctk`, despite the CLI help exposing `-ctk/-ctv`. Inspected `common/arg.cpp`; `GGML_TYPE_OSCAR2` is registered, but `llama-bench` does not accept `oscar2` through the cache-type parser in this build.
+- Consequence: no successful OSCAR2 KV cache throughput or VRAM artifact was produced for this model/config. The only successful per-build number from this tree is f16/f16 KV cache: `tg64 = 67.58 ± 0.30 t/s`, VRAM ~32088 MiB total. Per standing instructions, f16/FA results do not count as OSCAR2 results.
+- Additional known runtime blocker from prior logs: `llama-cli` requires `--flash-attn on` for V=`oscar2`; `--flash-attn off` aborts with `V cache quantization requires flash_attn`. That prior 128K oscar2 run completed generation-only at `4.2 / 1.9 t/s` with ~1188 MiB VRAM used.
+- New CLI check on `6c3822c6f`: `build/bin/llama-cli` accepts `--cache-type-k oscar2 --cache-type-v oscar2 --flash-attn on` for `/mnt/storage/models/qwen3.6-27b-q5kxl-hadamard.gguf`, but the run hangs beyond 600s on RTX 5090 sm_120. This is consistent with the verified blocker: OSCAR2 FA hangs on Blackwell sm_120. No t/s or VRAM artifact obtained from `llama-cli` in this state.
