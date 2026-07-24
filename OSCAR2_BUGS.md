@@ -1137,6 +1137,44 @@ missing in OSCAR-PORT-STATUS.md).
 ---
 
 ## Recent field status — TurboQuant oscar branch (`6c3822c6f`, `rebuild_tq.sh` build)
+## C-series code cleanliness — local, LOW-risk cleanup tracker
+
+Grep-validated on `oscar` branch SHA `6255be4`. Each entry has a Priority (1 = highest impact, 10 = lowest), risk, exact location, status. These are **not bugs** — they are refactors that improve readability and reduce line count without changing behavior. Public interfaces (`GGML_TYPE_OSCAR2`, `block_oscar2`, `QK_OSCAR2`, `DISPATCH_OSCAR2(D)`, GGUF on-disk) are preserved.
+
+### Verified facts (grep 2026-07-24)
+
+- `dequant_row_oscar2` (single-threaded) — only its own definition at `ggml-cuda/fattn-oscar2.cuh:34`. **Dead.**
+- `dequant_row_oscar2_parallel` — only its own definition at `ggml-cuda/fattn-oscar2.cuh:54`. **Dead.**
+- `oscar2_safe_for_swa` — referenced 4x in `src/llama-kv-cache.cpp` (decl 265, assign 286, log 288-289, comment 464). **NOT dead** — pre-scan feeds log message; do not delete.
+- `DISPATCH_OSCAR2(D)` only invoked for `D ∈ {128, 256, 512}` (`fattn.cu:601-603`). The `D < QK_OSCAR2` branch inside the kernel template is **unreachable**.
+- `static_assert(D >= QK_OSCAR2 && D % QK_OSCAR2 == 0, ...)` in `fattn-oscar2.cuh:158` already enforces the post-DISPATCH invariant.
+
+### Cleanup items (items C1-C6 will be applied in this turn)
+
+- **C1. Delete dead single-threaded `dequant_row_oscar2`** (`fattn-oscar2.cuh:33-58`). Priority 1, ZERO risk, ~24 LOC.
+- **C2. Delete dead `dequant_row_oscar2_parallel`** (`fattn-oscar2.cuh:60-79`). Priority 1, ZERO risk, ~21 LOC.
+- **C3+C4. Delete unreachable `D < QK_OSCAR2` else branches** in K and V dequant paths inside `flash_attn_ext_oscar2` kernel. Priority 2, LOW risk, ~23 LOC. (Validated by thinker: `use_block_unroll = (D >= 128)` is permanently true given the static_assert; NVCC will simply discard the dead branch. The `if constexpr` wrapper can also be removed in a follow-up.)
+- **C5. Trim misleading "OPTIMIZED" comment** at `fattn-oscar2.cuh:341`. Priority 3, ZERO risk. Replace `// OPTIMIZED: always 1 warp (was: D >= QK_OSCAR2 ? 4 : 1)` with `// 1 warp: each thread keeps D/32 elements`.
+- **C6. Fix misleading `nbytes` comment** at `fattn-oscar2.cuh:339`. Priority 3, ZERO risk. Replace `constexpr size_t nbytes = 0; // no dynamic shared memory needed` with the correct value 160 floats (or remove the misleading zero comment).
+
+### Deferred items (require follow-up scope decisions, NOT applied this turn)
+
+- **C7 (DEFERRED). Constants table refactor** — wrap `OSCAR2_LM_CENTROIDS[4]` and `P_BR_PERM[128]` in `GGML_TABLE_BEGIN` so they emit `static const __device__` under CUDA; then delete `*_DEV` duplicates in `fattn-oscar2.cuh`.
+- **C8 (DEFERRED). Extract `pbr_reorder_128_32w(...)` device helper** — duplicated body in K and V dequant paths.
+- **C9 (DEFERRED). Cache `oscar2_pbr_enabled()` env var read** — currently calls `getenv` on every dequant tick.
+- **C10 (DEFERRED). Replace hardcoded magic constant `0.08838834764f` (= `1/√128`)** with explicit `1.0f / sqrtf((float)QK_OSCAR2)` or named `HADAMARD_INV_NORM` constant.
+- **Phase 2 (NOT TOUCHED). K1 (delete `oscar2_safe_for_swa` pre-scan) was claimed dead in earlier analysis but is still referenced 4× in the file for log output. **NOT applicable** — keep alive.
+
+Net deletion if C1..C6 are applied: ~68 LOC across one file (`fattn-oscar2.cuh`), zero public-API change, single-file diff.
+
+### Validation contract for each cleanup item
+
+- `grep -c 'dequant_row_oscar2\b' ggml/src/ggml-cuda/fattn-oscar2.cuh` after C1 = 0.
+- `grep -c 'dequant_row_oscar2_parallel' ggml/src/ggml-cuda/fattn-oscar2.cuh` after C2 = 0.
+- The `else` keyword count inside `flash_attn_ext_oscar2` body after C3+C4 = 0 (with `if constexpr` wrappers still present).
+- `git diff --stat` after C1..C6 = only edits in `oscar-rotation/` and `fattn-oscar2.cuh` plus this doc.
+
+## Recent field status — TurboQuant oscar branch (`6c3822c6f`, `rebuild_tq.sh` build)
 
 - Build path: rebuilt with `/mnt/storage/llama-server/rebuild_tq.sh`; fresh artifacts under `/mnt/storage/Projects/turboquant/build` dated `2026-07-23 20:02 MDT`.
 - Verified fixes F1–F5 are reflected in the tree; only code change relative to `791ca44f` is `ggml/src/ggml-cuda/fattn-mma-f16.cuh`, which removes the unused F16 MMA OSCAR2 raw staging pointer; the OSCAR2 FA path itself was not changed in this delta.

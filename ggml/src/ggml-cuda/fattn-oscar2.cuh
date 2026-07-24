@@ -31,47 +31,8 @@ static __device__ const int   P_BR_DEV[128] = {
 // Single-threaded helpers (fallback for D < 128)
 // ---------------------------------------------------------------------------
 
-static __device__ __forceinline__ void dequant_row_oscar2(
-    const block_oscar2 * blk, int D, float * buf) {
-    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
-    const int nb = D / QK_OSCAR2;
-    for (int ib = 0; ib < nb; ++ib) {
-        const float d = __half2float(blk[ib].d);
-        const float m = __half2float(blk[ib].m);
-        for (int j = 0; j < QK_OSCAR2; ++j) {
-            const int by  = j / 4;
-            const int sub = j % 4;
-            const uint8_t code = (blk[ib].qs[by] >> (2 * sub)) & 0x03;
-            buf[ib * QK_OSCAR2 + j] = centroids[code] * d + m;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 128-thread cooperative dequant
-// ---------------------------------------------------------------------------
-
-static __device__ __forceinline__ void dequant_row_oscar2_parallel(
-    const block_oscar2 * blk, int D, float * buf) {
-    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
-    constexpr int nthreads = 128;
-    const int nb = D / QK_OSCAR2;
-    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
-
-    for (int ib = 0; ib < nb; ++ib) {
-        const float d = __half2float(blk[ib].d);
-        const float m = __half2float(blk[ib].m);
-        for (int off = 0; off < QK_OSCAR2; off += nthreads) {
-            const int elem = off + tid;
-            if (elem >= QK_OSCAR2) break;
-            const int by  = elem / 4;
-            const int sub = elem % 4;
-            const uint8_t code = (blk[ib].qs[by] >> (2 * sub)) & 0x03;
-            buf[ib * QK_OSCAR2 + elem] = centroids[code] * d + m;
-        }
-        __syncwarp();
-    }
-}
+// K/V dequant happens inline in flash_attn_ext_oscar2 (per-warp, per-thread).
+// Helpers removed: dequant_row_oscar2, dequant_row_oscar2_parallel.
 // ---------------------------------------------------------------------------
 // 32-thread inverse Hadamard on 128 elements (shared memory).
 // Each thread owns 4 elements: tid, tid+32, tid+64, tid+96.
@@ -238,14 +199,6 @@ static __global__ void flash_attn_ext_oscar2(
                             sum += sh_val_had[tid + e * nthreads] * Q_reg[j][b * elems_per_block + e];
                         }
                     }
-                } else {
-                    // D < QK_OSCAR2 single-block path (use_block_unroll == false).
-                    const float d_k0 = __half2float(K_blk[0].d);
-                    const float m_k0 = __half2float(K_blk[0].m);
-                    for (int e = 0; e < nelems; ++e) {
-                        const uint8_t code = (K_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        sum += (OSCAR2_CENTROIDS_DEV[code] * d_k0 + m_k0) * Q_reg[j][e];
-                    }
                 }
                 KQ_val[j] = sum;
             }
@@ -308,14 +261,6 @@ static __global__ void flash_attn_ext_oscar2(
                             VKQ[j][b * elems_per_block + e] += ke * (sh_val_had[ti] + mean_v);
                         }
                     }
-                } else {
-                    const float d_v0 = __half2float(V_blk[0].d);
-                    const float m_v0 = __half2float(V_blk[0].m);
-                    #pragma unroll
-                    for (int e = 0; e < nelems; ++e) {
-                        const uint8_t code = (V_blk[0].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        VKQ[j][e] += ke * (OSCAR2_CENTROIDS_DEV[code] * d_v0 + m_v0);
-                    }
                 }
             }
 
@@ -362,8 +307,9 @@ void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     // Shared memory: just s_red[32] = 128 bytes (no K/V s_buf)
-    constexpr size_t nbytes = 0; // no dynamic shared memory needed
-    // OPTIMIZED: always 1 warp (was: D >= QK_OSCAR2 ? 4 : 1)
+    // dynamic shared memory requested from the launcher (kernel uses only static __shared__)
+    constexpr size_t nbytes = 0;
+    // 1 warp: each thread keeps D/32 elements; avoids __syncthreads.
     constexpr int nwarps = 1;
 
     const int nbatch_fa = dst->src[1]->ne[1];
