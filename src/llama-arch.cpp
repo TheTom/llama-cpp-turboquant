@@ -367,6 +367,15 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
     { LLM_KV_TOKENIZER_SUFFIX_ID, "tokenizer.ggml.suffix_token_id" },
     { LLM_KV_TOKENIZER_MIDDLE_ID, "tokenizer.ggml.middle_token_id" },
+
+    { LLM_KV_EAGLE3_EXTRACT_LAYERS,      "%s.extract_layers"        },
+    { LLM_KV_EAGLE3_TARGET_HIDDEN_SIZE,  "%s.target_hidden_size"    },
+    { LLM_KV_EAGLE3_NORM_BEFORE_RESIDUAL,"%s.norm_before_residual"  },
+
+    { LLM_KV_DFLASH_TARGET_LAYER_IDS,    "%s.target_layers"         },
+    { LLM_KV_DFLASH_BLOCK_SIZE,          "%s.block_size"            },
+    { LLM_KV_DFLASH_MASK_TOKEN_ID,       "%s.mask_token_id"         },
+
 };
 
 static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
@@ -604,6 +613,16 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
     { LLM_TENSOR_FC,                                     "fc" },
     { LLM_TENSOR_D2T,                                    "d2t" },
+
+    // EAGLE3 draft model
+    { LLM_TENSOR_EAGLE3_HIDDEN_NORM,                     "blk.%d.eagle3_hidden_norm" },
+    { LLM_TENSOR_EAGLE3_FC,                              "eagle3_fc" },
+    { LLM_TENSOR_EAGLE3_D2T,                             "d2t" },
+
+    // DFlash draft model
+    { LLM_TENSOR_DFLASH_FC,                              "fc" },
+    { LLM_TENSOR_DFLASH_HIDDEN_NORM,                     "enc.output_norm" },
+
 };
 
 // declare information about the model weight tensors:
@@ -855,6 +874,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // eagle3
     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+
+    // EAGLE3
+    {LLM_TENSOR_EAGLE3_HIDDEN_NORM,                     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE3_FC,                              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_EAGLE3_D2T,                             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+
+    // DFlash
+    {LLM_TENSOR_DFLASH_HIDDEN_NORM,                     {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+    {LLM_TENSOR_DFLASH_FC,                              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

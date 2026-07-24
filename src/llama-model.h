@@ -261,6 +261,12 @@ struct llama_layer {
     struct ggml_tensor * wqkv_b    = nullptr;
     struct ggml_tensor * wo_a      = nullptr;
     struct ggml_tensor * wo_b      = nullptr;
+    // DFlash: separate Q/K/V/O bias tensors
+    struct ggml_tensor * bq   = nullptr;
+    struct ggml_tensor * bk   = nullptr;
+    struct ggml_tensor * bv   = nullptr;
+    struct ggml_tensor * bo   = nullptr;
+
     struct ggml_tensor * wq_cross  = nullptr;
     struct ggml_tensor * wk_cross  = nullptr;
     struct ggml_tensor * wv_cross  = nullptr;
@@ -517,6 +523,9 @@ struct llama_layer {
 
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
+    // EAGLE3 hidden norm (per-layer)
+    struct ggml_tensor * eagle3_hidden_norm = nullptr;
+
 
     struct llama_layer_posnet posnet;
 
@@ -601,6 +610,14 @@ struct llama_model {
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
+    // dflash
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
+    struct ggml_tensor * target_output = nullptr;  // reference to target model's lm_head
+
+    // Reference to target model's embedding layer
+    // This allows EAGLE3 to use target model's embeddings without copying
+    struct ggml_tensor * target_tok_embd = nullptr;
+
 
     std::vector<llama_layer> layers;
 

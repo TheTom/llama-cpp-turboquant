@@ -48,7 +48,17 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    // Max outputs needed per sequence based on declared speculative types
+    uint32_t n_max = (uint32_t) common_speculative_n_max(&params.speculative);
+
+    // Also account for draft modes enabled by flags (--dflash, --eagle3) that aren't
+    // yet in the speculative types list at this point (they are added later during
+    // common_speculative_init, after the target context is created)
+    if (params.speculative.draft.dflash || params.speculative.draft.eagle3) {
+        n_max = std::max(n_max, (uint32_t) std::max(0, params.speculative.draft.n_max));
+    }
+
+    const uint32_t n_outputs_per_seq = 1 + n_max;
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
@@ -1263,7 +1273,7 @@ private:
 
         slots.clear();
 
-        // Always probe seq_rm capability — used for completion checkpoints, not only speculative.
+        // Always probe seq_rm (completion checkpoints). Do not skip when speculative is off (#217).
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
 
         // setup slots
@@ -1275,11 +1285,15 @@ private:
             slots.emplace_back();
         }
 
-        // try speculative decoding (only when a non-NONE speculative type is configured)
-        const bool is_speculative_enabled = std::any_of(
-            params_base.speculative.types.begin(),
-            params_base.speculative.types.end(),
-            [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+        // Speculative init only when a type or --dflash/--eagle3 convenience flag is set.
+        // Still requires seq_rm support for draft rollback.
+        const bool is_speculative_enabled =
+            params_base.speculative.draft.dflash ||
+            params_base.speculative.draft.eagle3 ||
+            std::any_of(
+                params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
         if (is_speculative_enabled) {
             if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
                 SRV_WRN("%s", "speculative decoding not supported by this context\n");
