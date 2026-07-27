@@ -91,8 +91,13 @@ incoherent. Debugging showed:
 **Still open:**
 - `B4` — Mask indexing ignores stride parameters (only matters for non-standard mask layouts)
 - `B6` — nb11 stride has comment but no GGML_ASSERT (pre-rotated K / zero-padded K risk)
+- **`B21` — K mean omitted from QK logits (CRITICAL, leading hypothesis for garbled output)**
 
-*The fixes above have been applied to the kernel source. Whether the kernel is now producing correct output requires actual testing — the applied fixes address all known critical bugs in the dequant/dot/Hadamard path.*
+The per-block K mean stored in `block_oscar2.m` is dropped from the KQ dot product.
+The code comment claims it "doesn't affect softmax" but the mean varies per K token,
+so the missing term `mean(K_block) * sum(Q_block)` is token-dependent and can reorder
+attention scores. V path handles its mean correctly via `VKQ_mean` — the K path omission
+is inconsistent. Fix: add `m_k * Q_had_DC * sqrt(128)` per block to KQ score.
 
 ### 2. VEC Path Broken for Quantized KV at D>256 — FUNDAMENTAL
 Pre-existing issue: VEC path fails because set_rows_cuda_oscar2 stores K/V in Hadamard

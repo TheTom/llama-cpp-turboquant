@@ -4,7 +4,7 @@ Branch: `origin/oscar` (HEAD `791ca44f4432b0b5730e44a6394bed5621dd01d6`).
 
 This list supplements the four known issues already in `OSCAR-PORT-STATUS.md`:
 
-1. ~~Dedicated OSCAR2 FA kernel produces incoherent output.~~ PARTIALLY FIXED — B1/B2/B3-bound/B5/B8/B13 resolved; B4 (mask stride) and B6 (nb11 assert) remain open.
+1. ~~Dedicated OSCAR2 FA kernel produces incoherent output.~~ PARTIALLY FIXED — B1/B2/B3-bound/B5/B8/B13 resolved; B4 (mask stride), B6 (nb11 assert), and **B21 (K mean omitted from QK logits)** remain open. B21 is the leading hypothesis for garbled output.
 2. ~~VEC path broken for quantized KV at `D > 256`.~~ STILL BROKEN — fundamental domain mismatch: set_rows stores Hadamard-domain values, VEC dequant reads as natural-domain. Not fixable without adding inverse Hadamard to VEC path. Recommend explicit VEC-path disable for oscar2.
 3. ~~Rotation matrices for Gemma-4-12B fall back to identity.~~ FIXED (F17)
 4. ~~HP sink buffer not implemented for OSCAR2.~~ NOT ADDRESSED (separate feature, not a bug — planned but not blocking correctness at short context)
@@ -147,6 +147,58 @@ Fix applied: zero-initialized with `= {}` (lines 129-130).
 
 `QK_OSCAR2` is the only source of the 128-element block size. The Hadamard shares a `__shared__ float sh_val_had[QK_OSCAR2]` buffer, but `d_per_block = QK_OSCAR2` is also declared. The role of `d_per_block` is unclear and unused for sizing — delete or use it consistently. Low priority: no active bug, just a maintenance risk if QK_OSCAR2 changes.
 
+### B21. Per-block K mean omitted from QK logits (CRITICAL) — NOT FIXED
+
+**Location**: `fattn-oscar2.cuh:202-216` — K dequant loop omits `m_k`.
+
+```cpp
+// K dequant in dedicated kernel:
+const float val = OSCAR2_CENTROIDS_DEV[code] * d_k; // centered — no mean
+sum += val * Q_reg[j][b * elems_per_block + e];
+```
+
+**The bug**: set_rows stores `K' = H @ (K_raw - mean) / sqrt(128)` where H is the
+unnormalized Hadamard. The FA kernel dequants `K'` and dots with
+`Q' = H @ Q / sqrt(128)`. Since `H_norm = H / sqrt(128)` is orthonormal:
+
+```
+dot(K', Q') = (K_raw - mean_vec) @ Q
+            = K_raw @ Q - mean_vec @ Q
+            = K_raw @ Q - mean * sum(Q)
+```
+
+The term `mean * sum(Q)` is NOT constant across K tokens — each 128-element block
+has its own stored mean (`block_oscar2.m`). For D=256 (2 blocks/head), each of the
+2 means contributes independently. The omitted term per block is:
+
+```
+delta_t = mean(K_block) * sum(Q_over_block)
+```
+
+This varies per K token (`mean(K_block)` differs across tokens) and per Q position
+(`sum(Q_over_block)` differs across Q rows). The softmax does NOT cancel it.
+
+**Evidence the fix was intended**: The V path correctly handles mean via separate
+`VKQ_mean` accumulation (`fattn-oscar2.cuh:249-266`). The K path's omission is
+inconsistent with the kernel's own design pattern and with the block format header:
+"Dequant: val = OSCAR2_LM_CENTROIDS[code] * sigma + mean" (`fattn-oscar2.cuh:2-4`).
+The CPU reference dequantizer also restores `+ m` (`ggml-quants.c:658-680`).
+
+**Severity**: CRITICAL for coherent output. The code comment claims the mean "doesn't
+affect softmax" — this is incorrect for token-varying means. If the rotation or
+activations produce non-zero block means, this directly corrupts attention score
+rankings.
+
+**Fix**: Add `m_k` contribution to the KQ dot. Since the dot is in Hadamard domain
+and the mean is a constant vector per block, the correction per block is:
+`KQ_correction += m_k * Q_had[block_start + 0] * sqrt(QK_OSCAR2)` where
+`Q_had[block_start + 0]` is element 0 (DC component) of that block's Q in Hadamard
+domain.
+
+Alternatively, add the mean directly in the K dequant loop — since Q is already
+in Hadamard domain (`hadamard_inverse_128_32w` applied), and the mean effect in
+Hadamard domain is only on the DC element, the correction above is the efficient
+form.
 ---
 
 ## `ggml/src/ggml-cuda/fattn.cu` (OSCAR2 dispatch)
