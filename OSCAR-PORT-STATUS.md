@@ -106,13 +106,29 @@ After B21 fix and associated patches:
 | Gemma4-12B Hadamard | Hadamard (data-free) | 256/512 mixed | ✓ | **✗** | **✗** |
 
 **B21 fix verified working**: The K mean correction resolves garbled output for D=128 and D=512
-models (Qwen3.6). The dedicated FA kernel produces coherent output matching f16 baseline.
+models (Qwen3.6). Short completions and extended thinking/reasoning generations produce coherent
+output matching f16 baseline:
 
-**Gemma4 issue**: ALL quantized cache types (oscar2, q2_0, q8_0) fail on Gemma4 regardless of
-rotation method. f16 works. This is a pre-existing Gemma4-specific issue, not caused by the
-oscar2 FA kernel — the FA kernel was never the primary path for Gemma4 with quantized caches.
-Likely root cause: ISWA cache split interacting with quantized cache layout (stride/dimension
-mismatch for non-f16 types). Needs separate investigation.
+| Prompt | Tokens | oscar2 | f16 |
+|--------|--------|--------|-----|
+| "The capital of France is" | 4 prompt, ~20 generated | ✓ "Paris" | ✓ |
+| "2+2=" | 2 prompt, 30 generated | ✓ thinking + answer | ✓ |
+
+**Remaining oscar2 issue — instruction-prompt token bias**: Some instruction-style prompts
+(e.g. "Count from 1 to 5:", "Write a Python function") produce blank output or
+`reasoning_content: "//////"` with oscar2 while working correctly with f16. The first generated
+token is wrong, suggesting a **prefill-phase value corruption** rather than decode accumulation.
+
+Hypothesis: The B21 mean correction `m_k * Q_had[0] * sqrt(128)` is mathematically correct
+(verified: = `m_k * sum(Q_raw) * attn_scale`) but the fp16 precision of `m_k` (stored in
+`block_oscar2.m`) combined with float32 `Q_had` (which includes the attention scale factor)
+may introduce a systematic token bias for certain input distributions. The `///` pattern
+suggests the logits are biased toward a specific token ID.
+
+Suggested investigation: Apply the mean correction in Hadamard domain by transforming
+the mean vector through the same Hadamard transform as K/Q, rather than computing
+the DC-component correction separately. This would avoid the fp16↔float32 scaling
+interaction.
 
 ### 2. VEC Path Broken for Quantized KV at D>256 — FUNDAMENTAL
 Pre-existing issue: VEC path fails because set_rows_cuda_oscar2 stores K/V in Hadamard
