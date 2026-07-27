@@ -322,7 +322,12 @@ void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_
     constexpr size_t nbytes = 0;
     constexpr int nwarps = 1;
 
-    const int nbatch_fa = dst->src[1]->ne[1];
+    // nbatch_fa controls the number of parallel KV blocks. Using D (head dim)
+    // instead of K->ne[1] enables gridDim.y > 1 for prefill, allowing multiple
+    // warps to process different KV position ranges in parallel via the
+    // flash_attn_combine_results merge path. Decode (Q->ne[1]==1) naturally
+    // falls back to single block since K->ne[1] < D → ntiles_KV = 1.
+    const int nbatch_fa = D;
 
     // F2: multi-column prefill. Process more query tokens per block to
     // reduce redundant KV reads during prefill (large Q->ne[1]).

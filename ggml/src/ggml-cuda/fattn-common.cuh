@@ -192,7 +192,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_oscar2(
             const int ib = by / (QK_OSCAR2 / 4);
             const int  jb  = by % (QK_OSCAR2 / 4);
             const uint8_t code = (K_o2[ib].qs[jb] >> (2 * sub)) & 0x03;
-            const float val = centroids[code] * __half2float(K_o2[ib].d) + __half2float(K_o2[ib].m);
+            const float val = centroids[code] * __half2float(K_o2[ib].d); // centered — mean cancels in softmax; see note in fattn-oscar2.cuh
             const int   qv  = (int)(int8_t)(u >> (8 * b));
             const float q8eff = q8scale * (float)qv - q8off;
             sum += val * q8eff;

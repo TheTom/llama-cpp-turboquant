@@ -1406,7 +1406,7 @@ static __global__ void set_rows_cuda_oscar2(
         const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
         const uint64_t nb10, const uint64_t nb11, const uint64_t nb12,
         const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3,
-        const int32_t nk0) {
+        const int32_t nk0, const float clip_ratio) {
 
     const int32_t i03 = blockIdx.z;
     const int32_t i02 = blockIdx.y;
@@ -1462,6 +1462,28 @@ static __global__ void set_rows_cuda_oscar2(
         const float s_had = rsqrtf((float)QK_OSCAR2);
         sh_vals[t] *= s_had;
         __syncthreads();
+
+        // OSCAR outlier clip: threshold = clip_ratio percentile over the 128 group,
+        // exact rank counting (matches CPU qsort). Follows q2_0 pattern.
+        if (clip_ratio > 0.0f && clip_ratio < 1.0f) {
+            const int idx = min((int)(clip_ratio * (float)QK_OSCAR2), QK_OSCAR2 - 1);
+            const float a = fabsf(sh_vals[t]);
+            int lo = 0, le = 0;
+            #pragma unroll
+            for (int j = 0; j < QK_OSCAR2; ++j) {
+                const float aj = fabsf(sh_vals[j]);
+                lo += (aj <  a) ? 1 : 0;
+                le += (aj <= a) ? 1 : 0;
+            }
+            if (lo <= idx && idx < le) {
+                sh_wsum[0] = a;
+            }
+            __syncthreads();
+            const float thr = sh_wsum[0];
+            if (sh_vals[t] >  thr) sh_vals[t] =  thr;
+            if (sh_vals[t] < -thr) sh_vals[t] = -thr;
+            __syncthreads();
+        }
         // Compute RMS of Hadamard values (zero-centered after mean subtract)
         const float hv = sh_vals[t];
         s = hv;
@@ -1558,6 +1580,11 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
+    float clip_ratio = 0.0f;
+    if (const char * e = getenv("LLAMA_KV_CLIP_RATIO")) {
+        clip_ratio = (float) atof(e);
+    }
+
     if (dst->type == GGML_TYPE_OSCAR2) {
         GGML_TENSOR_BINARY_OP_LOCALS(src0, src1, dst);
 
@@ -1576,14 +1603,14 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 src0_d, src1_d, dst_d,
                 ne01, ne11, ne12,
                 nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
-                nk0);
+                nk0, clip_ratio);
         } else {
             set_rows_cuda_oscar2<int32_t><<<grid_size, block_size, 0, stream>>>(
                 src0_d, src1_d, dst_d,
                 ne01, ne11, ne12,
                 nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3,
-                nk0);
-        }
+                nk0, clip_ratio);
+    }
         GGML_ASSERT(cudaGetLastError() == cudaSuccess);
         return;
     }

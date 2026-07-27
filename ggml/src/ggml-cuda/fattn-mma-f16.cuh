@@ -604,14 +604,13 @@ static __device__ __forceinline__ void ih_butterfly_stage(half2 *buf) {
 // Inner loop batches by QK_OSCAR2/2=64 half2 block to hoist d,m loading: each oscar2
 // block's d (scale) and m (zero point) are loaded once instead of once per element
 // pair. For D=512 (4 blocks/row), this reduces global d,m reads from 256 to 4 per row.
-template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool restore_mean = false>
 static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int block_half2 = QK_OSCAR2 / 2; // 64 half2 elements per oscar2 block
     const int tid = threadIdx.y * warp_size + threadIdx.x;
-    #pragma unroll
     for (int row = tid; row < nbatch_fa; row += nthreads) {
         if (oob_check && row >= i_sup) {
             for (int c = 0; c < D2; ++c) tile_KV[row*stride_tile + c] = make_half2(0.0f, 0.0f);
@@ -674,6 +673,17 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
                     __hmul(__hsub(lo, hi), ih_scale));
             }
             // Stage 3: Write to tile shared memory
+            // For V path (restore_mean=true): add per-block mean back to each element.
+            // set_rows stores H(val - mean) / sqrt(128). After dequant + IH we have
+            // (val - mean). The softmax (K path) is unaffected by constant bias, but
+            // VKQ accumulation needs the original values. restore_mean adds mean back.
+            if constexpr (restore_mean) {
+                const half2 mean_h2 = __halves2half2(__float2half(m_f), __float2half(m_f));
+                #pragma unroll
+                for (int j = 0; j < block_half2; ++j) {
+                    local_buf[j] = __hadd2(local_buf[j], mean_h2);
+                }
+            }
             #pragma unroll
             for (int c = 0; c < ncols_this_block; ++c) {
                 tile_KV[row*stride_tile + blk_c + c] = local_buf[c];
@@ -688,7 +698,7 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
 // 36-byte blocks are not 16-byte aligned individually, so we copy
 // ceil(raw_bytes_per_row/16)*16 bytes per row. The shared-memory raw buffer is
 // at tile_oscar2_raw (nbytes_shared_total includes room for it on the host side).
-template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool restore_mean = false>
 static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_bytes, const int col_offset, const int i_sup,
@@ -771,6 +781,14 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
                 local_buf[j] = __halves2half2(
                     __hmul(__hadd(lo, hi), ih_scale),
                     __hmul(__hsub(lo, hi), ih_scale));
+            }
+            // For V path (restore_mean=true): add per-block mean back
+            if constexpr (restore_mean) {
+                const half2 mean_h2 = __halves2half2(__float2half(m_f), __float2half(m_f));
+                #pragma unroll
+                for (int j = 0; j < block_half2; ++j) {
+                    local_buf[j] = __hadd2(local_buf[j], mean_h2);
+                }
             }
             // Stage 3: Write to tile shared memory
             #pragma unroll
@@ -1380,7 +1398,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo2_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             } else {
-                flash_attn_ext_oscar2_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                flash_attn_ext_oscar2_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check, true>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             }
             __syncthreads();
