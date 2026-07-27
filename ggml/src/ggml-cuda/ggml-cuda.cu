@@ -644,6 +644,9 @@ struct ggml_backend_cuda_device_context {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     std::mutex device_mutex;
     int active_count = 0;
+    // set once the device has ever been used; a reset after that would invalidate
+    // host state that caches per-context data (e.g. raised shared memory limits)
+    bool ever_active = false;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 };
 
@@ -870,6 +873,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) buft->device->context;
     std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
     dev_ctx->active_count++;
+    dev_ctx->ever_active = true;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
@@ -1623,6 +1627,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) buft->device->context;
     std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
     dev_ctx->active_count++;
+    dev_ctx->ever_active = true;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     return buffer;
@@ -5289,7 +5294,10 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // If no backends or buffers are active, the cudaMemGetInfo call above lazily created a CUDA
     // context that permanently consumes VRAM. Reset the device to free it.
-    if (ctx->active_count == 0) {
+    // Only safe before the device has ever been used: a reset destroys the primary context,
+    // while host state caching per-context data (raised shared memory limits, cuBLAS handles)
+    // survives and would then refer to a context that no longer exists.
+    if (ctx->active_count == 0 && !ctx->ever_active) {
         CUDA_CHECK(cudaDeviceReset());
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -6025,6 +6033,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
     dev_ctx->active_count++;
+    dev_ctx->ever_active = true;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     return cuda_backend;
