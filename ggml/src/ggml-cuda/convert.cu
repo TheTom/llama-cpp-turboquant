@@ -504,34 +504,14 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
 }
 
 // oscar2 dequant with inverse Hadamard (for f16 conversion path). 128 threads/block.
-template <typename dst_t>
-static __global__ void k_dequantize_oscar2_ih(const block_oscar2 * __restrict__ vx, dst_t * __restrict__ y, const int64_t n) {
-    const int64_t blk = (int64_t)blockIdx.x * blockDim.y + threadIdx.y;
-    const int tid = threadIdx.y * 32 + threadIdx.x;
-    const int64_t e = blk * QK_OSCAR2 + tid;
-    if (e >= n) return;
-    const block_oscar2 * b = &vx[blk];
-    const float d = __half2float(b->d), m = __half2float(b->m);
-    const int j = tid, by = j / 4, sb = j % 4;
-    float v = fmaf((float)((b->qs[by] >> (2*sb)) & 0x03), d, m);
-    const float mu = m + 1.5f * d;
-    v -= mu;
-    __shared__ float sh[QK_OSCAR2]; sh[tid] = v;
-    __syncthreads();
-    for (int h = QK_OSCAR2/2; h > 0; h >>= 1) {
-        if (!(tid & h)) { int p = tid + h; float a = sh[tid], bv = sh[p]; sh[tid] = a + bv; sh[p] = a - bv; }
-        __syncthreads();
-    }
-    v = sh[tid] * rsqrtf(128.0f) + mu;
-    y[e] = (dst_t)v;
-}
-
-template <typename dst_t>
-static void dequantize_oscar2_ih_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int64_t nb = k / QK_OSCAR2;
-    const dim3 b(32, 4); const dim3 g((int)((nb+3)/4));
-    k_dequantize_oscar2_ih<<<g, b, QK_OSCAR2*4, stream>>>((const block_oscar2*)vx, y, k);
-}
+// DISABLED: oscar2 is KV-cache only, never model weights. The FA kernel handles
+// dequant natively. If general dequant is needed, use dequantize_oscar2 from
+// dequantize.cuh. Note: set_rows stores Hadamard-domain values so naive dequant
+// outside the FA pipeline would produce incorrect results.
+// template <typename dst_t>
+// static __global__ void k_dequantize_oscar2_ih(...) { ... }
+// template <typename dst_t>
+// static void dequantize_oscar2_ih_cuda(...) { ... }
 
 // Fast warp-cooperative TQ4_1S dequant: one warp per 32-element block.
 // WHT via __shfl_xor_sync — 16× less compute than the per-element generic template.
@@ -844,7 +824,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_TQ3_1S:
             return dequantize_block_cont_cuda<QK_TQ3_0, QR_TQ3_1S, dequantize_tq3_1s>;
         case GGML_TYPE_OSCAR2:
-            return dequantize_oscar2_ih_cuda<half>;
+            return nullptr; // KV-cache only, never model weights
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:

@@ -129,10 +129,10 @@ static __global__ void flash_attn_ext_oscar2(
     }
 
     // Load Q into registers and rotate each 128-element block into the
-    // P_br(H) domain in which oscar2 stores K and V. Because H and P_br are
-    // both orthogonal and self-inverse, dot(Q,K) is preserved when both
-    // operands live in the same transformed domain. This lets the inner loop
-    // skip the per-token inverse Hadamard/P_br on K and V.
+    // Hadamard domain in which set_rows stores K and V. The normalized
+    // Hadamard is orthonormal and self-inverse, so dot(Q,K) is preserved
+    // when both operands live in the same transformed domain. This lets
+    // the inner loop skip the per-token inverse Hadamard on K and V.
     float Q_reg[ncols][nelems];
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
@@ -189,7 +189,7 @@ static __global__ void flash_attn_ext_oscar2(
             assert(nb11 == nblocks * (int32_t)sizeof(block_oscar2)); // stride must match block layout
             const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
-            // ---- K dequant + dot product (K already lives in P_br(H) domain) ----
+            // ---- K dequant + dot product (K already lives in Hadamard domain) ----
             float KQ_val[ncols] = {0.0f};
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
@@ -249,7 +249,7 @@ static __global__ void flash_attn_ext_oscar2(
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
 
-                // ---- V dequant + accumulate in P_br(H) domain ----
+                // ---- V dequant + accumulate in Hadamard domain ----
                 // Keep the mean separate so the final output semantics match
                 // the original kernel (inv-Hadamard applied to centered value,
                 // then mean added back).
@@ -262,7 +262,7 @@ static __global__ void flash_attn_ext_oscar2(
                     for (int e = 0; e < elems_per_block; ++e) {
                         const int ti = tid + e * nthreads;
                         const uint8_t code = (V_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_v; // centered value in P_br(H) domain
+                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_v; // centered value in Hadamard domain
                         VKQ[j][b * elems_per_block + e] += ke * val;
                     }
                 }
@@ -270,7 +270,7 @@ static __global__ void flash_attn_ext_oscar2(
         } // end i_kv loop
     } // end kv_base loop
 
-    // ---- Write results: inverse-transform each 128-element block from P_br(H)
+    // ---- Write results: inverse-transform each 128-element block from Hadamard
     // domain back to natural domain, then add the accumulated per-block mean.
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
