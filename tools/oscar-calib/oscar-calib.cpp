@@ -24,6 +24,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#  include <direct.h>
+#else
+#  include <sys/stat.h>
+#endif
+
 // Accumulator for one layer's Q^T Q and V^T diag(w) V matrices.
 // Sized for head_dim up to 512 (the max oscar2 supports).
 struct calib_accumulator {
@@ -129,7 +135,7 @@ static bool calib_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     auto & acc = g_accumulators[layer];
 
     // We only process tensors of the right type and shape.
-    const enum ggml_type type = ggml_get_type(t);
+    const enum ggml_type type = t->type;
     if (type != GGML_TYPE_F32) return false;
 
     const int ne0 = ggml_nelements(t) > 0 ? t->ne[0] : 0;
@@ -289,11 +295,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Query model dimensions.
-    const int n_embd_head = llama_model_n_embd_head(model);
-    const int n_head     = llama_model_n_head(model);
-    const int n_head_kv  = llama_model_n_head_kv(model);
-    const int n_layers   = llama_model_n_layer(model);
+    // Query model dimensions. n_embd_head is not exposed directly in the public
+    // llm API, so derive it from n_embd / n_head.
+    const int n_embd      = llama_model_n_embd(model);
+    const int n_head      = llama_model_n_head(model);
+    const int n_embd_head = n_embd / n_head;
+    const int n_head_kv   = llama_model_n_head_kv(model);
+    const int n_layers    = llama_model_n_layer(model);
 
     g_n_layers = n_layers;
     g_n_embd_head = n_embd_head;
