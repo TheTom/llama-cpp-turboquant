@@ -143,6 +143,25 @@ Verified compatible: Gemma-2 (uniform D=128|256), Gemma-3, Cohere Command R, DFl
 Gemma-4: oscar2 on SWA layers (D=128); f16 fallback on dense layers (D=256).
 ---
 
+## CPU/GPU Quant Divergence Note
+
+The CPU and GPU quant paths for oscar2 produce **different block semantics**:
+- **CPU** (`quantize_row_oscar2_ref` in `ggml-quants.c:684-724`): applies optional
+  P_br (bit-reversal) permutation but NO Hadamard transform. Values are stored in
+  natural domain. The CPU `vec_dot_oscar2_f32` dequantizes back to natural domain.
+- **GPU** (`set_rows_cuda_oscar2` in `set-rows.cu:1432-1536`): applies forward
+  normalized Hadamard (mean subtract -> H -> /sqrt(128)) but NO P_br. Values are
+  stored in Hadamard domain. The dedicated FA kernel (`fattn-oscar2.cuh`) applies
+  inverse Hadamard during decode.
+
+This is internally consistent within each path (CPU quant -> CPU vec_dot, GPU quant ->
+GPU FA kernel), but blocks from one path MUST NOT cross into the other. Currently
+enforced by the GPU FA kernel being the sole supported decode path for oscar2 on CUDA.
+
+The unused `P_BR_DEV` table (removed from `fattn-oscar2.cuh` in 45956637c) and
+references to `P_br(H)` in old kernel comments are remnants of the OSCAR paper
+pipeline that the GPU implementation does not fully replicate.
+
 ## File Inventory
 
 ```
