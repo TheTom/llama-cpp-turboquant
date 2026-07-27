@@ -110,10 +110,10 @@ When a Gemma-4 GGUF lacks the optional calibrated `attn_k_rot`/`attn_v_rot` tens
 the model loads a Hadamard-like fallback matrix `TURBO_ROTATION_RT` from
 `src/turbo-rotation-data.h`. This replaces the previous identity fallback and restores
 the incoherence-reduction benefit for quantized KV caches. Calibrated per-layer
-rotations (from `export_rot_kv_gguf.py`) are still preferred when available.
+**Limitation**: Fallback only works for power-of-2 head dims >= 64. Hadamard matrix
+is generated at runtime via Sylvester construction for any supported dimension
+(128, 256, 512). FIXED — no longer throws for D=256/512.
 
-**Limitation**: Fallback only works for `n_embd_head == 128`. D=256/512 fallback
-generation needs a power-of-2 Hadamard generator.
 
 ### 4. HP (High-Precision) Sink Buffer — NOT ADDRESSED (feature, not bug)
 Not implemented for OSCAR2. The HP buffer (f16 fallback for sink+recent tokens)

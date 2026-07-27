@@ -2,6 +2,8 @@
 #include "../turbo-rotation-data.h"
 
 #include <cinttypes>
+#include <vector>
+#include <cmath>
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -89,8 +91,32 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
         // Fallback to data-free Hadamard rotation when calibrated rotations are missing.
         // Running without any rotation (identity) makes quantized KV cache incoherent.
         if (!layer.attn_k_rot || !layer.attn_v_rot) {
-            if (n_embd_head != 128) {
-                throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation requires head_dim == 128, got %" PRId64, n_embd_head));
+            const int64_t d = n_embd_head;
+            // Require power-of-2 head dim >= 64 for Hadamard construction
+            if ((d & (d - 1)) != 0 || d < 64) {
+                throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation requires head_dim to be a power of 2 >= 64, got %" PRId64, d));
+            }
+
+            // Generate normalized Hadamard matrix of size d x d.
+            // Sylvester construction: H_1 = [1]; H_{2n} = [H_n  H_n; H_n -H_n].
+            // After construction, normalize by 1/sqrt(d) so H^T H = I.
+            const float inv_sqrt_d = 1.0f / sqrtf((float)d);
+            std::vector<float> had((size_t)d * d);
+            had[0] = 1.0f;
+            for (int64_t size = 1; size < d; size *= 2) {
+                const int64_t s2 = size * 2;
+                for (int64_t i = 0; i < size; ++i) {
+                    for (int64_t j = 0; j < size; ++j) {
+                        const float v = had[(size_t)i * size + j];
+                        had[(size_t)i         * s2 + j]         = v;
+                        had[(size_t)(i+size)  * s2 + j]         = v;
+                        had[(size_t)i         * s2 + (j+size)]  = v;
+                        had[(size_t)(i+size)  * s2 + (j+size)]  = -v;
+                    }
+                }
+            }
+            for (size_t i = 0; i < (size_t)d * d; ++i) {
+                had[i] *= inv_sqrt_d;
             }
 
             ggml_context * ctx_fallback = ml->contexts.empty() ? nullptr : ml->contexts[0].get();
@@ -101,7 +127,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
             auto create_fallback_rot = [&](ggml_tensor *& rot, const char * name) {
                 if (rot != nullptr) return;
 
-                rot = ggml_new_tensor_2d(ctx_fallback, GGML_TYPE_F32, n_embd_head, n_embd_head);
+                rot = ggml_new_tensor_2d(ctx_fallback, GGML_TYPE_F32, d, d);
                 if (!rot) {
                     throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to create %s", name));
                 }
@@ -116,7 +142,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
                     throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to init buffer for %s", name));
                 }
 
-                ggml_backend_tensor_set(rot, TURBO_ROTATION_RT, 0, n_embd_head * n_embd_head * sizeof(float));
+                ggml_backend_tensor_set(rot, had.data(), 0, ggml_nbytes(rot));
             };
 
             create_fallback_rot(layer.attn_k_rot, "fallback.attn_k_rot");
