@@ -94,6 +94,26 @@ incoherent. Debugging showed:
 **Still open:**
 - `B4` — Mask indexing ignores stride parameters (only matters for non-standard mask layouts)
 
+### Verification Test Results (July 27, 2026)
+
+After B21 fix and associated patches:
+
+| Model | Rotation | Head Dim | f16 | oscar2 | q2_0 |
+|-------|----------|----------|-----|--------|------|
+| Qwen3.6-27B Hadamard | Hadamard (data-free) | 512 | ✓ | **✓** | ✓ |
+| Qwen3.6-27B UD | Calibrated (UD) | 128 | ✓ | **✓** | ✓ |
+| Gemma4-12B UD | Calibrated (UD) | 256/512 mixed | ✓ | **✗** | **✗** |
+| Gemma4-12B Hadamard | Hadamard (data-free) | 256/512 mixed | ✓ | **✗** | **✗** |
+
+**B21 fix verified working**: The K mean correction resolves garbled output for D=128 and D=512
+models (Qwen3.6). The dedicated FA kernel produces coherent output matching f16 baseline.
+
+**Gemma4 issue**: ALL quantized cache types (oscar2, q2_0, q8_0) fail on Gemma4 regardless of
+rotation method. f16 works. This is a pre-existing Gemma4-specific issue, not caused by the
+oscar2 FA kernel — the FA kernel was never the primary path for Gemma4 with quantized caches.
+Likely root cause: ISWA cache split interacting with quantized cache layout (stride/dimension
+mismatch for non-f16 types). Needs separate investigation.
+
 ### 2. VEC Path Broken for Quantized KV at D>256 — FUNDAMENTAL
 Pre-existing issue: VEC path fails because set_rows_cuda_oscar2 stores K/V in Hadamard
 domain, but the VEC dequant path (`vec_dot_fattn_vec_KQ_oscar2`, `dequantize_V_oscar2`)
