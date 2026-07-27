@@ -61,8 +61,8 @@ OSCAR differs from the existing q2_0 KV cache type:
 |--------|--------|-------|-------|
 | f16/f16 (baseline) | "The capital of France is Paris" | 96 t/s | ✓ Working |
 | q2_0/q2_0 (dedicated kernel) | "The capital of France is Paris" | 15 t/s | ✓ Working |
-| oscar2/oscar2 (dedicated kernel) | Garbled | 29 t/s | ✗ Bug in kernel |
-| oscar2/oscar2 (VEC path) | Garbled | 86 t/s | ✗ VEC path broken for quantized KV at D>256 |
+| oscar2/oscar2 (dedicated kernel) | Garbled* | 29 t/s | ✗ Bug in kernel — B1/B2/B5/B8/B13 fixed; B4/B6 remain |
+| oscar2/oscar2 (VEC path) | Garbled† | 86 t/s | ✗ Domain mismatch: set_rows stores Hadamard, VEC reads natural |
 
 ### Cache Compression
 | Format | Bytes/128-elem | vs f16 |
@@ -76,32 +76,46 @@ OSCAR2 saves 10% more VRAM than q2_0 and 7× vs f16. The cache IS compressed on 
 
 ---
 
-## Known Issues
+### 1. Dedicated OSCAR2 FA Kernel Produces Garbage — PARTIALLY FIXED
+The kernel dispatches correctly (29 t/s vs 90 t/s for VEC) but attention output was
+incoherent. Debugging showed:
 
-### 1. Dedicated OSCAR2 FA Kernel Produces Garbage
-The kernel dispatches correctly (29 t/s vs 90 t/s for VEC) but attention output is
-incoherent. Debugging shows:
-- `kv_max_ptr` is NULL for small prompts → kernel processes all `kv_size` slots
-  (most with zero data). q2_0 has the same behavior and works correctly.
-- K/V scale/zero and q-codes for populated positions are correct (match SET_ROWS output).
-- Suspected bug in the cooperative dequant, KQ reduction, or VKQ accumulation.
+**Bug fix summary (committed since initial report):**
+- `B1` — Duplicate KQ dot accumulation (D<128): FIXED
+- `B2` — Non-multiple-of-128 head dim truncation: FIXED (`static_assert`)
+- `B3` — Column-bound check using wrong dimension: PARTIALLY FIXED (bound fixed, dst_ptr index still uses ne01.z, works for single-batch)
+- `B5` — Hadamard inverse bounds/condition: FIXED (rewritten to clean loop)
+- `B8` — Uninitialized arrays: FIXED (zero-init)
+- `B13` — i_kv break bound unclamped: FIXED (min clamp on k_VKQ_max)
 
-### 2. VEC Path Broken for Quantized KV at D>256
-Pre-existing issue, noted in code comment "VEC path is broken on Blackwell."
-Affects ALL quantized types (q2_0, oscar2) through VEC at head dims > 128.
-q2_0 works because its dedicated kernel handles D=64/128/256/512. The Q_ds
-indexing fix was one bug; at least one more remains in the VEC kernel's
-quantized-KV path.
+**Still open:**
+- `B4` — Mask indexing ignores stride parameters (only matters for non-standard mask layouts)
+- `B6` — nb11 stride has comment but no GGML_ASSERT (pre-rotated K / zero-padded K risk)
 
-### 3. Rotation Matrices Not Loaded
+*The fixes above have been applied to the kernel source. Whether the kernel is now producing correct output requires actual testing — the applied fixes address all known critical bugs in the dequant/dot/Hadamard path.*
+
+### 2. VEC Path Broken for Quantized KV at D>256 — FUNDAMENTAL
+Pre-existing issue: VEC path fails because set_rows_cuda_oscar2 stores K/V in Hadamard
+domain, but the VEC dequant path (`vec_dot_fattn_vec_KQ_oscar2`, `dequantize_V_oscar2`)
+reads them as natural-domain values. The VEC kernel has no inverse-Hadamard transform
+for K or V at any head dim. This affects ALL head dims (not just D>256), though D>256
+has the additional template-instantiation gap.
+
+**Not fixable without adding inverse Hadamard to VEC path.** For now, the dedicated FA
+kernel (oscar2-only) is the correct path. Recommend adding a VEC-path exclusion for
+oscar2 to avoid silent domain mismatch.
+
+### 3. Rotation Matrices Not Loaded — FIXED (F17)
 When a Gemma-4 GGUF lacks the optional calibrated `attn_k_rot`/`attn_v_rot` tensors,
-the model now falls back to the data-free Hadamard matrix from `TURBO_ROTATION_RT`
-(`src/turbo-rotation-data.h`). This replaces the previous identity fallback and
-restores most of the incoherence-reduction benefit for quantized KV caches.
-Calibrated per-layer rotations (from `export_rot_kv_gguf.py`) are still preferred
-when available.
+the model loads a Hadamard-like fallback matrix `TURBO_ROTATION_RT` from
+`src/turbo-rotation-data.h`. This replaces the previous identity fallback and restores
+the incoherence-reduction benefit for quantized KV caches. Calibrated per-layer
+rotations (from `export_rot_kv_gguf.py`) are still preferred when available.
 
-### 4. HP (High-Precision) Sink Buffer
+**Limitation**: Fallback only works for `n_embd_head == 128`. D=256/512 fallback
+generation needs a power-of-2 Hadamard generator.
+
+### 4. HP (High-Precision) Sink Buffer — NOT ADDRESSED (feature, not bug)
 Not implemented for OSCAR2. The HP buffer (f16 fallback for sink+recent tokens)
 is a planned addition to recover quality at long contexts but is not needed for
 correctness at short contexts.
@@ -127,7 +141,6 @@ flagged every Gemma-4 layer as f16, defeating the per-layer fix.
 
 Verified compatible: Gemma-2 (uniform D=128|256), Gemma-3, Cohere Command R, DFlash.
 Gemma-4: oscar2 on SWA layers (D=128); f16 fallback on dense layers (D=256).
-
 ---
 
 ## File Inventory
