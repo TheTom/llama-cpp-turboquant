@@ -317,7 +317,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cb(Kcur, "Kcur_pos", il);
 
-            if (model.layers[il].attn_v_rot && getenv("LLAMA_KV_V_ROT")) {
+            if (model.layers[il].attn_v_rot) {
                 // attn_v_rot is stored as R_v^T; for V we want to quantize V@R_v (the calibrated
                 // incoherence-reducing direction), so rotate with R_v = (R_v^T)^T and undo with R_v^T.
                 ggml_tensor * Rv = ggml_cont(ctx0, ggml_transpose(ctx0, model.layers[il].attn_v_rot));

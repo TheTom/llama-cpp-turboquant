@@ -290,6 +290,36 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // INT2 cache type rotation check: warn when using INT2 without rotation tensors.
+    // The model's per-layer rotation tensors (attn_k_rot, attn_v_rot) are optional;
+    // when absent, quantized KV caches (oscar2, q2_0) can produce degraded output.
+    if (type_k == GGML_TYPE_OSCAR2 || type_v == GGML_TYPE_OSCAR2 ||
+        type_k == GGML_TYPE_Q2_0   || type_v == GGML_TYPE_Q2_0) {
+        bool has_rotation = false;
+        for (size_t il = 0; il < model.layers.size() && !has_rotation; il++) {
+            has_rotation = (model.layers[il].attn_k_rot != nullptr || model.layers[il].attn_v_rot != nullptr);
+        }
+        if (!has_rotation) {
+            LLAMA_LOG_WARN("%s: INT2 KV cache (%s/%s) without rotation tensors — "
+                           "output may be degraded. Use a rotated GGUF or set rotation env vars.\n",
+                           __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+        }
+    }
+
+    // Auto-detect: when rotation tensors are present with q2_0 KV cache,
+    // automatically set LLAMA_KV_NO_HADAMARD to prevent the in-quant Hadamard
+    // from being applied on top of the graph rotation (double transform).
+    if (type_k == GGML_TYPE_Q2_0 || type_v == GGML_TYPE_Q2_0) {
+        bool has_k_rot = false;
+        for (size_t il = 0; il < model.layers.size() && !has_k_rot; il++) {
+            has_k_rot = (model.layers[il].attn_k_rot != nullptr);
+        }
+        if (has_k_rot && !getenv("LLAMA_KV_NO_HADAMARD")) {
+            setenv("LLAMA_KV_NO_HADAMARD", "1", 0);
+            LLAMA_LOG_INFO("%s: auto-set LLAMA_KV_NO_HADAMARD=1 (q2_0 KV with rotation tensors)\n", __func__);
+        }
+    }
+
     const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < n_layer; il++) {

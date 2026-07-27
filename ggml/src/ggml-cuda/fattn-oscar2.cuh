@@ -16,16 +16,9 @@
 // ggml-common.h declares these as static const, but the CUDA compiler does
 // not make them visible in __device__ code for arrays > ~64 bytes. These
 // __device__ copies ensure the FA kernel can access them.
+// Note: P_br (bit-reversal permutation from the OSCAR paper) is CPU-only;
+// the GPU set_rows kernel does not apply it, so P_BR_DEV is not declared here.
 static __device__ const float OSCAR2_CENTROIDS_DEV[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
-static __device__ const int   P_BR_DEV[128] = {
-    0, 64, 32, 96, 16, 80, 48, 112,  8, 72, 40, 104, 24, 88, 56, 120,
-    4, 68, 36, 100, 20, 84, 52, 116, 12, 76, 44, 108, 28, 92, 60, 124,
-    2, 66, 34, 98, 18, 82, 50, 114, 10, 74, 42, 106, 26, 90, 58, 122,
-    6, 70, 38, 102, 22, 86, 54, 118, 14, 78, 46, 110, 30, 94, 62, 126,
-    1, 65, 33, 97, 17, 81, 49, 113,  9, 73, 41, 105, 25, 89, 57, 121,
-    5, 69, 37, 101, 21, 85, 53, 117, 13, 77, 45, 109, 29, 93, 61, 125,
-    3, 67, 35, 99, 19, 83, 51, 115, 11, 75, 43, 107, 27, 91, 59, 123,
-    7, 71, 39, 103, 23, 87, 55, 119, 15, 79, 47, 111, 31, 95, 63, 127};
 
 // ---------------------------------------------------------------------------
 // Single-threaded helpers (fallback for D < 128)
@@ -193,7 +186,7 @@ static __global__ void flash_attn_ext_oscar2(
             if (kv_base + i_kv >= k_VKQ_max) break;
 
             const block_oscar2 * K_blk = (const block_oscar2 *)(K + i_kv * nb11);
-            // INVARIANT: nb11 == nblocks * sizeof(block_oscar2) so K_blk[b] stays within the row
+            assert(nb11 == nblocks * (int32_t)sizeof(block_oscar2)); // stride must match block layout
             const block_oscar2 * V_blk = (const block_oscar2 *)(V + i_kv * nb21);
 
             // ---- K dequant + dot product (K already lives in P_br(H) domain) ----
@@ -208,8 +201,17 @@ static __global__ void flash_attn_ext_oscar2(
                     #pragma unroll
                     for (int e = 0; e < elems_per_block; ++e) {
                         const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_k; // centered; no mean — constant positional bias doesn't affect softmax
+                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_k;
                         sum += val * Q_reg[j][b * elems_per_block + e];
+                    }
+                    // Per-block K mean correction: the mean was subtracted before
+                    // Hadamard transform in set_rows, but is stored in block_oscar2.m.
+                    // The missing term in the centered dot is mean * sum(Q_over_block).
+                    // In Hadamard domain, Q_had[0] = sum(Q) / sqrt(128), so the
+                    // correction is m_k * Q_had[0] * sqrt(128). Only thread 0 (tid==0)
+                    // holds the DC component Q_had[0] at Q_reg[j][b * elems_per_block].
+                    if (tid == 0) {
+                        sum += m_k * Q_reg[j][b * elems_per_block] * 11.3137085f; // sqrtf(128.0f)
                     }
                 }
                 KQ_val[j] = sum;
@@ -264,18 +266,18 @@ static __global__ void flash_attn_ext_oscar2(
                         VKQ[j][b * elems_per_block + e] += ke * val;
                     }
                 }
-            }
+            } // end score for-j loop
+        } // end i_kv loop
+    } // end kv_base loop
 
-        }
-    }
-    // Write results: inverse-transform each 128-element block from P_br(H)
+    // ---- Write results: inverse-transform each 128-element block from P_br(H)
     // domain back to natural domain, then add the accumulated per-block mean.
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
         if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
         const float iks = gridDim.y == 1 ? 1.0f / KQ_sum[j] : 1.0f;
         if (gridDim.y != 1 && tid == 0) {
-            int mi = ((sequence * (int)ne01.z + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y;
+            int mi = ((sequence * (int)ne01.x + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y;
             dst_meta_ptr[mi] = make_float2(KQ_max[j], KQ_sum[j]);
         }
         #pragma unroll
@@ -291,9 +293,9 @@ static __global__ void flash_attn_ext_oscar2(
                 int di = tid + e * nthreads + b * QK_OSCAR2;
                 float val = sh_val_had[tid + e * nthreads] + VKQ_mean[j][b] * iks;
                 if (gridDim.y == 1)
-                    dst_ptr[(((sequence * (int)ne01.z + ic0 + j) * ne02 + head)) * D + di] = val;
+                    dst_ptr[(((sequence * (int)ne01.x + ic0 + j) * ne02 + head)) * D + di] = val;
                 else
-                    dst_ptr[(((sequence * (int)ne01.z + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y) * D + di] = val;
+                    dst_ptr[(((sequence * (int)ne01.x + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y) * D + di] = val;
             }
             __syncwarp();
         }

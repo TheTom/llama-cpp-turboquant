@@ -53,7 +53,7 @@ for (int b = 0; b < nblocks; ++b) {
 
 Fix applied: `static_assert(D % QK_OSCAR2 == 0)` and `D >= QK_OSCAR2` added in fattn-oscar2.cuh (line 96-97). The dispatcher in fattn.cu also gates D in {128, 256, 512}. Non-multiple-of-128 D now fails at compile time.
 
-### B3. Column-bound check uses wrong dimension (HIGH) — PARTIALLY FIXED
+### B3. Column-bound check uses wrong dimension (HIGH) — FIXED
 
 ```cpp
 if (ncols > 1 && ic0 + j >= (int)ne01.z) break;
@@ -63,7 +63,7 @@ dst_ptr[(((sequence * (int)ne01.z + ic0 + j) * ne02 + head)) * D + di] = val;
 
 `ne01` is declared as `const uint3`. Its components are `(ne[1], ne[2], ne[3]) = (ncols, n_head, batch)`. So `ne01.z` is actually `ne[3]` (batch), not the column dimension. The column bound should be against `(uint32_t)ne01.x` (which is `ncols`).
 
-Fix applied (partial): the column-bound check now uses `ne01.x` (line 275). The `dst_ptr` index still uses `ne01.z` — this is fragile for batch > 1 but works for the single-sequence case used in testing.
+Fix applied: column-bound check now uses `ne01.x` (line 285). `dst_ptr` index also updated to `ne01.x` (lines 303-305). FIXED.
 
 ### B4. Mask indexing ignores stride parameters (HIGH) — NOT FIXED
 

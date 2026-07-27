@@ -83,21 +83,16 @@ incoherent. Debugging showed:
 **Bug fix summary (committed since initial report):**
 - `B1` — Duplicate KQ dot accumulation (D<128): FIXED
 - `B2` — Non-multiple-of-128 head dim truncation: FIXED (`static_assert`)
-- `B3` — Column-bound check using wrong dimension: PARTIALLY FIXED (bound fixed, dst_ptr index still uses ne01.z, works for single-batch)
+- `B3` — Column-bound check using wrong dimension: FIXED (bound + dst_ptr index both use `ne01.x`)
 - `B5` — Hadamard inverse bounds/condition: FIXED (rewritten to clean loop)
 - `B8` — Uninitialized arrays: FIXED (zero-init)
 - `B13` — i_kv break bound unclamped: FIXED (min clamp on k_VKQ_max)
+- `B21` — K mean omitted from QK logits (CRITICAL): FIXED (mean correction added to KQ dot)
+- `B6` — nb11 stride assert: FIXED (assert added)
+- `B3` — dst_ptr index for batch>1: FIXED (ne01.x replaces ne01.z)
 
 **Still open:**
 - `B4` — Mask indexing ignores stride parameters (only matters for non-standard mask layouts)
-- `B6` — nb11 stride has comment but no GGML_ASSERT (pre-rotated K / zero-padded K risk)
-- **`B21` — K mean omitted from QK logits (CRITICAL, leading hypothesis for garbled output)**
-
-The per-block K mean stored in `block_oscar2.m` is dropped from the KQ dot product.
-The code comment claims it "doesn't affect softmax" but the mean varies per K token,
-so the missing term `mean(K_block) * sum(Q_block)` is token-dependent and can reorder
-attention scores. V path handles its mean correctly via `VKQ_mean` — the K path omission
-is inconsistent. Fix: add `m_k * Q_had_DC * sqrt(128)` per block to KQ score.
 
 ### 2. VEC Path Broken for Quantized KV at D>256 — FUNDAMENTAL
 Pre-existing issue: VEC path fails because set_rows_cuda_oscar2 stores K/V in Hadamard
