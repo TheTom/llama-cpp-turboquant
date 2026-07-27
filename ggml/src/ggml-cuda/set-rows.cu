@@ -1439,10 +1439,13 @@ static __global__ void set_rows_cuda_oscar2(
         for (int k = 16; k > 0; k >>= 1) s += __shfl_xor_sync(0xFFFFFFFF, s, k, 32);
         if (t % 32 == 0) sh_wsum[t / 32] = s;
         __syncthreads();
-        float total = (t < 4) ? sh_wsum[t] : 0.0f;
-        for (int k = 2; k > 0; k >>= 1) total += __shfl_xor_sync(0x0F, total, k, 4);
-        total = __shfl_sync(0xFFFFFFFF, total, 0, 32);
-        const float mean = total / (float)QK_OSCAR2;
+        if (t < 4) {
+            float total = sh_wsum[t];
+            for (int k = 2; k > 0; k >>= 1) total += __shfl_xor_sync(0x0F, total, k, 4);
+            if (t == 0) sh_wsum[0] = total;
+        }
+        __syncthreads();
+        const float mean = sh_wsum[0] / (float)QK_OSCAR2;
 
         // Subtract mean, forward Hadamard, normalize
         sh_vals[t] -= mean;
@@ -1469,13 +1472,15 @@ static __global__ void set_rows_cuda_oscar2(
         }
         if (t % 32 == 0) { sh_wsum[t / 32] = s; sh_wsum[4 + t / 32] = sq; }
         __syncthreads();
-        float total_sq = 0.0f;
-        total = 0.0f;
-        if (t < 4) { for (int i = 0; i < 4; ++i) { total += sh_wsum[i]; total_sq += sh_wsum[4 + i]; } }
-        total    = __shfl_sync(0xFFFFFFFF, total, 0, 32);
-        total_sq = __shfl_sync(0xFFFFFFFF, total_sq, 0, 32);
-        const float rms_val = sqrtf(fmaxf(0.0f, total_sq / (float)QK_OSCAR2 - 
-            (total / (float)QK_OSCAR2) * (total / (float)QK_OSCAR2)));
+        if (t == 0) {
+            float total = 0.0f, total_sq = 0.0f;
+            for (int i = 0; i < 4; ++i) { total += sh_wsum[i]; total_sq += sh_wsum[4 + i]; }
+            sh_wsum[0] = total;
+            sh_wsum[1] = total_sq;
+        }
+        __syncthreads();
+        const float rms_val = sqrtf(fmaxf(0.0f, sh_wsum[1] / (float)QK_OSCAR2 - 
+            (sh_wsum[0] / (float)QK_OSCAR2) * (sh_wsum[0] / (float)QK_OSCAR2)));
         const float k_scale = 1.0f;
         const float d_val   = fmaxf(rms_val * k_scale, 1e-10f);
         const float m_val   = mean;
