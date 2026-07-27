@@ -639,12 +639,15 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
             for (int b = 0; b < ncols_this_block / 2; ++b) {
                 const uint8_t qs = blk->qs[b];
                 const int c = b * 2;
+                // Centered dequant: centroid * sigma (no mean). The set_rows kernel stores
+                // H(val - mean) / sqrt(128). The inverse Hadamard below restores centered
+                // values. Mean is accumulated/preserved only in the scalar FA kernel's V path.
                 local_buf[c]     = __halves2half2(
-                    __float2half(fmaf((float)(qs & 0x3),         d_f, m_f)),
-                    __float2half(fmaf((float)((qs >> 2) & 0x3),  d_f, m_f)));
+                    __float2half((float)(qs & 0x3)         * d_f),
+                    __float2half((float)((qs >> 2) & 0x3)  * d_f));
                 local_buf[c + 1] = __halves2half2(
-                    __float2half(fmaf((float)((qs >> 4) & 0x3),  d_f, m_f)),
-                    __float2half(fmaf((float)(qs >> 6),          d_f, m_f)));
+                    __float2half((float)((qs >> 4) & 0x3)  * d_f),
+                    __float2half((float)(qs >> 6)          * d_f));
             }
             // Pad remainder with zeros if partial block
             #pragma unroll
@@ -732,8 +735,8 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
             const float m_f = __half2float(blk->m);
             const int blk_limit = min(blk_c + block_half2, D2);
             const int ncols_this_block = blk_limit - blk_c;
-            // Stage 2a: Dequant to local half2 buffer
-#pragma unroll
+            // Stage 2a: Dequant to local half2 buffer (centered values, no mean)
+            #pragma unroll
             for (int c = 0; c < ncols_this_block; ++c) {
                 const int col = col_offset + blk_c + c;
                 const int elem0 = col * 2;
@@ -742,8 +745,8 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
                 const int     shift  = (j0 % 4) * 2;
                 const uint8_t code0 = (qs_byte >> shift) & 0x3;
                 const uint8_t code1 = (qs_byte >> (shift + 2)) & 0x3;
-                const half lo = __float2half(fmaf((float)code0, d_f, m_f));
-                const half hi = __float2half(fmaf((float)code1, d_f, m_f));
+                const half lo = __float2half((float)code0 * d_f);
+                const half hi = __float2half((float)code1 * d_f);
                 local_buf[c] = __halves2half2(lo, hi);
             }
             // Pad remainder with zeros if partial block

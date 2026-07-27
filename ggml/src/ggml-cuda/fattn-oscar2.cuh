@@ -148,7 +148,9 @@ static __global__ void flash_attn_ext_oscar2(
         for (int e = 0; e < nelems; ++e) {
             Q_reg[j][e] = Q_j[tid + e * nthreads] * scale;
         }
-        // In-place transform: Q_reg[j] <- P_br(H * Q_reg[j])
+        // Transform Q to Hadamard domain: Q_reg[j] <- H(Q_reg[j]).
+        // set_rows stores K/V as H(val - mean) / sqrt(128). With Q also in H domain,
+        // the dot product (H(Q) · H(K)) preserves Q·K (H is orthogonal self-inverse).
         #pragma unroll
         for (int b = 0; b < nblocks; ++b) {
             #pragma unroll
@@ -157,11 +159,6 @@ static __global__ void flash_attn_ext_oscar2(
             }
             __syncwarp();
             hadamard_inverse_128_32w(sh_val_had, tid);
-            // P_br permutation (self-inverse)
-            { float _pbr[elems_per_block];
-              for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
-              for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
-            __syncwarp();
             #pragma unroll
             for (int e = 0; e < elems_per_block; ++e) {
                 Q_reg[j][b * elems_per_block + e] = sh_val_had[tid + e * nthreads];
@@ -211,7 +208,7 @@ static __global__ void flash_attn_ext_oscar2(
                     #pragma unroll
                     for (int e = 0; e < elems_per_block; ++e) {
                         const uint8_t code = (K_blk[b].qs[by_blk[e]] >> shift_blk[e]) & 0x03;
-                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_k + m_k;
+                        const float val = OSCAR2_CENTROIDS_DEV[code] * d_k; // centered; no mean — constant positional bias doesn't affect softmax
                         sum += val * Q_reg[j][b * elems_per_block + e];
                     }
                 }
@@ -287,11 +284,6 @@ static __global__ void flash_attn_ext_oscar2(
             for (int e = 0; e < elems_per_block; ++e) {
                 sh_val_had[tid + e * nthreads] = VKQ[j][b * elems_per_block + e] * iks;
             }
-            __syncwarp();
-            // P_br permutation (self-inverse)
-            { float _pbr[elems_per_block];
-              for (int _e = 0; _e < elems_per_block; ++_e) _pbr[_e] = sh_val_had[tid + _e * nthreads];
-              for (int _e = 0; _e < elems_per_block; ++_e) sh_val_had[P_BR_DEV[tid + _e * nthreads]] = _pbr[_e]; }
             __syncwarp();
             hadamard_inverse_128_32w(sh_val_had, tid);
             #pragma unroll

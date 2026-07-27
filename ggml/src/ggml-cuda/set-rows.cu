@@ -1459,7 +1459,6 @@ static __global__ void set_rows_cuda_oscar2(
         const float s_had = rsqrtf((float)QK_OSCAR2);
         sh_vals[t] *= s_had;
         __syncthreads();
-
         // Compute RMS of Hadamard values (zero-centered after mean subtract)
         const float hv = sh_vals[t];
         s = hv;

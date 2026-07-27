@@ -949,10 +949,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool turbo_matched = (K->type == V->type &&
             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0));
-        // F3: oscar2 decode uses the MMA turbo path. The oscar2 load_tile
-        // function (fattn-mma-f16.cuh:608) dequantizes inline AND applies
-        // inverse Hadamard, so no graph-level rotation is needed.
-        const bool oscar2_mma = (K->type == V->type && K->type == GGML_TYPE_OSCAR2);
+        // F3: oscar2 excluded from MMA turbo path — the V tile load cannot efficiently
+        // reconstruct per-block mean after inverse Hadamard. Scalar FA kernel handles
+        // V mean via separate VKQ_mean accumulation. Remove this gate once the MMA
+        // turbo load tile adds (128 * inv_hadamard_val + mean) V restoration.
+        const bool oscar2_mma = false;
         if ((turbo_matched || oscar2_mma)
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
             if (ggml_cuda_turbo_mma_fused()) {
@@ -961,7 +962,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                         case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                         case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
                         case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
-                        case GGML_TYPE_OSCAR2: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
                         default: break;
                     }
                 }
@@ -970,14 +970,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                         case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                         case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
                         case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
-                        case GGML_TYPE_OSCAR2: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
                         default: break;
                     }
                 }
                 if (Q->ne[0] == 512) {
-                    // D=512 (Gemma4): oscar2 only; turbo types don't support D=512 in the turbo gate.
+                    // D=512 (Gemma4): only turbo types support D=512 in the turbo gate.
                     if (K->type == GGML_TYPE_OSCAR2) {
-                        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return;
+                        // oscar2 is excluded (see above)
                     }
                 }
             }
