@@ -326,9 +326,10 @@ struct common_params_speculative_draft {
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
-    bool    eagle3       = false; // use EAGLE3 speculative decoding
-    bool    dflash       = false; // use DFlash speculative decoding
-    int32_t n_ctx        = 0;  // draft context size
+    bool    eagle3                = false; // use EAGLE3 speculative decoding
+    bool    dflash                = false; // use DFlash speculative decoding
+    bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
+    int32_t n_ctx                 = 0;     // draft context size
 
 };
 
