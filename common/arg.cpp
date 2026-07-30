@@ -3615,6 +3615,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--dflash-defer-injection"}, "<0|1>",
+        "DFlash deferred encoder KV injection (default: 1, 0 = per-chunk injection for higher acceptance on some models)",
+        [](common_params & params, int value) {
+            params.speculative.draft.dflash_defer_injection = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DFLASH_DEFER_INJECTION"));
+    add_opt(common_arg(
         {"-cd", "--ctx-size-draft"}, "N",
         string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.draft.n_ctx),
         [](common_params & params, int value) {

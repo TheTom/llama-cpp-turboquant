@@ -877,16 +877,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
-        // Detect target model type: Gemma4 models regress with deferred injection (low acceptance rate)
-        {
+        // Deferred KV injection policy:
+        //  - --dflash-defer-injection=0 → always off
+        //  - --dflash-defer-injection=1 → use model heuristic (Gemma = off, others = on)
+        if (this->params.dflash_defer_injection) {
             char model_desc[128] = {};
             llama_model_desc(model_tgt, model_desc, sizeof(model_desc));
             if (strstr(model_desc, "gemma")) {
                 m_use_deferred = false;
                 LOG_INF("%s: - deferred_kv_injection=0 (disabled for %s)\n", __func__, model_desc);
             } else {
+                m_use_deferred = true;
                 LOG_INF("%s: - deferred_kv_injection=1 (enabled for %s)\n", __func__, model_desc);
             }
+        } else {
+            m_use_deferred = false;
+            LOG_INF("%s: - deferred_kv_injection=0 (disabled by --dflash-defer-injection=0)\n", __func__);
         }
         if (this->params.n_max > block_size - 1 || this->params.n_min > block_size - 1) {
             LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained DFlash block size %d -- clamping to %d\n",
@@ -1045,6 +1051,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // Flush any remaining stashed encoder outputs for deferred mode.
+        // Doing this at the end of process() (rather than in draft()) ensures the
+        // encoder KV is in the decoder before the server saves its checkpoint.
+        // This prevents the checkpoint/restore cycle from losing encoder context,
+        // which was the root cause of both zero-draft on cache-hit and degraded
+        // acceptance over multiple generation iterations.
+        if (m_use_deferred) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                flush_injection(seq_id);
+            }
+        }
+
         return true;
     }
 
@@ -1077,14 +1095,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        if (m_use_deferred) {
-            // flush all stashed KV injections before drafting
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (dparams[seq_id].drafting) {
-                    flush_injection(seq_id);
-                }
-            }
-        }
+        // Note: encoder KV injection is now done at the end of process(),
+        // so by the time draft() runs the decoder already has all encoder
+        // KV entries. This ensures they survive the checkpoint/restore cycle.
 
         common_batch_clear(batch);
 
