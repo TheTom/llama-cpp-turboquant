@@ -260,7 +260,13 @@ function(hf_download version out_var out_resolved)
 
         file(ARCHIVE_EXTRACT INPUT "${archive}" DESTINATION "${DIST_DIR}")
 
-        if(NOT EXISTS "${DIST_DIR}/index.html")
+        # The archive must hold the COMPLETE asset set, not just index.html: a
+        # bucket that is older than llama-ui-embed's required-asset list (e.g.
+        # published before loading.html was added) extracts fine but then kills
+        # the whole build in emit_files. Reject it here so we can try the next
+        # candidate, and ultimately degrade to a no-embedded-UI build.
+        dist_is_complete("${DIST_DIR}" archive_ok)
+        if(NOT archive_ok)
             message(STATUS "UI: archive from ${resolved} is missing required assets")
             continue()
         endif()
