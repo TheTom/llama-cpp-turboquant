@@ -164,7 +164,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
-        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(arch == LLM_ARCH_DEEPSEEK4 ? 576 : 512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
@@ -433,6 +433,9 @@ static bool arch_supported(const llm_arch arch) {
         return false; // TODO tensor shapes
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
+        return false;
+    }
+    if (arch == LLM_ARCH_DEEPSEEK4) {
         return false;
     }
 

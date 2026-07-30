@@ -1144,12 +1144,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cb(cur, "ffn_norm", il);
 
         const auto & layer = model.layers[il];
-        ggml_tensor * selected_experts = nullptr;
-        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
-            selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
-            exp_probs_b = nullptr;
-        }
+        ggml_tensor * exp_probs_b = ((uint32_t) il < hparams.dsv4_hash_layer_count) ? nullptr : layer.ffn_exp_probs_b;
 
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -1161,13 +1156,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                selected_experts);
+                il);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,

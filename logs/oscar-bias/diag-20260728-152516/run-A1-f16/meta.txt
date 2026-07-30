@@ -1,7 +1,0 @@
-model=/mnt/storage/models/oscar-rotations/qwen3-8b-rot-kv.gguf
-prompt_class=A
-prompt_id=A1
-cache=f16
-ctx=2048
-n_gen=32
-seed=42
