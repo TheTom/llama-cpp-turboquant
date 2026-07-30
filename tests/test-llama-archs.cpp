@@ -212,9 +212,29 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,     uint32_t(4)); // sqrtsoftplus
+        } else {
+            ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,     uint32_t(2)); // sigmoid
+        }
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+    }
+
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,               1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                false);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                   std::vector<float>(n_layer, 0.0f));
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,                 std::vector<float>(n_layer, 0.0f));
+
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,       uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,         uint32_t(64));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,  10000.0f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,              uint32_t(1));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(3));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,           1.0e-6f);
+        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                   uint32_t(0));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,          std::vector<uint32_t>(n_layer, uint32_t(1)));
     }
 
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);

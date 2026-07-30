@@ -74,6 +74,7 @@ static __global__ void dsv4_hc_comb_f32(
         float col_sum = comb_val;
         col_sum += __shfl_xor_sync(MASK_FULL, col_sum, COL_REDUCE_MASK_1);
         col_sum += __shfl_xor_sync(MASK_FULL, col_sum, COL_REDUCE_MASK_2);
+        col_sum += eps; // match CPU: sum = eps + elements
         comb_val *= __frcp_rn(col_sum);
 
         // ---- Sinkhorn iterations ----
@@ -84,12 +85,14 @@ static __global__ void dsv4_hc_comb_f32(
             float rsum = comb_val;
             rsum += __shfl_xor_sync(MASK_FULL, rsum, ROW_REDUCE_MASK_1);
             rsum += __shfl_xor_sync(MASK_FULL, rsum, ROW_REDUCE_MASK_2);
+            rsum += eps; // match CPU: sum = eps + elements
             comb_val *= __frcp_rn(rsum);
 
             // Col norm
             float csum = comb_val;
             csum += __shfl_xor_sync(MASK_FULL, csum, COL_REDUCE_MASK_1);
             csum += __shfl_xor_sync(MASK_FULL, csum, COL_REDUCE_MASK_2);
+            csum += eps; // match CPU: sum = eps + elements
             comb_val *= __frcp_rn(csum);
         }
 

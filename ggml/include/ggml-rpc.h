@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    2
+#define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus
 // 102 = upstream 97 + TURBO_WHT + LIGHTNING_INDEXER + DSV4_HC_COMB + DSV4_HC_PRE + DSV4_HC_POST

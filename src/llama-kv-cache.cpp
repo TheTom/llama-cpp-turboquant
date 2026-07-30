@@ -268,6 +268,11 @@ llama_kv_cache::llama_kv_cache(
             n_embd_head_k_all = -1;
         }
 
+        // MLA caches V in latent (compressed) form — n_embd_head_v is not the
+        // head dimension of the stored values, so V-head-dim tracking and the
+        // LLAMA_ATTN_ROT_V_OVERRIDE V-rotation path (which depends on
+        // n_embd_head_v_all) are intentionally skipped. V-rotation on MLA latent
+        // KV is numerically invalid.
         if (!is_mla) {
             if (n_embd_head_v_all == 0) {
                 n_embd_head_v_all = (int32_t) hparams.n_embd_head_v(il);

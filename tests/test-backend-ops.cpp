@@ -6542,17 +6542,20 @@ struct test_turbo_wht_roundtrip : public test_case {
 struct test_dsv4_hc_comb : public test_case {
     const int64_t n_tokens;
     const int n_iter;
+    const float eps;
 
     std::string vars() override {
-        return VARS_TO_STR2(n_tokens, n_iter);
+        return VARS_TO_STR3(n_tokens, n_iter, eps);
     }
 
     double max_nmse_err() override {
-        return 5e-5;
+        // Looser tolerance at higher eps: the eps in denominator changes
+        // the condition number of the Sinkhorn iteration.
+        return eps >= 1.0e-3f ? 5e-4 : 5e-5;
     }
 
-    test_dsv4_hc_comb(int64_t n_tokens = 4, int n_iter = 3)
-        : n_tokens(n_tokens), n_iter(n_iter) {}
+    test_dsv4_hc_comb(int64_t n_tokens = 4, int n_iter = 3, float eps = 1e-6f)
+        : n_tokens(n_tokens), n_iter(n_iter), eps(eps) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         constexpr int64_t DSV4_HC = 4;
@@ -6570,7 +6573,125 @@ struct test_dsv4_hc_comb : public test_case {
         ggml_set_name(scale, "scale");
         ggml_set_name(base,  "base");
 
-        ggml_tensor * out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, 1e-6f, n_iter);
+        ggml_tensor * out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_HC_PRE
+struct test_dsv4_hc_pre : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-5;
+    }
+
+    test_dsv4_hc_pre(int64_t n_embd = 64, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t hc = 4;
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+
+        ggml_set_param(x);
+        ggml_set_param(weights);
+
+        ggml_set_name(x, "x");
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * out = ggml_dsv4_hc_pre(ctx, x, weights);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_HC_POST
+struct test_dsv4_hc_post : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-5;
+    }
+
+    test_dsv4_hc_post(int64_t n_embd = 64, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t hc = 4;
+
+        ggml_tensor * x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * post     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * comb     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+
+        ggml_set_param(x);
+        ggml_set_param(residual);
+        ggml_set_param(post);
+        ggml_set_param(comb);
+
+        ggml_set_name(x,        "x");
+        ggml_set_name(residual, "residual");
+        ggml_set_name(post,     "post");
+        ggml_set_name(comb,     "comb");
+
+        ggml_tensor * out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_LIGHTNING_INDEXER
+struct test_lightning_indexer : public test_case {
+    const int64_t n_embd;
+    const int64_t n_head;
+    const int64_t n_kv;
+    const ggml_type type_k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_head, n_kv, type_k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_lightning_indexer(
+            int64_t n_embd = 128, int64_t n_head = 64, int64_t n_kv = 8, ggml_type type_k = GGML_TYPE_F16)
+        : n_embd(n_embd), n_head(n_head), n_kv(n_kv), type_k(type_k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_batch  = 2;
+        constexpr int64_t n_stream = 1;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,    n_embd, n_head,  n_batch, n_stream);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_k,           n_embd, 1,       n_kv,    n_stream);
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,    n_head, n_batch, 1,       n_stream);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,    n_kv,   n_batch, 1,       n_stream);
+
+        ggml_set_param(q);
+        ggml_set_param(k);
+        ggml_set_param(w);
+        ggml_set_param(m);
+
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(w, "w");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9390,10 +9511,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // DSV4_HC_COMB tests
-    for (int64_t nt : {1, 2, 4, 8, 64}) {
-        for (int ni : {1, 3, 5}) {
-            test_cases.emplace_back(new test_dsv4_hc_comb(nt, ni));
+    // DSV4_HC_COMB tests — sweep eps across orders of magnitude
+    // to validate CPU/CUDA Sinkhorn eps semantics match
+    for (float eps : {1.0e-6f, 1.0e-3f, 1.0e-1f}) {
+        for (int64_t nt : {1, 2, 4, 8, 64}) {
+            for (int ni : {1, 3, 5}) {
+                test_cases.emplace_back(new test_dsv4_hc_comb(nt, ni, eps));
+            }
+        }
+    }
+
+    // DSV4_HC_PRE tests
+    for (int64_t n_embd : {64, 128}) {
+        for (int64_t nt : {1, 4, 8}) {
+            test_cases.emplace_back(new test_dsv4_hc_pre(n_embd, nt));
+        }
+    }
+
+    // DSV4_HC_POST tests
+    for (int64_t n_embd : {64, 128}) {
+        for (int64_t nt : {1, 4, 8}) {
+            test_cases.emplace_back(new test_dsv4_hc_post(n_embd, nt));
+        }
+    }
+
+    // LIGHTNING_INDEXER tests — n_embd=128 constrained by CUDA kernel
+    for (int64_t n_head : {64, 32}) {
+        for (int64_t n_kv : {4, 16}) {
+            test_cases.emplace_back(new test_lightning_indexer(128, n_head, n_kv, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_lightning_indexer(128, n_head, n_kv, GGML_TYPE_F32));
         }
     }
 
