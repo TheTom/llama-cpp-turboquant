@@ -254,6 +254,7 @@ struct llama_layer {
     struct ggml_tensor * wq_b      = nullptr;
     struct ggml_tensor * wkv_a_mqa = nullptr;
     struct ggml_tensor * wkv_b     = nullptr;
+    struct ggml_tensor * wkv       = nullptr;
     struct ggml_tensor * wk_b      = nullptr;
     struct ggml_tensor * wv_b      = nullptr;
     struct ggml_tensor * wqkv_b    = nullptr;
@@ -263,7 +264,7 @@ struct llama_layer {
     struct ggml_tensor * bk   = nullptr;
     struct ggml_tensor * bv   = nullptr;
     struct ggml_tensor * bo   = nullptr;
-
+    struct ggml_tensor * wo_a      = nullptr;
     struct ggml_tensor * wq_cross  = nullptr;
     struct ggml_tensor * wk_cross  = nullptr;
     struct ggml_tensor * wv_cross  = nullptr;
@@ -338,6 +339,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -506,6 +508,24 @@ struct llama_layer {
     struct ggml_tensor * eagle3_hidden_norm = nullptr;
 
 
+    // DeepSeek-V4
+    struct ggml_tensor * attn_kv_norm    = nullptr;
+    struct ggml_tensor * hc_attn_fn      = nullptr;
+    struct ggml_tensor * hc_attn_base    = nullptr;
+    struct ggml_tensor * hc_attn_scale   = nullptr;
+    struct ggml_tensor * hc_ffn_fn       = nullptr;
+    struct ggml_tensor * hc_ffn_base     = nullptr;
+    struct ggml_tensor * hc_ffn_scale    = nullptr;
+    struct ggml_tensor * attn_comp_wkv   = nullptr;
+    struct ggml_tensor * attn_comp_wgate = nullptr;
+    struct ggml_tensor * attn_comp_ape   = nullptr;
+    struct ggml_tensor * attn_comp_norm  = nullptr;
+    struct ggml_tensor * indexer_comp_wkv   = nullptr;
+    struct ggml_tensor * indexer_comp_wgate = nullptr;
+    struct ggml_tensor * indexer_comp_ape   = nullptr;
+    struct ggml_tensor * indexer_comp_norm  = nullptr;
+
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -560,6 +580,11 @@ struct llama_model {
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
+
+    // DeepSeek-V4
+    struct ggml_tensor * hc_head_fn    = nullptr;
+    struct ggml_tensor * hc_head_base  = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;

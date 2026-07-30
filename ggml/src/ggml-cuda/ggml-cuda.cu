@@ -66,6 +66,8 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3359,6 +3361,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_COMB:
+            ggml_cuda_op_dsv4_hc_comb(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_PRE:
+            ggml_cuda_op_dsv4_hc_pre(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_POST:
+            ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            ggml_cuda_lightning_indexer(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5470,11 +5484,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (op->type == GGML_TYPE_TURBO4_0 && op->src[0]->ne[0] % 128 != 0) {
                     return false;
                 }
-                return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                       op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
-                       op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO4_0) &&
-                       op->src[0]->type == GGML_TYPE_F32 &&
+                return (
+                           (
+                               (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                               op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                               op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO4_0) &&
+                               op->src[0]->type == GGML_TYPE_F32
+                           ) || (
+                               op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
+                           )
+                       ) &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
         case GGML_OP_SET:
@@ -5562,14 +5582,36 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+                const int32_t dim = op->op_params[0];
                 return src0_type == src1_type &&
                        src0_type == op->type &&
-                       !ggml_is_quantized(src0_type) &&
-                       ggml_blck_size(src0_type) == 1 &&
-                       (ggml_type_size(src0_type) == 1 ||
-                        ggml_type_size(src0_type) == 2 ||
-                        ggml_type_size(src0_type) == 4 ||
-                        ggml_type_size(src0_type) == 8);
+                       (
+                           (
+                               ggml_is_quantized(src0_type) &&
+                               (
+                                   (
+                                       dim == 3 &&
+                                       ggml_is_contiguous(op->src[0]) &&
+                                       ggml_is_contiguous(op->src[1])
+                                   ) || (
+                                       dim != 3 &&
+                                       ggml_is_contiguous_to_3(op->src[0]) &&
+                                       ggml_is_contiguous_to_3(op->src[1])
+                                   )
+                               ) &&
+                               op->src[0]->ne[0] % ggml_blck_size(src0_type) == 0 &&
+                               op->src[1]->ne[0] % ggml_blck_size(src0_type) == 0
+                           ) || (
+                               !ggml_is_quantized(src0_type) &&
+                               ggml_blck_size(src0_type) == 1 &&
+                               (
+                                   ggml_type_size(src0_type) == 1 ||
+                                   ggml_type_size(src0_type) == 2 ||
+                                   ggml_type_size(src0_type) == 4 ||
+                                   ggml_type_size(src0_type) == 8
+                               )
+                           )
+                       );
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
@@ -5704,6 +5746,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+            return true;
+        case GGML_OP_LIGHTNING_INDEXER:
+            return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+
 
         default:
             return false;

@@ -2103,6 +2103,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                ggml_compute_forward_lightning_indexer(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_COMB:
+            {
+                ggml_compute_forward_dsv4_hc_comb(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_PRE:
+            {
+                ggml_compute_forward_dsv4_hc_pre(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_POST:
+            {
+                ggml_compute_forward_dsv4_hc_post(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2292,6 +2308,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_LEAKY_RELU:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+            {
+                n_tasks = n_threads;
+            } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                n_tasks = n_threads;
             } break;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(node)) {
@@ -3008,6 +3034,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TURBO_WHT:
                     {
                         cur = 0;  // no extra workspace needed
+                    } break;
+                case GGML_OP_LIGHTNING_INDEXER:
+                    {
+                        // temp buffer for dequantizing lightning indexer keys
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        cur += sizeof(float)*ne10*n_tasks;
                     } break;
                 case GGML_OP_COUNT:
                     {

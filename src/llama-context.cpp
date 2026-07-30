@@ -22,6 +22,54 @@
 // llama_context
 //
 
+struct llm_fused_op_probe {
+    llm_fused_op op;
+    const char * name;
+    uint32_t n_tokens_per_seq;
+};
+
+static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN,
+    /*.name             =*/ "Flash Attention",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
+    /*.op               =*/ LLM_FUSED_OP_GDN_AR,
+    /*.name             =*/ "fused Gated Delta Net (autoregressive)",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
+    /*.op               =*/ LLM_FUSED_OP_GDN_CH,
+    /*.name             =*/ "fused Gated Delta Net (chunked)",
+    /*.n_tokens_per_seq =*/ 16,
+};
+
+static const llm_fused_op_probe llm_fused_op_lid_probe = {
+    /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
+    /*.name             =*/ "Lightning Indexer",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
+    /*.name             =*/ "fused DeepSeek V4 HC pre",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
+    /*.name             =*/ "fused DeepSeek V4 HC comb",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
+    /*.name             =*/ "fused DeepSeek V4 HC post",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -197,11 +245,17 @@ llama_context::llama_context(
     }
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.fused_lid    = true;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
+
+    cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_comb = true;
+    cparams.fused_dsv4_hc_post = true;
+    cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -598,6 +652,60 @@ void llama_context::sched_reserve() {
         }
 
         cparams.auto_fgdn = false;
+    }
+
+    if (cparams.auto_fhc) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", __func__);
+        auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
+            if (!enabled) {
+                return;
+            }
+
+            const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
+
+            auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx.get(), true);
+            if (!gf) {
+                throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
+            }
+
+            bool device_mismatch = false;
+            for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+                if (node.op != probe.op) {
+                    continue;
+                }
+
+                GGML_ASSERT(node.il >= 0);
+
+                ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
+                ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
+
+                ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+
+                if (device_fused != device_layer) {
+                    LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+                            "is assigned to device %s (usually due to missing support)\n",
+                            __func__, node.il,
+                            device_layer ? ggml_backend_dev_name(device_layer) : "none",
+                            probe.name,
+                            device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                    device_mismatch = true;
+                    break;
+                }
+            }
+
+            if (device_mismatch) {
+                enabled = false;
+                LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", __func__, probe.name);
+            } else {
+                enabled = true;
+                LLAMA_LOG_INFO("%s: %s enabled\n", __func__, probe.name);
+            }
+        };
+
+        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        cparams.auto_fhc = false;
     }
 
     // reserve worst-case graph
@@ -2317,7 +2425,7 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DEEPSEEK4) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
@@ -2451,11 +2559,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
-        // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

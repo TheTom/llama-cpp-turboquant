@@ -101,6 +101,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
+            || arch == LLM_ARCH_DEEPSEEK4
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -158,11 +159,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
     if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
+            || arch == LLM_ARCH_DEEPSEEK4
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
-        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(arch == LLM_ARCH_DEEPSEEK4 ? 576 : 512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
@@ -210,9 +212,28 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,     uint32_t(4)); // sqrtsoftplus
+        } else {
+            ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,     uint32_t(2)); // sigmoid
+        }
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+    }
+
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,               1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                false);
+        // swiglu_clamp keys are optional in the loader and default to 0.0f
+
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,       uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,         uint32_t(64));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,  10000.0f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,              uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(3));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,           1.0e-6f);
+        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                   uint32_t(0));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,          std::vector<uint32_t>(n_layer, uint32_t(0)));
     }
 
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);
@@ -336,6 +357,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -411,6 +433,12 @@ static bool arch_supported(const llm_arch arch) {
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
+    }
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        return false; // MATCHING ISSUE WITH UPSTREAM: swiglu_clamp_exp GGUF key ends up as
+        //       512-element array in synthetic test; add_kv_from_model() writes the full
+        //       std::array<float, 512> into the GGUF instead of n_layer() elements. Fix needed
+        //       in both codebases (gguf_set_arr_data / per_layer handling in llama_model_saver).
     }
 
     // FIXME some models are segfaulting with WebGPU:

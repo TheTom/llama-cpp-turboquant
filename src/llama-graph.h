@@ -23,6 +23,9 @@ struct llama_memory_context_i;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
+class llama_kv_cache_dsv4_raw_context;
+class llama_kv_cache_dsv4_context;
+
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
@@ -35,6 +38,17 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
 };
+
+enum llm_fused_op {
+    LLM_FUSED_OP_FLASH_ATTN,
+    LLM_FUSED_OP_GDN_AR,
+    LLM_FUSED_OP_GDN_CH,
+    LLM_FUSED_OP_LIGHTNING_INDEXER,
+    LLM_FUSED_OP_DSV4_HC_PRE,
+    LLM_FUSED_OP_DSV4_HC_COMB,
+    LLM_FUSED_OP_DSV4_HC_POST,
+};
+
 
 enum llm_ffn_op_type : int {
     LLM_FFN_NONE = 0,           // sentinel: unset; archs must assign before use
@@ -570,6 +584,79 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+class llm_graph_input_dsv4_raw {
+public:
+    llm_graph_input_dsv4_raw(
+            const llama_cparams & cparams,
+            const llama_kv_cache_dsv4_raw_context * mctx) :
+        cparams(cparams),
+        mctx(mctx) {
+    }
+
+    void set_input(const llama_ubatch * ubatch);
+
+    ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+
+    ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_k_rot = nullptr;
+
+    const llama_cparams cparams;
+
+    const llama_kv_cache_dsv4_raw_context * mctx;
+};
+
+class llm_graph_input_dsv4 : public llm_graph_input_i {
+public:
+    struct comp_input {
+        ggml_tensor * state_pos        = nullptr; // I32 [n_state]
+        ggml_tensor * state_persist_src_idxs = nullptr; // I32 [n_state_persist]
+        ggml_tensor * state_persist_dst_idxs = nullptr; // I32 [n_state_persist]
+        ggml_tensor * state_read_idxs  = nullptr; // I32 [ratio*n_state_write]
+        ggml_tensor * state_write_idxs = nullptr; // I64 [n_state_write]
+        ggml_tensor * state_write_pos  = nullptr; // I32 [n_state_write]
+
+        ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+
+        ggml_tensor * k_rot      = nullptr;
+    };
+
+    llm_graph_input_dsv4(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw,
+            const llama_kv_cache_dsv4_context * mctx) :
+        inp_raw(std::move(inp_raw)),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_dsv4() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_dsv4_raw * get_raw() const { return inp_raw.get(); }
+    const comp_input & get_csa() const { return inp_csa; }
+    const comp_input & get_hca() const { return inp_hca; }
+    const comp_input & get_lid() const { return inp_lid; }
+
+    std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw;
+
+    comp_input inp_csa;
+    comp_input inp_hca;
+    comp_input inp_lid;
+
+public:
+    const llama_cparams cparams;
+
+    const llama_kv_cache_dsv4_context * mctx;
+};
+
+
 //
 // llm_graph_result
 //
@@ -582,6 +669,13 @@ public:
 
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
+
+struct llm_graph_fused_node {
+    llm_fused_op op;
+    ggml_tensor * tensor;
+    int il;
+};
+
 
 class llm_graph_result;
 
@@ -728,6 +822,10 @@ public:
 
     void set_params(const llm_graph_params & params);
 
+    void add_fused_node(llm_graph_fused_node result);
+
+    const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
@@ -741,6 +839,7 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
+    std::vector<llm_graph_fused_node> fused_nodes;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
@@ -857,7 +956,8 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
-              ggml_tensor * ids) const;
+              ggml_tensor * ids,
+              ggml_tensor * w_s = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -938,7 +1038,6 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr) const;
-
     //
     // inputs
     //
@@ -1056,6 +1155,7 @@ struct llm_graph_context {
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_cross * inp,
+
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
@@ -1115,6 +1215,8 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    llm_graph_input_dsv4 * build_inp_dsv4() const;
 
     //
     // pooling
