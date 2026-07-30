@@ -1,0 +1,248 @@
+{#- Unsloth template fixes #}
+{%- if not add_generation_prompt is defined -%}
+  {%- set add_generation_prompt = false -%}
+{%- endif -%}
+{%- if not thinking is defined -%}
+  {%- if enable_thinking is defined -%}
+    {%- set thinking = enable_thinking -%}
+  {%- else -%}
+    {%- set thinking = false -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if not reasoning_effort is defined -%}
+  {%- set reasoning_effort = none -%}
+{%- endif -%}
+{%- set dsml_token = '｜DSML｜' -%}
+{%- set thinking_start_token = '<think>' -%}
+{%- set thinking_end_token = '</think>' -%}
+{%- set reasoning_effort_max = 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -%}
+{%- set tools_header = '## Tools\n\nYou have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a \"<' + dsml_token + 'tool_calls>\" block like the following:\n\n<' + dsml_token + 'tool_calls>\n<' + dsml_token + 'invoke name=\"$TOOL_NAME\">\n<' + dsml_token + 'parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</' + dsml_token + 'parameter>\n...\n</' + dsml_token + 'invoke>\n<' + dsml_token + 'invoke name=\"$TOOL_NAME2\">\n...\n</' + dsml_token + 'invoke>\n</' + dsml_token + 'tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by ' + thinking_start_token + '), you MUST output your complete reasoning inside ' + thinking_start_token + '...' + thinking_end_token + ' BEFORE any tool calls or final response.\n\nOtherwise, output directly after ' + thinking_end_token + ' with tool calls or final response.\n\n### Available Tool Schemas\n\n' -%}
+{%- set tools_footer = '\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n' -%}
+{%- set response_format_header = '## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n' -%}
+{#- Detect tools anywhere (top-level param or attached to any message): DeepSeek-V4's
+    encoder disables reasoning-dropping entirely when tools are present. -#}
+{%- set tp = namespace(has=false) -%}
+{%- if tools is defined and tools -%}
+  {%- set tp.has = true -%}
+{%- endif -%}
+{%- for message in messages -%}
+  {%- if message['tools'] is defined and message['tools'] -%}
+    {%- set tp.has = true -%}
+  {%- endif -%}
+{%- endfor -%}
+{#- Build system prompt from all system messages (+ optional per-message response_format). -#}
+{%- set ns = namespace(system_prompt='', is_first_sp=true) -%}
+{%- for message in messages -%}
+  {%- if message['role'] == 'system' -%}
+    {%- if ns.is_first_sp -%}
+      {%- set ns.system_prompt = ns.system_prompt + (message['content'] or '') -%}
+      {%- set ns.is_first_sp = false -%}
+    {%- else -%}
+      {%- set ns.system_prompt = ns.system_prompt + '\n\n' + (message['content'] or '') -%}
+    {%- endif -%}
+    {%- if message['response_format'] is defined and message['response_format'] -%}
+      {%- set ns.system_prompt = ns.system_prompt + '\n\n' + response_format_header + (message['response_format'] | tojson) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if tools is defined and tools -%}
+  {%- set ts = namespace(schemas='') -%}
+  {%- for tool in tools -%}
+    {%- if tool['type'] == 'function' -%}
+      {%- set ts.schemas = ts.schemas + (tool['function'] | tojson) + '\n' -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- Match the reference: tools attach to the system message, so a system message
+      that exists but is empty still contributes its \"\" + \"\n\n\" separator. -#}
+  {%- if not ns.is_first_sp -%}
+    {%- set ns.system_prompt = ns.system_prompt + '\n\n' + tools_header + ts.schemas + tools_footer -%}
+  {%- else -%}
+    {%- set ns.system_prompt = tools_header + ts.schemas + tools_footer -%}
+  {%- endif -%}
+{%- endif -%}
+{{- bos_token -}}
+{%- if thinking and reasoning_effort == 'max' -%}
+  {{- reasoning_effort_max -}}
+{%- endif -%}
+{{- ns.system_prompt -}}
+{#- Last user-like index: controls which turns keep reasoning. The encoder merges tool
+    results into user messages before computing this, so tool turns count as user here. -#}
+{%- set last_user_idx = namespace(value=-1) -%}
+{%- for message in messages -%}
+  {%- if message['role'] == 'user' or message['role'] == 'developer' or message['role'] == 'tool' -%}
+    {%- set last_user_idx.value = loop.index0 -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set state = namespace(in_user=false) -%}
+{%- for message in messages -%}
+  {%- if message['role'] == 'user' -%}
+    {%- if state.in_user -%}
+      {{- '\n\n' -}}
+    {%- else -%}
+      {{- '<｜User｜>' -}}
+      {%- set state.in_user = true -%}
+    {%- endif -%}
+    {{- message['content'] or '' -}}
+    {%- if message['task'] is defined and message['task'] and (loop.last or messages[loop.index0 + 1]['role'] in ['assistant', 'latest_reminder']) -%}
+      {%- set state.in_user = false -%}
+      {%- if message['task'] == 'action' -%}
+        {{- '<｜Assistant｜>' -}}
+        {%- if thinking -%}{{- thinking_start_token -}}{%- else -%}{{- thinking_end_token -}}{%- endif -%}
+        {{- '<｜action｜>' -}}
+      {%- else -%}
+        {{- '<｜' + message['task'] + '｜>' -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif message['role'] == 'tool' -%}
+    {%- if state.in_user -%}
+      {{- '\n\n' -}}
+    {%- else -%}
+      {{- '<｜User｜>' -}}
+      {%- set state.in_user = true -%}
+    {%- endif -%}
+    {{- '<tool_result>' + (message['content'] or '') + '</tool_result>' -}}
+  {%- elif message['role'] == 'developer' -%}
+    {#- The encoder's _drop_thinking_messages drops developer turns that sit before the
+        last user turn when in thinking mode with reasoning-dropping active (no tools).
+        (No-op under llama.cpp, which remaps developer -> system before templating.) -#}
+    {%- if thinking and not tp.has and loop.index0 < last_user_idx.value -%}
+    {%- else -%}
+    {%- set state.in_user = false -%}
+    {{- '<｜User｜>' + (message['content'] or '') -}}
+    {%- if message['tools'] is defined and message['tools'] -%}
+      {%- set ds = namespace(schemas='') -%}
+      {%- for tool in message['tools'] -%}
+        {%- if tool['type'] == 'function' -%}
+          {%- set ds.schemas = ds.schemas + (tool['function'] | tojson) + '\n' -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{- '\n\n' + tools_header + ds.schemas + tools_footer -}}
+    {%- endif -%}
+    {%- if message['response_format'] is defined and message['response_format'] -%}
+      {{- '\n\n' + response_format_header + (message['response_format'] | tojson) -}}
+    {%- endif -%}
+    {%- if message['task'] is defined and message['task'] and (loop.last or messages[loop.index0 + 1]['role'] in ['assistant', 'latest_reminder']) -%}
+      {%- if message['task'] == 'action' -%}
+        {{- '<｜Assistant｜>' -}}
+        {%- if thinking -%}{{- thinking_start_token -}}{%- else -%}{{- thinking_end_token -}}{%- endif -%}
+        {{- '<｜action｜>' -}}
+      {%- else -%}
+        {{- '<｜' + message['task'] + '｜>' -}}
+      {%- endif -%}
+    {%- endif -%}
+    {%- endif -%}
+  {%- elif message['role'] == 'latest_reminder' -%}
+    {%- set state.in_user = false -%}
+    {#- The encoder emits the user/developer -> assistant transition before a
+        latest_reminder as well (the opening think stays open across the reminder and is
+        closed by the following assistant). Same effective-predecessor rule as assistant. -#}
+    {%- set ep = namespace(idx=(loop.index0 - 1), done=false, is_ud=false, has_task=false) -%}
+    {%- for _i in range(loop.index0) -%}
+      {%- if not ep.done and ep.idx >= 0 -%}
+        {%- set _pm = messages[ep.idx] -%}
+        {%- if (_pm['role'] == 'developer') and thinking and (not tp.has) and (ep.idx < last_user_idx.value) -%}
+          {%- set ep.idx = ep.idx - 1 -%}
+        {%- else -%}
+          {%- set ep.done = true -%}
+          {%- set ep.is_ud = _pm['role'] in ['user', 'developer', 'tool'] -%}
+          {%- set ep.has_task = _pm['task'] is defined and _pm['task'] -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if ep.has_task -%}
+    {%- elif ep.is_ud -%}
+      {{- '<｜Assistant｜>' -}}
+      {%- if thinking and (tp.has or (loop.index0 > last_user_idx.value)) -%}
+        {{- thinking_start_token -}}
+      {%- else -%}
+        {{- thinking_end_token -}}
+      {%- endif -%}
+    {%- endif -%}
+    {{- '<｜latest_reminder｜>' + (message['content'] or '') -}}
+  {%- elif message['role'] == 'assistant' -%}
+    {%- set state.in_user = false -%}
+    {#- The encoder emits the \"<｜Assistant｜>\" + opening think/end token as a trailing
+        transition on a user/developer predecessor (tool results merge into user), never
+        on the assistant message itself. Find the effective predecessor, skipping any
+        developer the encoder drops (developer before the last user in thinking+drop). -#}
+    {%- set ep = namespace(idx=(loop.index0 - 1), done=false, is_ud=false, has_task=false) -%}
+    {%- for _i in range(loop.index0) -%}
+      {%- if not ep.done and ep.idx >= 0 -%}
+        {%- set _pm = messages[ep.idx] -%}
+        {%- if (_pm['role'] == 'developer') and thinking and (not tp.has) and (ep.idx < last_user_idx.value) -%}
+          {%- set ep.idx = ep.idx - 1 -%}
+        {%- else -%}
+          {%- set ep.done = true -%}
+          {%- set ep.is_ud = _pm['role'] in ['user', 'developer', 'tool'] -%}
+          {%- set ep.has_task = _pm['task'] is defined and _pm['task'] -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set keep_reasoning = tp.has or (loop.index0 > last_user_idx.value) -%}
+    {%- if ep.has_task -%}
+      {#- The predecessor's task token already emitted the assistant prompt. -#}
+    {%- elif ep.is_ud -%}
+      {{- '<｜Assistant｜>' -}}
+      {%- if keep_reasoning and thinking -%}
+        {{- thinking_start_token -}}
+        {%- if message['reasoning_content'] is defined and message['reasoning_content'] -%}
+          {{- message['reasoning_content'] -}}
+        {%- endif -%}
+        {{- thinking_end_token -}}
+      {%- else -%}
+        {{- thinking_end_token -}}
+      {%- endif -%}
+    {%- else -%}
+      {#- Predecessor is not user/developer/tool (first turn, latest_reminder, another
+          assistant, or an all-dropped-developer run): the encoder emits no prefix and
+          no opening think; a kept reasoning turn still closes with its content + </think>. -#}
+      {%- if keep_reasoning and thinking -%}
+        {%- if message['reasoning_content'] is defined and message['reasoning_content'] -%}
+          {{- message['reasoning_content'] -}}
+        {%- endif -%}
+        {{- thinking_end_token -}}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if message['content'] is defined and message['content'] -%}
+      {{- message['content'] -}}
+    {%- endif -%}
+    {%- if message['tool_calls'] -%}
+      {{- '\n\n<' + dsml_token + 'tool_calls>\n' -}}
+      {%- for tool in message['tool_calls'] -%}
+        {%- set func = tool['function'] -%}
+        {{- '<' + dsml_token + 'invoke name=\"' + func['name'] + '\">\n' -}}
+        {%- set args = func['arguments'] -%}
+        {%- if args is string -%}
+          {%- set args = args | from_json -%}
+        {%- endif -%}
+        {%- for key, val in args.items() -%}
+          {%- if val is string -%}
+            {{- '<' + dsml_token + 'parameter name=\"' + key + '\" string=\"true\">' + val + '</' + dsml_token + 'parameter>\n' -}}
+          {%- else -%}
+            {{- '<' + dsml_token + 'parameter name=\"' + key + '\" string=\"false\">' + (val | tojson) + '</' + dsml_token + 'parameter>\n' -}}
+          {%- endif -%}
+        {%- endfor -%}
+        {{- '</' + dsml_token + 'invoke>\n' -}}
+      {%- endfor -%}
+      {{- '</' + dsml_token + 'tool_calls>' -}}
+    {%- endif -%}
+    {{- '<｜end▁of▁sentence｜>' -}}
+    {%- if message['task'] is defined and message['task'] == 'title' and (loop.last or messages[loop.index0 + 1]['role'] in ['assistant', 'latest_reminder']) -%}
+      {{- '<｜title｜>' -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {#- Suppress the standard generation prefix when the final message already
+      emitted a task token (which serves as the generation prompt). -#}
+  {%- set _last = messages[messages | length - 1] -%}
+  {%- if not (_last['task'] is defined and _last['task']) -%}
+    {{- '<｜Assistant｜>' -}}
+    {%- if thinking -%}
+      {{- thinking_start_token -}}
+    {%- else -%}
+      {{- thinking_end_token -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Copyright 2026-present Unsloth. Apache 2.0 License. #}
