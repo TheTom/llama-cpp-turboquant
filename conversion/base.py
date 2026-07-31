@@ -17,6 +17,19 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Itera
 from itertools import chain
 from transformers import AutoConfig
 
+# transformers (5.x) crashes resolving tokenizers/configs for unknown archs
+# whose config.json carries rope_scaling: the generic PreTrainedConfig
+# __post_init__ rope standardization reads self.max_position_embeddings
+# before the extra-kwarg carrying it is bound (AttributeError). A class
+# attribute fallback makes the lookup succeed; real values still win.
+try:  # pragma: no cover - defensive shim
+    from transformers.configuration_utils import PreTrainedConfig as _PTC
+
+    if not hasattr(_PTC, "max_position_embeddings"):
+        _PTC.max_position_embeddings = None
+except Exception:
+    pass
+
 import numpy as np
 import torch
 
