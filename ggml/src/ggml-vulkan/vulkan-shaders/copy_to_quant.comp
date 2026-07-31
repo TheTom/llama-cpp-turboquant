@@ -450,11 +450,19 @@ void main() {
         data_q[db].qs[t / 4u] = uint8_t(qs_byte);
     }
 
-    // Pack signs: 8 elements per byte via subgroup ballot
+    // Pack signs: 8 elements per byte via subgroup ballot.
+    // The ballot result is a uvec4 with one bit per subgroup lane, 32 lanes per
+    // component. On wave32 every lane's bit is in ballot.x, but on wave64
+    // (GCN/Polaris) lanes 32-63 land in ballot.y — indexing .x with a shift of
+    // (sg_lane/8)*8 >= 32 is UB and reads the wrong lanes' bits, corrupting
+    // half of every signs byte at write time (#241). Select the component by
+    // lane/32 and the byte within it by (lane%32)/8, valid for any subgroup
+    // size that is a multiple of 8.
     uvec4 ballot = subgroupBallot(((idx >> 2u) & 1u) != 0u);
     if (sg_lane % 8u == 0u) {
-        uint local_byte = sg_lane / 8u;
-        data_q[db].signs[t / 8u] = uint8_t((ballot.x >> (local_byte * 8u)) & 0xFFu);
+        uint ballot_word   = sg_lane / 32u;
+        uint byte_in_word  = (sg_lane % 32u) / 8u;
+        data_q[db].signs[t / 8u] = uint8_t((ballot[ballot_word] >> (byte_in_word * 8u)) & 0xFFu);
     }
 
     // Step 7: reconstruction norm via subgroup reduction
