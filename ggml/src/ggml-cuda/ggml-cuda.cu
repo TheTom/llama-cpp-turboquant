@@ -2048,13 +2048,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (is_tq_weight && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+    // The fused TQ kernels index src1/dst as flat contiguous buffers (no
+    // nb[] stride handling in mmvq-tq.cu) — permuted/viewed activations
+    // (e.g. DeepSeek-V4 MLA projections) must take the stride-aware cuBLAS
+    // fallback below, which dequantizes TQ via ggml_get_to_fp16_cuda.
+    const bool tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+    if (is_tq_weight && tq_fast_path_ok && ne11 <= MMVQ_MAX_BATCH_SIZE) {
         // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
         // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
         ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
         return;
     }
-    if (is_tq_weight && src0->type == GGML_TYPE_TQ4_1S) {
+    if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S) {
         // Large prefill: runtime TQ4_1S → q8_0 scratch conversion + cuBLAS
         // Gets tensor core throughput without permanent 1.7× VRAM cost
         ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
