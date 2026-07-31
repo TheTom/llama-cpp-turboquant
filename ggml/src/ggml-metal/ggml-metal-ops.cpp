@@ -2300,8 +2300,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         const bool is_tq_weight = (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S);
 
+        // Escape hatch: TQ_NO_ROTATE=1 forces TQ weights through the standard mul_mm path
+        // (with-inverse-RHT dequant, matches CPU) instead of the fused rotate-act optimization.
+        // Workaround for backends/shapes where the rotate-act path produces NaN
+        // (observed on Nemotron-H's ReLU^2 FFN on Metal).
+        static const bool tq_no_rotate = getenv("TQ_NO_ROTATE") != nullptr;
+
         // TQ weight optimization: pre-rotate activations, use no-RHT dequant, then un-rotate
-        if (is_tq_weight && ne00 % 32 == 0) {
+        if (is_tq_weight && ne00 % 32 == 0 && !tq_no_rotate) {
             // Step 1: Forward-rotate src1 in-place
             const int64_t n_act = (int64_t)ne10 * ne11 * ne12 * ne13;
             int64_t n_act_val = n_act;
