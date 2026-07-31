@@ -3865,6 +3865,13 @@ private:
                         // originally `break`'d the whole per-slot batching loop (stop giving any
                         // later slot batch room this round, not just this one); iterate() has no
                         // early-exit, so replicate it via the same add_ok kill-switch used above.
+                        // This slot's tokens are already in the batch, so it must still claim
+                        // slot_batched — upstream now asserts (slot_batched || batch empty)
+                        // before decode (the pre-merge fork had no such assert, so its `break`
+                        // skipping the assignment was benign).
+                        if (!slot_batched) {
+                            slot_batched = &slot;
+                        }
                         add_ok = false;
                         return;
                     }
