@@ -2307,7 +2307,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         static const bool tq_no_rotate = getenv("TQ_NO_ROTATE") != nullptr;
 
         // TQ weight optimization: pre-rotate activations, use no-RHT dequant, then un-rotate
-        if (is_tq_weight && ne00 % 32 == 0 && !tq_no_rotate) {
+        // rotate-act walks src1 as a flat contiguous array, so it requires contiguous src1
+        if (is_tq_weight && ne00 % 32 == 0 && !tq_no_rotate && ggml_is_contiguous(op->src[1])) {
             // Step 1: Forward-rotate src1 in-place
             const int64_t n_act = (int64_t)ne10 * ne11 * ne12 * ne13;
             int64_t n_act_val = n_act;
@@ -2349,7 +2350,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
             const size_t smem = pipeline_mm.smem;
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + 31)/32), ((ne01 + 63)/64), ne12*ne13, 128, 1, 1);
+
+            const int nr0 = pipeline_mm.nr0;
+            const int nr1 = pipeline_mm.nr1;
+            const int nsg = pipeline_mm.nsg;
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
 
             // Memory barrier between matmul and unrotate
             ggml_metal_op_concurrency_reset(ctx);
@@ -2564,7 +2569,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         {
             // TQ weight MoE: pre-rotate activations for rotated dispatch
-            if (is_tq_weight && ne00 % 32 == 0) {
+            // rotate-act walks src1 as a flat contiguous array, so it requires contiguous src1
+            if (is_tq_weight && ne00 % 32 == 0 && ggml_is_contiguous(op->src[1])) {
                 const int64_t n_act = (int64_t)ne10 * ne11 * ne12 * ne13;
                 int64_t n_act_val = n_act;
 

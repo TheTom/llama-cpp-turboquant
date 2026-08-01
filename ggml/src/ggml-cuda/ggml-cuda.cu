@@ -2059,7 +2059,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Root-caused via eval-callback node-diffing on DeepSeek-V4-Flash (real
     // TQ3_1S attn/ffn weights, CUDA vs CPU-oracle): output for some MUL_MAT
     // nodes (e.g. blk.N.attn_q_a, a 4096->1024 low-rank bottleneck) diverges
-    // ~2%/layer, compounding over 61 layers into incoherent generation on
+    // ~2%/layer, compounding over 43 layers into incoherent generation on
     // CUDA (coherent on CPU/Metal). The math of the fused kernel (per-block
     // WHT rotation + centroid dot product) was verified bit-for-bit
     // equivalent to the (known-correct) dequantize_tq3_1s inverse-WHT used

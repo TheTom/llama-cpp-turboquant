@@ -992,7 +992,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tq_rotate
     const ggml_type tsrc1 = op->src[1]->type;
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
-    const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
+
+    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
+    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+
+    const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+
+    const bool bc_out = has_tensor
+        ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
+        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -1020,7 +1028,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tq_rotate
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = bc_out ? 8192 : 4096 + 2048;
+    if (has_tensor) {
+        res.nr0 = NRA;
+        res.nr1 = NRB;
+
+        res.smem = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
+    } else {
+        res.nr0 = 64;
+        res.nr1 = 32;
+
+        res.smem = bc_out ? 8192 : (4096 + 2048);
+    }
+
+    res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
 
     return res;
 }
