@@ -260,6 +260,16 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
+// oscar2 dequant with inverse Hadamard (for f16 conversion path). 128 threads/block.
+// DISABLED: oscar2 is KV-cache only, never model weights. The FA kernel handles
+// dequant natively. If general dequant is needed, use dequantize_oscar2 from
+// dequantize.cuh. Note: set_rows stores Hadamard-domain values so naive dequant
+// outside the FA pipeline would produce incorrect results.
+// template <typename dst_t>
+// static __global__ void k_dequantize_oscar2_ih(...) { ... }
+// template <typename dst_t>
+// static void dequantize_oscar2_ih_cuda(...) { ... }
+
 // Fast warp-cooperative TQ4_1S dequant: one warp per 32-element block.
 // WHT via __shfl_xor_sync — 16× less compute than the per-element generic template.
 template <typename dst_t>
@@ -618,6 +628,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_tq4_1s_warp_cuda<half>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
             return dequantize_block_cont_cuda<QK_TQ3_0, QR_TQ3_1S, dequantize_tq3_1s>;
+        case GGML_TYPE_OSCAR2:
+            return nullptr; // KV-cache only, never model weights
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:

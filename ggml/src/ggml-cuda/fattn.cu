@@ -1,9 +1,12 @@
+#include "fattn-oscar2.cuh"
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -46,9 +49,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -471,6 +474,64 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
 
+    // OSCAR2 KV cache types — NOT supported in VEC path. The VEC kernel lacks
+    // inverse Hadamard transform, so set_rows-stored Hadamard-domain values would
+    // be incorrectly interpreted as natural-domain values. The dedicated FA kernel
+    // (BEST_FATTN_KERNEL_OSCAR2) is the only correct path.
+    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2)  // DISABLED
+    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_F16)     // DISABLED
+    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_OSCAR2)    // DISABLED
+    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0)    // DISABLED
+    // FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_OSCAR2)   // DISABLED
+    // D=512 (Gemma4) OSCAR2 VEC combinatorics — DISABLED
+    // FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2)    // DISABLED
+    // FATTN_VEC_CASE(512, GGML_TYPE_F16,    GGML_TYPE_OSCAR2)    // DISABLED
+    // FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_F16)       // DISABLED
+    // FATTN_VEC_CASE(512, GGML_TYPE_Q8_0,   GGML_TYPE_OSCAR2)    // DISABLED
+    // FATTN_VEC_CASE(512, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0)      // DISABLED
+
+    GGML_ABORT("fatal error");
+}
+
+static void ggml_cuda_flash_attn_ext_oscar2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * Q = dst->src[0];
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+
+    const int32_t D = Q->ne[0];
+
+    const ggml_type type_K = K->type;
+    const ggml_type type_V = V->type;
+
+#define DISPATCH_OSCAR2(DIM)                                                        \
+    switch (type_K) {                                                               \
+        case GGML_TYPE_OSCAR2:                                                      \
+            switch (type_V) {                                                       \
+                case GGML_TYPE_OSCAR2: ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2>(ctx, dst); return; \
+                case GGML_TYPE_F16:  ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_F16> (ctx, dst); return; \
+                case GGML_TYPE_Q8_0: ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_OSCAR2, GGML_TYPE_Q8_0>(ctx, dst); return; \
+                default: break;                                                     \
+            }                                                                       \
+            break;                                                                  \
+        case GGML_TYPE_F16:                                                         \
+            if (type_V == GGML_TYPE_OSCAR2) {                                       \
+                ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_F16,  GGML_TYPE_OSCAR2>(ctx, dst); return; \
+            }                                                                       \
+            break;                                                                  \
+        case GGML_TYPE_Q8_0:                                                        \
+            if (type_V == GGML_TYPE_OSCAR2) {                                       \
+                ggml_cuda_flash_attn_ext_oscar2_case<DIM, GGML_TYPE_Q8_0, GGML_TYPE_OSCAR2>(ctx, dst); return; \
+            }                                                                       \
+            break;                                                                  \
+        default: break;                                                             \
+    }
+
+    if (D == 128) { DISPATCH_OSCAR2(128); }
+    if (D == 256) { DISPATCH_OSCAR2(256); }
+    if (D == 512) { DISPATCH_OSCAR2(512); }
+
+#undef DISPATCH_OSCAR2
+
     GGML_ABORT("fatal error");
 }
 
@@ -478,6 +539,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
     BEST_FATTN_KERNEL_TILE    = 200,
+    // OSCAR2 = 40: lower than VEC to prevent accidental override, but
+    // selected directly by type-gate (not by max-score competition).
+    BEST_FATTN_KERNEL_OSCAR2   =  40,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
@@ -496,6 +560,9 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q2_0:
+            return true;
+        case GGML_TYPE_OSCAR2:
             return true;
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
@@ -527,6 +594,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
+    const int cc = ggml_cuda_info().devices[device].cc;
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
@@ -541,10 +609,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
-    const int cc = ggml_cuda_info().devices[device].cc;
-
+    // OSCAR2 KV: dedicated kernel handles head dims divisible by QK_OSCAR2 (128).
+    // D=64 is not supported because QK_OSCAR2=128 and the kernel template enforces
+    // D >= QK_OSCAR2 && D % QK_OSCAR2 == 0 via static_assert; fall through to NONE.
+    // TILE/VEC/MMA paths lack inverse Hadamard and would produce garbage for
+    // Hadamard-domain OSCAR2 values.
+    if (K->type == GGML_TYPE_OSCAR2 || V->type == GGML_TYPE_OSCAR2) {
+        const int D = K->ne[0];
+        if (D == 128 || D == 256 || D == 512) {
+            return BEST_FATTN_KERNEL_OSCAR2;
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    }
     switch (K->ne[0]) {
-        case  40:
         case  64:
         case  72:
         case  80:
@@ -800,27 +877,35 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool turbo_matched = (K->type == V->type &&
             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0));
-        if (ggml_cuda_turbo_mma_fused() && turbo_matched
+        // F3: oscar2 excluded from MMA turbo path — the V tile load cannot efficiently
+        // reconstruct per-block mean after inverse Hadamard. Scalar FA kernel handles
+        // V mean via separate VKQ_mean accumulation. Remove this gate once the MMA
+        // turbo load tile adds (128 * inv_hadamard_val + mean) V restoration.
+        const bool oscar2_mma = false;
+        if ((turbo_matched || oscar2_mma)
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
-            if (Q->ne[0] == 128) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
-                    default: break;
+            if (ggml_cuda_turbo_mma_fused()) {
+                if (Q->ne[0] == 128) {
+                    switch (K->type) {
+                        case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
+                        case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                        case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
+                        default: break;
+                    }
                 }
-            }
-            if (Q->ne[0] == 256) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    // turbo2 + head_dim 256: intentionally NO fused case (routes to VEC via
-                    // default below). At 2-bit KV the fused path's GQA-pack saving is tiny while the
-                    // dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and
-                    // regresses ~1-2.5% on bandwidth-limited ones (tester @everson: Gemma-12B / RTX
-                    // 5060 Ti). VEC == baseline there. turbo2 + hd128 keeps fused (a +6.6..+69% depth
-                    // win on dense models); turbo3/turbo4 stay fused at both head dims.
-                    default: break;
+                if (Q->ne[0] == 256) {
+                    switch (K->type) {
+                        case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
+                        case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                        case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
+                        default: break;
+                    }
+                }
+                if (Q->ne[0] == 512) {
+                    // D=512 (Gemma4): only turbo types support D=512 in the turbo gate.
+                    if (K->type == GGML_TYPE_OSCAR2) {
+                        // oscar2 is excluded (see above)
+                    }
                 }
             }
         }
@@ -829,6 +914,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
+        case BEST_FATTN_KERNEL_OSCAR2:
+            ggml_cuda_flash_attn_ext_oscar2(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
@@ -844,3 +932,4 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+

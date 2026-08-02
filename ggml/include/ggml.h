@@ -435,7 +435,8 @@ extern "C" {
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_OSCAR2   = 48, // OSCAR INT2: per-head_dim min-max asymmetric quant, no Hadamard
+        GGML_TYPE_COUNT    = 49,
     };
 
     // precision
@@ -2442,7 +2443,6 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
-
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

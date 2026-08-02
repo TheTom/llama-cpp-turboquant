@@ -1,5 +1,9 @@
 #include "models.h"
 
+#include <cinttypes>
+#include <vector>
+#include <cmath>
+
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
@@ -78,6 +82,71 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
         layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, kv_flags);
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
+
+        // OSCAR calibrated K/V rotations (per-layer [head_dim, head_dim]); optional
+        layer.attn_k_rot = create_tensor(tn(LLM_TENSOR_ATTN_K_ROT, "weight", i), {n_embd_head, n_embd_head}, TENSOR_NOT_REQUIRED);
+        layer.attn_v_rot = create_tensor(tn(LLM_TENSOR_ATTN_V_ROT, "weight", i), {n_embd_head, n_embd_head}, TENSOR_NOT_REQUIRED);
+
+        // Fallback to data-free Hadamard rotation when calibrated rotations are missing.
+        // Running without any rotation (identity) makes quantized KV cache incoherent.
+        if (!layer.attn_k_rot || !layer.attn_v_rot) {
+            const int64_t d = n_embd_head;
+            // Require power-of-2 head dim >= 64 for Hadamard construction
+            if ((d & (d - 1)) != 0 || d < 64) {
+                throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation requires head_dim to be a power of 2 >= 64, got %" PRId64, d));
+            }
+
+            // Generate normalized Hadamard matrix of size d x d.
+            // Sylvester construction: H_1 = [1]; H_{2n} = [H_n  H_n; H_n -H_n].
+            // After construction, normalize by 1/sqrt(d) so H^T H = I.
+            const float inv_sqrt_d = 1.0f / sqrtf((float)d);
+            std::vector<float> had((size_t)d * d);
+            had[0] = 1.0f;
+            for (int64_t size = 1; size < d; size *= 2) {
+                const int64_t s2 = size * 2;
+                for (int64_t i = 0; i < size; ++i) {
+                    for (int64_t j = 0; j < size; ++j) {
+                        const float v = had[(size_t)i * size + j];
+                        had[(size_t)i         * s2 + j]         = v;
+                        had[(size_t)(i+size)  * s2 + j]         = v;
+                        had[(size_t)i         * s2 + (j+size)]  = v;
+                        had[(size_t)(i+size)  * s2 + (j+size)]  = -v;
+                    }
+                }
+            }
+            for (size_t i = 0; i < (size_t)d * d; ++i) {
+                had[i] *= inv_sqrt_d;
+            }
+
+            ggml_context * ctx_fallback = ml->contexts.empty() ? nullptr : ml->contexts[0].get();
+            if (!ctx_fallback) {
+                throw std::runtime_error("Gemma-4 OSCAR fallback rotation: no model context available");
+            }
+
+            auto create_fallback_rot = [&](ggml_tensor *& rot, const char * name) {
+                if (rot != nullptr) return;
+
+                rot = ggml_new_tensor_2d(ctx_fallback, GGML_TYPE_F32, d, d);
+                if (!rot) {
+                    throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to create %s", name));
+                }
+                ggml_set_name(rot, name);
+
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(rot));
+                if (!buf) {
+                    throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to allocate buffer for %s", name));
+                }
+                if (ggml_backend_buffer_init_tensor(buf, rot) != GGML_STATUS_SUCCESS) {
+                    ggml_backend_buffer_free(buf);
+                    throw std::runtime_error(format("Gemma-4 OSCAR fallback rotation: failed to init buffer for %s", name));
+                }
+
+                ggml_backend_tensor_set(rot, had.data(), 0, ggml_nbytes(rot));
+            };
+
+            create_fallback_rot(layer.attn_k_rot, "fallback.attn_k_rot");
+            create_fallback_rot(layer.attn_v_rot, "fallback.attn_v_rot");
+        }
 
         layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
 
@@ -234,11 +303,35 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                  ext_factor, attn_factor, beta_fast, beta_slow);
 
+            // OSCAR calibrated rotation (in-graph): Q@M_k, K@M_k (post-RoPE; same orthogonal M
+            // on both => Q'·K' == Q·K) and V@M_v (undone via M_v^T after attention). KV are then
+            // stored as plain INT2 (run with LLAMA_KV_NO_HADAMARD=1) — no in-quant Hadamard.
+            if (model.layers[il].attn_k_rot) {
+                Qcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Qcur);
+                Kcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Kcur);
+                cb(Qcur, "Qcur_rot", il);
+                cb(Kcur, "Kcur_rot", il);
+            }
+
             cb(Kcur, "Kcur_pos", il);
 
-            cur = build_attn(inp_attn, model.layers[il].wo,
-                    nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
-                    hparams.f_attention_scale, il);
+            if (model.layers[il].attn_v_rot) {
+                // attn_v_rot is stored as R_v^T; for V we want to quantize V@R_v (the calibrated
+                // incoherence-reducing direction), so rotate with R_v = (R_v^T)^T and undo with R_v^T.
+                ggml_tensor * Rv = ggml_cont(ctx0, ggml_transpose(ctx0, model.layers[il].attn_v_rot));
+                Vcur = ggml_mul_mat(ctx0, Rv, Vcur);
+                cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+                // undo: o @ R_v^T per head, then output projection
+                cur = ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, cur->ne[1]);
+                cur = ggml_mul_mat(ctx0, model.layers[il].attn_v_rot, cur);
+                cur = ggml_cont_2d(ctx0, cur, n_embd_head * n_head, cur->ne[2]);
+                cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+            } else {
+                cur = build_attn(inp_attn, model.layers[il].wo,
+                        nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                        hparams.f_attention_scale, il);
+            }
         } else {
             // reuse KV cache of earlier layers
             cur = build_attn(inp_attn,

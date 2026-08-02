@@ -500,6 +500,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
+    if (s == "oscar2") {
+        return GGML_TYPE_OSCAR2;
+    }
     if (s == "turbo2") {
         return GGML_TYPE_TURBO2_0;
     }

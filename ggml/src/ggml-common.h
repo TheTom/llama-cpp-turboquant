@@ -287,6 +287,35 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// OSCAR2: per-head_dim (128) Lloyd-Max 2-bit quantization
+// Layout: [int2_codes(32B) | sigma_fp16(2B) | mean_fp16(2B)] = 36 bytes per 128 elements
+// Dequant: val = OSCAR2_LM_CENTROIDS[code] * sigma + mean
+// Centroids are optimal for N(0,1) with 2-bit/4-level quantization.
+// Pipeline: H (Hadamard) -> P_br (bit-reversal) -> quantize.
+// P_br interleaves high-variance and low-variance channels across quant groups.
+#define QK_OSCAR2 128
+// Bit-reversal permutation P_br for 128 elements (OSCAR paper: R.H.P_br).
+// Applied after Hadamard, before quantization. Self-inverse.
+static const int P_BR_PERM[128] = {
+    0, 64, 32, 96, 16, 80, 48, 112,  8, 72, 40, 104, 24, 88, 56, 120,
+    4, 68, 36, 100, 20, 84, 52, 116, 12, 76, 44, 108, 28, 92, 60, 124,
+    2, 66, 34, 98, 18, 82, 50, 114, 10, 74, 42, 106, 26, 90, 58, 122,
+    6, 70, 38, 102, 22, 86, 54, 118, 14, 78, 46, 110, 30, 94, 62, 126,
+    1, 65, 33, 97, 17, 81, 49, 113,  9, 73, 41, 105, 25, 89, 57, 121,
+    5, 69, 37, 101, 21, 85, 53, 117, 13, 77, 45, 109, 29, 93, 61, 125,
+    3, 67, 35, 99, 19, 83, 51, 115, 11, 75, 43, 107, 27, 91, 59, 123,
+    7, 71, 39, 103, 23, 87, 55, 119, 15, 79, 47, 111, 31, 95, 63, 127};
+typedef struct {
+    uint8_t    qs[QK_OSCAR2 / 4];   // 32 bytes: 4 two-bit codes per byte
+    ggml_half  d;                    // sigma / std-dev (fp16)
+    ggml_half  m;                    // mean (fp16)
+} block_oscar2;
+static_assert(sizeof(block_oscar2) == QK_OSCAR2/4 + 2*sizeof(ggml_half), "wrong oscar2 block size");
+
+// Lloyd-Max centroids for 2-bit quantization of N(0,1)
+// Used by the oscar2 type.
+static const float OSCAR2_LM_CENTROIDS[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+
 // TurboQuant 3-bit MSE-only: 3-bit PolarQuant indices (no QJL)
 // Storage block size = 32 (matches q4_0 for optimal GPU parallelism)
 // Transform group size = 128 (head_dim, for rotation Gaussianization)

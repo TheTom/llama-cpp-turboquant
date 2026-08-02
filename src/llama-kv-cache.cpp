@@ -225,10 +225,59 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+
     // [TAG_V_CACHE_VARIABLE]
     if (v_trans && hparams.is_n_embd_v_gqa_variable()) {
         LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to %d\n",
                 __func__, hparams.n_embd_v_gqa_max());
+    }
+
+    // Pre-scan: SWA models with oscar2 mixed-head-dim problem. Only Gemma-4 (SWA=128, dense=256)
+    // genuinely breaks. Simple SWA models (Gemma-2/3, Cohere) with uniform head dim work fine.
+    // Pre-scan determines whether head dims are uniform across all KV-bearing layers and whether
+    // that uniform value is one of the values supported by the oscar2 FA kernel dispatcher
+    // (D in {128, 256, 512}). If both yes, oscar2 is safe for SWA models.
+    bool oscar2_safe_for_swa = false;
+    {
+        int32_t head_k_first = -1;
+        int32_t head_v_first = -1;
+        bool uniform_head = true;
+        bool has_kv_layer = false;
+        for (uint32_t il_pre = 0; il_pre < n_layer; il_pre++) {
+            if (!hparams.has_kv(il_pre)) continue;
+            has_kv_layer = true;
+            const int32_t hk = (int32_t) hparams.n_embd_head_k(il_pre);
+            const int32_t hv = (int32_t) hparams.n_embd_head_v(il_pre);
+            if (head_k_first < 0) head_k_first = hk;
+            if (head_v_first < 0) head_v_first = hv;
+            if (hk != head_k_first || hv != head_v_first) {
+                uniform_head = false;
+                break;
+            }
+        }
+        // oscar2 FA kernel only dispatches D in {128, 256, 512}
+        const bool k_compat = (head_k_first == 128 || head_k_first == 256 || head_k_first == 512);
+        const bool v_compat = (head_v_first == 128 || head_v_first == 256 || head_v_first == 512);
+        oscar2_safe_for_swa = has_kv_layer && uniform_head && k_compat && v_compat;
+        if (n_swa > 0 && (type_k == GGML_TYPE_OSCAR2 || type_v == GGML_TYPE_OSCAR2)) {
+            LLAMA_LOG_INFO("%s: oscar2_safe_for_swa = %d (n_swa=%u, head_k=%d, head_v=%d, uniform=%d)\n",
+                    __func__, oscar2_safe_for_swa, n_swa, head_k_first, head_v_first, uniform_head);
+        }
+    }
+
+    // INT2 cache type rotation check: warn when using oscar2 without rotation tensors.
+    // The model's per-layer rotation tensors (attn_k_rot, attn_v_rot) are optional;
+    // when absent, the oscar2 KV cache can produce degraded output.
+    if (type_k == GGML_TYPE_OSCAR2 || type_v == GGML_TYPE_OSCAR2) {
+        bool has_rotation = false;
+        for (size_t il = 0; il < model.layers.size() && !has_rotation; il++) {
+            has_rotation = (model.layers[il].attn_k_rot != nullptr || model.layers[il].attn_v_rot != nullptr);
+        }
+        if (!has_rotation) {
+            LLAMA_LOG_WARN("%s: INT2 KV cache (%s/%s) without rotation tensors — "
+                           "output may be degraded. Use a rotated GGUF or set rotation env vars.\n",
+                           __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+        }
     }
 
     const bool is_mla = hparams.is_mla();
@@ -321,6 +370,7 @@ llama_kv_cache::llama_kv_cache(
         //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
         //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
         //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
@@ -401,6 +451,27 @@ llama_kv_cache::llama_kv_cache(
                                __func__, n_embd_head_v, padded_head_v, n_embd_v_gqa, n_embd_v_gqa_eff);
             }
         }
+
+        // [OSCAR FIX] oscar2 Hadamard + INT2 pipeline processes 128-element blocks.
+        // FA kernel and set_rows already support head_dim in {128, 256, 512}
+        // (they process D/QK_OSCAR2 blocks per head). Per-layer override:
+        // layers whose head dim is a multiple of 128 keep oscar2, others
+        // drop to f16. The ISWA cache splits base and swa into separate
+        // llama_kv_cache instances; each instance's per-layer check sees only
+        // its own subset. The legacy oscar2_safe_for_swa uniform-dim SWA guard
+        // is intentionally NOT called here because its pre-scan ignores the
+        // filter callback and would falsely flag every Gemma-4 layer (mixed
+        // head dims) as f16, defeating the per-layer fix.
+        {
+            const uint32_t hk = (layer_type_k == GGML_TYPE_OSCAR2) ? hparams.n_embd_head_k(il) : 0;
+            const uint32_t hv = (layer_type_v == GGML_TYPE_OSCAR2 && !is_mla) ? hparams.n_embd_head_v(il) : 0;
+            const bool layer_ok_k = (layer_type_k != GGML_TYPE_OSCAR2) || (hk % 128 == 0);
+            const bool layer_ok_v = (layer_type_v != GGML_TYPE_OSCAR2) || is_mla || (hv % 128 == 0);
+            if (!layer_ok_k) layer_type_k = GGML_TYPE_F16;
+            if (!layer_ok_v) layer_type_v = GGML_TYPE_F16;
+        }
+
+        { static bool once = false; if (!once) { once = true; fprintf(stderr, "[OSCAR] KV cache dtype: K=%s V=%s (n_embd_k_gqa=%d, kv_size=%d)\n", ggml_type_name(layer_type_k), ggml_type_name(layer_type_v), (int) n_embd_k_gqa_eff, (int) kv_size); fflush(stderr); } }
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
@@ -1447,6 +1518,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     assert(res.s1 >= res.s0);
 
+
     return res;
 }
 
@@ -1536,6 +1608,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -1622,25 +1695,25 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     auto * k = layers[ikv].k;
 
     const uint64_t kv_size      = get_size();
+
+    // For KV-sharing layers (map_layer_ids[il] != il), k->ne[0] reflects the
+    // base layer's n_embd_k_gqa (which may differ from hparams.n_embd_k_gqa(il)
+    // when head_count_kv varies per layer, e.g. Gemma-4). Use the cache
+    // tensor's actual dimension as the authoritative value.
     const uint64_t n_embd_k_gqa = k->ne[0];
 
-    // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    if (k_is_turbo) {
-        assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
-    } else {
-        assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
-    }
-
-    // Use padded head_dim for turbo types so the full padded data is returned
     const uint32_t head_k = hparams.n_embd_head_k(il);
+    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
     const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
+
+    // Derive the effective number of KV heads from the cache tensor.
+    const int32_t n_head_kv_eff = (int32_t)(n_embd_k_gqa / head_k_eff);
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
-            head_k_eff, hparams.n_head_kv(il), n_kv, ns,
+            head_k_eff, n_head_kv_eff, n_kv, ns,
             ggml_row_size(k->type, head_k_eff),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
@@ -1653,10 +1726,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     auto * v = layers[ikv].v;
 
     const uint64_t kv_size      = get_size();
+    // Use cache tensor's actual n_embd_v_gqa (authoritative for KV-sharing layers)
     const uint64_t n_embd_v_gqa = v->ne[0];
-
-    // [TAG_V_CACHE_VARIABLE] — for turbo-padded V, cache may be larger
-    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     // Use padded head_dim for turbo types
     const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
@@ -1664,12 +1735,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
 
+    // Derive the effective number of KV heads from the cache tensor allocation.
+    const int32_t n_head_kv_eff = (int32_t)(n_embd_v_gqa / head_v_eff);
+
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                head_v_eff, hparams.n_head_kv(il), n_kv, ns,
+                head_v_eff, n_head_kv_eff, n_kv, ns,
                 ggml_row_size(v->type, head_v_eff),                      // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                    // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),            // v->nb[3]
@@ -1678,7 +1752,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), head_v_eff, ns,
+            n_kv, n_head_kv_eff, head_v_eff, ns,
             ggml_row_size(v->type, kv_size*head_v_eff),              // v->nb[1]
             ggml_row_size(v->type, kv_size),                         // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),            // v->nb[3]
@@ -1880,22 +1954,16 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
-        // for K, mirroring V's choice. Master defaults to the largest power-of-2
-        // that divides head_dim, but the upstream comment hypothesizes smaller
-        // tiles preserve more local structure → less PPL hit on sensitive models
-        // (gemma-4 26B-A4B reportedly regresses with the largest tile).
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
         const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
-        int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
-
-        // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
-        if (nrot == 0) {
-            nrot = 64;
-            do {
-                nrot *= 2;
-            } while (n_embd_head_k_all % nrot == 0);
-            nrot /= 2;
+        int nrot = 64;  // Default: 64 (empirically best)
+        if (LLAMA_ATTN_ROT_K_NROT) {
+            nrot = atoi(LLAMA_ATTN_ROT_K_NROT);
+            // nrot=0 means auto-detect largest power-of-2 dividing head_dim
+            if (nrot == 0) {
+                nrot = 64;
+                do { nrot *= 2; } while (n_embd_head_k_all % nrot == 0);
+                nrot /= 2;
+            }
         }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
@@ -1910,13 +1978,17 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_v) {
-        int nrot = 64;
-        // using smaller rotation matrices for V seems beneficial
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
-        //do {
-        //    nrot *= 2;
-        //} while (hparams.n_embd_head_v() % nrot == 0);
-        //nrot /= 2;
+        const char * LLAMA_ATTN_ROT_V_NROT = getenv("LLAMA_ATTN_ROT_V_NROT");
+        int nrot = 64;  // Default: 64 (empirically best)
+        if (LLAMA_ATTN_ROT_V_NROT) {
+            nrot = atoi(LLAMA_ATTN_ROT_V_NROT);
+            // nrot=0 means auto-detect largest power-of-2 dividing head_dim
+            if (nrot == 0) {
+                nrot = 64;
+                do { nrot *= 2; } while (hparams.n_embd_head_v(0) % nrot == 0);
+                nrot /= 2;
+            }
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -1925,6 +1997,8 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 
     return res;
 }
+
+
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
@@ -3262,3 +3336,4 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
+

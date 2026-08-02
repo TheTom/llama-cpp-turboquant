@@ -475,6 +475,95 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
         }
     }
 }
+// Bit-reversal permutation P_br for OSCAR2 (OSCAR paper: R.H.P_br).
+// Enabled by default via LLAMA_KV_OSCAR2_PBR=1.
+// Interleaves high-variance and low-variance channels across quant groups.
+static int oscar2_pbr_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("LLAMA_KV_OSCAR2_PBR");
+        v = e ? atoi(e) : 1; // enabled by default
+    }
+    return v;
+}
+
+void dequantize_row_oscar2(const block_oscar2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_OSCAR2 == 0);
+    const int nb = k / QK_OSCAR2;
+    const int pbr = oscar2_pbr_enabled();
+    float tmp[QK_OSCAR2];
+    for (int ib = 0; ib < nb; ib++) {
+        const float d = GGML_FP16_TO_FP32(x[ib].d);
+        const float m = GGML_FP16_TO_FP32(x[ib].m);
+        for (int j = 0; j < QK_OSCAR2 / 4; j++) {
+            const uint8_t packed = x[ib].qs[j];
+            for (int b = 0; b < 4; b++) {
+                const int code = (packed >> (2 * b)) & 0x03;
+                tmp[j * 4 + b] = OSCAR2_LM_CENTROIDS[code] * d + m;
+            }
+        }
+        if (pbr) {
+            // Apply P_br (self-inverse) to undo the bit-reversal permutation
+            for (int j = 0; j < QK_OSCAR2; j++) {
+                y[ib * QK_OSCAR2 + j] = tmp[P_BR_PERM[j]];
+            }
+        } else {
+            memcpy(y + ib * QK_OSCAR2, tmp, QK_OSCAR2 * sizeof(float));
+        }
+    }
+}
+
+void quantize_row_oscar2_ref(const float * GGML_RESTRICT x, block_oscar2 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_OSCAR2 == 0);
+    const int nb = k / QK_OSCAR2;
+    const int pbr = oscar2_pbr_enabled();
+    float perm[QK_OSCAR2];
+    for (int ib = 0; ib < nb; ib++) {
+        const float * vec = x + ib * QK_OSCAR2;
+        const float * vin;
+        if (pbr) {
+            // Apply P_br (self-inverse) to the input before quantization
+            for (int j = 0; j < QK_OSCAR2; j++) perm[P_BR_PERM[j]] = vec[j];
+            vin = perm;
+        } else {
+            vin = vec;
+        }
+        // Compute mean and sigma (standard deviation)
+        float mean = 0.0f;
+        for (int j = 0; j < QK_OSCAR2; j++) mean += vin[j];
+        mean /= QK_OSCAR2;
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QK_OSCAR2; j++) {
+            float d = vin[j] - mean;
+            sum_sq += d * d;
+        }
+        const float sigma = sqrtf(sum_sq / QK_OSCAR2);
+        const float inv_sigma = (sigma > 1e-8f) ? 1.0f / sigma : 0.0f;
+        y[ib].d = GGML_FP32_TO_FP16(sigma);
+        y[ib].m = GGML_FP32_TO_FP16(mean);
+        for (int j = 0; j < QK_OSCAR2 / 4; j++) {
+            uint8_t packed = 0;
+            for (int b = 0; b < 4; b++) {
+                float val_norm = (vin[j * 4 + b] - mean) * inv_sigma;
+                // Find nearest Lloyd-Max centroid
+                int code = 0;
+                float best = fabsf(val_norm - OSCAR2_LM_CENTROIDS[0]);
+                for (int c = 1; c < 4; c++) {
+                    float err = fabsf(val_norm - OSCAR2_LM_CENTROIDS[c]);
+                    if (err < best) { code = c; best = err; }
+                }
+                packed |= (uint8_t)(code << (2 * b));
+            }
+            y[ib].qs[j] = packed;
+        }
+    }
+}
+
+size_t quantize_oscar2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * GGML_RESTRICT imatrix) {
+    (void)imatrix;
+    quantize_row_oscar2_ref(src, (block_oscar2 *) dst, nrows * n_per_row);
+    return nrows * sizeof(block_oscar2) * (n_per_row / QK_OSCAR2);
+}
 
 void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_1;

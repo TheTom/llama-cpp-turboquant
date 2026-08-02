@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_cparams;
@@ -40,7 +41,7 @@ public:
         uint32_t s1;
 
         std::vector<llama_seq_id> strm; // [ns]
-        std::vector<idx_vec_t>    idxs; // [ns]
+        std::vector<idx_vec_t>    idxs; // [ns] LP global slot indices
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -174,7 +175,6 @@ public:
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_k_idx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
-    // TurboQuant: get rotation matrices (stored as row-major C arrays)
     // turbo_rotation = R (forward rotation, for Q pre-rotate-queries)
     // turbo_rotation_inv = R^T = R^{-1} (inverse rotation, for V output un-rotation)
     ggml_tensor * get_turbo_rotation() const { return turbo_rotation; }
@@ -188,8 +188,6 @@ public:
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_k_idx(ggml_context * ctx, ggml_tensor * k_idx_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
 
-    //
-    // preparation API
     //
 
     // find places for the provided ubatches in the cache, returns the slot infos
@@ -219,10 +217,9 @@ public:
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
-    void set_input_k_shift(ggml_tensor * dst) const;
-
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_shift  (ggml_tensor * dst) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -395,7 +392,6 @@ public:
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_k_idx(ggml_context * ctx, int32_t il) const;
 
-    // TurboQuant rotation accessors
     ggml_tensor * get_turbo_rotation() const;
     ggml_tensor * get_turbo_rotation_inv() const;
 
@@ -428,9 +424,9 @@ public:
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
-    void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_shift  (ggml_tensor * dst) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

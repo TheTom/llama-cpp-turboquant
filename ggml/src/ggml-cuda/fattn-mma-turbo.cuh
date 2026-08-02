@@ -26,6 +26,8 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 
+    // Initialize KV window constant memory (reads GGML_KV_WINDOW env var once)
+    ggml_cuda_kv_window();
     constexpr int ncols = ncols1 * ncols2;
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
@@ -35,7 +37,9 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
 
-    // turbo path is always single-stage synchronous (nstages forced to 0 in the kernel).
+    // turbo path is always single-stage (nstages forced to 0 in the kernel).
+    // oscar2 uses cp.async within the load tile for the bulk data copy, then dequants from SMEM.
+    // Extra SMEM for the raw oscar2 block buffer is computed below.
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps         = nthreads / warp_size_host;
@@ -47,10 +51,18 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
-
+    // Extra shared memory for oscar2 raw block cp.async buffer (unused for other turbo types).
+    constexpr int nblocks_row_o2_k = (DKQ + QK_OSCAR2 - 1) / QK_OSCAR2;
+    constexpr int nblocks_row_o2_v = (DV + QK_OSCAR2 - 1) / QK_OSCAR2;
+    constexpr int nblocks_row_o2   = nblocks_row_o2_k > nblocks_row_o2_v ? nblocks_row_o2_k : nblocks_row_o2_v;
+    constexpr int raw_bytes_o2     = nblocks_row_o2 * (int)sizeof(block_oscar2);
+    constexpr int raw_chunks_o2    = (raw_bytes_o2 + 15) / 16;
+    constexpr int raw_align_o2     = raw_chunks_o2 * 16;
+    const size_t nbytes_shared_oscar2_raw = nbatch_fa * raw_align_o2;
+ 
     const size_t nbytes_shared_KV = nbytes_shared_KV_1stage;
-
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+ 
+    const size_t nbytes_shared_total = nbytes_shared_oscar2_raw + std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
 
@@ -116,3 +128,7 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2);
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2);
+
+DECL_FATTN_MMA_TURBO_ALL(512, 512, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2);

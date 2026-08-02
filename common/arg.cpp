@@ -309,6 +309,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_OSCAR2,
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
@@ -325,8 +326,12 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
-    for (const auto & type : kv_cache_types) {
-        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+    for (size_t i = 0; i < kv_cache_types.size(); ++i) {
+        const auto & type = kv_cache_types[i];
+        msg << ggml_type_name(type);
+        if (i < kv_cache_types.size() - 1) {
+            msg << ", ";
+        }
     }
     return msg.str();
 }

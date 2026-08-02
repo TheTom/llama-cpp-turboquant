@@ -765,7 +765,7 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
-@ModelBase.register("Gemma4UnifiedForConditionalGeneration")
+@ModelBase.register("Gemma4UnifiedForCausalLM", "Gemma4UnifiedForConditionalGeneration")
 class Gemma4UnifiedModel(Gemma4Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4
 

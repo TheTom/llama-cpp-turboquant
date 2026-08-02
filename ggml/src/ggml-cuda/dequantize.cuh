@@ -552,3 +552,19 @@ static __device__ __forceinline__ void dequantize_tq3_1s(const void * vx, const 
     v.x = buf[iqs];
     v.y = buf[iqs + 1];
 }
+
+// OSCAR2: asymmetric INT2, block size 128, fp16 scale+min per block.
+// iqs is the element index within the block (even), produces elements iqs and iqs+1
+static __device__ __forceinline__ void dequantize_oscar2(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_oscar2 * x = (const block_oscar2 *) vx;
+    const float d = __half2float(x[ib].d);
+    const float m = __half2float(x[ib].m);
+    const int by0 = iqs / 4;
+    const int sub0 = iqs % 4;
+    const int by1 = (iqs + 1) / 4;
+    const int sub1 = (iqs + 1) % 4;
+    const uint8_t code0 = (x[ib].qs[by0] >> (2 * sub0)) & 0x03;
+    const uint8_t code1 = (x[ib].qs[by1] >> (2 * sub1)) & 0x03;
+    v.x = (float)code0 * d + m;
+    v.y = (float)code1 * d + m;
+}

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
 import torch
@@ -282,7 +280,7 @@ class Qwen3NextModel(Qwen2MoeModel):
         self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
         if (rope_dim := self.hparams.get("head_dim")) is None:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
-        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.25)))
+        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.25)))
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -543,7 +541,6 @@ class _Qwen35MtpMixin:
     `mtp.*` to the standard layer-indexed nextn naming so the existing
     tensor_map handles them."""
 
-    supports_mtp_export = True
     hparams: dict[str, Any]
     model_arch: gguf.MODEL_ARCH
     gguf_writer: gguf.GGUFWriter
@@ -643,19 +640,7 @@ class DFlashModel(Qwen3Model):
         logger.info(f"DFlash: Using tokenizer from target model: {self.target_model_dir}")
         original_dir = self.dir_model
         self.dir_model = self.target_model_dir
-
-        # Reuse the target model's own vocab handler (e.g. Gemma-4 needs its
-        # own tokenizer logic, not the Qwen default).
-        from . import get_model_class
-        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
-            target_arch = json.load(f)["architectures"][0]
-        target_cls = get_model_class(target_arch)
-
-        if target_cls is not type(self):
-            target_cls.set_vocab(self)  # ty: ignore[unresolved-attribute]
-        else:
-            super().set_vocab()
-
+        super().set_vocab()
         self.dir_model = original_dir
 
         mask_token_id = self.hparams.get("dflash_config", {}).get("mask_token_id")
@@ -665,10 +650,9 @@ class DFlashModel(Qwen3Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
-        dflash_config = self.hparams.get("dflash_config", {})
-
-        block_size = dflash_config.get("block_size", self.hparams.get("block_size", 16))
+        block_size = self.hparams.get("block_size", 16)
         self.gguf_writer.add_block_size(block_size)
+        dflash_config = self.hparams.get("dflash_config", {})
 
         target_layer_ids = dflash_config.get("target_layer_ids", [])
         if target_layer_ids:
@@ -689,23 +673,3 @@ class DFlashModel(Qwen3Model):
         if not name.startswith("model."):
             name = "model." + name
         return super().filter_tensors((name, gen))
-
-@ModelBase.register("Qwen3DSparkModel")
-class DSparkModel(DFlashModel):
-    # DSpark = DFlash + a semi-autoregressive Markov head
-    model_arch = gguf.MODEL_ARCH.DFLASH
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # normalize the flat DeepSpec schema to DFlash's nested dflash_config
-        self.hparams.setdefault("dflash_config", {
-            k: self.hparams[k] for k in ("target_layer_ids", "mask_token_id") if k in self.hparams
-        })
-
-    @classmethod
-    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
-        name, gen = item
-        if name.endswith(("embed_tokens.weight", "lm_head.weight")):
-            return None
-        return super().filter_tensors((name, gen))
-

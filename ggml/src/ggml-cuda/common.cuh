@@ -228,13 +228,22 @@ static const char * cu_get_error_str(CUresult err) {
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Per-kernel tracking: each kernel function needs its own dynamic smem limit raised via
+// cudaFuncSetAttribute. Cap must cover every distinct FA kernel in the matrix (hundreds);
+// 64 was too small and silently skipped the raise for kernels registered after the cap,
+// producing garbage attention on Blackwell (hsk=72/sinks failures only in full-suite runs).
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
-            const int   id                                                = ggml_cuda_get_device();            \
-            if (!shared_memory_limit_raised[id]) {                                                             \
+            static const void * raised_kernels[GGML_CUDA_MAX_DEVICES][4096];                                   \
+            static int          raised_count[GGML_CUDA_MAX_DEVICES] = { 0 };                                   \
+            const int           id   = ggml_cuda_get_device();                                                 \
+            bool                found = false;                                                                 \
+            for (int i = 0; i < raised_count[id] && !found; i++) {                                            \
+                if (raised_kernels[id][i] == (const void *)(kernel)) found = true;                             \
+            }                                                                                                  \
+            if (!found) {                                                                                      \
                 CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
-                shared_memory_limit_raised[id] = true;                                                         \
+                if (raised_count[id] < 4096) raised_kernels[id][raised_count[id]++] = (const void *)(kernel);  \
             }                                                                                                  \
         } while (0)
 #else

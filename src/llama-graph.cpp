@@ -18,6 +18,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+
+// Helper: apply a rotation matrix to the last dimension via mul_mat (with Hadamard hint)
+static ggml_tensor * ggml_mul_mat_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * rot) {
+    const auto n = rot->ne[0];
+
+    ggml_tensor * res;
+
+    res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    res = ggml_mul_mat   (ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -2795,7 +2812,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        cur = ggml_mul_mat_aux(ctx0, cur, ggml_cont(ctx0, ggml_transpose(ctx0, inp->self_v_rot)));
     }
 
     if (wo) {
@@ -3082,6 +3099,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
+    // The rotation is applied unconditionally (also needed for the HP path)
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
         if (q->ne[0] % 128 != 0) {
             const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
@@ -3092,7 +3110,10 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur;
+
+    cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
@@ -3117,7 +3138,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     if (v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+        cur = ggml_mul_mat_aux(ctx0, cur, ggml_cont(ctx0, ggml_transpose(ctx0, v_rot)));
     }
 
     if (wo) {

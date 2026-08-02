@@ -49,7 +49,6 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_POST,
 };
 
-
 enum llm_ffn_op_type : int {
     LLM_FFN_NONE = 0,           // sentinel: unset; archs must assign before use
     LLM_FFN_SILU,
@@ -663,7 +662,6 @@ struct llm_graph_fused_node {
     int il;
 };
 
-
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
@@ -784,7 +782,6 @@ struct llm_graph_params {
     }
 };
 
-
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -823,8 +820,6 @@ public:
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
     void set_params(const llm_graph_params & params);
-
-
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
@@ -965,7 +960,6 @@ struct llm_graph_context {
              ggml_tensor * mb,
            llm_norm_type   type,
                      int   il) const;
-
 
     // compute Q, K, V projections with optional bias and reshape
     // supports both fused wqkv and separate wq/wk/wv paths

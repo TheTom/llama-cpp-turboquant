@@ -178,6 +178,37 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
 }
 
 template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_oscar2(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_oscar2 * K_o2 = (const block_oscar2 *) K_c;
+    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+    GGML_UNUSED(Q_v);
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int   u  = Q_q8[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float q8scale = Q_ds.x;
+        const float q8off   = Q_ds.y / (float)QI8_1;
+        #pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const int  k   = k_KQ * 4 + b;
+            const int  by  = k / 4;
+            const int  sub = k % 4;
+            const int ib = by / (QK_OSCAR2 / 4);
+            const int  jb  = by % (QK_OSCAR2 / 4);
+            const uint8_t code = (K_o2[ib].qs[jb] >> (2 * sub)) & 0x03;
+            const float val = centroids[code] * __half2float(K_o2[ib].d); // centered — mean cancels in softmax; see note in fattn-oscar2.cuh
+            const int   qv  = (int)(int8_t)(u >> (8 * b));
+            const float q8eff = q8scale * (float)qv - q8off;
+            sum += val * q8eff;
+        }
+    }
+    return sum;
+}
+
+template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
@@ -743,6 +774,32 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
     }
 }
 
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_oscar2(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_oscar2 * x = (const block_oscar2 *) vx;
+    constexpr float centroids[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+    const int64_t ib = i0 / QK_OSCAR2;
+    const float d = __half2float(x[ib].d);
+    const float m = __half2float(x[ib].m);
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    #pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int64_t j    = (i0 + l) % QK_OSCAR2;
+        const int     by   = j / 4;
+        const int     sub  = j % 4;
+        const uint8_t code = (x[ib].qs[by] >> (2 * sub)) & 0x03;
+        const float   val  = centroids[code] * d + m;
+        if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(val);
+        } else if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = val;
+        } else {
+            static_assert(std::is_same_v<T, void>, "bad type");
+        }
+    }
+}
+
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
@@ -1021,6 +1078,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_OSCAR2) {
+        return vec_dot_fattn_vec_KQ_oscar2<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
         return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO2_0) {
@@ -1047,6 +1106,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_OSCAR2) {
+        return dequantize_V_oscar2<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {

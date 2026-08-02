@@ -9948,6 +9948,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+
+    // OSCAR2 KV cache: asymmetric INT2 with no Hadamard.
+    // Head dim 128 = one oscar2 block per vector.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    // Head dim 256 = two oscar2 blocks per vector (Gemma-4).
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    // Head dim 512 = four oscar2 blocks per vector (Gemma-4 large).
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -10288,6 +10298,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+
+    // OSCAR INT2 KV cache (q2_0): head size 128 = one 128-wide mean group per head.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
+
+    // OSCAR2 KV cache: asymmetric INT2, no Hadamard.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {1, 1}, 96,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_OSCAR2, GGML_TYPE_OSCAR2));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 

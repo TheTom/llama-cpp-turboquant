@@ -39,6 +39,10 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
 
+        // OSCAR calibrated K/V rotations (per-layer [head_dim, head_dim]); optional
+        layer.attn_k_rot = create_tensor(tn(LLM_TENSOR_ATTN_K_ROT, "weight", i), {n_embd_head_k, n_embd_head_k}, TENSOR_NOT_REQUIRED);
+        layer.attn_v_rot = create_tensor(tn(LLM_TENSOR_ATTN_V_ROT, "weight", i), {n_embd_head_k, n_embd_head_k}, TENSOR_NOT_REQUIRED);
+
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
@@ -103,13 +107,38 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
 
+            // OSCAR calibrated rotation (post-RoPE): rotate Q and K by the same
+            // per-layer orthogonal M so Q'·K' == Q·K, but K' quantizes far better.
+            if (model.layers[il].attn_k_rot) {
+                Qcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Qcur);
+                Kcur = ggml_mul_mat(ctx0, model.layers[il].attn_k_rot, Kcur);
+                cb(Qcur, "Qcur_rot", il);
+                cb(Kcur, "Kcur_rot", il);
+            }
+
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            if (model.layers[il].attn_v_rot) {
+                // OSCAR V rotation: store V' = V@M_v (quantizes well), undo M_v^T on
+                // the attention output before W_o (V isn't paired with Q, so explicit undo).
+                Vcur = ggml_mul_mat(ctx0, model.layers[il].attn_v_rot, Vcur);
+                cb(Vcur, "Vcur_rot", il);
+                cur = build_attn(inp_attn,
+                        nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                // cur is [n_embd_head*n_head, n_tokens]; undo M_v^T per head, then W_o
+                ggml_tensor * Mv = ggml_cont(ctx0, ggml_transpose(ctx0, model.layers[il].attn_v_rot));
+                cur = ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, cur->ne[1]);
+                cur = ggml_mul_mat(ctx0, Mv, cur);
+                cur = ggml_cont_2d(ctx0, cur, n_embd_head * n_head, cur->ne[2]);
+                cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+            } else {
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
