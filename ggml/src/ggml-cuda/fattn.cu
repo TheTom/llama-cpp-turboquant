@@ -642,8 +642,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // ~3.4x faster; prefill runs eagerly (not captured) so its f16 temp buffer is
     // allocated/freed raw in launch_fattn without violating graph-capture rules.
     // Limitation: head_dim > 256 cannot use VEC (falls through to TILE).
-    if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel && Q->ne[1] <= 8) {
-        return BEST_FATTN_KERNEL_VEC;
+    // Narrowed (#249): force VEC only for the TurboQuant cache types, which the
+    // TILE/MMA paths cannot decode natively. Standard quantized KV (q4_0/q8_0/...)
+    // follows upstream selection — the always-VEC form made MTP verify batches
+    // (n rows <= 8) walk the full KV sequentially per row, costing ~2.7x decode
+    // at 123K ctx vs mainline on RDNA3.
+    {
+        auto is_turbo_kv = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        };
+        if ((is_turbo_kv(K->type) || is_turbo_kv(V->type)) && can_use_vector_kernel && Q->ne[1] <= 8) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
     }
 #endif // GGML_USE_HIP
 
