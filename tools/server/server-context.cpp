@@ -3213,7 +3213,7 @@ private:
             }
 
             if (has_checkpoint_restored_prompt) {
-                continue;
+                return;
             }
 
             // check if we can batch this slot with the previous one
@@ -3654,7 +3654,7 @@ private:
                     } // end of SLOT_STATE_STARTED
 
                     if (slot.prompt_checkpoint_restored && n_tokens_prev > 0) {
-                        continue;
+                        return;
                     }
 
                     if (!slot.can_split()) {
@@ -3726,16 +3726,10 @@ private:
                             continue;
                         }
 
-                        if (ctx_dft && llama_get_ctx_other(ctx_dft.get()) != ctx_tgt) {
-                            // TODO: in the future, figure out how to infuse target embeddings to the images
-                            //       for now, we skip this for simplicity
-                            //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
-                            //       [TAG_MTMD_DRAFT_PROCESSING]
-                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
-                            if (res != 0) {
-                                GGML_ABORT("failed to process multi-modal data on draft context\n");
-                            }
-                        }
+                        // note: draft-context image feeding (ctx_dft) is now handled inside
+                        // process_mtmd_chunk()'s decode callback via common_speculative_process()
+                        // (see process_mtmd_chunk above) [TAG_MTMD_DRAFT_PROCESSING] — the old
+                        // server_tokens::process_chunk() this used to call was removed upstream.
 
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
@@ -3868,7 +3862,18 @@ private:
                     }
 
                     if (slot.prompt_checkpoint_restored || (!slot.prompt.checkpoints.empty() && near_prompt_end)) {
-                        break;
+                        // originally `break`'d the whole per-slot batching loop (stop giving any
+                        // later slot batch room this round, not just this one); iterate() has no
+                        // early-exit, so replicate it via the same add_ok kill-switch used above.
+                        // This slot's tokens are already in the batch, so it must still claim
+                        // slot_batched — upstream now asserts (slot_batched || batch empty)
+                        // before decode (the pre-merge fork had no such assert, so its `break`
+                        // skipping the assignment was benign).
+                        if (!slot_batched) {
+                            slot_batched = &slot;
+                        }
+                        add_ok = false;
+                        return;
                     }
                 }
 

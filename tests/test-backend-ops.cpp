@@ -2463,7 +2463,7 @@ struct test_set_rows : public test_case {
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
-        if (type == GGML_TYPE_TQ4_1S) {
+        if (type_dst == GGML_TYPE_TQ4_1S) {
             // Reduction order matters; TQ4_1S has 32-element WHT inside the
             // dot product which amplifies fp reduction differences slightly.
             return 0.01;
@@ -9127,6 +9127,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
             }
         }
+    }
+
+    // TQ3_1S: large-batch MUL_MAT, mirrors the TQ4_1S block above. This is the shape
+    // that caught the mul_mm tensor-geometry dispatch bug: the rotated mul_mm kernel
+    // over-dispatched grid.x under the Metal tensor-API mul_mm kernel and wrote past dst.
+    for (int k : { 1536, 2048 }) {
+        for (int m : { 256, 2048 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, m, 256, k, {1, 1}, {1, 1}));
+        }
+    }
+
+    // TQ3_1S: DeepSeek-V4 MLA head_dim=512 batched-prefill shape.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 128, 512, 512, {1, 1}, {1, 1}));
+
+    // TQ3_1S / TQ4_1S: non-contiguous src1 (k_v > k view) with batched n, to exercise
+    // the rotate-act contiguity fallback. rotate-act walks src1 as a flat array so it
+    // requires contiguous src1; non-contiguous must fall back to the standard mul_mm
+    // path (inverse-RHT dequant), which handles strides via nb1x.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 256, 256, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1600));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 256, 256, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1600));
+
+    // TQ3_1S: small-batch (n<=8) FUSED multi-token kernel path (mul_mat_tq3_1s_multi /
+    // ggml_cuda_mul_mat_tq on CUDA). This is DeepSeek-V4-Flash's real attn_q_a shape
+    // (n_embd=4096 -> q_lora_rank=1024) at an 8-token prefill batch, contiguous src1 —
+    // exactly the case found to diverge (~2% on real weights) via eval-callback node
+    // diffing against the CPU reference. A second case mirrors hc_attn_fn's shape
+    // (k=16384, m=24) as a control that was observed numerically fine.
+    for (int nb : { 1, 2, 4, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 1024, nb, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 24, nb, 16384, {1, 1}, {1, 1}));
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));

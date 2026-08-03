@@ -100,12 +100,27 @@ __device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, int &c0, int
 }
 
 // ============================================================================
-// Pre-rotate activation to half (for TQ3_1S scalar path)
+// Pre-rotate activation to float (for TQ3_1S scalar path)
 // ============================================================================
 
+// NOTE: dst is float, not half. The rotated activation for a given input
+// element is REUSED against every one of the (up to 1024+) output rows in
+// mul_mat_tq3_1s_multi/mul_mat_tq4_1s_scalar_multi below, so a per-element
+// fp16 rounding error here is not independent per-row noise that averages
+// out — it's a fixed bias replayed into every row's dot product. For real
+// (non-uniform, elementwise-scaled) model activations — e.g. DeepSeek-V4's
+// attn_norm output, which is RMSNorm * a learned per-channel weight with
+// large dynamic range — this compounded into ~2% per-layer error at
+// blk.0.attn_q_a (verified via eval-callback node diffing against the CPU
+// reference: qr-0 sum -0.771243 true weights) but was invisible on
+// synthetic/uniform test-backend-ops data, and accumulated across 61 layers
+// into token-soup garbage output. Keeping the rotated activation in float
+// (the WHT butterfly itself was always computed in float registers; only
+// the final store truncated to half) removes this without touching the
+// weight-side quantization or the WHT math itself.
 static __global__ void tq_prerotate_activation(
         const float * __restrict__ src,
-        half        * __restrict__ dst,
+        float       * __restrict__ dst,
         const int n_elements) {
 
     const int block_idx = blockIdx.x * blockDim.y + threadIdx.y;
@@ -122,7 +137,7 @@ static __global__ void tq_prerotate_activation(
         val = (lane & h) ? (o - val) : (val + o);
     }
     val *= 0.17677669529663688f;
-    dst[offset] = __float2half(val);
+    dst[offset] = val;
 }
 
 static __device__ __forceinline__ uint8_t tq3_extract_index(const uint8_t * __restrict__ qs, int lane) {
@@ -213,7 +228,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multi(
 template <int ncols_dst>
 static __global__ void mul_mat_tq3_1s_multi(
         const void  * __restrict__ vx,
-        const half  * __restrict__ vy_rot,
+        const float * __restrict__ vy_rot,
         float       * __restrict__ dst,
         const int ncols_x,
         const int nrows_x,
@@ -242,7 +257,7 @@ static __global__ void mul_mat_tq3_1s_multi(
 
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++) {
-            const float act = __half2float(vy_rot[j * stride_col_y + ib * QK_TQ3_0 + lane]);
+            const float act = vy_rot[j * stride_col_y + ib * QK_TQ3_0 + lane];
             sumf[j] += act * w;
         }
     }
@@ -262,15 +277,15 @@ static __global__ void mul_mat_tq3_1s_multi(
 }
 
 // ============================================================================
-// TQ4_1S scalar/half kernel (AMD fallback — no dp4a)
-// Same pattern as TQ3_1S: pre-rotated half activations, scalar centroid lookup.
+// TQ4_1S scalar/float kernel (AMD fallback — no dp4a)
+// Same pattern as TQ3_1S: pre-rotated float activations, scalar centroid lookup.
 // On RDNA4, sudot4 throughput differs from NVIDIA dp4a — this path is faster.
 // ============================================================================
 
 template <int ncols_dst>
 static __global__ void mul_mat_tq4_1s_scalar_multi(
         const void  * __restrict__ vx,
-        const half  * __restrict__ vy_rot,
+        const float * __restrict__ vy_rot,
         float       * __restrict__ dst,
         const int ncols_x,
         const int nrows_x,
@@ -299,7 +314,7 @@ static __global__ void mul_mat_tq4_1s_scalar_multi(
 
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++) {
-            const float act = __half2float(vy_rot[j * stride_col_y + ib * QK_TQ4_1S + lane]);
+            const float act = vy_rot[j * stride_col_y + ib * QK_TQ4_1S + lane];
             sumf[j] += act * w;
         }
     }
@@ -337,7 +352,7 @@ static void launch_tq4_1s_multi(
 
 template <int ncols_dst>
 static void launch_tq4_1s_scalar_multi(
-        const void * src0_d, const half * act_buf,
+        const void * src0_d, const float * act_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
@@ -348,7 +363,7 @@ static void launch_tq4_1s_scalar_multi(
 
 template <int ncols_dst>
 static void launch_tq3_1s_multi(
-        const void * src0_d, const half * act_buf,
+        const void * src0_d, const float * act_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
@@ -408,8 +423,9 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
             case 8: launch_tq4_1s_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
         }
     } else {
-        // Scalar half path: TQ3_1S (all vendors) + TQ4_1S on AMD (dp4a regresses on RDNA4)
-        ggml_cuda_pool_alloc<half> act_buf(ctx.pool(id), n_total_elements);
+        // Scalar float path: TQ3_1S (all vendors) + TQ4_1S on AMD (dp4a regresses on RDNA4).
+        // float, not half: see the comment on tq_prerotate_activation for why.
+        ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_total_elements);
 
         {
             const int n_total_blocks = n_total_elements / 32;
@@ -419,7 +435,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
             tq_prerotate_activation<<<grid, block, 0, stream>>>(src1_d, act_buf.get(), n_total_elements);
         }
 
-        const int stride_col_y   = ncols_x;  // half elements per column
+        const int stride_col_y   = ncols_x;  // float elements per column
         const int stride_col_dst = nrows_x;
         const bool is_tq4 = (src0->type == GGML_TYPE_TQ4_1S);
 
@@ -443,7 +459,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
             // Large prefill: batch in groups of 8
             for (int j = 0; j < ncols_dst; j += 8) {
                 const int batch = min(8, ncols_dst - j);
-                const half * act_j = act_buf.get() + j * ncols_x;
+                const float * act_j = act_buf.get() + j * ncols_x;
                 float * dst_j = dst_d + j * nrows_x;
                 switch (batch) {
                     case 1: LAUNCH_SCALAR(1, src0_d, act_j, dst_j); break;

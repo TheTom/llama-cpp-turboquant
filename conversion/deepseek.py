@@ -619,12 +619,15 @@ class DeepseekV4Model(TextModel):
         vals = torch.stack((low, high), dim=-1).reshape(out_features, n_blocks, 32)
         qs = vals[:, :, :16] | (vals[:, :, 16:] << 4)
         raw = torch.cat((scale_u8.unsqueeze(-1), qs.to(torch.uint8)), dim=-1)
-        return raw.reshape(out_features, n_blocks * 17).cpu().numpy()
+        # Stay in torch (and therefore lazy when inputs are LazyTorchTensor):
+        # eagerizing here retains every packed expert tensor in RAM until the
+        # final write pass (~129 x ~1.1 GB on DeepSeek-V4-Flash = OOM).
+        return raw.reshape(out_features, n_blocks * 17)
 
     def _write_mxfp4_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
         n_experts = self.hparams["n_routed_experts"]
-        data: np.ndarray | None = None
         consumed: list[str] = []
+        parts: list[Tensor] = []
 
         for eid in range(n_experts):
             weight_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.weight"
@@ -632,15 +635,17 @@ class DeepseekV4Model(TextModel):
             if weight_name not in self.model_tensors or scale_name not in self.model_tensors:
                 raise KeyError(f"Missing routed expert tensors for {weight_name}")
 
-            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
-            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
-            packed = self._pack_mxfp4_blocks(weight, scale)
-            if data is None:
-                data = np.empty((n_experts, *packed.shape), dtype=packed.dtype)
-            data[eid] = packed
+            # Keep tensors LAZY: the pack pipeline is pure torch ops, so the
+            # whole per-layer expert stack materializes only inside the
+            # writer's per-tensor write (then frees), instead of all layers
+            # accumulating eagerly (OOM on 284B models).
+            weight = self.model_tensors[weight_name]()
+            scale = self.model_tensors[scale_name]()
+            parts.append(self._pack_mxfp4_blocks(weight, scale))
             consumed.extend((weight_name, scale_name))
 
-        assert data is not None
+        data_torch = torch.stack(parts)
+        data = data_torch.numpy() if isinstance(data_torch, LazyTorchTensor) else data_torch.cpu().numpy()
         new_name = self.format_tensor_name(tensor_key, bid)
         shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
         logger.info(f"{new_name}: repacked routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
