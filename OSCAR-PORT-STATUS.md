@@ -171,8 +171,26 @@ OSCAR two-tier KV: quantized LP + F16 HP sink/recent in one fused FA kernel.
   CUDA-only); HP is effectively a CUDA-backend feature.
 - ALiBi: HP mask now carries -|p0-p1| for kept cells (matches LP mask), so the
   kernel's slope multiply is correct.
+- HP KQ mask mirrors the LP mask's SWA window: `is_masked_swa` is applied to HP
+  cells too (Gemma-4 swa sub-cache), so out-of-window HP cells are -inf.
 - `ggml_flash_attn_ext_mixed` asserts the LP tier is OSCAR2 (other kernels ignore
   the HP sources).
+
+**Validated (2026-08-02, RTX 5090):** Qwen3.6-27B UD + Hadamard and Gemma-4-12B
+UD + Hadamard, all with `--cache-type-k oscar2 --cache-type-v oscar2` + HP
+(sink=64 recent=256): capital, count and factorial prompts all coherent.
+Two root-cause fixes landed:
+1. Memory-hybrid graph inputs (Qwen3.6 = QWEN35 hybrid) never filled the HP
+   index tensors - `llm_graph_input_mem_hybrid{,_iswa}::set_input` lacked
+   `set_input_hp_k_idxs`/`set_input_hp_batch_idxs`/`set_input_hp_kq_mask`, so
+   the HP store's `get_rows` read uninitialized memory (crash). Now filled,
+   with matching `can_reuse` size checks.
+2. FA kernel used the fastdiv **multiplier** (`ne01.x`) instead of the divisor
+   (`ne01.z`) for the query count in all bounds guards and dst indexing. Guards
+   never fired and dst stride was garbage. Qwen survived only via graph Q
+   padding; Gemma (n_pad=1) showed it as a spurious first-token ("MINE").
+   Fixed to `n_queries = ne01.z`; out-of-range Q columns are zeroed.
+3. HP tier now rescales `VKQ_mean` on online-softmax max shift (matches LP tier).
 
 ### 5. SWA + OSCAR2 Compatibility
 
