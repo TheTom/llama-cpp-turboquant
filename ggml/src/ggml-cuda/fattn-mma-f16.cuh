@@ -582,6 +582,11 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
     }
 }
 
+// Lloyd-Max levels for oscar2 INT2 (match OSCAR2_LM_CENTROIDS in ggml-common.h).
+// Dequant MUST use these levels: val = LEVELS[code] * d (+ m). Using the raw
+// 2-bit code (0..3) as the value would over-scale code 3 by 3.06x and corrupt attention.
+static __device__ const float OSCAR2_CENT_FATTN[4] = {-1.510257f, -0.452734f, 0.452734f, 1.510257f};
+
 // Inverse Hadamard butterfly stage for oscar2 128-element blocks (64 half2).
 // Template param h_h2 = half2-pair distance at this stage: 32, 16, 8, 4, 2.
 // Each stage pairs buf[j] with buf[j+h_h2]. Compile-time constants enable full unrolling.
@@ -640,13 +645,14 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile(
                 const int c = b * 2;
                 // Centered dequant: centroid * sigma (no mean). The set_rows kernel stores
                 // H(val - mean) / sqrt(128). The inverse Hadamard below restores centered
-                // values. Mean is accumulated/preserved only in the scalar FA kernel's V path.
+                // values. Mean is added back only when restore_mean is set (V path, and K
+                // path with restore_mean so the KQ dot sees the exact rotated K).
                 local_buf[c]     = __halves2half2(
-                    __float2half((float)(qs & 0x3)         * d_f),
-                    __float2half((float)((qs >> 2) & 0x3)  * d_f));
+                    __float2half(OSCAR2_CENT_FATTN[qs & 0x3]         * d_f),
+                    __float2half(OSCAR2_CENT_FATTN[(qs >> 2) & 0x3]  * d_f));
                 local_buf[c + 1] = __halves2half2(
-                    __float2half((float)((qs >> 4) & 0x3)  * d_f),
-                    __float2half((float)(qs >> 6)          * d_f));
+                    __float2half(OSCAR2_CENT_FATTN[(qs >> 4) & 0x3]  * d_f),
+                    __float2half(OSCAR2_CENT_FATTN[(qs >> 6) & 0x3]  * d_f));
             }
             // Pad remainder with zeros if partial block
             #pragma unroll
@@ -755,8 +761,8 @@ static __device__ __forceinline__ void flash_attn_ext_oscar2_load_tile_cp_async(
                 const int     shift  = (j0 % 4) * 2;
                 const uint8_t code0 = (qs_byte >> shift) & 0x3;
                 const uint8_t code1 = (qs_byte >> (shift + 2)) & 0x3;
-                const half lo = __float2half((float)code0 * d_f);
-                const half hi = __float2half((float)code1 * d_f);
+                const half lo = __float2half(OSCAR2_CENT_FATTN[code0] * d_f);
+                const half hi = __float2half(OSCAR2_CENT_FATTN[code1] * d_f);
                 local_buf[c] = __halves2half2(lo, hi);
             }
             // Pad remainder with zeros if partial block
@@ -1023,7 +1029,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo2_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else {
-                flash_attn_ext_oscar2_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
+                // restore_mean=true for K: the stored value is H(K_rot - mean)/sqrt(128);
+                // after the inverse Hadamard below we have K_rot - mean. Adding the mean
+                // back yields the exact rotated K, so the KQ tile equals Q.K_rot with no
+                // per-block mean correction needed (mirrors B21 in the scalar kernel).
+                flash_attn_ext_oscar2_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check, true>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             }
             __syncthreads();

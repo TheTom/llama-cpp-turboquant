@@ -2074,6 +2074,10 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // OSCAR HP (F16 sink+recent) buffer requires flash attention; the oscar2 type
+    // check happens inside the llama_kv_cache alloc.
+    const bool hp_enabled = cparams.flash_attn;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2130,13 +2134,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
-                            1,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            nullptr,
-                            filter,
-                            nullptr,
-                            nullptr);
+                            1,                                hparams.n_swa,
+                                hparams.swa_type,
+                                nullptr,
+                                filter,
+                                nullptr,
+                                nullptr,
+                                hp_enabled);
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -2233,6 +2237,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
+                            /* hp_enabled        */ hp_enabled,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2252,6 +2257,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
+                            /* hp_enabled        */ hp_enabled,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2341,7 +2347,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    hp_enabled);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2358,7 +2365,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    hp_enabled);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2379,7 +2387,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                hp_enabled);
                     }
                 }
             }

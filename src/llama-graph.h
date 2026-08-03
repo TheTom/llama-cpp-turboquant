@@ -346,6 +346,12 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // OSCAR HP (F16 sink+recent) inputs - only valid when the kv cache has HP
+    ggml_tensor * hp_k_idxs     = nullptr; // I64 [n_hp_batch]: global HP slot indices to write
+    ggml_tensor * hp_batch_idxs = nullptr; // I32 [n_hp_batch]: which rows in k_cur are HP tokens
+    ggml_tensor * hp_kq_mask    = nullptr; // F32 [n_hp_total, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * hp_kq_mask_cnv = nullptr; //     [n_hp_total, n_batch/n_stream, 1, n_stream]
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -465,6 +471,16 @@ public:
 
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
+
+    // OSCAR HP (F16 sink+recent) inputs - per sub-cache (full + SWA)
+    ggml_tensor * hp_k_idxs          = nullptr; // I64 [n_hp_batch]: global HP slot indices to write
+    ggml_tensor * hp_batch_idxs      = nullptr; // I32 [n_hp_batch]: which rows in k_cur are HP tokens
+    ggml_tensor * hp_kq_mask         = nullptr; // F32 [n_hp_total, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * hp_kq_mask_cnv     = nullptr; //     [n_hp_total, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * hp_k_idxs_swa      = nullptr;
+    ggml_tensor * hp_batch_idxs_swa  = nullptr;
+    ggml_tensor * hp_kq_mask_swa     = nullptr;
+    ggml_tensor * hp_kq_mask_swa_cnv = nullptr;
 
     const llama_hparams hparams;
     const llama_cparams cparams;

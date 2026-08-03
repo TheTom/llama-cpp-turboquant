@@ -477,20 +477,14 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
 }
 // Bit-reversal permutation P_br for OSCAR2 (OSCAR paper: R.H.P_br).
 // Enabled by default via LLAMA_KV_OSCAR2_PBR=1.
-// Interleaves high-variance and low-variance channels across quant groups.
-static int oscar2_pbr_enabled(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char * e = getenv("LLAMA_KV_OSCAR2_PBR");
-        v = e ? atoi(e) : 1; // enabled by default
-    }
-    return v;
-}
+// OSCAR2 store pipeline (matches set_rows_cuda_oscar2 bit-for-bit): subtract
+// mean -> forward normalized Hadamard (H/sqrt(128)) -> RMS scale -> Lloyd-Max
+// encode. The Hadamard domain is what the fused FA kernels consume, so CPU and
+// CUDA produce byte-identical blocks.
 
 void dequantize_row_oscar2(const block_oscar2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_OSCAR2 == 0);
     const int nb = k / QK_OSCAR2;
-    const int pbr = oscar2_pbr_enabled();
     float tmp[QK_OSCAR2];
     for (int ib = 0; ib < nb; ib++) {
         const float d = GGML_FP16_TO_FP32(x[ib].d);
@@ -499,16 +493,23 @@ void dequantize_row_oscar2(const block_oscar2 * GGML_RESTRICT x, float * GGML_RE
             const uint8_t packed = x[ib].qs[j];
             for (int b = 0; b < 4; b++) {
                 const int code = (packed >> (2 * b)) & 0x03;
-                tmp[j * 4 + b] = OSCAR2_LM_CENTROIDS[code] * d + m;
+                tmp[j * 4 + b] = OSCAR2_LM_CENTROIDS[code] * d;
             }
         }
-        if (pbr) {
-            // Apply P_br (self-inverse) to undo the bit-reversal permutation
+        // Inverse normalized Hadamard (self-inverse), then add the mean back
+        for (int h = 64; h > 0; h >>= 1) {
             for (int j = 0; j < QK_OSCAR2; j++) {
-                y[ib * QK_OSCAR2 + j] = tmp[P_BR_PERM[j]];
+                if (!(j & h)) {
+                    const float a = tmp[j];
+                    const float b = tmp[j + h];
+                    tmp[j]     = a + b;
+                    tmp[j + h] = a - b;
+                }
             }
-        } else {
-            memcpy(y + ib * QK_OSCAR2, tmp, QK_OSCAR2 * sizeof(float));
+        }
+        const float s = 1.0f / sqrtf((float) QK_OSCAR2);
+        for (int j = 0; j < QK_OSCAR2; j++) {
+            y[ib * QK_OSCAR2 + j] = tmp[j] * s + m;
         }
     }
 }
@@ -516,42 +517,48 @@ void dequantize_row_oscar2(const block_oscar2 * GGML_RESTRICT x, float * GGML_RE
 void quantize_row_oscar2_ref(const float * GGML_RESTRICT x, block_oscar2 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_OSCAR2 == 0);
     const int nb = k / QK_OSCAR2;
-    const int pbr = oscar2_pbr_enabled();
-    float perm[QK_OSCAR2];
     for (int ib = 0; ib < nb; ib++) {
         const float * vec = x + ib * QK_OSCAR2;
-        const float * vin;
-        if (pbr) {
-            // Apply P_br (self-inverse) to the input before quantization
-            for (int j = 0; j < QK_OSCAR2; j++) perm[P_BR_PERM[j]] = vec[j];
-            vin = perm;
-        } else {
-            vin = vec;
-        }
-        // Compute mean and sigma (standard deviation)
+        // Mean over the 128-wide group
         float mean = 0.0f;
-        for (int j = 0; j < QK_OSCAR2; j++) mean += vin[j];
+        for (int j = 0; j < QK_OSCAR2; j++) mean += vec[j];
         mean /= QK_OSCAR2;
-        float sum_sq = 0.0f;
-        for (int j = 0; j < QK_OSCAR2; j++) {
-            float d = vin[j] - mean;
-            sum_sq += d * d;
+        // Forward normalized Hadamard of (vec - mean); same as set_rows_cuda_oscar2
+        float had[QK_OSCAR2];
+        for (int j = 0; j < QK_OSCAR2; j++) had[j] = vec[j] - mean;
+        for (int h = 1; h < QK_OSCAR2; h <<= 1) {
+            for (int j = 0; j < QK_OSCAR2; j++) {
+                if (!(j & h)) {
+                    const float a = had[j];
+                    const float b = had[j + h];
+                    had[j]     = a + b;
+                    had[j + h] = a - b;
+                }
+            }
         }
-        const float sigma = sqrtf(sum_sq / QK_OSCAR2);
-        const float inv_sigma = (sigma > 1e-8f) ? 1.0f / sigma : 0.0f;
-        y[ib].d = GGML_FP32_TO_FP16(sigma);
+        const float s_had = 1.0f / sqrtf((float) QK_OSCAR2);
+        for (int j = 0; j < QK_OSCAR2; j++) had[j] *= s_had;
+        // RMS of the centered Hadamard values == std-dev of the group
+        float sum = 0.0f, sum_sq = 0.0f;
+        for (int j = 0; j < QK_OSCAR2; j++) {
+            sum    += had[j];
+            sum_sq += had[j] * had[j];
+        }
+        const float rms_val = sqrtf(fmaxf(0.0f, sum_sq / QK_OSCAR2 - (sum / QK_OSCAR2) * (sum / QK_OSCAR2)));
+        const float d_val   = fmaxf(rms_val, 1e-10f);
+        const float inv_d   = 1.0f / d_val;
+        y[ib].d = GGML_FP32_TO_FP16(d_val);
         y[ib].m = GGML_FP32_TO_FP16(mean);
+        // Lloyd-Max encode: decision boundaries are midpoints of the levels
         for (int j = 0; j < QK_OSCAR2 / 4; j++) {
             uint8_t packed = 0;
             for (int b = 0; b < 4; b++) {
-                float val_norm = (vin[j * 4 + b] - mean) * inv_sigma;
-                // Find nearest Lloyd-Max centroid
-                int code = 0;
-                float best = fabsf(val_norm - OSCAR2_LM_CENTROIDS[0]);
-                for (int c = 1; c < 4; c++) {
-                    float err = fabsf(val_norm - OSCAR2_LM_CENTROIDS[c]);
-                    if (err < best) { code = c; best = err; }
-                }
+                const float vs = had[j * 4 + b] * inv_d;
+                int code;
+                if      (vs < -0.9814955f) code = 0;
+                else if (vs <  0.0f)       code = 1;
+                else if (vs <  0.9814955f) code = 2;
+                else                       code = 3;
                 packed |= (uint8_t)(code << (2 * b));
             }
             y[ib].qs[j] = packed;

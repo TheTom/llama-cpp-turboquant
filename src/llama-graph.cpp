@@ -534,6 +534,16 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (hp_k_idxs && hp_k_idxs->buffer) {
+        mctx->set_input_hp_k_idxs(hp_k_idxs, ubatch);
+    }
+    if (hp_batch_idxs && hp_batch_idxs->buffer) {
+        mctx->set_input_hp_batch_idxs(hp_batch_idxs, ubatch);
+    }
+    if (hp_kq_mask && hp_kq_mask->buffer) {
+        mctx->set_input_hp_kq_mask(hp_kq_mask, ubatch, cparams.causal_attn);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -547,6 +557,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    if (hp_k_idxs && hp_k_idxs->buffer) {
+        res &= hp_k_idxs->ne[0] == mctx->get_n_hp_batch();
+    }
+    if (hp_kq_mask && hp_kq_mask->buffer) {
+        res &= can_reuse_kq_mask(hp_kq_mask, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -939,6 +956,27 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot_swa && self_v_rot_swa->buffer) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
+
+    // HP inputs (base + swa sub-caches)
+    if (hp_k_idxs && hp_k_idxs->buffer) {
+        mctx->get_base()->set_input_hp_k_idxs(hp_k_idxs, ubatch);
+        if (hp_batch_idxs) {
+            mctx->get_base()->set_input_hp_batch_idxs(hp_batch_idxs, ubatch);
+        }
+    }
+    if (hp_kq_mask && hp_kq_mask->buffer) {
+        mctx->get_base()->set_input_hp_kq_mask(hp_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (hp_k_idxs_swa && hp_k_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_hp_k_idxs(hp_k_idxs_swa, ubatch);
+        if (hp_batch_idxs_swa) {
+            mctx->get_swa()->set_input_hp_batch_idxs(hp_batch_idxs_swa, ubatch);
+        }
+    }
+    if (hp_kq_mask_swa && hp_kq_mask_swa->buffer) {
+        mctx->get_swa()->set_input_hp_kq_mask(hp_kq_mask_swa, ubatch, cparams.causal_attn);
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -966,6 +1004,19 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+    }
+
+    if (hp_k_idxs && hp_k_idxs->buffer) {
+        res &= hp_k_idxs->ne[0] == mctx->get_base()->get_n_hp_batch();
+    }
+    if (hp_kq_mask && hp_kq_mask->buffer) {
+        res &= can_reuse_kq_mask(hp_kq_mask, mctx->get_base(), params.ubatch, params.cparams);
+    }
+    if (hp_k_idxs_swa && hp_k_idxs_swa->buffer) {
+        res &= hp_k_idxs_swa->ne[0] == mctx->get_swa()->get_n_hp_batch();
+    }
+    if (hp_kq_mask_swa && hp_kq_mask_swa->buffer) {
+        res &= can_reuse_kq_mask(hp_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
 
     return res;
@@ -2707,6 +2758,16 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
+    // OSCAR HP (F16 sink+recent) inputs - only with flash attention
+    if (mctx_cur->has_hp() && cparams.flash_attn) {
+        inp->hp_k_idxs     = mctx_cur->build_input_hp_k_idxs(ctx0);
+        inp->hp_batch_idxs = mctx_cur->build_input_hp_batch_idxs(ctx0);
+        inp->hp_kq_mask    = mctx_cur->build_input_hp_kq_mask(ctx0, ubatch);
+        if (inp->hp_kq_mask) {
+            inp->hp_kq_mask_cnv = ggml_cast(ctx0, inp->hp_kq_mask, GGML_TYPE_F16);
+        }
+    }
+
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
@@ -2763,6 +2824,12 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    // store to HP KV cache (sink+recent tokens only)
+    if (mctx_cur->has_hp() && inp->hp_batch_idxs) {
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k_hp(ctx0, k_cur, inp->hp_batch_idxs, inp->hp_k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v_hp(ctx0, v_cur, inp->hp_batch_idxs, inp->hp_k_idxs, il));
+    }
+
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
@@ -2783,7 +2850,35 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur;
+    if (mctx_cur->has_hp() && inp->hp_kq_mask) {
+        // OSCAR two-tier fused FA: quantized LP + F16 HP (sink+recent) in one online
+        // softmax. HP K/V are stored in the Hadamard domain (see cpy_k_hp/cpy_v_hp),
+        // matching the oscar2 kernel's Q transform, so the HP tier is exact.
+        ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
+        ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
+
+        const int64_t n_stream = k->ne[3];
+
+        ggml_tensor * q_perm = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+
+        ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
+        ggml_tensor * v_lp_p = ggml_permute(ctx0, v,    0, 2, 1, 3);
+        ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+        ggml_tensor * v_hp_p = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+
+        cur = ggml_flash_attn_ext_mixed(ctx0, q_perm, k_lp_p, v_lp_p, kq_mask,
+                                        k_hp_p, v_hp_p, inp->hp_kq_mask_cnv,
+                                        kq_scale, hparams.f_max_alibi_bias,
+                                        hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.
@@ -3092,6 +3187,16 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    // store to HP KV cache (sink+recent tokens only), per sub-cache
+    {
+        ggml_tensor * hp_batch_idxs = is_swa ? inp->hp_batch_idxs_swa : inp->hp_batch_idxs;
+        ggml_tensor * hp_k_idxs     = is_swa ? inp->hp_k_idxs_swa     : inp->hp_k_idxs;
+        if (mctx_cur->has_hp() && hp_batch_idxs && k_cur && v_cur) {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k_hp(ctx0, k_cur, hp_batch_idxs, hp_k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v_hp(ctx0, v_cur, hp_batch_idxs, hp_k_idxs, il));
+        }
+    }
+
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
@@ -3112,7 +3217,33 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur;
 
-    cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * hp_kq_mask_cnv = is_swa ? inp->hp_kq_mask_swa_cnv : inp->hp_kq_mask_cnv;
+    if (mctx_cur->has_hp() && hp_kq_mask_cnv) {
+        // OSCAR two-tier fused FA for the selected sub-cache (full or SWA)
+        ggml_tensor * k_hp = mctx_cur->get_k_hp(ctx0, il);
+        ggml_tensor * v_hp = mctx_cur->get_v_hp(ctx0, il);
+
+        const int64_t n_stream = k->ne[3];
+
+        ggml_tensor * q_perm = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                                            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+
+        ggml_tensor * k_lp_p = ggml_permute(ctx0, k,    0, 2, 1, 3);
+        ggml_tensor * v_lp_p = ggml_permute(ctx0, v,    0, 2, 1, 3);
+        ggml_tensor * k_hp_p = ggml_permute(ctx0, k_hp, 0, 2, 1, 3);
+        ggml_tensor * v_hp_p = ggml_permute(ctx0, v_hp, 0, 2, 1, 3);
+
+        cur = ggml_flash_attn_ext_mixed(ctx0, q_perm, k_lp_p, v_lp_p, kq_mask,
+                                        k_hp_p, v_hp_p, hp_kq_mask_cnv,
+                                        kq_scale, hparams.f_max_alibi_bias,
+                                        hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
 
     cb(cur, "kqv_out", il);
 
@@ -3267,6 +3398,25 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
+    }
+
+    // OSCAR HP (F16 sink+recent) inputs - per sub-cache, only with flash attention
+    if (mctx_cur->get_base()->has_hp() && cparams.flash_attn) {
+        inp->hp_k_idxs     = mctx_cur->get_base()->build_input_hp_k_idxs(ctx0);
+        inp->hp_batch_idxs = mctx_cur->get_base()->build_input_hp_batch_idxs(ctx0);
+        inp->hp_kq_mask    = mctx_cur->get_base()->build_input_hp_kq_mask(ctx0, ubatch);
+        if (inp->hp_kq_mask) {
+            inp->hp_kq_mask_cnv = ggml_cast(ctx0, inp->hp_kq_mask, GGML_TYPE_F16);
+        }
+    }
+
+    if (mctx_cur->get_swa()->has_hp() && cparams.flash_attn) {
+        inp->hp_k_idxs_swa     = mctx_cur->get_swa()->build_input_hp_k_idxs(ctx0);
+        inp->hp_batch_idxs_swa = mctx_cur->get_swa()->build_input_hp_batch_idxs(ctx0);
+        inp->hp_kq_mask_swa    = mctx_cur->get_swa()->build_input_hp_kq_mask(ctx0, ubatch);
+        if (inp->hp_kq_mask_swa) {
+            inp->hp_kq_mask_swa_cnv = ggml_cast(ctx0, inp->hp_kq_mask_swa, GGML_TYPE_F16);
+        }
     }
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);

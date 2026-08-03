@@ -18,6 +18,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                     bool   hp_enabled,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -49,7 +50,8 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        hp_enabled
     )),
     mem_recr(new llama_memory_recurrent(
         model,

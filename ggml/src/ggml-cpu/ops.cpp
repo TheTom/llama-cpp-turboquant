@@ -9226,6 +9226,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // OSCAR two-tier (LP + HP) attention is CUDA-only; the HP f16 tier is
+    // handled inside the dedicated oscar2 FA kernel.
+    if (dst->src[5] != nullptr) {
+        GGML_ABORT("flash_attn_ext_mixed (OSCAR HP tier) is not supported on CPU");
+    }
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

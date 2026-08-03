@@ -40,14 +40,21 @@ OSCAR differs from the existing q2_0 KV cache type:
 | CUDA store kernel (set_rows) | Complete, verified correct | Jul 2026 |
 | CUDA decode (dedicated FA kernel) | **B21 fixed — works for short/medium generations** | Jul 27, 2026 |
 | CUDA decode (VEC path) | **Disabled** (fundamental Hadamard domain mismatch) | Jul 27, 2026 |
-| CUDA decode (MMA turbo path) | Implemented but gated off (V mean reconstruction) | Jul 2026 |
+| CUDA decode (MMA turbo path) | Gated off (stale comment); **centroid + K-mean bugs FIXED** | Aug 2, 2026 |
 | Rotation fallback | FIXED (F17) — runtime Sylvester Hadamard generator | Jul 27, 2026 |
 | V rotation gating (Gemma4) | Fixed — unconditional when tensor present | Jul 27, 2026 |
 | q2_0 NO_HADAMARD auto-detect | Fixed — auto-set when rotation tensors detected | Jul 27, 2026 |
 | INT2-without-rotation warning | Added | Jul 27, 2026 |
+| **HP (F16 sink+recent) buffer** | **IMPLEMENTED** — two-tier fused FA (LP oscar2 + HP f16) | Aug 2, 2026 |
+| **Mixed FA op** | `ggml_flash_attn_ext_mixed` — HP tier in same online softmax | Aug 2, 2026 |
 
-**Remaining issue**: Instruction-style prompts produce blank/`///` output with oscar2.
-See [Verification Test Results](#verification-test-results-july-27-2026) for details.
+**Remaining issue (root-caused)**: Instruction-style prompts produce blank/`///` output
+with oscar2 because the port has **no HP sink+recent buffer**. The vLLM reference
+(`vllm#46774`) and the OSCAR author's llama.cpp port both proved that without
+sink=64/recent=256 high-precision windows, quantization is fine but **short-range
+dependencies degrade** (gsm8k strict-match -12 pts). The first generated tokens depend
+on the most recent prompt tokens, which were INT2-quantized. The HP buffer now
+addresses this. See [Verification Test Results](#verification-test-results-july-27-2026).
 
 ---
 
@@ -144,9 +151,28 @@ is the only correct path. All VEC oscar2 template instantiations have been **dis
 When a model lacks calibrated `attn_k_rot`/`attn_v_rot` tensors, a Hadamard-like fallback
 is generated at runtime via Sylvester construction. Supports any power-of-2 head dim >= 64.
 
-### 4. HP (High-Precision) Sink Buffer — NOT ADDRESSED
+### 4. HP (High-Precision) Sink+Recent Buffer — IMPLEMENTED (Aug 2, 2026)
 
-Not implemented for OSCAR2. Planned feature for long-context quality recovery.
+OSCAR two-tier KV: quantized LP + F16 HP sink/recent in one fused FA kernel.
+- Env: `LLAMA_KV_HP_SINK` (default 0), `LLAMA_KV_HP_RECENT` (default 0). Recommend
+  sink=64 recent=256 per the vLLM reference and the author's llama.cpp port.
+- HP K/V stored F16 in the **Hadamard domain** (forward normalized Hadamard, no mean
+  subtract, no quantization) via a dedicated set_rows kernel; the oscar2 FA kernel
+  attends them with zero error (Q is already transformed to the same domain).
+- LP mask excludes HP positions (no double counting); HP mask is -inf for empty slots.
+- iSWA (Gemma-4) gets per-sub-cache HP buffers (base + swa) - addresses the Gemma-4
+  "recent V in INT2 degenerates over long generation" failure (author's commit 7e1019bf0).
+- State save/load does NOT persist HP cells (same limitation as the author's port).
+- Cross-stream seq_cp resets the destination stream's HP cells (HP buffer is not
+  copied by sc_info); same-stream seq_cp shares HP cells via metadata. Copied
+  sequences lose HP coverage until they write tokens - safe degradation.
+- Requires flash attention and an oscar2 LP cache type; silently disables otherwise.
+  NOTE: on CPU-only builds the mixed op aborts (the Hadamard-domain math is
+  CUDA-only); HP is effectively a CUDA-backend feature.
+- ALiBi: HP mask now carries -|p0-p1| for kept cells (matches LP mask), so the
+  kernel's slope multiply is correct.
+- `ggml_flash_attn_ext_mixed` asserts the LP tier is OSCAR2 (other kernels ignore
+  the HP sources).
 
 ### 5. SWA + OSCAR2 Compatibility
 
@@ -181,20 +207,24 @@ produce blank output or `reasoning_content: "//////"` with oscar2 while working 
 with f16. The first generated token is wrong, suggesting a **prefill-phase value corruption**
 rather than decode accumulation.
 
-**Hypothesis**: The B21 mean correction `m_k * Q_had[0] * sqrt(128)` is mathematically
-correct (= `m_k * sum(Q_raw) * attn_scale`) but the fp16 precision of `m_k` (stored in
-`block_oscar2.m`) combined with float32 `Q_had` (which includes the attention scale factor)
-may introduce a systematic token bias for certain input distributions. The `///` pattern
-suggests the logits are biased toward a specific token ID.
-
-**Suggested investigation**: Apply the mean correction in Hadamard domain by transforming
-the mean vector through the same Hadamard transform as K/Q, rather than computing
-the DC-component correction separately.
+**Root cause (verified Aug 2, 2026)**: Not the fp16 mean precision - the correction
+error is ~1e-5 (math traced end-to-end). The failure is the **missing HP sink+recent
+buffer**: first generated tokens attend the most recent prompt tokens, which were
+INT2-quantized, degrading short-range dependencies. Confirmed by:
+- vLLM PR #46774: without sink=64/recent=256 BF16 windows, "the quantization itself
+  is fine but short-range dependencies degrade" (gsm8k -12 pts).
+- OSCAR author's llama.cpp port (zhongzhu/llamacpp on this machine): HP sink/recent
+  F16 buffer + two-tier fused attention; commit 7e1019bf0 fixed exactly the Gemma-4
+  iSWA "recent V in INT2 degenerates over long generation" failure.
 
 ### Gemma4 Issue (Separate)
 
 ALL quantized cache types (oscar2, q2_0, q8_0) fail on Gemma4 regardless of rotation
 method. f16 works. Pre-existing Gemma4-specific issue with ISWA cache split interaction.
+**Root cause (verified Aug 2, 2026)**: Gemma's interleaved sliding-window cache kept
+recent V in INT2 and degenerated over long generation. Fixed by the HP-recent window
+on the iSWA path (author's commit 7e1019bf0), now ported as per-sub-cache HP buffers
+(base + swa). Requires `LLAMA_KV_HP_SINK`/`LLAMA_KV_HP_RECENT` set.
 
 ---
 
@@ -308,6 +338,23 @@ the incorrect claim that it "doesn't affect softmax." The term `mean(K_block) * 
 varies per K token and per Q position. Fix: mean correction added for thread 0 which holds
 the DC component `Q_had[0]`. Matches V path's correct mean handling pattern.
 
+#### B22. MMA tile loader dequantizes with raw code instead of centroid (CRITICAL) — FIXED (Aug 2, 2026)
+`fattn-mma-f16.cuh` dequantized `code * d` instead of `CENTROIDS[code] * d` in both
+tile loaders. Would produce garbage if the MMA gate opened. Fixed to use the Lloyd-Max
+centroid table (matches the scalar kernel).
+
+#### B23. MMA K path drops per-block mean correction (CRITICAL) — FIXED (Aug 2, 2026)
+Same bug class as B21 in the MMA tile load: K mean (`block_oscar2.m`) not restored.
+Fixed with the same mean correction as the scalar path. The gate comment claiming the
+V-mean "can't be restored in the MMA tile load" is stale - `restore_mean=true` already
+exists; the gate stays closed pending validation, not correctness.
+
+#### B24. HP tier double-counted with parallel KV blocks (CRITICAL) — FIXED (Aug 2, 2026)
+The new HP f16 tier loop ran in every `blockIdx.y` partial block. With `nbatch_fa = D`,
+prefill with long KV splits the LP range across `gridDim.y > 1` blocks merged by
+`flash_attn_combine_results`; HP tokens would be counted `gridDim.y` times.
+Fix: HP tier processed only by `blockIdx.y == 0`.
+
 ### `ggml/src/ggml-cuda/fattn.cu` (OSCAR2 dispatch)
 
 #### B10. Variable after closing macro (MEDIUM) — FIXED
@@ -367,18 +414,37 @@ hardcoded `false` pending V-mean tile reconstruction.
 ## File Inventory
 
 ```
-ggml/include/ggml.h                          enum, count
+ggml/include/ggml.h                          enum, count; ggml_flash_attn_ext_mixed decl
 ggml/src/ggml-common.h                       block_oscar2 struct
-ggml/src/ggml.c                              type traits, quantize_chunk
+ggml/src/ggml.c                              type traits, quantize_chunk; mixed op
 ggml/src/ggml-quants.h                       declarations
 ggml/src/ggml-quants.c                       CPU ref quant/dequant
 common/arg.cpp                               CLI arg
-ggml/src/ggml-cuda/set-rows.cu               set_rows_cuda_oscar2 kernel
+ggml/src/ggml-cuda/set-rows.cu               set_rows_cuda_oscar2 kernel; HP f16 Hadamard store kernel
 ggml/src/ggml-cuda/ggml-cuda.cu              SET_ROWS support
 ggml/src/ggml-cuda/fattn-common.cuh          vec_dot/dequant + dispatch
 ggml/src/ggml-cuda/fattn-vec.cuh             nthreads routing
-ggml/src/ggml-cuda/fattn-oscar2.cuh          dedicated FA kernel
+ggml/src/ggml-cuda/fattn-oscar2.cuh          dedicated FA kernel + HP f16 tier
 ggml/src/ggml-cuda/fattn.cu                  dispatch, instantiations, routing
+ggml/src/ggml-cuda/fattn-mma-f16.cuh         MMA tile loaders (B22/B23 fixed)
+ggml/src/ggml-cpu/ops.cpp                    CPU FA abort on mixed op
+src/llama-kv-cache.h/.cpp                    HP buffer: env gate, tensors, cells, masks, cpy, state
+src/llama-kv-cache-iswa.h/.cpp               hp_enabled threading
+src/llama-memory-hybrid{,-iswa}.h/.cpp       hp_enabled threading
+src/llama-model.cpp                          create_memory hp_enabled wiring
+src/llama-graph.h/.cpp                       HP inputs, dual-write, mixed FA (kv + iswa)
+```
+
+## HP Feature Usage (Aug 2, 2026)
+
+```bash
+# Qwen3.6 / any oscar2 model
+./build/bin/llama-cli \
+    -m /mnt/storage/models/oscar-rotations/qwen3.6-27b-q5kxl-hadamard.gguf \
+    -ngl 99 -fa on -c 262144 \
+    --cache-type-k oscar2 --cache-type-v oscar2 \
+    --temp 0 -p "Count from 1 to 5:" -n 40
+LLAMA_KV_HP_SINK=64 LLAMA_KV_HP_RECENT=256 ./build/bin/llama-cli ...
 ```
 
 Generated July 27, 2026. Consolidated from `OSCAR2_BUGS.md`, `OSCAR2_PERF.md`,

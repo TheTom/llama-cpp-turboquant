@@ -5537,6 +5537,75 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// ggml_flash_attn_ext_mixed (OSCAR two-tier KV: quantized LP + F16 HP sink/recent)
+// Reuses GGML_OP_FLASH_ATTN_EXT; op_params[4] == 1 marks mixed mode.
+// src[5] = k_hp, src[6] = v_hp, src[7] = mask_hp (all optional, must be set together)
+
+struct ggml_tensor * ggml_flash_attn_ext_mixed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_lp,
+        struct ggml_tensor  * v_lp,
+        struct ggml_tensor  * mask_lp,
+        struct ggml_tensor  * k_hp,
+        struct ggml_tensor  * v_hp,
+        struct ggml_tensor  * mask_hp,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(ggml_can_mul_mat(k_lp, q));
+    GGML_ASSERT(ggml_can_mul_mat(k_hp, q));
+
+    // the mixed (two-tier) path is only supported by the oscar2 FA kernel - the
+    // TILE/VEC/MMA kernels ignore the HP sources, so reject other LP types here
+    GGML_ASSERT(k_lp->type == GGML_TYPE_OSCAR2 || v_lp->type == GGML_TYPE_OSCAR2);
+
+    GGML_ASSERT(q->ne[3] == k_lp->ne[3]);
+    GGML_ASSERT(q->ne[3] == v_lp->ne[3]);
+    GGML_ASSERT(q->ne[3] == k_hp->ne[3]);
+    GGML_ASSERT(q->ne[3] == v_hp->ne[3]);
+
+    // both tiers must share the value head dim and KV head count
+    GGML_ASSERT(v_lp->ne[0] == v_hp->ne[0]);
+    GGML_ASSERT(k_lp->ne[0] == k_hp->ne[0]);
+    GGML_ASSERT(k_lp->ne[2] == k_hp->ne[2]);
+
+    if (mask_lp) {
+        GGML_ASSERT(mask_lp->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask_lp));
+        GGML_ASSERT(q->ne[2] % mask_lp->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask_lp->ne[3] == 0);
+    }
+    if (mask_hp) {
+        GGML_ASSERT(mask_hp->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask_hp));
+    }
+
+    if (max_bias > 0.0f) {
+        GGML_ASSERT(mask_lp);
+    }
+
+    // permute(0, 2, 1, 3) - same output layout as ggml_flash_attn_ext
+    int64_t ne[4] = { v_lp->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, max_bias, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 4, 1); // mixed-mode flag (op_params[3] is reserved for prec)
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT;
+    result->src[0] = q;
+    result->src[1] = k_lp;
+    result->src[2] = v_lp;
+    result->src[3] = mask_lp;
+    result->src[4] = NULL;     // sinks - not used in mixed mode
+    result->src[5] = k_hp;
+    result->src[6] = v_hp;
+    result->src[7] = mask_hp;
+
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

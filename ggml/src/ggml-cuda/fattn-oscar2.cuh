@@ -1,7 +1,7 @@
 // OSCAR2 dedicated flash attention kernel
 // Per-128-vector (QK_OSCAR2 = 128) Lloyd-Max INT2 dequant:
-//   val = OSCAR2_LM_CENTROIDS[code] * sigma + mean
-// Centroids: {-0.9816, -0.4528, 0.4528, 0.9816} for N(0,1).
+//   val = inv-Hadamard(OSCAR2_LM_CENTROIDS[code] * sigma) + mean
+// Levels: {-1.510257, -0.452734, 0.452734, 1.510257} for N(0,1).
 // Includes inverse Hadamard transform to recover pre-quantization values.
 // block_oscar2 layout (ggml-common.h): qs[QK_OSCAR2 / 4] = 32 byte codes
 //                                      + 2 halves (sigma, mean) = 4 bytes
@@ -18,7 +18,7 @@
 // __device__ copies ensure the FA kernel can access them.
 // Note: P_br (bit-reversal permutation from the OSCAR paper) is CPU-only;
 // the GPU set_rows kernel does not apply it, so P_BR_DEV is not declared here.
-static __device__ const float OSCAR2_CENTROIDS_DEV[4] = {-0.9816f, -0.4528f, 0.4528f, 0.9816f};
+static __device__ const float OSCAR2_CENTROIDS_DEV[4] = {-1.510257f, -0.452734f, 0.452734f, 1.510257f};
 
 // ---------------------------------------------------------------------------
 // Single-threaded helpers (fallback for D < 128)
@@ -78,7 +78,16 @@ static __global__ void flash_attn_ext_oscar2(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        // HP tier (F16 sink+recent, stored in Hadamard domain) - null/0 when disabled
+        const char  * K_hp_ptr,
+        const char  * V_hp_ptr,
+        const char  * mask_hp_ptr,
+        const int32_t ne_hp11, const int32_t ne_hp12, const int32_t ne_hp13,
+                            const int32_t nb_hp11, const int32_t nb_hp12, const int64_t nb_hp13,
+                            const int32_t nb_vhp11, const int32_t nb_vhp12, const int64_t nb_vhp13,
+                            const int32_t ne_hp31, const int32_t ne_hp32, const int32_t ne_hp33,
+                            const int32_t nb_hp31, const int32_t nb_hp32, const int64_t nb_hp33) {
 
 #ifdef FLASH_ATTN_AVAILABLE
     // OPTIMIZED: use 1 warp (32 threads) instead of 4 warps (128 threads).
@@ -108,6 +117,12 @@ static __global__ void flash_attn_ext_oscar2(
     const half * maskh = mask_ptr ? (const half *)mask_ptr + (nb33/2)*(sequence % ne33) + (nb31/2)*ic0 + blockIdx.y * nthreads : nullptr;
     const float * sinks = sinks_ptr ? (const float *)(sinks_ptr + (sequence*ne02 + head) * 2) : nullptr;
     GGML_UNUSED(sinks);
+
+    // HP tier bases (per stream/head); HP rows are not tiled by blockIdx.y, so every
+    // partial block processes the full HP set (correct under flash_attn_combine_results).
+    const char * K_hp = K_hp_ptr ? K_hp_ptr + nb_hp13*sequence + nb_hp12*(head / gqa_ratio) : nullptr;
+    const char * V_hp = V_hp_ptr ? V_hp_ptr + nb_vhp13*sequence + nb_vhp12*(head / gqa_ratio) : nullptr;
+    const half * maskh_hp = mask_hp_ptr ? (const half *)mask_hp_ptr + (nb_hp33/2)*(sequence % ne_hp33) + (nb_hp31/2)*ic0 : nullptr;
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -248,6 +263,10 @@ static __global__ void flash_attn_ext_oscar2(
 
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
+                // the per-block mean accumulator must be rescaled on max shift too,
+                // otherwise its contribution drifts relative to KQ_sum and VKQ
+                #pragma unroll
+                for (int b = 0; b < nblocks; ++b) VKQ_mean[j][b] *= ks;
 
                 // ---- V dequant + accumulate in Hadamard domain ----
                 // Keep the mean separate so the final output semantics match
@@ -269,6 +288,56 @@ static __global__ void flash_attn_ext_oscar2(
             } // end score for-j loop
         } // end i_kv loop
     } // end kv_base loop
+
+    // ---- HP tier: F16 sink+recent tokens, stored in the Hadamard domain (no mean).
+    // The Q transform above (normalized Hadamard) makes the HP dot exact: (H q) . (H k).
+    // Masked-out (empty) HP slots carry -inf and contribute zero via exp(-inf).
+    // NOTE: only blockIdx.y == 0 processes the HP tier. When gridDim.y > 1 the LP
+    // KV is split across partial blocks merged by flash_attn_combine_results; the
+    // HP tier must appear in exactly one partial, or it gets counted gridDim.y times.
+    // After permute(0,2,1,3): ne[1] = n_hp_cells, ne[2] = n_head_kv
+    const int n_hp_cells = ne_hp11;
+    if (K_hp && blockIdx.y == 0) {
+        for (int i_hp = 0; i_hp < n_hp_cells; ++i_hp) {
+            const half * Kh = (const half *)(K_hp + i_hp * nb_hp11);
+            const half * Vh = (const half *)(V_hp + i_hp * nb_vhp11);
+
+            float KQ_val_hp[ncols];
+            #pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < nelems; ++e) {
+                    sum += __half2float(Kh[tid + e * nthreads]) * Q_reg[j][e];
+                }
+                KQ_val_hp[j] = warp_reduce_sum(sum);
+            }
+
+            #pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
+                float full_kq = KQ_val_hp[j];
+                if (use_logit_softcap) full_kq = logit_softcap * tanhf(full_kq);
+                if (maskh_hp) full_kq += slope * __half2float(maskh_hp[j*n_hp_cells + i_hp]);
+
+                const float rn = fmaxf(KQ_max[j], full_kq + FATTN_KQ_MAX_OFFSET);
+                const float ks = expf(KQ_max[j] - rn);
+                KQ_max[j] = rn;
+                const float ke = expf(full_kq - KQ_max[j]);
+                KQ_sum[j] = KQ_sum[j] * ks + ke;
+
+                #pragma unroll
+                for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
+
+                // HP V accumulate (f16 in Hadamard domain, no mean term)
+                #pragma unroll
+                for (int e = 0; e < nelems; ++e) {
+                    VKQ[j][e] += ke * __half2float(Vh[tid + e * nthreads]);
+                }
+            }
+        }
+    }
 
     // ---- Write results: inverse-transform each 128-element block from Hadamard
     // domain back to natural domain, then add the accumulated per-block mean.
@@ -306,13 +375,188 @@ static __global__ void flash_attn_ext_oscar2(
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
         ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
-        ne31, ne32, ne33, nb31, nb32, nb33);
+        ne31, ne32, ne33, nb31, nb32, nb33,
+        K_hp_ptr, V_hp_ptr, mask_hp_ptr,
+        ne_hp11, ne_hp12, ne_hp13, nb_hp11, nb_hp12, nb_hp13, nb_vhp11, nb_vhp12, nb_vhp13,
+        ne_hp31, ne_hp32, ne_hp33, nb_hp31, nb_hp32, nb_hp33);
 #endif
 }
 
 // ---------------------------------------------------------------------------
 // Host-side launcher
 // ---------------------------------------------------------------------------
+
+// Dedicated launcher for the oscar2 FA kernel. Replicates the grid/workspace setup
+// of launch_fattn (ncols1 = ncols2 = 1, no stream-k, no f16 conversion) and
+// additionally forwards the HP tier tensors (dst->src[5..7]) to the kernel.
+template <int D, typename KF>
+static void launch_fattn_oscar2(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        KF fattn_kernel,
+        const int nwarps,
+        const size_t nbytes_shared,
+        const int nbatch_fa) {
+
+    const ggml_tensor * Q      = dst->src[0];
+    const ggml_tensor * K      = dst->src[1];
+    const ggml_tensor * V      = dst->src[2];
+    const ggml_tensor * mask   = dst->src[3];
+    const ggml_tensor * sinks  = dst->src[4];
+    const ggml_tensor * K_hp   = dst->src[5];
+    const ggml_tensor * V_hp   = dst->src[6];
+    const ggml_tensor * mask_hp = dst->src[7];
+    const ggml_tensor * KQV    = dst;
+
+    GGML_ASSERT(Q->type == GGML_TYPE_F32);
+    GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+    GGML_ASSERT(Q->nb[0] == ggml_element_size(Q));
+    GGML_ASSERT(K->nb[0] == ggml_element_size(K));
+    GGML_ASSERT(V->nb[0] == ggml_element_size(V));
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!K_hp || (K_hp->type == GGML_TYPE_F16 && V_hp && V_hp->type == GGML_TYPE_F16));
+    GGML_ASSERT(!mask_hp || mask_hp->type == GGML_TYPE_F16);
+
+    ggml_cuda_pool & pool = ctx.pool();
+    cudaStream_t main_stream = ctx.stream();
+    const int id  = ggml_cuda_get_device();
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+
+    ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+    ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+
+    const char * K_data = (const char *) K->data;
+    const size_t nb11 = K->nb[1];
+    const size_t nb12 = K->nb[2];
+    const size_t nb13 = K->nb[3];
+
+    const char * V_data = (const char *) V->data;
+    const size_t nb21 = V->nb[1];
+    const size_t nb22 = V->nb[2];
+    const size_t nb23 = V->nb[3];
+
+    constexpr int ncols1 = 1;
+    constexpr int ncols2 = 1;
+
+    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    const int gqa_ratio    = Q->ne[2] / K->ne[2];
+    const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
+    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+
+    // Optional optimization: scan the mask to skip masked-out KV regions (same as launch_fattn)
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+        const int64_t s31 = mask->nb[1] / sizeof(half2);
+        const int64_t s33 = mask->nb[3] / sizeof(half2);
+
+        const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
+        const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
+
+        const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
+        const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+        KV_max.alloc(ne_KV_max);
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const dim3 block_dim(WARP_SIZE, nwarps, 1);
+    int max_blocks_per_sm = 1;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    GGML_ASSERT(max_blocks_per_sm > 0);
+    int parallel_blocks = max_blocks_per_sm;
+
+    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+
+    // non-stream-k path only (the oscar2 kernel has no stream-k support)
+    parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    int nwaves_best = 0;
+    int efficiency_percent_best = 0;
+    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        const int nblocks_total = ntiles_dst * parallel_blocks_test;
+        const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+        const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+
+        if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+            break;
+        }
+
+        if (efficiency_percent > efficiency_percent_best) {
+            nwaves_best = nwaves;
+            efficiency_percent_best = efficiency_percent;
+            parallel_blocks = parallel_blocks_test;
+        }
+    }
+
+    const dim3 blocks_num(ntiles_x, parallel_blocks, ntiles_z_gqa*K->ne[2]*Q->ne[3]);
+
+    if (parallel_blocks > 1) {
+        dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+        dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+    }
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = Q->ne[2];
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
+
+    GGML_ASSERT(block_dim.x % WARP_SIZE == 0);
+    fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
+        (const char *) Q->data,
+        K_data,
+        V_data,
+        mask ? ((const char *) mask->data) : nullptr,
+        sinks ? ((const char *) sinks->data) : nullptr,
+        KV_max.ptr,
+        parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        nb21, nb22, nb23,
+        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        // HP tier
+        K_hp ? ((const char *) K_hp->data) : nullptr,
+        V_hp ? ((const char *) V_hp->data) : nullptr,
+        mask_hp ? ((const char *) mask_hp->data) : nullptr,
+        K_hp ? K_hp->ne[1] : 0, K_hp ? K_hp->ne[2] : 0, K_hp ? K_hp->ne[3] : 0,
+        K_hp ? K_hp->nb[1] : 0, K_hp ? K_hp->nb[2] : 0, K_hp ? K_hp->nb[3] : 0,
+        V_hp ? V_hp->nb[1] : 0, V_hp ? V_hp->nb[2] : 0, V_hp ? V_hp->nb[3] : 0,
+        mask_hp ? mask_hp->ne[1] : 0, mask_hp ? mask_hp->ne[2] : 0, mask_hp ? mask_hp->ne[3] : 0,
+        mask_hp ? mask_hp->nb[1] : 0, mask_hp ? mask_hp->nb[2] : 0, mask_hp ? mask_hp->nb[3] : 0
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    if (parallel_blocks > 1) {
+        const dim3 block_dim_combine(D, 1, 1);
+        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
+        const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+
+        flash_attn_combine_results<D>
+            <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
+            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -347,18 +591,18 @@ void ggml_cuda_flash_attn_ext_oscar2_case(ggml_backend_cuda_context & ctx, ggml_
     auto launch = [&](int ncols_val, bool lsc) {
         if (lsc) {
             switch (ncols_val) {
-                case 1: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 1, true, type_K, type_V>; launch_fattn<D, 1, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
-                case 2: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 2, true, type_K, type_V>; launch_fattn<D, 2, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
-                case 4: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 4, true, type_K, type_V>; launch_fattn<D, 4, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
-                case 8: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 8, true, type_K, type_V>; launch_fattn<D, 8, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 1: { auto k = flash_attn_ext_oscar2<D, 1, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 2: { auto k = flash_attn_ext_oscar2<D, 2, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 4: { auto k = flash_attn_ext_oscar2<D, 4, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 8: { auto k = flash_attn_ext_oscar2<D, 8, true, type_K, type_V>;  launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
                 default: GGML_ABORT("unsupported ncols for oscar2 FA"); break;
             }
         } else {
             switch (ncols_val) {
-                case 1: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 1, false, type_K, type_V>; launch_fattn<D, 1, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
-                case 2: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 2, false, type_K, type_V>; launch_fattn<D, 2, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
-                case 4: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 4, false, type_K, type_V>; launch_fattn<D, 4, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
-                case 8: { fattn_kernel_t k = flash_attn_ext_oscar2<D, 8, false, type_K, type_V>; launch_fattn<D, 8, 1>(ctx, dst, k, nwarps, nbytes, nbatch_fa, false, false, false); } break;
+                case 1: { auto k = flash_attn_ext_oscar2<D, 1, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 2: { auto k = flash_attn_ext_oscar2<D, 2, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 4: { auto k = flash_attn_ext_oscar2<D, 4, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
+                case 8: { auto k = flash_attn_ext_oscar2<D, 8, false, type_K, type_V>; launch_fattn_oscar2<D>(ctx, dst, k, nwarps, nbytes, nbatch_fa); } break;
                 default: GGML_ABORT("unsupported ncols for oscar2 FA"); break;
             }
         }

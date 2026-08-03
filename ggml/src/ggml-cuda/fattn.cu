@@ -851,6 +851,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_OSCAR2:
+            // the dedicated oscar2 kernel works directly on the quantized blocks,
+            // no f16 conversion needed
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }

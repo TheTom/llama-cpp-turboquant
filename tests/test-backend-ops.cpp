@@ -1474,11 +1474,10 @@ struct test_case {
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
-                //printf("\n");
-                //exit(1);
+                for (int i = 0; i < (int) f1.size() && i < 64; i++) {
+                    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
+                }
+                printf("\n");
                 ud->ok = false;
             }
             return true;
@@ -7134,11 +7133,38 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
-        ggml_set_name(k, "k");
+        // OSCAR2 K/V have no canonical byte layout across backends: the CPU store
+        // quantizes in the natural domain (with P_br), the CUDA store writes the
+        // Hadamard domain. The generic harness initializes K/V through the CPU
+        // quantize path (ggml_quantize_chunk), which the CUDA FA kernel cannot
+        // decode (garbage scores, ERR ~ 1). Route OSCAR2 K/V through SET_ROWS so
+        // each backend stores rows in its own domain; the attention output is
+        // domain-invariant, so comparing only the final node (run_whole_graph)
+        // still validates the store+FA pipeline end-to-end.
+        ggml_tensor * k;
+        if (type_K == GGML_TYPE_OSCAR2) {
+            ggml_tensor * k_dst = ggml_new_tensor_4d(ctx, type_K, hsk_padded, kv, nh, nr23[1]);
+            ggml_set_name(k_dst, "k_dst");
+            ggml_tensor * k_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk_padded, kv, nh, nr23[1]);
+            ggml_set_name(k_src, "k_src");
+            ggml_tensor * k_row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, kv);
+            ggml_set_name(k_row_idxs, "k_row_idxs");
+            k = ggml_set_rows(ctx, k_dst, k_src, k_row_idxs);
+        } else {
+            k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
+            ggml_set_name(k, "k");
+        }
 
         ggml_tensor * v = nullptr;
-        if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
+        if (type_V == GGML_TYPE_OSCAR2) {
+            ggml_tensor * v_dst = ggml_new_tensor_4d(ctx, type_V, hsv_padded, kv, nh, nr23[1]);
+            ggml_set_name(v_dst, "v_dst");
+            ggml_tensor * v_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsv_padded, kv, nh, nr23[1]);
+            ggml_set_name(v_src, "v_src");
+            ggml_tensor * v_row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, kv);
+            ggml_set_name(v_row_idxs, "v_row_idxs");
+            v = ggml_set_rows(ctx, v_dst, v_src, v_row_idxs);
+        } else if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
             // TODO: this branch should become a separate test case parameter instead of hardcoding this for these head shapes
 
             // in this branch, the V cache is sub-view of the K cache. this is used by some MLA-based models
@@ -7179,6 +7205,14 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "k_row_idxs") == 0 || strcmp(t->name, "v_row_idxs") == 0) {
+                // identity row mapping: source row i -> destination row i,
+                // keeps the K rows aligned with the mask rows
+                std::vector<int64_t> data(kv);
+                for (int64_t i = 0; i < kv; i++) {
+                    data[i] = i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, kv * sizeof(int64_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -7187,6 +7221,12 @@ struct test_flash_attn_ext : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+
+    bool run_whole_graph() override {
+        // oscar2 graphs include SET_ROWS stores whose byte layout is backend-specific
+        // (CPU natural-domain vs CUDA Hadamard-domain); compare only the final output
+        return type_K == GGML_TYPE_OSCAR2 || type_V == GGML_TYPE_OSCAR2;
     }
 };
 

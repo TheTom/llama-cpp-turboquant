@@ -1361,14 +1361,14 @@ static __global__ void set_rows_cuda_oscar2(
         const float m_val   = mean;
         const float inv_d   = 1.0f / d_val;
 
-        // Lloyd-Max quantization: match OSCAR2_LM_CENTROIDS {-0.9816,-0.4528,0.4528,0.9816}.
-        // Decision boundaries are midpoints between consecutive centroids.
+        // Lloyd-Max quantization: match OSCAR2_LM_CENTROIDS {-1.510257,-0.452734,0.452734,1.510257}.
+        // Decision boundaries are midpoints between consecutive levels: 0 and +-0.9814955.
         const float vs = hv * inv_d;
         int code;
-        if      (vs < -0.7172f) code = 0;
-        else if (vs <  0.0f)   code = 1;
-        else if (vs <  0.7172f) code = 2;
-        else                    code = 3;
+        if      (vs < -0.9814955f) code = 0;
+        else if (vs <  0.0f)       code = 1;
+        else if (vs <  0.9814955f) code = 2;
+        else                       code = 3;
         sh_codes[t] = (uint8_t)code;
         __syncthreads();
 
@@ -1389,12 +1389,98 @@ static __global__ void set_rows_cuda_oscar2(
     }
 }
 
+// OSCAR2 HP set-rows: forward normalized Hadamard transform (no mean subtract, no
+// quantization) + F16 store. The HP tier keeps sink+recent tokens in F16 in the
+// Hadamard domain, so the oscar2 FA kernel can attend them with zero error.
+// Selected when the set_rows op carries the HP marker (see cpy_k_hp/cpy_v_hp).
+template <typename idx_t>
+static __global__ void set_rows_cuda_oscar2_hp(
+        const char * src0, const char * src1, char * dst,
+        const int32_t ne01, const int32_t ne11, const int32_t ne12,
+        const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12,
+        const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3,
+        const int32_t nk0) {
+
+    const int32_t i03 = blockIdx.z;
+    const int32_t i02 = blockIdx.y;
+    const int32_t i01 = blockIdx.x;
+    if (i01 >= ne01) return;
+
+    const int32_t i12 = i03 % ne12;
+    const int32_t i11 = i02 % ne11;
+    const int32_t i10 = i01;
+
+    const idx_t i1 = *((const idx_t *) (src1 + i10*nb10 + i11*nb11 + i12*nb12));
+
+    const float * src_row = (const float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+    ggml_half * dst_row = (ggml_half *) (dst + (uint64_t)i1*nb1 + i02*nb2 + i03*nb3);
+
+    const unsigned t = threadIdx.x; // 0..127, one per element
+
+    __shared__ float sh_vals[QK_OSCAR2];
+
+    for (int iv = 0; iv < nk0; ++iv) {
+        sh_vals[t] = src_row[iv * QK_OSCAR2 + t];
+        __syncthreads();
+
+        // Forward normalized Hadamard (same butterfly as set_rows_cuda_oscar2;
+        // no mean subtract - the HP tier needs no centering for exactness).
+        for (int h = 1; h < QK_OSCAR2; h <<= 1) {
+            if (!(t & h)) {
+                const float a = sh_vals[t];
+                const float b = sh_vals[t + h];
+                sh_vals[t]     = a + b;
+                sh_vals[t + h] = a - b;
+            }
+            __syncthreads();
+        }
+        const float s_had = rsqrtf((float)QK_OSCAR2);
+        sh_vals[t] *= s_had;
+        __syncthreads();
+
+        dst_row[iv * QK_OSCAR2 + t] = __float2half(sh_vals[t]);
+        __syncthreads();
+    }
+}
+
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    // OSCAR HP (F16 sink+recent): marked set_rows with F32 src -> F16 dst in Hadamard domain
+    if (dst->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F32) {
+        int32_t hp_marker = 0;
+        memcpy(&hp_marker, dst->op_params, sizeof(int32_t));
+        if (hp_marker == 1) {
+            GGML_TENSOR_BINARY_OP_LOCALS(src0, src1, dst);
+
+            const int32_t nk0 = (int32_t)(ne00 / ggml_blck_size(GGML_TYPE_OSCAR2));
+            cudaStream_t stream = ctx.stream();
+
+            const dim3 grid_size(ne01, ne02, ne03);
+            const dim3 block_size(128, 1, 1);
+
+            const char * src0_d = (const char *) src0->data;
+            const char * src1_d = (const char *) src1->data;
+            char       * dst_d  = (char *)       dst->data;
+
+            if (src1->type == GGML_TYPE_I64) {
+                set_rows_cuda_oscar2_hp<int64_t><<<grid_size, block_size, 0, stream>>>(
+                    src0_d, src1_d, dst_d,
+                    ne01, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, nk0);
+            } else {
+                set_rows_cuda_oscar2_hp<int32_t><<<grid_size, block_size, 0, stream>>>(
+                    src0_d, src1_d, dst_d,
+                    ne01, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, nk0);
+            }
+            GGML_ASSERT(cudaGetLastError() == cudaSuccess);
+            return;
+        }
+    }
 
     float clip_ratio = 0.0f;
     if (const char * e = getenv("LLAMA_KV_CLIP_RATIO")) {
@@ -1433,6 +1519,8 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     if (src1->type == GGML_TYPE_I64) {
         set_rows_cuda<float, int64_t>(ctx, src0, src1, dst);
+    } else if (src1->type == GGML_TYPE_I32) {
+        set_rows_cuda<float, int32_t>(ctx, src0, src1, dst);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }

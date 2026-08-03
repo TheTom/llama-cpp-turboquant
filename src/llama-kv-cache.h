@@ -43,6 +43,10 @@ public:
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns] LP global slot indices
 
+        // HP (high-precision sink+recent) slot info - populated when HP mode is enabled
+        std::vector<idx_vec_t> hp_idxs;       // [ns] HP global slot indices per HP token
+        std::vector<idx_vec_t> hp_batch_idxs; // [ns] batch-local token row indices for HP tokens
+
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
             GGML_ASSERT(!idxs[0].empty());
@@ -53,6 +57,8 @@ public:
         void resize(size_t n) {
             strm.resize(n);
             idxs.resize(n);
+            hp_idxs.resize(n);
+            hp_batch_idxs.resize(n);
         }
 
         size_t size() const {
@@ -113,7 +119,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                         bool   hp_enabled = false);
 
     ~llama_kv_cache() = default;
 
@@ -188,6 +195,16 @@ public:
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_k_idx(ggml_context * ctx, ggml_tensor * k_idx_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // HP (high-precision) variants - only valid when n_hp_total > 0
+    uint32_t get_n_hp() const { return n_hp_total; }
+    uint32_t get_n_hp_kv(const slot_info & sinfo) const;
+    ggml_tensor * get_k_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const;
+
+    // HP write: extract HP-token rows from k_cur/v_cur and store in HP buffer
+    ggml_tensor * cpy_k_hp(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_hp(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
+
     //
 
     // find places for the provided ubatches in the cache, returns the slot infos
@@ -214,6 +231,15 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // HP input builders/setters (only valid when n_hp_total > 0)
+    ggml_tensor * build_input_hp_k_idxs(ggml_context * ctx, uint32_t n_hp_batch) const;
+    ggml_tensor * build_input_hp_batch_idxs(ggml_context * ctx, uint32_t n_hp_batch) const;
+    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
+    void set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -237,9 +263,15 @@ private:
         ggml_tensor * v;
         ggml_tensor * k_idx;   // MSA single-head indexer keys, F32
 
+        // HP (F16 sink+recent) buffers - null when HP disabled
+        ggml_tensor * k_hp = nullptr;
+        ggml_tensor * v_hp = nullptr;
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
         std::vector<ggml_tensor *> k_idx_stream;
+        std::vector<ggml_tensor *> k_hp_stream;
+        std::vector<ggml_tensor *> v_hp_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -264,6 +296,21 @@ private:
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // OSCAR-style HP (high-precision) sink+recent buffer
+    // env: LLAMA_KV_HP_SINK, LLAMA_KV_HP_RECENT
+    // sink tokens (pos < n_kv_sink) and recent tokens (latest n_kv_recent positions)
+    // are kept in F16; all other tokens use the main LP (e.g. oscar2) cache
+    uint32_t n_kv_sink   = 0;  // # permanent sink tokens in HP
+    uint32_t n_kv_recent = 0;  // # recent tokens in HP ring buffer
+    uint32_t n_hp_total  = 0;  // n_kv_sink + n_kv_recent (0 = HP disabled)
+
+    // HP cell tracking (indexed 0..n_hp_total-1 per stream)
+    // sink region: [0, n_kv_sink), recent ring: [n_kv_sink, n_hp_total)
+    std::vector<llama_kv_cells> v_hp_cells;
+
+    // set of positions currently stored in HP, for LP mask exclusion
+    std::vector<std::unordered_set<llama_pos>> hp_positions;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -411,6 +458,26 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
     ggml_tensor * cpy_k_idx(ggml_context * ctx, ggml_tensor * k_idx_cur, ggml_tensor * k_idxs, int32_t il) const;
+
+    // HP (high-precision sink+recent) variants - only valid when has_hp() == true
+    bool has_hp() const;
+    uint32_t get_n_hp() const;
+    uint32_t get_n_hp_kv() const;
+    uint32_t get_n_hp_batch() const;
+    ggml_tensor * get_k_hp(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hp(ggml_context * ctx, int32_t il) const;
+
+    ggml_tensor * cpy_k_hp(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_hp(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * hp_batch_idxs, ggml_tensor * hp_k_idxs, int32_t il) const;
+
+    ggml_tensor * build_input_hp_k_idxs(ggml_context * ctx) const;
+    ggml_tensor * build_input_hp_batch_idxs(ggml_context * ctx) const;
+    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx) const;
+    ggml_tensor * build_input_hp_kq_mask(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
+    void set_input_hp_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_hp_batch_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

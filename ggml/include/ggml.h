@@ -2443,6 +2443,20 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // OSCAR two-tier attention: quantized LP + F16 HP (sink/recent) KV tiers
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_mixed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_lp,
+            struct ggml_tensor  * v_lp,
+            struct ggml_tensor  * mask_lp,
+            struct ggml_tensor  * k_hp,
+            struct ggml_tensor  * v_hp,
+            struct ggml_tensor  * mask_hp,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
