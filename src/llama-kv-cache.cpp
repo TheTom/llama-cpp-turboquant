@@ -215,6 +215,15 @@ llama_kv_cache::llama_kv_cache(
             const char * env_recent = getenv("LLAMA_KV_HP_RECENT");
             n_kv_sink   = env_sink   ? (uint32_t)atoi(env_sink)   : 0;
             n_kv_recent = env_recent ? (uint32_t)atoi(env_recent) : 0;
+
+            // Gemma-4 with oscar2 INT2 K+V: the 2-bit quantization noise (err ~50% of signal)
+            // scrambles attention when scale=1.0 (no 1/sqrt(D) scaling). Keep the most recent
+            // context positions as F16 so local attention gets exact KQ. At 96 recent cells
+            // PPL drops from 12M to 1.2K; at 128 (full context) it reaches the f16 baseline.
+            if (n_kv_recent == 0 && model.arch == LLM_ARCH_GEMMA4) {
+                n_kv_recent = 96;
+            }
+
             n_hp_total  = n_kv_sink + n_kv_recent;
             if (n_hp_total > 0) {
                 LLAMA_LOG_INFO("%s: HP sink+recent buffer: sink=%u, recent=%u, total=%u (F16, Hadamard domain)\n",
@@ -585,6 +594,33 @@ llama_kv_cache::llama_kv_cache(
             }
 
             GGML_ASSERT(map_layer_ids.find(il_reuse) != map_layer_ids.end());
+            GGML_ASSERT(map_layer_ids.find(il) != map_layer_ids.end());
+
+            const int32_t ikv_cur   = map_layer_ids.at(il);
+            const int32_t ikv_reuse = map_layer_ids.at(il_reuse);
+
+            const auto & layer_cur   = layers[ikv_cur];
+            const auto & layer_reuse = layers[ikv_reuse];
+
+            const bool k_compatible =
+                (layer_cur.k == nullptr && layer_reuse.k == nullptr) ||
+                (layer_cur.k && layer_reuse.k &&
+                 layer_cur.k->type == layer_reuse.k->type &&
+                 layer_cur.k->ne[0] == layer_reuse.k->ne[0] &&
+                 layer_cur.k->ne[1] == layer_reuse.k->ne[1]);
+
+            const bool v_compatible =
+                (layer_cur.v == nullptr && layer_reuse.v == nullptr) ||
+                (layer_cur.v && layer_reuse.v &&
+                 layer_cur.v->type == layer_reuse.v->type &&
+                 layer_cur.v->ne[0] == layer_reuse.v->ne[0] &&
+                 layer_cur.v->ne[1] == layer_reuse.v->ne[1]);
+
+            if (!k_compatible || !v_compatible) {
+                LLAMA_LOG_WARN("%s: - layer %3d: skip reuse from layer %d due to incompatible KV layout\n",
+                        __func__, il, il_reuse);
+                continue;
+            }
 
             map_layer_ids[il] = map_layer_ids[il_reuse];
 
@@ -1888,6 +1924,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
+    const int32_t il_kv = layers[ikv].il;
 
     auto * k = layers[ikv].k;
 
@@ -1899,7 +1936,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     // tensor's actual dimension as the authoritative value.
     const uint64_t n_embd_k_gqa = k->ne[0];
 
-    const uint32_t head_k = hparams.n_embd_head_k(il);
+    const uint32_t head_k = hparams.n_embd_head_k(il_kv);
     const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
     const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
@@ -1919,6 +1956,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
+    const int32_t il_kv = layers[ikv].il;
 
     auto * v = layers[ikv].v;
 
@@ -1928,7 +1966,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     // Use padded head_dim for turbo types
     const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
-    const uint32_t head_v = hparams.n_embd_head_v(il);
+    const uint32_t head_v = hparams.n_embd_head_v(il_kv);
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
 
@@ -1976,6 +2014,7 @@ ggml_tensor * llama_kv_cache::get_k_idx(ggml_context * ctx, int32_t il, uint32_t
 ggml_tensor * llama_kv_cache::get_k_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const {
     GGML_ASSERT(n_hp_total > 0);
     const int32_t ikv = map_layer_ids.at(il);
+    const int32_t il_kv = layers[ikv].il;
     auto * k = layers[ikv].k_hp;
     GGML_ASSERT(k != nullptr);
 
@@ -1983,8 +2022,8 @@ ggml_tensor * llama_kv_cache::get_k_hp(ggml_context * ctx, int32_t il, uint32_t 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_hp_kv, ns,
-            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+            hparams.n_embd_head_k(il_kv), hparams.n_head_kv(il_kv), n_hp_kv, ns,
+            ggml_row_size(k->type, hparams.n_embd_head_k(il_kv)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa * n_hp_total),
             ggml_row_size(k->type, n_embd_k_gqa * n_hp_total) * sinfo.s0);
@@ -1993,6 +2032,7 @@ ggml_tensor * llama_kv_cache::get_k_hp(ggml_context * ctx, int32_t il, uint32_t 
 ggml_tensor * llama_kv_cache::get_v_hp(ggml_context * ctx, int32_t il, uint32_t n_hp_kv, const slot_info & sinfo) const {
     GGML_ASSERT(n_hp_total > 0);
     const int32_t ikv = map_layer_ids.at(il);
+    const int32_t il_kv = layers[ikv].il;
     auto * v = layers[ikv].v_hp;
     GGML_ASSERT(v != nullptr);
 
@@ -2001,8 +2041,8 @@ ggml_tensor * llama_kv_cache::get_v_hp(ggml_context * ctx, int32_t il, uint32_t 
 
     // HP V is always non-transposed (flash-attn path only)
     return ggml_view_4d(ctx, v,
-            hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_hp_kv, ns,
-            ggml_row_size(v->type, hparams.n_embd_head_v(il)),
+            hparams.n_embd_head_v(il_kv), hparams.n_head_kv(il_kv), n_hp_kv, ns,
+            ggml_row_size(v->type, hparams.n_embd_head_v(il_kv)),
             ggml_row_size(v->type, n_embd_v_gqa),
             ggml_row_size(v->type, n_embd_v_gqa * n_hp_total),
             ggml_row_size(v->type, n_embd_v_gqa * n_hp_total) * sinfo.s0);
