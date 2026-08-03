@@ -2667,10 +2667,16 @@ void llama_kv_cache::set_input_hp_kq_mask(ggml_tensor * dst, const llama_ubatch 
                 if (!hp_cells.is_empty(j) && hp_cells.seq_has(j, sid)) {
                     const llama_pos p0 = hp_cells.pos_get(j);
                     if (!causal_attn || p0 <= p1) {
-                        // ALiBi: the kernel multiplies the mask by the head slope,
-                        // so kept cells must carry -|p0-p1| exactly like the LP mask
-                        // (set_input_kq_mask_impl's alibi branch).
-                        f = alibi ? static_cast<float>(-std::abs(p0 - p1)) : 0.0f;
+                        // SWA: mirror the LP mask - cells outside the sliding
+                        // window must be masked in the HP tier too.
+                        if (swa_type != LLAMA_SWA_TYPE_NONE && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                            f = -INFINITY;
+                        } else {
+                            // ALiBi: the kernel multiplies the mask by the head slope,
+                            // so kept cells must carry -|p0-p1| exactly like the LP mask
+                            // (set_input_kq_mask_impl's alibi branch).
+                            f = alibi ? static_cast<float>(-std::abs(p0 - p1)) : 0.0f;
+                        }
                     }
                 }
                 data[s*(n_tps*n_hp_total) + ii*n_hp_total + j] = f;

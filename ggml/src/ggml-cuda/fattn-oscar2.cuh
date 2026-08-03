@@ -110,6 +110,8 @@ static __global__ void flash_attn_ext_oscar2(
     const int sequence = blockIdx.z / ne02;
     const int head     = blockIdx.z - sequence * ne02;
     const int gqa_ratio = ne02 / ne12; // n_head / n_head_kv (ne12 = n_head_kv after permute)
+    // ne01 is the fastdiv triplet <mp, L, divisor>; the row count (divisor) lives in .z
+    const int n_queries = (int) ne01.z;
 
     const char * Q = Q_ptr + nb03*sequence + nb02*head + nb01*ic0;
     const char * K = K_ptr + nb13*sequence + nb12*(head / gqa_ratio) + blockIdx.y * nthreads * nb11;
@@ -151,6 +153,14 @@ static __global__ void flash_attn_ext_oscar2(
     float Q_reg[ncols][nelems];
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
+        // Out-of-bounds columns (last tile when Q->ne[1] is not a multiple of
+        // ncols) must be zeroed, not read: Q has only n_queries rows and reading
+        // Q + (ic0+j)*nb01 for ic0+j >= n_queries is an illegal memory access.
+        if (ncols > 1 && ic0 + j >= n_queries) {
+            #pragma unroll
+            for (int e = 0; e < nelems; ++e) Q_reg[j][e] = 0.0f;
+            continue;
+        }
         const float * Q_j = (const float *) (Q + j*nb01);
         #pragma unroll
         for (int e = 0; e < nelems; ++e) {
@@ -252,7 +262,7 @@ static __global__ void flash_attn_ext_oscar2(
                 }
 
                 if (use_logit_softcap) full_kq = logit_softcap * tanhf(full_kq);
-                if (maskh && (ncols == 1 || ic0 + j < (int)ne01.x))
+                if (maskh && (ncols == 1 || ic0 + j < n_queries))
                     full_kq += slope * __half2float(maskh[j*ne11 + i_kv]);
 
                 const float rn = fmaxf(KQ_max[j], full_kq + FATTN_KQ_MAX_OFFSET);
@@ -305,7 +315,7 @@ static __global__ void flash_attn_ext_oscar2(
             float KQ_val_hp[ncols];
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
+                if (ncols > 1 && ic0 + j >= n_queries) break;
                 float sum = 0.0f;
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) {
@@ -316,7 +326,7 @@ static __global__ void flash_attn_ext_oscar2(
 
             #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
+                if (ncols > 1 && ic0 + j >= n_queries) break;
                 float full_kq = KQ_val_hp[j];
                 if (use_logit_softcap) full_kq = logit_softcap * tanhf(full_kq);
                 if (maskh_hp) full_kq += slope * __half2float(maskh_hp[j*n_hp_cells + i_hp]);
@@ -329,6 +339,9 @@ static __global__ void flash_attn_ext_oscar2(
 
                 #pragma unroll
                 for (int e = 0; e < nelems; ++e) VKQ[j][e] *= ks;
+                // the per-block mean accumulator must be rescaled on max shift too
+                #pragma unroll
+                for (int b = 0; b < nblocks; ++b) VKQ_mean[j][b] *= ks;
 
                 // HP V accumulate (f16 in Hadamard domain, no mean term)
                 #pragma unroll
@@ -343,10 +356,10 @@ static __global__ void flash_attn_ext_oscar2(
     // domain back to natural domain, then add the accumulated per-block mean.
     #pragma unroll
     for (int j = 0; j < ncols; ++j) {
-        if (ncols > 1 && ic0 + j >= (int)ne01.x) break;
+        if (ncols > 1 && ic0 + j >= n_queries) break;
         const float iks = gridDim.y == 1 ? 1.0f / KQ_sum[j] : 1.0f;
         if (gridDim.y != 1 && tid == 0) {
-            int mi = ((sequence * (int)ne01.x + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y;
+            int mi = ((sequence * n_queries + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y;
             dst_meta_ptr[mi] = make_float2(KQ_max[j], KQ_sum[j]);
         }
         #pragma unroll
@@ -362,9 +375,9 @@ static __global__ void flash_attn_ext_oscar2(
                 int di = tid + e * nthreads + b * QK_OSCAR2;
                 float val = sh_val_had[tid + e * nthreads] + VKQ_mean[j][b] * iks;
                 if (gridDim.y == 1)
-                    dst_ptr[(((sequence * (int)ne01.x + ic0 + j) * ne02 + head)) * D + di] = val;
+                    dst_ptr[(((sequence * n_queries + ic0 + j) * ne02 + head)) * D + di] = val;
                 else
-                    dst_ptr[(((sequence * (int)ne01.x + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y) * D + di] = val;
+                    dst_ptr[(((sequence * n_queries + ic0 + j) * ne02 + head) * gridDim.y + blockIdx.y) * D + di] = val;
             }
             __syncwarp();
         }

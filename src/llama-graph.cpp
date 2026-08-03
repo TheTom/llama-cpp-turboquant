@@ -1072,6 +1072,17 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    // OSCAR HP inputs (F16 sink+recent) - mirror llm_graph_input_attn_kv::set_input
+    if (inp_attn->hp_k_idxs && inp_attn->hp_k_idxs->buffer) {
+        mctx->get_attn()->set_input_hp_k_idxs(inp_attn->hp_k_idxs, ubatch);
+        if (inp_attn->hp_batch_idxs) {
+            mctx->get_attn()->set_input_hp_batch_idxs(inp_attn->hp_batch_idxs, ubatch);
+        }
+    }
+    if (inp_attn->hp_kq_mask && inp_attn->hp_kq_mask->buffer) {
+        mctx->get_attn()->set_input_hp_kq_mask(inp_attn->hp_kq_mask, ubatch, cparams.causal_attn);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1094,6 +1105,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+
+    if (inp_attn->hp_k_idxs && inp_attn->hp_k_idxs->buffer) {
+        res &= inp_attn->hp_k_idxs->ne[0] == mctx->get_attn()->get_n_hp_batch();
+    }
+    if (inp_attn->hp_kq_mask && inp_attn->hp_kq_mask->buffer) {
+        res &= can_reuse_kq_mask(inp_attn->hp_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
@@ -1190,6 +1208,27 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
+    // OSCAR HP inputs (base + swa sub-caches) - mirror llm_graph_input_attn_kv_iswa::set_input
+    if (inp_attn->hp_k_idxs && inp_attn->hp_k_idxs->buffer) {
+        attn_ctx->get_base()->set_input_hp_k_idxs(inp_attn->hp_k_idxs, ubatch);
+        if (inp_attn->hp_batch_idxs) {
+            attn_ctx->get_base()->set_input_hp_batch_idxs(inp_attn->hp_batch_idxs, ubatch);
+        }
+    }
+    if (inp_attn->hp_kq_mask && inp_attn->hp_kq_mask->buffer) {
+        attn_ctx->get_base()->set_input_hp_kq_mask(inp_attn->hp_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (inp_attn->hp_k_idxs_swa && inp_attn->hp_k_idxs_swa->buffer) {
+        attn_ctx->get_swa()->set_input_hp_k_idxs(inp_attn->hp_k_idxs_swa, ubatch);
+        if (inp_attn->hp_batch_idxs_swa) {
+            attn_ctx->get_swa()->set_input_hp_batch_idxs(inp_attn->hp_batch_idxs_swa, ubatch);
+        }
+    }
+    if (inp_attn->hp_kq_mask_swa && inp_attn->hp_kq_mask_swa->buffer) {
+        attn_ctx->get_swa()->set_input_hp_kq_mask(inp_attn->hp_kq_mask_swa, ubatch, cparams.causal_attn);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1227,6 +1266,20 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     }
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+
+    // HP reuse checks (base + swa sub-caches)
+    if (inp_attn->hp_k_idxs && inp_attn->hp_k_idxs->buffer) {
+        res &= inp_attn->hp_k_idxs->ne[0] == attn_ctx->get_base()->get_n_hp_batch();
+    }
+    if (inp_attn->hp_kq_mask && inp_attn->hp_kq_mask->buffer) {
+        res &= can_reuse_kq_mask(inp_attn->hp_kq_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
+    }
+    if (inp_attn->hp_k_idxs_swa && inp_attn->hp_k_idxs_swa->buffer) {
+        res &= inp_attn->hp_k_idxs_swa->ne[0] == attn_ctx->get_swa()->get_n_hp_batch();
+    }
+    if (inp_attn->hp_kq_mask_swa && inp_attn->hp_kq_mask_swa->buffer) {
+        res &= can_reuse_kq_mask(inp_attn->hp_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
