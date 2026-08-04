@@ -3702,13 +3702,6 @@ private:
                                 break;
                             }
                         }
-
-                        // a restored checkpoint leaves a short prompt suffix to evaluate; keep it
-                        // in small batches (the CUDA path is not stable when it is evaluated
-                        // concurrently with other active slots)
-                        if (slot.prompt_checkpoint_restored) {
-                            break;
-                        }
                     }
 
                     // the number of tokens added to the batch for the current slot
