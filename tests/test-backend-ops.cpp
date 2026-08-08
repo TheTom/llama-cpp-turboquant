@@ -129,24 +129,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 }
             }
         }
-        // A non-contiguous tensor (e.g. a k_v view whose rows are strided over a
-        // wider base) must be written row by row. ggml_backend_tensor_set copies
-        // `size` bytes contiguously from tensor->data, so a single packed write
-        // lays row i at i*row_size instead of i*nb[1], leaving the tail of the
-        // logical extent holding whatever was there before.
-        if (!ggml_is_contiguous(tensor) && ggml_n_dims(tensor) >= 2) {
-            const size_t row_sz = ggml_row_size(tensor->type, tensor->ne[0]);
-            const int64_t nrows = ggml_nrows(tensor);
-            for (int64_t r = 0; r < nrows; r++) {
-                const int64_t i3 =  r / (tensor->ne[1]*tensor->ne[2]);
-                const int64_t i2 = (r / tensor->ne[1]) % tensor->ne[2];
-                const int64_t i1 =  r % tensor->ne[1];
-                const size_t off = i1*tensor->nb[1] + i2*tensor->nb[2] + i3*tensor->nb[3];
-                ggml_backend_tensor_set(tensor, dataq.data() + r*row_sz, off, row_sz);
-            }
-        } else {
-            ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
-        }
+        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
     } else if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16) {
         // This is going to create some weird integers though.
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * ggml_type_size(tensor->type));
@@ -9999,7 +9982,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                     for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
                                                         if ((type_KV == GGML_TYPE_TURBO3_0 || type_KV == GGML_TYPE_TURBO4_0) && hsk < 128) continue;
-                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128) continue;
+                                                        // turbo KV types are also used at head dim 256 (e.g. qwen35moe
+                                                        // key_length=value_length=256); allow 256 for them so that shape
+                                                        // is exercised rather than silently skipped.
+                                                        const bool turbo_kv = (type_KV == GGML_TYPE_TURBO3_0 || type_KV == GGML_TYPE_TURBO4_0 || type_KV == GGML_TYPE_TURBO2_0);
+                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128 && !(turbo_kv && hsk == 256)) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV));
                                                         // run fewer test cases permuted
