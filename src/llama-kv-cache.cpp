@@ -163,6 +163,34 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // Layer-adaptive KV precision (TURBO_LAYER_ADAPTIVE). Resolved once per cache
+    // instance: a static local here would leak the first cache's policy into every
+    // later cache in the process (draft/target MTP caches, multi-model servers).
+    // Shared (MTP draft) caches resolve their own mode from their own types; unlike
+    // attn_rot below, the adaptive mode is not inherited from the parent cache.
+    //   0 = uniform (default)
+    //   1 = q8_0 K+V for first+last 4 layers
+    //   2 = q8_0 K+V for last 8 layers
+    //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
+    //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
+    //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+    const int adaptive_mode = [&]() {
+        const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+        if (env) {
+            int mode = atoi(env);
+            if (mode > 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
+            }
+            return mode;
+        }
+        // Auto-enable Boundary V (mode 7) when V is turbo2
+        if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
+            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+            return 7;
+        }
+        return 0;
+    }();
+
     // #24060/MTP fix: iterate ALL layers (incl. nextn) so an all-nextn draft
     // (gemma4-assistant: n_layer()==0) registers its KV layers; has_kv() still
     // gates per-layer. Upstream loops the full hparams.n_layer member here.
@@ -313,33 +341,9 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // Layer-adaptive: use higher precision for quality-sensitive layers
-        // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
-        //   0 = uniform (default)
-        //   1 = q8_0 K+V for first+last 4 layers
-        //   2 = q8_0 K+V for last 8 layers
-        //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
-        //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
-        //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            static const int adaptive_mode = [&]() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-                    }
-                    return mode;
-                }
-                // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
-                }
-                return 0;
-            }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
             const uint32_t n_layer = hparams.n_layer();
