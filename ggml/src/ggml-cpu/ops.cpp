@@ -12,16 +12,6 @@
 #include <cfloat>
 #include <cmath>
 
-extern "C" {
-// Declaration only. The definition lives in ggml-turbo-quant.c (libggml-base).
-// Without `extern` this is a second definition in libggml-cpu, so the SET_ROWS
-// handler here and the quantizer there operate on different variables. Whether
-// the two happen to unify is a property of the platform's symbol resolution
-// (ELF interposition may merge them; two-level-namespace and DLL targets will
-// not), which made the group-size propagation silently link-order dependent.
-GGML_API extern int turbo3_cpu_wht_group_size;
-}
-
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -5143,13 +5133,6 @@ static void ggml_compute_forward_set_rows_impl(
     const size_t rs = ggml_row_size(src0->type, nc);
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
-
-    // For turbo types: communicate WHT group size to the quantize function via global
-    if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0) {
-        int gs = 0;
-        memcpy(&gs, dst->op_params, sizeof(int));
-        turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
-    }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
