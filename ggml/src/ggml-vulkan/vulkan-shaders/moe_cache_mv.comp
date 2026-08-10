@@ -1,0 +1,75 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#include "types.glsl"
+
+// Layout: one workgroup per hit row, N workgroups in X dimension
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Buffer bindings
+// binding 0: pool slab (block_q8_0 expert weights)
+// binding 1: slot indices (int32_t[n_hits])
+// binding 2: q8_1 activations (block_q8_1[n_hits * padded_n_in / QK8_1])
+// binding 3: output (float[n_hits * n_out])
+// binding 4: uniform params
+
+layout (binding = 0) readonly buffer A {uint8_t data_slab[];};
+layout (binding = 1) readonly buffer B {int32_t data_ids[];};
+layout (binding = 2) readonly buffer C {block_q8_1 data_act[];};
+layout (binding = 3) writeonly buffer D {float data_dst[];};
+
+layout (binding = 4) uniform Params {
+    int64_t n_in;
+    int64_t n_out;
+    int64_t expert_stride;   // bytes per expert in slab
+    int64_t row_stride;      // bytes per output row (ggml_row_size(Q8_0, n_in))
+    int64_t n_hits;
+    int64_t padded_n_in;
+} p;
+
+void main() {
+    const uint global_id = gl_GlobalInvocationID.x;
+
+    if (global_id >= p.n_hits) {
+        return;
+    }
+
+    const int slot = data_ids[global_id];
+    if (slot < 0) {
+        data_dst[global_id] = 0.0f;
+        return;
+    }
+
+    // Compute base offset into slab for this expert slot
+    const uint slab_base = uint(int64_t(slot) * p.expert_stride);
+
+    // Each workgroup handles one hit row.
+    // Threads within the workgroup split the n_out dimension.
+    const uint local_id = gl_LocalInvocationID.x;
+    const uint n_out_u = uint(p.n_out);
+
+    const int nb = int(p.n_in / int64_t(QK8_0));  // blocks per row
+    const uint act_base = uint(global_id) * uint(p.padded_n_in / int64_t(QK8_1));
+
+    // Each thread handles a subset of output rows
+    for (uint row = local_id; row < n_out_u; row += gl_WorkGroupSize.x) {
+        // Pointer to this output row's weight blocks
+        const uint row_off = slab_base + uint(int64_t(row) * p.row_stride);
+        const block_q8_0 * w_blocks = (const block_q8_0 *)(data_slab + row_off);
+        const block_q8_1 * a_blocks = data_act + act_base;
+
+        float sum = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const float d_w = float(w_blocks[ib].d);
+            const float d_a = float(a_blocks[ib].d);
+            int sum_q = 0;
+            for (int i = 0; i < QK8_0; i++) {
+                sum_q += int(w_blocks[ib].qs[i]) * int(a_blocks[ib].qs[i]);
+            }
+            sum += d_w * d_a * float(sum_q);
+        }
+        data_dst[global_id * n_out_u + row] = sum;
+    }
+}
