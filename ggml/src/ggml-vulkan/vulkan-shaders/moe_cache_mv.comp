@@ -9,12 +9,6 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 // Buffer bindings
-// binding 0: pool slab (block_q8_0 expert weights)
-// binding 1: slot indices (int32_t[n_hits])
-// binding 2: q8_1 activations (block_q8_1[n_hits * padded_n_in / QK8_1])
-// binding 3: output (float[n_hits * n_out])
-// binding 4: uniform params
-
 layout (binding = 0) readonly buffer A {uint8_t data_slab[];};
 layout (binding = 1) readonly buffer B {int32_t data_ids[];};
 layout (binding = 2) readonly buffer C {block_q8_1 data_act[];};
@@ -23,18 +17,112 @@ layout (binding = 3) writeonly buffer D {float data_dst[];};
 layout (binding = 4) uniform Params {
     int64_t n_in;
     int64_t n_out;
-    int64_t expert_stride;   // bytes per expert in slab
-    int64_t row_stride;      // bytes per output row (ggml_row_size(Q8_0, n_in))
+    int64_t expert_stride;
+    int64_t row_stride;
     int64_t n_hits;
     int64_t padded_n_in;
 } p;
 
+// Select weight block type via preprocessor define.
+// Compiled separately per type (like mul_mm.comp does).
+#if !defined(MOE_CACHE_WTYPE)
+#define MOE_CACHE_WTYPE Q8_0
+#endif
+
+#if MOE_CACHE_WTYPE == Q8_0
+#define WBLOCK_T block_q8_0
+#define WBLOCK_QK 32
+#endif
+
+#if MOE_CACHE_WTYPE == Q4_0
+#define WBLOCK_T block_q4_0
+#define WBLOCK_QK 32
+#endif
+
+#if MOE_CACHE_WTYPE == Q4_K
+#define WBLOCK_T block_q4_K
+#define WBLOCK_QK 256
+#endif
+
+#if MOE_CACHE_WTYPE == Q6_K
+#define WBLOCK_T block_q6_K
+#define WBLOCK_QK 256
+#endif
+
+// ---------------------------------------------------------------------------
+// Per-type block dot product functions
+// ---------------------------------------------------------------------------
+
+float dot_block_q8_0(const block_q8_0 w, const block_q8_1 a) {
+    const float d_w = float(w.d);
+    const float d_a = float(a.d);
+    int sum_q = 0;
+    for (int i = 0; i < 32; i++) {
+        sum_q += int(w.qs[i]) * int(a.qs[i]);
+    }
+    return d_w * d_a * float(sum_q);
+}
+
+float dot_block_q4_0(const block_q4_0 w, const block_q8_1 a) {
+    const float d_w = float(w.d);
+    const float d_a = float(a.d);
+    int sum_q = 0;
+    for (int i = 0; i < 16; i++) {
+        const uint nibbles = w.qs[i];
+        sum_q += (int(nibbles & 0xFu) - 8) * int(a.qs[2*i]);
+        sum_q += (int(nibbles >> 4) - 8) * int(a.qs[2*i + 1]);
+    }
+    return d_w * d_a * float(sum_q);
+}
+
+float dot_block_q4_K(const block_q4_K w, const block_q8_1 a) {
+    const float d_all = float(w.dm[0]);
+    const float d_min = float(w.dm[1]);
+    const float d_a = float(a.d);
+
+    float sum = 0.0f;
+    for (int sb = 0; sb < 8; sb++) {
+        const uint scale_bits = w.scales[sb / 2];
+        const float scale = ((sb & 1) != 0) ? float(scale_bits >> 4) : float(scale_bits & 0xFu);
+        const float dl = d_all * scale;
+        const float ml = d_min * scale;
+
+        for (int j = 0; j < 32; j++) {
+            const int idx = sb * 32 + j;
+            const uint nibbles = w.qs[idx / 2];
+            const int n0 = ((idx & 1) != 0) ? int(nibbles >> 4) : int(nibbles & 0xFu);
+            sum += (dl * float(n0) - ml) * d_a * float(a.qs[idx]);
+        }
+    }
+    return sum;
+}
+
+float dot_block_q6_K(const block_q6_K w, const block_q8_1 a) {
+    const float d_all = float(w.d);
+    const float d_a = float(a.d);
+
+    float sum = 0.0f;
+    for (int i = 0; i < 256; i++) {
+        const int sb = i / 16;
+        const int scale = int(w.scales[sb]);
+        const float dl = d_all * float(scale);
+
+        const uint low = w.ql[i / 2];
+        const uint high = w.qh[i / 4];
+        const int q4 = ((i & 1) != 0) ? int(low >> 4) : int(low & 0xFu);
+        const int q2 = int(high >> (2 * (i % 4))) & 0x3;
+        const int q6 = q4 | (q2 << 4);
+        const float w_val = dl * float(q6 - 32);
+
+        sum += w_val * d_a * float(a.qs[i]);
+    }
+    return sum;
+}
+
 void main() {
     const uint global_id = gl_GlobalInvocationID.x;
 
-    if (global_id >= p.n_hits) {
-        return;
-    }
+    if (global_id >= p.n_hits) return;
 
     const int slot = data_ids[global_id];
     if (slot < 0) {
@@ -42,33 +130,28 @@ void main() {
         return;
     }
 
-    // Compute base offset into slab for this expert slot
     const uint slab_base = uint(int64_t(slot) * p.expert_stride);
-
-    // Each workgroup handles one hit row.
-    // Threads within the workgroup split the n_out dimension.
     const uint local_id = gl_LocalInvocationID.x;
     const uint n_out_u = uint(p.n_out);
+    const int nb = int(p.n_in / int64_t(WBLOCK_QK));
+    const uint act_base = uint(global_id) * uint(p.padded_n_in / int64_t(32));
 
-    const int nb = int(p.n_in / int64_t(QK8_0));  // blocks per row
-    const uint act_base = uint(global_id) * uint(p.padded_n_in / int64_t(QK8_1));
-
-    // Each thread handles a subset of output rows
     for (uint row = local_id; row < n_out_u; row += gl_WorkGroupSize.x) {
-        // Pointer to this output row's weight blocks
         const uint row_off = slab_base + uint(int64_t(row) * p.row_stride);
-        const block_q8_0 * w_blocks = (const block_q8_0 *)(data_slab + row_off);
+        const WBLOCK_T * w_blocks = (const WBLOCK_T *)(data_slab + row_off);
         const block_q8_1 * a_blocks = data_act + act_base;
 
         float sum = 0.0f;
         for (int ib = 0; ib < nb; ib++) {
-            const float d_w = float(w_blocks[ib].d);
-            const float d_a = float(a_blocks[ib].d);
-            int sum_q = 0;
-            for (int i = 0; i < QK8_0; i++) {
-                sum_q += int(w_blocks[ib].qs[i]) * int(a_blocks[ib].qs[i]);
-            }
-            sum += d_w * d_a * float(sum_q);
+#if MOE_CACHE_WTYPE == Q8_0
+            sum += dot_block_q8_0(w_blocks[ib], a_blocks[ib]);
+#elif MOE_CACHE_WTYPE == Q4_0
+            sum += dot_block_q4_0(w_blocks[ib], a_blocks[ib]);
+#elif MOE_CACHE_WTYPE == Q4_K
+            sum += dot_block_q4_K(w_blocks[ib], a_blocks[ib]);
+#elif MOE_CACHE_WTYPE == Q6_K
+            sum += dot_block_q6_K(w_blocks[ib], a_blocks[ib]);
+#endif
         }
         data_dst[global_id * n_out_u + row] = sum;
     }

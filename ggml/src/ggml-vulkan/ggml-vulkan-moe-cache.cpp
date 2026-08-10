@@ -362,8 +362,8 @@ static int vk_moe_query_shape(int wtype, int64_t n_in, int64_t n_out,
                                ggml_moe_cache_shape_caps * result) {
     if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) return 0;
     if (!moe_cache_type_supported((ggml_type)wtype)) return 0;
-    // v1: Q8_0 only
-    if (wtype != GGML_TYPE_Q8_0) return 0;
+    if (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
+        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) return 0;
 
     const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, n_in);
     if (row_size == 0) return 0;

@@ -13645,26 +13645,114 @@ kernel void kernel_dsv4_hc_post_f32(
 // MoE Expert Cache matvec — reads quantized weights from a pool slab
 // at per-row offsets and computes dot products with q8_1 activations.
 // One thread per (hit, output_row) pair.
+// Template parameter: block_t = the quantized block type.
 // ============================================================================
-kernel void kernel_moe_cache_mv_q8_0_f32(
-    device const char * slab,          // [0]: pool slab (all experts)
-    device const int32_t * ids,        // [1]: slot indices per hit [n_hits]
-    device const block_q8_1 * act_q8,  // [2]: q8_1 activations [n_hits * padded_n_in/QK8_1]
-    device float * dst,                // [3]: output [n_hits * n_out]
-    constant int64_t & n_in,           // [4]: inner dimension (elements)
-    constant int64_t & n_out,          // [4]: outer dimension (output rows per expert)
-    constant int64_t & expert_stride,  // [4]: bytes per expert in slab
-    constant int64_t & row_stride,     // [4]: bytes per output row (ggml_row_size)
-    constant int64_t & n_hits,         // [4]: number of hits
-    constant int64_t & padded_n_in,    // [4]: padded inner dim
+
+template <typename block_t>
+void kernel_moe_cache_mv_block_dot(
+    device const block_t * w_block,
+    device const block_q8_1 * a_block,
+    thread float & sum) {
+    // Q8_0 specialization: signed 8-bit quants
+    if (__is_same_v<block_t, block_q8_0>) {
+        const float d_w = (float)w_block->d;
+        const float d_a = (float)a_block->d;
+        int sum_q = 0;
+        for (int i = 0; i < QK8_0; i++) {
+            sum_q += (int)w_block->qs[i] * (int)a_block->qs[i];
+        }
+        sum += d_w * d_a * (float)sum_q;
+        return;
+    }
+
+    // Q4_0 specialization: 4-bit nibbles, offset by -8
+    if (__is_same_v<block_t, block_q4_0>) {
+        const float d_w = (float)w_block->d;
+        const float d_a = (float)a_block->d;
+        const float offset = -8.0f * d_w;
+        int sum_q = 0;
+        for (int i = 0; i < 16; i++) {
+            const uint8_t nibbles = w_block->qs[i];
+            sum_q += ((int)(nibbles & 0xF) - 8) * (int)a_block->qs[2*i];
+            sum_q += ((int)(nibbles >> 4)  - 8) * (int)a_block->qs[2*i + 1];
+        }
+        sum += d_w * d_a * (float)sum_q;
+        return;
+    }
+
+    // Q4_K specialization: per-subblock scales, nibble values
+    if (__is_same_v<block_t, block_q4_K>) {
+        // Q4_K block structure:
+        //   dm = {d, dmin}
+        //   scales[12] = 6-bit scale pairs (lower 6 bits per subblock)
+        //   qs[128] = nibbles for 256 values
+        // Each sub-block of 32 elements uses scale from scales[subblock_idx/2]
+        // with lower/upper 4 bits of scale for even/odd subblock.
+        device const uint8_t * q = w_block->qs;
+        device const uint8_t * sc = w_block->scales;
+        const float d_all = (float)w_block->dm[0];
+        const float d_min = (float)w_block->dm[1];
+        const float d_a = (float)a_block->d;
+
+        for (int sb = 0; sb < 8; sb++) {
+            const uint8_t scale_bits = sc[sb / 2];
+            const float scale = (sb & 1) ? (float)(scale_bits >> 4) : (float)(scale_bits & 0xF);
+            const float dl = d_all * scale;
+            const float ml = d_min * scale;
+
+            for (int j = 0; j < 16; j++) {
+                const int idx = sb * 16 + j;
+                const uint8_t nibbles = q[idx / 2];
+                const int n0 = (idx & 1) ? (nibbles >> 4) : (nibbles & 0xF);
+                sum += (dl * (float)n0 - ml) * d_a * (float)a_block->qs[idx];
+            }
+        }
+        return;
+    }
+
+    // Q6_K specialization: 6-bit values (4-bit low + 2-bit high), per-subblock scale
+    if (__is_same_v<block_t, block_q6_K>) {
+        device const uint8_t * ql_ptr = (device const uint8_t *)w_block->ql;
+        device const uint8_t * qh_ptr = (device const uint8_t *)w_block->qh;
+        const float d_all = (float)w_block->d;
+        const float d_a = (float)a_block->d;
+
+        for (int i = 0; i < QK_K; i++) {
+            const int sb = i / 16;
+            const int8_t scale = w_block->scales[sb];
+            const float dl = d_all * (float)scale;
+
+            const uint8_t low = ql_ptr[i / 2];
+            const uint8_t high = qh_ptr[i / 4];
+            const int q4 = (i & 1) ? (low >> 4) : (low & 0xF);
+            const int q2 = (high >> (2 * (i % 4))) & 0x3;
+            const int q6 = q4 | (q2 << 4);
+            const float w_val = dl * (float)(q6 - 32);
+
+            sum += w_val * d_a * (float)a_block->qs[i];
+        }
+        return;
+    }
+}
+
+template <typename block_t, short qk>
+kernel void kernel_moe_cache_mv_generic(
+    device const char * slab,
+    device const int32_t * ids,
+    device const block_q8_1 * act_q8,
+    device float * dst,
+    constant int64_t & n_in,
+    constant int64_t & n_out,
+    constant int64_t & expert_stride,
+    constant int64_t & row_stride,
+    constant int64_t & n_hits,
+    constant int64_t & padded_n_in,
     uint id [[thread_position_in_grid]]
 ) {
     const int64_t hit = (int64_t)id / n_out;
     const int64_t row = (int64_t)id - hit * n_out;
 
-    if (hit >= n_hits) {
-        return;
-    }
+    if (hit >= n_hits) return;
 
     const int slot = ids[hit];
     if (slot < 0) {
@@ -13672,19 +13760,39 @@ kernel void kernel_moe_cache_mv_q8_0_f32(
         return;
     }
 
-    device const block_q8_0 * w_row = (device const block_q8_0 *)(slab + (int64_t)slot * expert_stride + row * row_stride);
-    device const block_q8_1 * act    = act_q8 + hit * (padded_n_in / QK8_1);
+    device const block_t * w_row = (device const block_t *)(slab + (int64_t)slot * expert_stride + row * row_stride);
+    device const block_q8_1 * act = act_q8 + hit * (padded_n_in / QK8_1);
 
-    const int nb = (int)(n_in / QK8_0);
+    const int nb = (int)(n_in / qk);
     float sum = 0.0f;
     for (int ib = 0; ib < nb; ib++) {
-        const float d_w = (float)w_row[ib].d;
-        const float d_a = (float)act[ib].d;
-        int sum_q = 0;
-        for (int i = 0; i < QK8_0; i++) {
-            sum_q += (int)w_row[ib].qs[i] * (int)act[ib].qs[i];
-        }
-        sum += d_w * d_a * (float)sum_q;
+        kernel_moe_cache_mv_block_dot<block_t>(&w_row[ib], &act[ib], sum);
     }
     dst[hit * n_out + row] = sum;
 }
+
+// Per-type instantiations with host_name for runtime dispatch
+
+template [[host_name("kernel_moe_cache_mv_q8_0_f32")]]
+kernel void kernel_moe_cache_mv_generic<block_q8_0, QK8_0>(
+    device const char *, device const int32_t *, device const block_q8_1 *,
+    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
+    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+
+template [[host_name("kernel_moe_cache_mv_q4_0_f32")]]
+kernel void kernel_moe_cache_mv_generic<block_q4_0, QK4_0>(
+    device const char *, device const int32_t *, device const block_q8_1 *,
+    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
+    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+
+template [[host_name("kernel_moe_cache_mv_q4_K_f32")]]
+kernel void kernel_moe_cache_mv_generic<block_q4_K, QK_K>(
+    device const char *, device const int32_t *, device const block_q8_1 *,
+    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
+    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+
+template [[host_name("kernel_moe_cache_mv_q6_K_f32")]]
+kernel void kernel_moe_cache_mv_generic<block_q6_K, QK_K>(
+    device const char *, device const int32_t *, device const block_q8_1 *,
+    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
+    constant int64_t &, constant int64_t &, constant int64_t &, uint);

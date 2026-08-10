@@ -36,6 +36,10 @@ struct moe_cache_metal_device : public moe_cache_device {
     id<MTLDevice> mtl_device;
     id<MTLCommandQueue> mtl_queue;
     id<MTLComputePipelineState> mmv_pipeline = nil;
+    // Per-type pipeline variants
+    id<MTLComputePipelineState> mmv_pipeline_q4_0 = nil;
+    id<MTLComputePipelineState> mmv_pipeline_q4_K = nil;
+    id<MTLComputePipelineState> mmv_pipeline_q6_K = nil;
 
     // Tracked MTLBuffers for slab pools and scratch.
     std::vector<id<MTLBuffer>> slab_buffers;
@@ -134,10 +138,11 @@ static int metal_query_shape(int wtype, int64_t n_in, int64_t n_out,
                               ggml_moe_cache_shape_caps * result) {
     if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) return 0;
     if (!moe_cache_type_supported((ggml_type)wtype)) return 0;
-    // v1: Q8_0 only
-    if (wtype != GGML_TYPE_Q8_0) return 0;
+    // Supported quant types (all block-based, Q8_1 activation compatible)
+    if (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
+        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) return 0;
 
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, n_in);
+    const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
     if (row_size == 0) return 0;
     if ((uint64_t)n_out > SIZE_MAX / row_size) return 0;
     if (expert_size != (size_t)n_out * row_size) return 0;
@@ -231,43 +236,63 @@ static void * metal_session_create(void * const * backends, int n_backends,
             return nullptr;
         }
 
-        id<MTLFunction> fn = [lib newFunctionWithName:
-            @"kernel_moe_cache_mv_q8_0_f32"];
+        // Load all kernel variants
+        static const char * kernel_names[] = {
+            "kernel_moe_cache_mv_q8_0_f32",
+            "kernel_moe_cache_mv_q4_0_f32",
+            "kernel_moe_cache_mv_q4_K_f32",
+            "kernel_moe_cache_mv_q6_K_f32",
+        };
+        id<MTLComputePipelineState> * pipelines[] = {
+            &dev->mmv_pipeline,
+            &dev->mmv_pipeline_q4_0,
+            &dev->mmv_pipeline_q4_K,
+            &dev->mmv_pipeline_q6_K,
+        };
+
+        int loaded = 0;
+        for (int ki = 0; ki < 4; ki++) {
+            id<MTLFunction> fn = [lib newFunctionWithName:
+                [NSString stringWithUTF8String:kernel_names[ki]]];
+            if (!fn) {
+                MOE_CACHE_LOG("[moe-cache] kernel %s not found\n", kernel_names[ki]);
+                continue;
+            }
+            *pipelines[ki] = [mtl_dev newComputePipelineStateWithFunction:fn error:&error];
+            [fn release];
+            if (!*pipelines[ki]) {
+                MOE_CACHE_LOG("[moe-cache] pipeline %s failed: %s\n", kernel_names[ki],
+                    error ? [[error description] UTF8String] : "unknown");
+                error = nil;
+            } else {
+                loaded++;
+            }
+        }
         [lib release];
 
-        if (!fn) {
-            MOE_CACHE_LOG("[moe-cache] kernel not found in metallib "
-                "(was ggml-metal.metal updated?)\n");
-            return nullptr;
-        }
-
-        id<MTLComputePipelineState> pipeline =
-            [mtl_dev newComputePipelineStateWithFunction:fn error:&error];
-        [fn release];
-
-        if (!pipeline) {
-            MOE_CACHE_LOG("[moe-cache] pipeline failed: %s\n",
-                error ? [[error description] UTF8String] : "unknown");
-            return nullptr;
+        if (loaded == 0) {
+            MOE_CACHE_LOG("[moe-cache] no Metal kernels loaded\n");
+            continue;
         }
 
         id<MTLCommandQueue> queue = [mtl_dev newCommandQueue];
         if (!queue) {
-            [pipeline release];
-            return nullptr;
+            continue;
         }
 
         auto session = std::make_unique<moe_cache_session>();
         session->config = std::move(config);
 
         auto dev = std::make_unique<moe_cache_metal_device>(mtl_dev, queue);
-        dev->mmv_pipeline = pipeline;
-        [queue release]; // retained by device
-        [pipeline release]; // retained by device
+        dev->mmv_pipeline = pipelines[0] ? *pipelines[0] : nil;
+        dev->mmv_pipeline_q4_0 = pipelines[1] ? *pipelines[1] : nil;
+        dev->mmv_pipeline_q4_K = pipelines[2] ? *pipelines[2] : nil;
+        dev->mmv_pipeline_q6_K = pipelines[3] ? *pipelines[3] : nil;
+        [queue release];
 
         session->devices.push_back(std::move(dev));
 
-        MOE_CACHE_LOG("[moe-cache] Metal session created\n");
+        MOE_CACHE_LOG("[moe-cache] Metal session created (%d/4 kernel variants)\n", loaded);
         return session.release();
     } catch (...) {
         MOE_CACHE_LOG("[moe-cache] Metal session creation failed\n");
@@ -405,7 +430,7 @@ static void * metal_begin(const ggml_moe_cache_tensor_desc * tensor, int pool,
     node->n_out = tensor->n_out;
     node->n_expert = tensor->n_expert;
     node->n_tokens = n_tokens;
-    node->wtype = GGML_TYPE_Q8_0;
+    node->wtype = tensor->type;
     node->dispatch_lock = std::move(lock);
 
     // Pin the slots that were hits
@@ -459,7 +484,7 @@ static int metal_dispatch_internal(
     const int64_t n_in = node->n_in;
     const int64_t n_out = node->n_out;
     const int64_t expert_stride = node->expert_size;
-    const int64_t row_stride = ggml_row_size(GGML_TYPE_Q8_0, n_in);
+    const int64_t row_stride = ggml_row_size((ggml_type)node->wtype, n_in);
     const int64_t padded_n_in =
         ((n_in + QK8_1 - 1) / QK8_1) * QK8_1;
 
@@ -519,7 +544,16 @@ static int metal_dispatch_internal(
     id<MTLComputeCommandEncoder> enc =
         [cmd_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 
-    [enc setComputePipelineState:dev.mmv_pipeline];
+    // Select pipeline based on weight type
+    id<MTLComputePipelineState> pipeline = dev.mmv_pipeline; // default Q8_0
+    switch (node->wtype) {
+        case GGML_TYPE_Q4_0: pipeline = dev.mmv_pipeline_q4_0 ?: dev.mmv_pipeline; break;
+        case GGML_TYPE_Q4_K: pipeline = dev.mmv_pipeline_q4_K ?: dev.mmv_pipeline; break;
+        case GGML_TYPE_Q6_K: pipeline = dev.mmv_pipeline_q6_K ?: dev.mmv_pipeline; break;
+        default: break;
+    }
+    if (!pipeline) { [enc endEncoding]; [cmd_buf release]; [ids_buf release]; [act_buf release]; [out_buf release]; return 0; }
+    [enc setComputePipelineState:pipeline];
 
     // Get the slab buffer — it's one of the tracked slab_buffers.
     // The pool slab pointer points into a specific MTLBuffer's contents.
