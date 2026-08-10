@@ -12,6 +12,9 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include "../ggml/src/ggml-backend-moe-cache.h"
+
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -110,6 +113,8 @@ llama_context::llama_context(
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
+    cparams.moe_cache_mode          = params.moe_cache_mode;
+    cparams.moe_cache_budget_mib    = params.moe_cache_budget_mib;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -575,6 +580,77 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+static bool llama_model_has_cacheable_moe_weights(
+        const llama_model & model, llama_moe_cache_mode mode, size_t budget_mib,
+        const std::vector<ggml_backend_t> & backends) {
+    if (mode == LLAMA_MOE_CACHE_MODE_OFF ||
+        !ggml_moe_cache.query_config || !ggml_moe_cache.query_device ||
+        !ggml_moe_cache.query_shape) {
+        return false;
+    }
+
+    ggml_moe_cache_config config = {};
+    const int automatic = mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED
+        ? -1 : mode == LLAMA_MOE_CACHE_MODE_AUTO;
+    if (!ggml_moe_cache.query_config(automatic, budget_mib, &config)) {
+        return false;
+    }
+
+    std::vector<int32_t> physical_devices;
+    size_t min_expert_bytes = 0;
+    for (ggml_backend_t backend : backends) {
+        if (!backend) {
+            continue;
+        }
+        ggml_moe_cache_device_caps caps = {};
+        if (!ggml_moe_cache.query_device(
+                    ggml_backend_get_device(backend), &config, &caps) ||
+            std::find(physical_devices.begin(), physical_devices.end(),
+                    caps.physical_device) != physical_devices.end()) {
+            continue;
+        }
+        physical_devices.push_back(caps.physical_device);
+        min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
+    }
+    if ((int) physical_devices.size() < config.min_devices) {
+        return false;
+    }
+
+    for (const auto & entry : model.tensors_by_name) {
+        const std::string & name = entry.first;
+        const ggml_tensor * tensor = entry.second;
+        if (!tensor || (name.find("_exps") == std::string::npos &&
+                        name.find("_chexps") == std::string::npos) ||
+            ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 ||
+            tensor->ne[1] <= 0 || tensor->ne[2] <= 0 ||
+            tensor->nb[2] < min_expert_bytes) {
+            continue;
+        }
+
+        ggml_backend_buffer_t buffer = tensor->view_src
+            ? tensor->view_src->buffer : tensor->buffer;
+        if (!buffer || !ggml_backend_buffer_is_host(buffer) ||
+            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;
+        }
+
+        ggml_moe_cache_shape_caps shape = {};
+        if (ggml_moe_cache.query_shape(
+                    tensor->type, tensor->ne[0], tensor->ne[1], tensor->ne[2],
+                    tensor->nb[2], &shape)) {
+            const size_t slab_bytes = std::max(
+                    shape.pool_bytes, config.minimum_slab_bytes);
+            if (config.budget_bytes > 0 &&
+                (shape.scratch_bytes > config.budget_bytes ||
+                 slab_bytes > config.budget_bytes - shape.scratch_bytes)) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -598,7 +674,26 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
+    const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
+            model, (llama_moe_cache_mode)cparams.moe_cache_mode,
+            cparams.moe_cache_budget_mib, backend_ptrs);
+    const ggml_moe_cache_mode moe_cache_mode = moe_cache_eligible
+        ? (ggml_moe_cache_mode)cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
+    const char * moe_cache_requested = "provider";
+    switch (cparams.moe_cache_mode) {
+        case LLAMA_MOE_CACHE_MODE_OFF:  moe_cache_requested = "off";  break;
+        case LLAMA_MOE_CACHE_MODE_AUTO: moe_cache_requested = "auto"; break;
+        case LLAMA_MOE_CACHE_MODE_ON:   moe_cache_requested = "on";   break;
+        case LLAMA_MOE_CACHE_MODE_UNSPECIFIED: break;
+    }
+    LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s\n",
+            __func__, moe_cache_requested,
+            moe_cache_eligible ? moe_cache_requested : "off");
+
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_moe_cache(
+            sched.get(), moe_cache_mode,
+            cparams.moe_cache_budget_mib);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -688,6 +783,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_moe_cache(
+                        sched.get(), moe_cache_mode,
+                        cparams.moe_cache_budget_mib);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3561,6 +3659,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
+        /*.moe_cache_budget_mib        =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
