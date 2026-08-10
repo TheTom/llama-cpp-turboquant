@@ -13640,3 +13640,51 @@ kernel void kernel_dsv4_hc_post_f32(
     }
 }
 
+
+// ============================================================================
+// MoE Expert Cache matvec — reads quantized weights from a pool slab
+// at per-row offsets and computes dot products with q8_1 activations.
+// One thread per (hit, output_row) pair.
+// ============================================================================
+kernel void kernel_moe_cache_mv_q8_0_f32(
+    device const char * slab,          // [0]: pool slab (all experts)
+    device const int32_t * ids,        // [1]: slot indices per hit [n_hits]
+    device const block_q8_1 * act_q8,  // [2]: q8_1 activations [n_hits * padded_n_in/QK8_1]
+    device float * dst,                // [3]: output [n_hits * n_out]
+    constant int64_t & n_in,           // [4]: inner dimension (elements)
+    constant int64_t & n_out,          // [4]: outer dimension (output rows per expert)
+    constant int64_t & expert_stride,  // [4]: bytes per expert in slab
+    constant int64_t & row_stride,     // [4]: bytes per output row (ggml_row_size)
+    constant int64_t & n_hits,         // [4]: number of hits
+    constant int64_t & padded_n_in,    // [4]: padded inner dim
+    uint id [[thread_position_in_grid]]
+) {
+    const int64_t hit = (int64_t)id / n_out;
+    const int64_t row = (int64_t)id - hit * n_out;
+
+    if (hit >= n_hits) {
+        return;
+    }
+
+    const int slot = ids[hit];
+    if (slot < 0) {
+        dst[hit * n_out + row] = 0.0f;
+        return;
+    }
+
+    device const block_q8_0 * w_row = (device const block_q8_0 *)(slab + (int64_t)slot * expert_stride + row * row_stride);
+    device const block_q8_1 * act    = act_q8 + hit * (padded_n_in / QK8_1);
+
+    const int nb = (int)(n_in / QK8_0);
+    float sum = 0.0f;
+    for (int ib = 0; ib < nb; ib++) {
+        const float d_w = (float)w_row[ib].d;
+        const float d_a = (float)act[ib].d;
+        int sum_q = 0;
+        for (int i = 0; i < QK8_0; i++) {
+            sum_q += (int)w_row[ib].qs[i] * (int)act[ib].qs[i];
+        }
+        sum += d_w * d_a * (float)sum_q;
+    }
+    dst[hit * n_out + row] = sum;
+}
