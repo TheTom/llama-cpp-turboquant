@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-void ggml_moe_cache_register(const void * owner);
+void ggml_cuda_moe_cache_register(void * reg);
 
 // Surrender the device's cache VRAM under allocator pressure; returns bytes freed.
 size_t ggml_moe_cache_trim(int device);

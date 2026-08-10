@@ -13680,14 +13680,10 @@ void kernel_moe_cache_mv_block_dot(
         return;
     }
 
-    // Q4_K specialization: per-subblock scales, nibble values
+    // Q4_K specialization: 8 sub-blocks of 32 elements. Each sub-block has a
+    // 6-bit scale and a 6-bit min packed across scales[12]; matches the
+    // get_scale_min_k4 unpacking used by the CPU and other GPU backends.
     if (__is_same_v<block_t, block_q4_K>) {
-        // Q4_K block structure:
-        //   dm = {d, dmin}
-        //   scales[12] = 6-bit scale pairs (lower 6 bits per subblock)
-        //   qs[128] = nibbles for 256 values
-        // Each sub-block of 32 elements uses scale from scales[subblock_idx/2]
-        // with lower/upper 4 bits of scale for even/odd subblock.
         device const uint8_t * q = w_block->qs;
         device const uint8_t * sc = w_block->scales;
         const float d_all = (float)w_block->dm[0];
@@ -13695,13 +13691,19 @@ void kernel_moe_cache_mv_block_dot(
         const float d_a = (float)a_block->d;
 
         for (int sb = 0; sb < 8; sb++) {
-            const uint8_t scale_bits = sc[sb / 2];
-            const float scale = (sb & 1) ? (float)(scale_bits >> 4) : (float)(scale_bits & 0xF);
-            const float dl = d_all * scale;
-            const float ml = d_min * scale;
+            int sc6, mn6;
+            if (sb < 4) {
+                sc6 = sc[sb] & 0x3F;
+                mn6 = sc[sb + 4] & 0x3F;
+            } else {
+                sc6 = (sc[sb + 4] & 0xF) | ((sc[sb - 4] & 0xC0) >> 2);
+                mn6 = (sc[sb + 4] >> 4) | ((sc[sb] & 0xC0) >> 2);
+            }
+            const float dl = d_all * (float)sc6;
+            const float ml = d_min * (float)mn6;
 
-            for (int j = 0; j < 16; j++) {
-                const int idx = sb * 16 + j;
+            for (int j = 0; j < 32; j++) {
+                const int idx = sb * 32 + j;
                 const uint8_t nibbles = q[idx / 2];
                 const int n0 = (idx & 1) ? (nibbles >> 4) : (nibbles & 0xF);
                 sum += (dl * (float)n0 - ml) * d_a * (float)a_block->qs[idx];
@@ -13766,7 +13768,8 @@ kernel void kernel_moe_cache_mv_generic(
     const int nb = (int)(n_in / qk);
     float sum = 0.0f;
     for (int ib = 0; ib < nb; ib++) {
-        kernel_moe_cache_mv_block_dot<block_t>(&w_row[ib], &act[ib], sum);
+        // a 256-column K-type weight block consumes qk / QK8_1 act blocks
+        kernel_moe_cache_mv_block_dot<block_t>(&w_row[ib], &act[ib * (qk / QK8_1)], sum);
     }
     dst[hit * n_out + row] = sum;
 }

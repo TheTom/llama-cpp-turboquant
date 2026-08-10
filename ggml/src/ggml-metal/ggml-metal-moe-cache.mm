@@ -1,19 +1,45 @@
-// Metal MoE Expert Cache — self-contained implementation.
+// Metal MoE Expert Cache.
 //
-// Uses unified memory (no H2D copies), pre-compiled kernel from ggml-metal.metal.
+// Keeps the hottest CPU-resident MoE expert weights resident in Metal
+// shared (unified) memory, so decode-time expert matvecs run on the GPU
+// instead of the CPU path with PCIe-round-trip weight reads.
 //
-// Activate by:
-//   1. Adding to CMakeLists.txt
-//   2. Calling ggml_metal_moe_cache_register() from ggml_backend_metal_reg_init()
+// This implements the real ggml_moe_cache_api contract (see
+// ggml-backend-moe-cache.h). The scheduler owns one cache session; the
+// CPU MUL_MAT_ID path calls begin/plan/dispatch/collect/end per node.
+//
+// v1 notes:
+//   - synchronous fills (no worker thread): plan() copies missed experts
+//     into the slab before returning, so a miss still serves this node
+//   - one pool per (expert_size, wtype), allocated lazily in begin()
+//   - unified memory: fills are plain memcpy, results live in shared
+//     buffers readable by the CPU
+//   - fused SwiGLU returns NULL (stock CPU path handles the node)
+//
+// Register by calling ggml_metal_moe_cache_register() from
+// ggml_backend_metal_reg() after the backend reg struct is set up.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "ggml-metal.h"
+#include "ggml-metal-context.h"
+#include "ggml-metal-device.h"
+
+#include "ggml-backend-impl.h"
+#include "ggml-backend.h"
+#include "ggml-impl.h"
+#include "ggml.h"
+#include "../ggml-quants.h"
 #include "../ggml-moe-cache-common.h"
 
-// Thread-local session stack (owned by this backend; separate from CUDA's).
+// Thread-local session stack (owned by this backend; independent of CUDA's).
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
+
+// Global session registry for invalidate()/teardown paths.
+static std::mutex g_registry_mu;
+static std::unordered_set<moe_cache_session *> g_sessions;
 
 // ---------------------------------------------------------------------------
 // Metal device extension
@@ -28,20 +54,23 @@ struct moe_cache_metal_device : public moe_cache_device {
 
     ~moe_cache_metal_device() {
         free_slabs();
-        free_scratch();
+        if (out_buffer) {
+            [out_buffer release];
+            out_buffer = nil;
+        }
         [mtl_queue release];
         [mtl_device release];
     }
 
     id<MTLDevice> mtl_device;
     id<MTLCommandQueue> mtl_queue;
-    id<MTLComputePipelineState> mmv_pipeline = nil;
-    // Per-type pipeline variants
-    id<MTLComputePipelineState> mmv_pipeline_q4_0 = nil;
-    id<MTLComputePipelineState> mmv_pipeline_q4_K = nil;
-    id<MTLComputePipelineState> mmv_pipeline_q6_K = nil;
+    ggml_metal_library_t lib = nullptr;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q8_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q4_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q4_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q6_K;
 
-    // Tracked MTLBuffers for slab pools and scratch.
+    // Tracked MTLBuffers for slab pools.
     std::vector<id<MTLBuffer>> slab_buffers;
     id<MTLBuffer> out_buffer = nil;
 
@@ -54,34 +83,18 @@ struct moe_cache_metal_device : public moe_cache_device {
             p->slab = nullptr;
         }
     }
-
-    void free_scratch() {
-        if (out_buffer) {
-            [out_buffer release];
-            out_buffer = nil;
-            d_out = nullptr;
-            d_out_cap = 0;
-        }
-        if (d_act_q8) {
-            // act_q8 is owned by an MTLBuffer stored separately
-            // d_act_q8 is set from [buf contents]
-            d_act_q8 = nullptr;
-            act_q8_cap = 0;
-        }
-    }
 };
 
-// Forward decls
-static const ggml_moe_cache_api metal_moe_cache_api;
-
 // ---------------------------------------------------------------------------
-// Slab allocation — MTLBuffer with shared storage.
+// Slab allocation — MTLBuffer with shared storage (unified memory).
 // ---------------------------------------------------------------------------
 
 static char * metal_slab_alloc(moe_cache_metal_device & dev, size_t bytes) {
     id<MTLBuffer> buf = [dev.mtl_device newBufferWithLength:bytes
         options:MTLResourceStorageModeShared];
-    if (!buf) return nullptr;
+    if (!buf) {
+        return nullptr;
+    }
     dev.slab_buffers.push_back(buf);
     return (char *)[buf contents];
 }
@@ -92,16 +105,25 @@ static char * metal_slab_alloc(moe_cache_metal_device & dev, size_t bytes) {
 
 static int metal_query_config(int automatic, size_t budget_mib,
                                ggml_moe_cache_config * result) {
-    if (!result) return 0;
+    if (!result) {
+        return 0;
+    }
 
     moe_cache_config config = moe_cache_read_config();
     if (automatic >= 0) {
         config.enabled = true;
         config.automatic = automatic != 0;
         moe_cache_apply_mode_defaults(config);
+        config.min_compute_capability =
+            moe_cache_min_compute_capability(config.automatic);
     }
-    if (budget_mib > 0) config.budget_mb = budget_mib;
-    if (!config.enabled) return 0;
+    if (budget_mib > 0) {
+        config.budget_mb = budget_mib;
+    }
+    if (!config.enabled || config.budget_mb > (SIZE_MAX >> 20) ||
+        config.reserve_mb > (SIZE_MAX >> 20)) {
+        return 0;
+    }
 
     result->budget_bytes = config.budget_mb << 20;
     result->reserve_bytes = config.reserve_mb << 20;
@@ -109,24 +131,27 @@ static int metal_query_config(int automatic, size_t budget_mib,
     result->min_expert_bytes = config.min_expert_bytes;
     result->min_expert_explicit = config.min_expert_explicit;
     result->max_batch = config.max_batch;
-    result->min_compute_capability = 800;
-    result->min_devices = 1;
+    result->min_compute_capability = config.min_compute_capability;
+    result->min_devices = 1; // Metal always has exactly one device
     result->overlap_cpu_rows = config.overlap_cpu_rows;
     return 1;
 }
 
 static int metal_query_device(void * opaque, const ggml_moe_cache_config * config,
                                ggml_moe_cache_device_caps * result) {
-    if (!opaque || !config || !result) return 0;
-    if (metal_moe_cache_api.owner != ggml_moe_cache.owner) return 0;
+    if (!opaque || !config || !result || !ggml_moe_cache.owner) {
+        return 0;
+    }
 
     ggml_backend_dev_t device = (ggml_backend_dev_t)opaque;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-    if ((const void *)reg != metal_moe_cache_api.owner) return 0;
+    if ((const void *)reg != ggml_moe_cache.owner) {
+        return 0;
+    }
 
     result->logical_device = 0;
     result->physical_device = 0;
-    result->compute_capability = 800;
+    result->compute_capability = 800; // Apple Silicon ~ Ampere-class
     result->min_expert_bytes = config->min_expert_explicit
         ? config->min_expert_bytes
         : moe_cache_default_min_expert_bytes(800);
@@ -136,28 +161,100 @@ static int metal_query_device(void * opaque, const ggml_moe_cache_config * confi
 static int metal_query_shape(int wtype, int64_t n_in, int64_t n_out,
                               int64_t n_expert, size_t expert_size,
                               ggml_moe_cache_shape_caps * result) {
-    if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) return 0;
-    if (!moe_cache_type_supported((ggml_type)wtype)) return 0;
-    // Supported quant types (all block-based, Q8_1 activation compatible)
+    if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) {
+        return 0;
+    }
     if (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) return 0;
+        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) {
+        return 0;
+    }
 
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
-    if (row_size == 0) return 0;
-    if ((uint64_t)n_out > SIZE_MAX / row_size) return 0;
-    if (expert_size != (size_t)n_out * row_size) return 0;
+    if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
+        expert_size != (size_t)n_out * row_size ||
+        expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
+        return 0;
+    }
 
-    const size_t pool_bytes = expert_size * moe_cache_pool_slots_min;
     const size_t out_bytes =
         moe_cache_node_rows_max * (size_t)n_out * sizeof(float);
     const size_t act_q8_bytes =
         moe_cache_node_rows_max *
         (size_t)((n_in + QK8_1 - 1) / QK8_1) * sizeof(block_q8_1);
-
-    result->scratch_bytes = out_bytes + act_q8_bytes;
+    const size_t scratch_bytes = out_bytes + act_q8_bytes;
+    const size_t pool_bytes = expert_size * moe_cache_pool_slots_min;
+    if (pool_bytes > SIZE_MAX - scratch_bytes) {
+        return 0;
+    }
+    result->scratch_bytes = scratch_bytes;
     result->pool_bytes = pool_bytes;
-    result->minimum_bytes = pool_bytes;
+    result->minimum_bytes = scratch_bytes + pool_bytes;
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Pool lifecycle
+// ---------------------------------------------------------------------------
+
+static moe_cache_pool * metal_find_or_create_pool(
+        moe_cache_metal_device & dev, size_t expert_size, int wtype,
+        int64_t n_expert, size_t budget_bytes) {
+    const int existing = moe_cache_find_pool(dev, expert_size, wtype);
+    if (existing >= 0) {
+        return dev.pools[existing].get();
+    }
+
+    size_t slots = budget_bytes / expert_size;
+    if (slots < moe_cache_pool_slots_min) {
+        return nullptr;
+    }
+    if ((uint64_t)n_expert > 0 && slots > (size_t)n_expert) {
+        slots = (size_t)n_expert;
+    }
+    if (slots < moe_cache_pool_slots_min) {
+        return nullptr;
+    }
+    if (slots > (size_t)INT_MAX) {
+        slots = INT_MAX;
+    }
+    const size_t slab_bytes = slots * expert_size;
+
+    char * slab = metal_slab_alloc(dev, slab_bytes);
+    if (!slab) {
+        MOE_CACHE_LOG("[moe-cache] Metal: failed to allocate %zu MiB expert pool\n",
+                slab_bytes >> 20);
+        return nullptr;
+    }
+
+    try {
+        std::unique_ptr<moe_cache_pool> pool(new moe_cache_pool());
+        pool->expert_size = expert_size;
+        pool->wtype = wtype;
+        pool->slab = slab;
+        pool->n_slots = (int)slots;
+        pool->covers_all_entries = (uint64_t)slots >= (uint64_t)n_expert;
+        pool->slots.resize(slots);
+        pool->free_slots.reserve(slots);
+        pool->map.reserve(slots);
+        for (int index = (int)slots - 1; index >= 0; index--) {
+            pool->free_slots.push_back(index);
+        }
+        dev.allocated_bytes += slab_bytes;
+        dev.pools.push_back(std::move(pool));
+        MOE_CACHE_LOG("[moe-cache] Metal pool: type=%s expert=%zu KiB slots=%zu total=%zu MiB\n",
+                ggml_type_name((ggml_type)wtype), expert_size >> 10,
+                slots, slab_bytes >> 20);
+        return dev.pools.back().get();
+    } catch (...) {
+        // remove the tracked buffer and restore the pool list
+        if (!dev.slab_buffers.empty()) {
+            id<MTLBuffer> buf = dev.slab_buffers.back();
+            [buf release];
+            dev.slab_buffers.pop_back();
+        }
+        dev.allocated_bytes -= slab_bytes;
+        return nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +267,21 @@ static void * metal_session_create(void * const * backends, int n_backends,
         moe_cache_config config = moe_cache_read_config();
         if (supplied_config) {
             constexpr size_t MiB = 1024 * 1024;
+            if (supplied_config->budget_bytes % MiB != 0 ||
+                supplied_config->reserve_bytes % MiB != 0 ||
+                supplied_config->minimum_slab_bytes % MiB != 0 ||
+                supplied_config->min_expert_bytes == 0 ||
+                supplied_config->min_expert_explicit < 0 ||
+                supplied_config->min_expert_explicit > 1 ||
+                supplied_config->max_batch < 1 ||
+                supplied_config->max_batch > moe_cache_batch_max ||
+                supplied_config->min_devices < 1 ||
+                supplied_config->min_compute_capability < 0 ||
+                supplied_config->min_compute_capability > 999 ||
+                supplied_config->overlap_cpu_rows < -1 ||
+                supplied_config->overlap_cpu_rows > 8) {
+                return nullptr;
+            }
             config.enabled = true;
             config.automatic = supplied_config->min_devices > 1;
             config.budget_mb = supplied_config->budget_bytes / MiB;
@@ -181,119 +293,93 @@ static void * metal_session_create(void * const * backends, int n_backends,
             config.min_compute_capability = supplied_config->min_compute_capability;
             config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
         }
-        if (!config.enabled) return nullptr;
+        if (!config.enabled) {
+            return nullptr;
+        }
 
-        // Find the Metal backend
+        // Find the Metal backend among the scheduler's backends.
+        ggml_metal_device_t ctx_dev = nullptr;
         id<MTLDevice> mtl_dev = nil;
         for (int i = 0; i < n_backends; i++) {
             ggml_backend_t be = (ggml_backend_t)backends[i];
-            if (!be) continue;
-            ggml_backend_reg_t reg = ggml_backend_get_backend_reg(be);
-            const char * name = ggml_backend_reg_get_name(reg);
-            if (!name || strncmp(name, "Metal", 5) != 0) continue;
-
-            // Access the Metal device through the backend's buffer type
-            ggml_backend_buffer_type_t buft =
-                ggml_backend_get_default_buffer_type(be);
-            if (!buft) continue;
-
-            // The Metal backend stores its device in a way accessible
-            // via ggml_backend_dev_t. Get the device from the backend.
+            if (!be || !ggml_backend_is_metal(be)) {
+                continue;
+            }
             ggml_backend_dev_t dev = ggml_backend_get_device(be);
-            mtl_dev = (__bridge id<MTLDevice>)dev;
+            if (!dev || !dev->context) {
+                continue;
+            }
+            ctx_dev = (ggml_metal_device_t)dev->context;
+            mtl_dev = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(ctx_dev);
             break;
         }
-
         if (!mtl_dev) {
             MOE_CACHE_LOG("[moe-cache] no Metal device found\n");
             return nullptr;
         }
 
-        // Load kernel from pre-compiled library (ggml-metal.metal)
-        // The kernel was added at the end of ggml-metal.metal.
-        // Access it through the Metal library system.
-        id<MTLLibrary> lib = nil;
-        NSError * error = nil;
-
-        // Try loading from default.metallib first
-        NSString * path = [[NSBundle mainBundle] pathForResource:@"default"
-                                                          ofType:@"metallib"];
-        if (!path) {
-            // Try relative to the binary
-            NSString * binDir = [[[NSProcessInfo processInfo] arguments][0]
-                stringByDeletingLastPathComponent];
-            path = [binDir stringByAppendingPathComponent:@"default.metallib"];
-        }
-
-        if (path && [[NSFileManager defaultManager] isReadableFileAtPath:path]) {
-            lib = [mtl_dev newLibraryWithURL:[NSURL fileURLWithPath:path]
-                                       error:&error];
-        }
-
+        // Load the shared kernel library (same embedded source as the
+        // backend; contains kernel_moe_cache_mv_* from ggml-metal.metal).
+        ggml_metal_library_t lib = ggml_metal_library_init(ctx_dev);
         if (!lib) {
-            MOE_CACHE_LOG("[moe-cache] cannot load default.metallib: %s\n",
-                error ? [[error description] UTF8String] : "not found");
+            MOE_CACHE_LOG("[moe-cache] Metal library init failed\n");
             return nullptr;
         }
 
-        // Load all kernel variants
-        static const char * kernel_names[] = {
-            "kernel_moe_cache_mv_q8_0_f32",
-            "kernel_moe_cache_mv_q4_0_f32",
-            "kernel_moe_cache_mv_q4_K_f32",
-            "kernel_moe_cache_mv_q6_K_f32",
-        };
-        id<MTLComputePipelineState> * pipelines[] = {
-            &dev->mmv_pipeline,
-            &dev->mmv_pipeline_q4_0,
-            &dev->mmv_pipeline_q4_K,
-            &dev->mmv_pipeline_q6_K,
-        };
-
-        int loaded = 0;
-        for (int ki = 0; ki < 4; ki++) {
-            id<MTLFunction> fn = [lib newFunctionWithName:
-                [NSString stringWithUTF8String:kernel_names[ki]]];
-            if (!fn) {
-                MOE_CACHE_LOG("[moe-cache] kernel %s not found\n", kernel_names[ki]);
-                continue;
-            }
-            *pipelines[ki] = [mtl_dev newComputePipelineStateWithFunction:fn error:&error];
-            [fn release];
-            if (!*pipelines[ki]) {
-                MOE_CACHE_LOG("[moe-cache] pipeline %s failed: %s\n", kernel_names[ki],
-                    error ? [[error description] UTF8String] : "unknown");
-                error = nil;
-            } else {
-                loaded++;
-            }
-        }
-        [lib release];
-
-        if (loaded == 0) {
-            MOE_CACHE_LOG("[moe-cache] no Metal kernels loaded\n");
-            continue;
+        struct ggml_metal_pipeline_with_params p_q8_0 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q8_0_f32");
+        struct ggml_metal_pipeline_with_params p_q4_0 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_0_f32");
+        struct ggml_metal_pipeline_with_params p_q4_K =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_K_f32");
+        struct ggml_metal_pipeline_with_params p_q6_K =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q6_K_f32");
+        if (!p_q8_0.pipeline || !p_q4_0.pipeline ||
+            !p_q4_K.pipeline || !p_q6_K.pipeline) {
+            MOE_CACHE_LOG("[moe-cache] Metal: one or more moe cache kernels missing\n");
+            ggml_metal_library_free(lib);
+            return nullptr;
         }
 
         id<MTLCommandQueue> queue = [mtl_dev newCommandQueue];
         if (!queue) {
-            continue;
+            ggml_metal_library_free(lib);
+            return nullptr;
         }
 
-        auto session = std::make_unique<moe_cache_session>();
+        std::unique_ptr<moe_cache_session> session(new (std::nothrow) moe_cache_session());
+        if (!session) {
+            [queue release];
+            ggml_metal_library_free(lib);
+            return nullptr;
+        }
         session->config = std::move(config);
 
-        auto dev = std::make_unique<moe_cache_metal_device>(mtl_dev, queue);
-        dev->mmv_pipeline = pipelines[0] ? *pipelines[0] : nil;
-        dev->mmv_pipeline_q4_0 = pipelines[1] ? *pipelines[1] : nil;
-        dev->mmv_pipeline_q4_K = pipelines[2] ? *pipelines[2] : nil;
-        dev->mmv_pipeline_q6_K = pipelines[3] ? *pipelines[3] : nil;
+        std::unique_ptr<moe_cache_metal_device> dev(new (std::nothrow)
+                moe_cache_metal_device(mtl_dev, queue));
         [queue release];
-
+        if (!dev) {
+            ggml_metal_library_free(lib);
+            return nullptr;
+        }
+        dev->lib = lib;
+        dev->mmv_pipeline_q8_0 = p_q8_0;
+        dev->mmv_pipeline_q4_0 = p_q4_0;
+        dev->mmv_pipeline_q4_K = p_q4_K;
+        dev->mmv_pipeline_q6_K = p_q6_K;
         session->devices.push_back(std::move(dev));
 
-        MOE_CACHE_LOG("[moe-cache] Metal session created (%d/4 kernel variants)\n", loaded);
-        return session.release();
+        MOE_CACHE_LOG("[moe-cache] Metal session created (budget=%zu MiB)\n",
+                session->config.budget_mb);
+        moe_cache_session * result = session.get();
+        try {
+            std::lock_guard<std::mutex> lock(g_registry_mu);
+            g_sessions.insert(result);
+        } catch (...) {
+            return nullptr;
+        }
+        session.release();
+        return result;
     } catch (...) {
         MOE_CACHE_LOG("[moe-cache] Metal session creation failed\n");
         return nullptr;
@@ -301,22 +387,70 @@ static void * metal_session_create(void * const * backends, int n_backends,
 }
 
 static void metal_session_destroy(void * opaque) {
-    if (!opaque) return;
-    delete (moe_cache_session *)opaque;
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_registry_mu);
+        g_sessions.erase(session);
+    }
+    for (auto & dev_ptr : session->devices) {
+        moe_cache_metal_device & dev =
+            static_cast<moe_cache_metal_device &>(*dev_ptr);
+        if (dev.lib) {
+            ggml_metal_library_free(dev.lib);
+            dev.lib = nullptr;
+        }
+    }
+    delete session;
 }
 
 static void metal_session_enter(void * opaque) {
+    if (g_session_suppressed > 0) {
+        g_session_suppressed++;
+        return;
+    }
+
     moe_cache_session * session = (moe_cache_session *)opaque;
-    moe_cache_scope_frame frame;
-    frame.requested = session;
-    frame.active = nullptr;
-    g_session_stack.push_back(frame);
+    if (!session || session->dormant.load() || session->stopping) {
+        if (g_session_stack.empty()) {
+            return;
+        }
+        try {
+            g_session_stack.push_back({session, nullptr});
+        } catch (...) {
+            g_session_suppressed++;
+        }
+        return;
+    }
+    try {
+        g_session_stack.push_back({session, session});
+    } catch (...) {
+        g_session_suppressed++;
+        return;
+    }
+    session->active_scopes++;
 }
 
 static void metal_session_leave(void * opaque) {
-    (void)opaque;
-    if (!g_session_stack.empty()) {
-        g_session_stack.pop_back();
+    if (g_session_suppressed > 0) {
+        g_session_suppressed--;
+        return;
+    }
+    moe_cache_session * expected = (moe_cache_session *)opaque;
+    auto found = std::find_if(
+            g_session_stack.rbegin(), g_session_stack.rend(),
+            [expected](const moe_cache_scope_frame & frame) {
+                return frame.requested == expected;
+            });
+    if (found == g_session_stack.rend()) {
+        return;
+    }
+    moe_cache_session * active = found->active;
+    g_session_stack.erase(std::next(found).base());
+    if (active && active->active_scopes > 0) {
+        active->active_scopes--;
     }
 }
 
@@ -344,190 +478,241 @@ static void metal_quantize_act_q8_1(const float * src, block_q8_1 * dst,
             dst[ib].qs[i] = q;
             sum += (float)q * d;
         }
-        dst[ib].d = (half)d;
-        dst[ib].s = (half)sum;
+        dst[ib].d = ggml_fp32_to_fp16(d);
+        dst[ib].s = ggml_fp32_to_fp16(sum);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Begin: Check cache, fill misses, build node.
+// Begin: find pool, create node. Pools are created lazily on first use.
 // ---------------------------------------------------------------------------
 
-static void * metal_begin(const ggml_moe_cache_tensor_desc * tensor, int pool,
-                           int64_t n_tokens, int n_rows, const int32_t * ids,
-                           const float * const * act_rows, uint64_t * hit_mask) {
-    if (!tensor || !ids || !act_rows || !hit_mask) return nullptr;
-    if (n_rows <= 0 || n_rows > moe_cache_node_rows_max) return nullptr;
-
-    // Find active session from thread-local stack
-    moe_cache_session * session = nullptr;
-    for (auto it = g_session_stack.rbegin();
-         it != g_session_stack.rend(); ++it) {
-        if (it->active) { session = it->active; break; }
+static void * metal_begin(const char * name, const void * host_base,
+                           size_t expert_size, int64_t n_in, int64_t n_out,
+                           int wtype, int64_t n_expert, int64_t n_tokens,
+                           int64_t n_rows) {
+    if (g_session_suppressed > 0 || g_session_stack.empty()) {
+        return nullptr;
     }
-    if (!session || session->devices.empty()) return nullptr;
-
-    moe_cache_device * dev_raw = session->devices[0].get();
-    auto & dev = static_cast<moe_cache_metal_device &>(*dev_raw);
-
-    std::unique_lock<std::mutex> lock(dev.dispatch_mu);
-
-    if (pool < 0 || pool >= (int)dev.pools.size()) return nullptr;
-    moe_cache_pool * pool_ptr = dev.pools[pool].get();
-
-    // Check hits and sync-fill misses
-    int n_hits = 0;
-    for (int i = 0; i < n_rows; i++) {
-        moe_cache_key key{tensor->data, ids[i]};
-        auto it = pool_ptr->map.find(key);
-        if (it != pool_ptr->map.end()) {
-            moe_cache_slot & slot = pool_ptr->slots[it->second];
-            if (slot.state == moe_cache_slot_state::valid) {
-                hit_mask[i / 64] |= (1ULL << (i % 64));
-                n_hits++;
-                dev.hits++;
-                continue;
-            }
-        }
-        dev.misses++;
-
-        // Evict LRU if full
-        if (pool_ptr->free_slots.empty() && pool_ptr->lru_tail >= 0) {
-            moe_cache_slot_reset(*pool_ptr, pool_ptr->lru_tail, true);
-        }
-
-        if (!pool_ptr->free_slots.empty()) {
-            int slot_idx = pool_ptr->free_slots.back();
-            pool_ptr->free_slots.pop_back();
-            moe_cache_slot & s = pool_ptr->slots[slot_idx];
-            s.key = key;
-            s.state = moe_cache_slot_state::valid;
-            pool_ptr->map[key] = slot_idx;
-
-            // memcpy expert weight into slab (unified memory — direct)
-            memcpy(pool_ptr->slab + (size_t)slot_idx * pool_ptr->expert_size,
-                   tensor->data, tensor->expert_size);
-
-            moe_cache_lru_push_back(*pool_ptr, slot_idx);
-            hit_mask[i / 64] |= (1ULL << (i % 64));
-            n_hits++;
-            dev.hits++;
-            dev.fills++;
-        }
+    moe_cache_session * session = g_session_stack.back().active;
+    if (!session || session->stopping || session->dormant) {
+        return nullptr;
+    }
+    if (!name || !host_base || !moe_cache_tensor_name_supported(name) ||
+        n_tokens < 1 || expert_size < session->config.min_expert_bytes ||
+        n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
+        (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
+         wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K)) {
+        return nullptr;
+    }
+    if (n_rows < n_tokens || n_rows % n_tokens != 0 ||
+        n_tokens > session->config.max_batch ||
+        n_rows > moe_cache_node_rows_max) {
+        return nullptr;
     }
 
-    if (n_hits == 0) return nullptr;
+    const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
+    if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
+        expert_size != (size_t)n_out * row_size ||
+        expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
+        return nullptr;
+    }
 
-    // Build node
-    auto node = std::make_unique<moe_cache_node>();
+    if (session->devices.empty()) {
+        return nullptr;
+    }
+    moe_cache_metal_device & dev =
+        static_cast<moe_cache_metal_device &>(*session->devices[0]);
+
+    std::unique_lock<std::mutex> dispatch_lock;
+    try {
+        dispatch_lock = std::unique_lock<std::mutex>(
+                dev.dispatch_mu, std::try_to_lock);
+    } catch (...) {
+        return nullptr;
+    }
+    if (!dispatch_lock.owns_lock() || dev.dead.load()) {
+        return nullptr;
+    }
+
+    const size_t budget_bytes = session->config.budget_mb << 20;
+    moe_cache_pool * pool = metal_find_or_create_pool(
+            dev, expert_size, wtype, n_expert, budget_bytes);
+    if (!pool) {
+        return nullptr;
+    }
+    const int pool_index = moe_cache_find_pool(dev, expert_size, wtype);
+    if (pool_index < 0) {
+        return nullptr;
+    }
+
+    std::unique_ptr<moe_cache_node> node(new (std::nothrow) moe_cache_node());
+    if (!node) {
+        return nullptr;
+    }
     node->session = session;
-    node->device = dev_raw;
-    node->pool = pool_ptr;
-    node->pool_index = pool;
-    node->host_base = tensor->data;
-    node->expert_size = tensor->expert_size;
-    node->n_in = tensor->n_in;
-    node->n_out = tensor->n_out;
-    node->n_expert = tensor->n_expert;
+    node->device = &dev;
+    node->pool = pool;
+    node->pool_index = pool_index;
+    node->host_base = host_base;
+    node->expert_size = expert_size;
+    node->n_in = n_in;
+    node->n_out = n_out;
+    node->n_expert = n_expert;
     node->n_tokens = n_tokens;
-    node->wtype = tensor->type;
-    node->dispatch_lock = std::move(lock);
-
-    // Pin the slots that were hits
-    int pin_count = 0;
-    for (int i = 0; i < n_rows; i++) {
-        if (!(hit_mask[i / 64] & (1ULL << (i % 64)))) continue;
-        moe_cache_key key{tensor->data, ids[i]};
-        auto it = pool_ptr->map.find(key);
-        if (it != pool_ptr->map.end()) {
-            node->pins[pin_count].pool = pool_ptr;
-            node->pins[pin_count].slot = it->second;
-            pool_ptr->slots[it->second].readers++;
-            pin_count++;
-        }
-    }
-    node->n_pins = pin_count;
-
-    dev.nodes++;
+    node->wtype = wtype;
+    node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
 
 // ---------------------------------------------------------------------------
-// Plan: Prepare activation quantization + upload.
+// Plan: mark cache hits; sync-fill misses into the slab so they can also
+// be served by this node. slot_idx[i] >= 0 means the row is cache-served.
 // ---------------------------------------------------------------------------
 
-static int metal_plan(void * opaque) {
-    // For Metal v1: fill already done in begin().
-    // Plan just marks the node ready.
-    if (!opaque) return 0;
+static int metal_plan(void * opaque, const int32_t * ids, int n_ids,
+                       int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
+    if (!node || !ids || !slot_indices || n_ids < 0 ||
+        n_ids > moe_cache_node_rows_max || node->planned) {
+        return 0;
+    }
     node->planned = true;
-    return 1;
+    for (int index = 0; index < n_ids; index++) {
+        slot_indices[index] = -1;
+    }
+
+    moe_cache_session & session = *node->session;
+    moe_cache_device & device = *node->device;
+    moe_cache_pool & pool = *node->pool;
+    int hits = 0;
+
+    std::unique_lock<std::mutex> lock(session.mu);
+    if (session.stopping) {
+        return 0;
+    }
+    for (int index = 0; index < n_ids; index++) {
+        const int32_t expert = ids[index];
+        if (expert < 0 || expert >= node->n_expert || device.dead.load()) {
+            continue;
+        }
+
+        const moe_cache_key key{node->host_base, expert};
+        auto found = pool.map.find(key);
+        if (found != pool.map.end() &&
+            pool.slots[found->second].state == moe_cache_slot_state::valid) {
+            const int slot_index = found->second;
+            moe_cache_slot & slot = pool.slots[slot_index];
+            slot.readers++;
+            moe_cache_lru_remove(pool, slot_index);
+            moe_cache_lru_push_back(pool, slot_index);
+            node->pins[node->n_pins++] = {&pool, slot_index};
+            slot_indices[index] = slot_index;
+            device.hits++;
+            hits++;
+            continue;
+        }
+
+        // miss: evict LRU if full, then sync-fill
+        device.misses++;
+        int slot_index = -1;
+        if (!pool.free_slots.empty()) {
+            slot_index = pool.free_slots.back();
+            pool.free_slots.pop_back();
+        } else {
+            int candidate = pool.lru_head;
+            while (candidate >= 0 && pool.slots[candidate].readers > 0) {
+                candidate = pool.slots[candidate].next;
+            }
+            if (candidate < 0) {
+                continue; // all slots pinned; CPU handles this row
+            }
+            slot_index = candidate;
+            moe_cache_slot_reset(pool, slot_index, false);
+            device.evictions++;
+        }
+
+        moe_cache_slot & slot = pool.slots[slot_index];
+        slot.key = key;
+        slot.generation++;
+        slot.state = moe_cache_slot_state::copying;
+        const void * source =
+            (const char *)node->host_base + (size_t)expert * node->expert_size;
+        try {
+            pool.map.emplace(key, slot_index);
+        } catch (...) {
+            moe_cache_slot_reset(pool, slot_index, true);
+            device.insert_skips++;
+            continue;
+        }
+
+        // unified memory: direct copy into the shared slab
+        memcpy(pool.slab + (size_t)slot_index * node->expert_size,
+               source, node->expert_size);
+        slot.state = moe_cache_slot_state::valid;
+        moe_cache_lru_push_back(pool, slot_index);
+
+        slot.readers++;
+        node->pins[node->n_pins++] = {&pool, slot_index};
+        slot_indices[index] = slot_index;
+        device.inserts++;
+        device.fills++;
+        device.hits++;
+        hits++;
+    }
+    device.nodes++;
+    return hits;
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch: Launch Metal matvec kernel.
+// Dispatch: launch the Metal matvec kernel over the hit rows.
 // ---------------------------------------------------------------------------
 
-static int metal_dispatch_internal(
-        moe_cache_node * node, int n_hits,
-        const int32_t * slot_indices, const float * const * act_rows) {
-    if (!node || !node->planned || !slot_indices || !act_rows) return 0;
-    if (n_hits <= 0 || n_hits > moe_cache_node_rows_max) return 0;
-
-    moe_cache_session & session = *node->session;
-    auto & dev = static_cast<moe_cache_metal_device &>(*node->device);
-    moe_cache_pool & pool = *node->pool;
-
-    if (dev.dead.load()) return 0;
-
-    const int64_t n_in = node->n_in;
-    const int64_t n_out = node->n_out;
-    const int64_t expert_stride = node->expert_size;
-    const int64_t row_stride = ggml_row_size((ggml_type)node->wtype, n_in);
-    const int64_t padded_n_in =
-        ((n_in + QK8_1 - 1) / QK8_1) * QK8_1;
-
-    // Deduplicate activation rows
-    const float * unique_act_rows[moe_cache_node_rows_max];
-    int activation_indices[moe_cache_node_rows_max];
-    int activation_rows = 0;
-
-    for (int i = 0; i < n_hits; i++) {
-        int act = 0;
-        while (act < activation_rows &&
-               unique_act_rows[act] != act_rows[i]) act++;
-        if (act == activation_rows) {
-            unique_act_rows[activation_rows++] = act_rows[i];
-        }
-        activation_indices[i] = act;
+static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
+                           int n_hits, const int32_t * slot_indices,
+                           const float * const * act_rows) {
+    moe_cache_node * node = (moe_cache_node *)opaque;
+    if (!node || !node->planned || !slot_indices || !act_rows ||
+        n_hits <= 0 || n_hits > moe_cache_node_rows_max ||
+        n_hits != node->n_pins ||
+        wtype != node->wtype || n_in != node->n_in || n_out != node->n_out) {
+        return 0;
     }
 
-    // Allocate output buffer
+    moe_cache_metal_device & dev =
+        static_cast<moe_cache_metal_device &>(*node->device);
+    if (dev.dead.load()) {
+        return 0;
+    }
+
+    const int64_t padded_n_in = ((n_in + QK8_1 - 1) / QK8_1) * QK8_1;
+    const int64_t expert_stride = node->expert_size;
+    const int64_t row_stride = ggml_row_size((ggml_type)wtype, n_in);
+
+    // Output buffer (shared; CPU reads results directly).
     const size_t out_bytes = (size_t)n_hits * (size_t)n_out * sizeof(float);
     id<MTLBuffer> out_buf = [dev.mtl_device newBufferWithLength:out_bytes
         options:MTLResourceStorageModeShared];
-    if (!out_buf) return 0;
-    float * out_ptr = (float *)[out_buf contents];
+    if (!out_buf) {
+        return 0;
+    }
 
-    // Allocate and quantize activation buffer
-    const size_t act_q8_bytes =
-        (size_t)activation_rows * (size_t)(padded_n_in / QK8_1) *
+    // Activation buffer: q8_1 per hit row.
+    const size_t act_bytes = (size_t)n_hits * (size_t)(padded_n_in / QK8_1) *
         sizeof(block_q8_1);
-    id<MTLBuffer> act_buf = [dev.mtl_device newBufferWithLength:act_q8_bytes
+    id<MTLBuffer> act_buf = [dev.mtl_device newBufferWithLength:act_bytes
         options:MTLResourceStorageModeShared];
     if (!act_buf) {
         [out_buf release];
         return 0;
     }
     block_q8_1 * act_q8 = (block_q8_1 *)[act_buf contents];
-
-    for (int a = 0; a < activation_rows; a++) {
-        metal_quantize_act_q8_1(unique_act_rows[a],
-            act_q8 + a * (padded_n_in / QK8_1), n_in, padded_n_in);
+    for (int i = 0; i < n_hits; i++) {
+        metal_quantize_act_q8_1(act_rows[i],
+            act_q8 + i * (padded_n_in / QK8_1), n_in, padded_n_in);
     }
 
-    // Allocate and fill slot indices buffer
+    // Slot index buffer.
     const size_t ids_bytes = (size_t)n_hits * sizeof(int32_t);
     id<MTLBuffer> ids_buf = [dev.mtl_device newBufferWithLength:ids_bytes
         options:MTLResourceStorageModeShared];
@@ -536,34 +721,32 @@ static int metal_dispatch_internal(
         [out_buf release];
         return 0;
     }
-    int32_t * ids_ptr = (int32_t *)[ids_buf contents];
-    memcpy(ids_ptr, slot_indices, ids_bytes);
+    memcpy([ids_buf contents], slot_indices, ids_bytes);
 
-    // Launch Metal kernel
-    id<MTLCommandBuffer> cmd_buf = [dev.mtl_queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc =
-        [cmd_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-
-    // Select pipeline based on weight type
-    id<MTLComputePipelineState> pipeline = dev.mmv_pipeline; // default Q8_0
-    switch (node->wtype) {
-        case GGML_TYPE_Q4_0: pipeline = dev.mmv_pipeline_q4_0 ?: dev.mmv_pipeline; break;
-        case GGML_TYPE_Q4_K: pipeline = dev.mmv_pipeline_q4_K ?: dev.mmv_pipeline; break;
-        case GGML_TYPE_Q6_K: pipeline = dev.mmv_pipeline_q6_K ?: dev.mmv_pipeline; break;
+    // Select pipeline by weight type.
+    struct ggml_metal_pipeline_with_params pipeline = dev.mmv_pipeline_q8_0;
+    switch (wtype) {
+        case GGML_TYPE_Q4_0: pipeline = dev.mmv_pipeline_q4_0; break;
+        case GGML_TYPE_Q4_K: pipeline = dev.mmv_pipeline_q4_K; break;
+        case GGML_TYPE_Q6_K: pipeline = dev.mmv_pipeline_q6_K; break;
         default: break;
     }
-    if (!pipeline) { [enc endEncoding]; [cmd_buf release]; [ids_buf release]; [act_buf release]; [out_buf release]; return 0; }
-    [enc setComputePipelineState:pipeline];
+    if (!pipeline.pipeline) {
+        [ids_buf release];
+        [act_buf release];
+        [out_buf release];
+        return 0;
+    }
 
-    // Get the slab buffer — it's one of the tracked slab_buffers.
-    // The pool slab pointer points into a specific MTLBuffer's contents.
-    // Find which buffer it belongs to.
+    // Find the slab MTLBuffer that backs this pool.
     id<MTLBuffer> slab_buf = nil;
+    NSUInteger slab_offset = 0;
     for (id<MTLBuffer> buf : dev.slab_buffers) {
         char * contents = (char *)[buf contents];
-        char * slab = pool.slab;
+        char * slab = node->pool->slab;
         if (slab >= contents && slab < contents + [buf length]) {
             slab_buf = buf;
+            slab_offset = (NSUInteger)(slab - contents);
             break;
         }
     }
@@ -571,89 +754,120 @@ static int metal_dispatch_internal(
         [ids_buf release];
         [act_buf release];
         [out_buf release];
-        [enc endEncoding];
-        [cmd_buf release];
         return 0;
     }
 
-    // Calculate slab offset within the buffer
-    const NSUInteger slab_offset = (NSUInteger)(pool.slab - (char *)[slab_buf contents]);
+    id<MTLCommandBuffer> cmd_buf = [dev.mtl_queue newCommandBuffer];
+    if (!cmd_buf) {
+        [ids_buf release];
+        [act_buf release];
+        [out_buf release];
+        return 0;
+    }
+    ggml_metal_encoder_t enc = ggml_metal_encoder_init(
+            (ggml_metal_cmd_buf_t)cmd_buf, true);
+    if (!enc) {
+        [cmd_buf release];
+        [ids_buf release];
+        [act_buf release];
+        [out_buf release];
+        return 0;
+    }
 
-    [enc setBuffer:slab_buf offset:slab_offset atIndex:0];
-    [enc setBuffer:ids_buf offset:0 atIndex:1];
-    [enc setBuffer:act_buf offset:0 atIndex:2];
-    [enc setBuffer:out_buf offset:0 atIndex:3];
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_buffer(enc, {(__bridge void *)slab_buf, slab_offset}, 0);
+    ggml_metal_encoder_set_buffer(enc, {(__bridge void *)ids_buf, 0}, 1);
+    ggml_metal_encoder_set_buffer(enc, {(__bridge void *)act_buf, 0}, 2);
+    ggml_metal_encoder_set_buffer(enc, {(__bridge void *)out_buf, 0}, 3);
 
-    int64_t args[] = {n_in, n_out, expert_stride, row_stride, n_hits, padded_n_in};
-    [enc setBytes:args length:sizeof(args) atIndex:4];
+    int64_t args[6] = {n_in, n_out, expert_stride, row_stride, n_hits, padded_n_in};
+    ggml_metal_encoder_set_bytes(enc, args, sizeof(args), 4);
 
     const NSUInteger total_threads = (NSUInteger)(n_hits * n_out);
-    [enc dispatchThreadgroups:MTLSizeMake(
-        (total_threads + 255) / 256, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ggml_metal_encoder_dispatch_threadgroups(
+            enc, (int)((total_threads + 255) / 256), 1, 1, 256, 1, 1);
 
-    [enc endEncoding];
+    ggml_metal_encoder_end_encoding(enc);
+    ggml_metal_encoder_free(enc);
+
     [cmd_buf commit];
     [cmd_buf waitUntilCompleted];
+    [cmd_buf release];
 
-    // Store results for collect
-    dev.d_out = out_ptr;
-    dev.d_out_cap = out_bytes;
-
-    // Release temporary buffers (output kept)
     [ids_buf release];
     [act_buf release];
-    // out_buf released in end() or next dispatch
-    if (dev.out_buffer) [dev.out_buffer release];
+    if (dev.out_buffer) {
+        [dev.out_buffer release];
+    }
     dev.out_buffer = out_buf;
+    dev.d_out = [out_buf contents];
+    dev.d_out_cap = out_bytes;
 
-    dev.dispatch_failures = 0; // reset (not tracking per-node yet)
-    return 1;
-}
-
-static int metal_dispatch(void * opaque) {
-    // The actual dispatch is done inline when the scheduler calls,
-    // but we don't have access to the slot_indices/act_rows here.
-    // These are passed through the ggml_moe_cache_api dispatch function,
-    // which calls metal_dispatch_internal via the API table.
-    //
-    // For now, this is a placeholder. The real dispatch happens when
-    // the scheduler calls ggml_moe_cache.dispatch(node, wtype, n_in, n_out,
-    // n_hits, slot_indices, act_rows) which maps to the API table entry.
-    (void)opaque;
+    node->dispatched = true;
     return 1;
 }
 
 // ---------------------------------------------------------------------------
-// Collect: Results already in shared memory.
+// Collect: copy results from the shared output buffer into dst_rows.
 // ---------------------------------------------------------------------------
 
-static int metal_collect(void * opaque) {
-    if (!opaque) return 0;
-    // Results are in d_out (shared memory on unified arch).
-    // The scheduler reads them directly.
-    return 1;
-}
-
-// ---------------------------------------------------------------------------
-// End: Unpin slots, free node.
-// ---------------------------------------------------------------------------
-
-static void metal_end(void * opaque) {
-    if (!opaque) return;
+static int metal_collect(void * opaque, int n_hits, float * const * dst_rows,
+                          int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-
-    for (int i = 0; i < node->n_pins; i++) {
-        if (node->pins[i].pool && node->pins[i].slot >= 0) {
-            node->pins[i].pool->slots[node->pins[i].slot].readers--;
+    if (!node || !node->dispatched || n_hits <= 0 ||
+        n_hits > moe_cache_node_rows_max ||
+        node->n_pins != n_hits || !dst_rows || n_out != node->n_out) {
+        return 0;
+    }
+    for (int index = 0; index < n_hits; index++) {
+        if (!dst_rows[index]) {
+            return 0;
         }
     }
 
-    delete node;
+    moe_cache_metal_device & dev =
+        static_cast<moe_cache_metal_device &>(*node->device);
+    if (!dev.out_buffer || !dev.d_out) {
+        node->dispatched = false;
+        return 0;
+    }
+
+    float * out = (float *)dev.d_out;
+    for (int index = 0; index < n_hits; index++) {
+        memcpy(dst_rows[index], out + (size_t)index * n_out,
+               (size_t)n_out * sizeof(float));
+    }
+    node->dispatched = false;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
-// Fused SwiGLU — not implemented for v1.
+// End: release slot pins and the node.
+// ---------------------------------------------------------------------------
+
+static void metal_end(void * opaque) {
+    std::unique_ptr<moe_cache_node> node((moe_cache_node *)opaque);
+    if (!node) {
+        return;
+    }
+    moe_cache_session & session = *node->session;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (int index = 0; index < node->n_pins; index++) {
+            const moe_cache_pin & pin = node->pins[index];
+            if (pin.pool && pin.slot >= 0 && pin.slot < pin.pool->n_slots) {
+                moe_cache_slot & slot = pin.pool->slots[pin.slot];
+                if (slot.readers > 0) {
+                    slot.readers--;
+                }
+            }
+        }
+        session.active_nodes--;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused SwiGLU — not implemented for v1; stock CPU path handles the node.
 // ---------------------------------------------------------------------------
 
 static void * metal_fused_begin(const ggml_moe_cache_tensor_desc * up,
@@ -670,49 +884,63 @@ static void * metal_fused_begin(const ggml_moe_cache_tensor_desc * up,
     return nullptr;
 }
 
-static void metal_invalidate(void * opaque, const void * tensor_base) {
-    if (!opaque || !tensor_base) return;
-    moe_cache_session * session = (moe_cache_session *)opaque;
-    for (auto & dev_ptr : session->devices) {
-        for (auto & pool_ptr : dev_ptr->pools) {
-            for (int i = 0; i < pool_ptr->n_slots; i++) {
-                if (pool_ptr->slots[i].key.tensor == tensor_base) {
-                    moe_cache_slot_reset(*pool_ptr, i, true);
+// ---------------------------------------------------------------------------
+// Invalidate: drop cached slots whose tensor range overlaps [base, base+size).
+// ---------------------------------------------------------------------------
+
+static void metal_invalidate(const void * base, size_t size) {
+    if (!base || size == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (auto & dev_ptr : session->devices) {
+            for (auto & pool_ptr : dev_ptr->pools) {
+                for (int i = 0; i < pool_ptr->n_slots; i++) {
+                    if (pool_ptr->slots[i].key.tensor &&
+                        moe_cache_ranges_overlap(
+                            pool_ptr->slots[i].key.tensor,
+                            pool_ptr->expert_size, base, size)) {
+                        moe_cache_slot_reset(*pool_ptr, i, true);
+                    }
                 }
             }
         }
     }
 }
 
-static int metal_trim(void * opaque, size_t target_bytes) {
-    (void)opaque;
-    (void)target_bytes;
-    return 0;
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+// Each backend wires its own function table into the global
+// ggml_moe_cache. The register helper is static (internal linkage) so
+// multiple backends can be linked into one binary without duplicate
+// symbols; the owner is the backend reg pointer so that query_device
+// can match ggml_backend_dev_backend_reg(device).
+
+static void ggml_moe_cache_register(const void * owner) {
+    if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
+        return;
+    }
+    ggml_moe_cache.owner = owner;
+    ggml_moe_cache.query_config = metal_query_config;
+    ggml_moe_cache.query_device = metal_query_device;
+    ggml_moe_cache.query_shape = metal_query_shape;
+    ggml_moe_cache.session_create = metal_session_create;
+    ggml_moe_cache.session_destroy = metal_session_destroy;
+    ggml_moe_cache.session_enter = metal_session_enter;
+    ggml_moe_cache.session_leave = metal_session_leave;
+    ggml_moe_cache.begin = metal_begin;
+    ggml_moe_cache.plan = metal_plan;
+    ggml_moe_cache.dispatch = metal_dispatch;
+    ggml_moe_cache.collect = metal_collect;
+    ggml_moe_cache.end = metal_end;
+    ggml_moe_cache.fused_begin = metal_fused_begin;
+    ggml_moe_cache.invalidate = metal_invalidate;
 }
 
-// ---------------------------------------------------------------------------
-// API table + Registration
-// ---------------------------------------------------------------------------
-
-static const ggml_moe_cache_api metal_moe_cache_api = {
-    /* .owner          = */ &metal_moe_cache_api,
-    /* .query_config   = */ metal_query_config,
-    /* .query_device   = */ metal_query_device,
-    /* .query_shape    = */ metal_query_shape,
-    /* .session_create  = */ metal_session_create,
-    /* .session_destroy = */ metal_session_destroy,
-    /* .session_enter   = */ metal_session_enter,
-    /* .session_leave   = */ metal_session_leave,
-    /* .begin           = */ metal_begin,
-    /* .plan            = */ metal_plan,
-    /* .dispatch        = */ metal_dispatch,
-    /* .collect         = */ metal_collect,
-    /* .end             = */ metal_end,
-    /* .fused_begin     = */ metal_fused_begin,
-    /* .invalidate      = */ metal_invalidate,
-    /* .trim            = */ metal_trim,
-};
-
-extern "C" void ggml_metal_moe_cache_register(void) {
-    ggml_moe_cache_register(&metal_moe_cache_api);
+extern "C" void ggml_metal_moe_cache_register(void * reg) {
+    ggml_moe_cache_register(reg);
 }

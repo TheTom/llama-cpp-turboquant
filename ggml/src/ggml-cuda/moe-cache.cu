@@ -7,7 +7,7 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     return 0;
 }
 
-void ggml_moe_cache_register(const void * owner) {
+static void ggml_moe_cache_register(const void * owner) {
     (void) owner;
 }
 
@@ -3121,7 +3121,7 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     return freed;
 }
 
-void ggml_moe_cache_register(const void * owner) {
+static void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
     }
@@ -3143,3 +3143,7 @@ void ggml_moe_cache_register(const void * owner) {
 }
 
 #endif
+
+void ggml_cuda_moe_cache_register(void * reg) {
+    ggml_moe_cache_register(reg);
+}

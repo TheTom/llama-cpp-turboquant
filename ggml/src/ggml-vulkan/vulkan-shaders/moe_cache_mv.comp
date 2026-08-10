@@ -1,15 +1,17 @@
 #version 450
 
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
 
 #include "types.glsl"
 
-// Layout: one workgroup per hit row, N workgroups in X dimension
+// Layout: one thread per (hit, output row) pair.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 // Buffer bindings
-layout (binding = 0) readonly buffer A {uint8_t data_slab[];};
 layout (binding = 1) readonly buffer B {int32_t data_ids[];};
 layout (binding = 2) readonly buffer C {block_q8_1 data_act[];};
 layout (binding = 3) writeonly buffer D {float data_dst[];};
@@ -23,30 +25,38 @@ layout (binding = 4) uniform Params {
     int64_t padded_n_in;
 } p;
 
-// Select weight block type via preprocessor define.
-// Compiled separately per type (like mul_mm.comp does).
+// Select weight block type via preprocessor define (1=Q8_0, 2=Q4_0, 3=Q4_K, 4=Q6_K).
+// Compiled separately per type by vulkan-shaders-gen (see process_shaders()).
 #if !defined(MOE_CACHE_WTYPE)
-#define MOE_CACHE_WTYPE Q8_0
+#define MOE_CACHE_WTYPE 1
 #endif
 
-#if MOE_CACHE_WTYPE == Q8_0
-#define WBLOCK_T block_q8_0
+#if MOE_CACHE_WTYPE == 1
+layout (binding = 0) readonly buffer A {block_q8_0 data_slab[];};
 #define WBLOCK_QK 32
+#define WBLOCK_BYTES 34
+#define ACT_BLOCKS_PER_WBLOCK 1
 #endif
 
-#if MOE_CACHE_WTYPE == Q4_0
-#define WBLOCK_T block_q4_0
+#if MOE_CACHE_WTYPE == 2
+layout (binding = 0) readonly buffer A {block_q4_0 data_slab[];};
 #define WBLOCK_QK 32
+#define WBLOCK_BYTES 18
+#define ACT_BLOCKS_PER_WBLOCK 1
 #endif
 
-#if MOE_CACHE_WTYPE == Q4_K
-#define WBLOCK_T block_q4_K
+#if MOE_CACHE_WTYPE == 3
+layout (binding = 0) readonly buffer A {block_q4_K data_slab[];};
 #define WBLOCK_QK 256
+#define WBLOCK_BYTES 144
+#define ACT_BLOCKS_PER_WBLOCK 8
 #endif
 
-#if MOE_CACHE_WTYPE == Q6_K
-#define WBLOCK_T block_q6_K
+#if MOE_CACHE_WTYPE == 4
+layout (binding = 0) readonly buffer A {block_q6_K data_slab[];};
 #define WBLOCK_QK 256
+#define WBLOCK_BYTES 210
+#define ACT_BLOCKS_PER_WBLOCK 8
 #endif
 
 // ---------------------------------------------------------------------------
@@ -55,7 +65,7 @@ layout (binding = 4) uniform Params {
 
 float dot_block_q8_0(const block_q8_0 w, const block_q8_1 a) {
     const float d_w = float(w.d);
-    const float d_a = float(a.d);
+    const float d_a = float(a.ds.x);
     int sum_q = 0;
     for (int i = 0; i < 32; i++) {
         sum_q += int(w.qs[i]) * int(a.qs[i]);
@@ -65,7 +75,7 @@ float dot_block_q8_0(const block_q8_0 w, const block_q8_1 a) {
 
 float dot_block_q4_0(const block_q4_0 w, const block_q8_1 a) {
     const float d_w = float(w.d);
-    const float d_a = float(a.d);
+    const float d_a = float(a.ds.x);
     int sum_q = 0;
     for (int i = 0; i < 16; i++) {
         const uint nibbles = w.qs[i];
@@ -75,17 +85,26 @@ float dot_block_q4_0(const block_q4_0 w, const block_q8_1 a) {
     return d_w * d_a * float(sum_q);
 }
 
+// Q4_K: 8 sub-blocks of 32. Each sub-block has a 6-bit scale and a 6-bit min
+// packed across scales[12] (matches ggml get_scale_min_k4 / the Metal and
+// CPU reference dequantizers).
 float dot_block_q4_K(const block_q4_K w, const block_q8_1 a) {
     const float d_all = float(w.dm[0]);
     const float d_min = float(w.dm[1]);
-    const float d_a = float(a.d);
+    const float d_a = float(a.ds.x);
 
     float sum = 0.0f;
     for (int sb = 0; sb < 8; sb++) {
-        const uint scale_bits = w.scales[sb / 2];
-        const float scale = ((sb & 1) != 0) ? float(scale_bits >> 4) : float(scale_bits & 0xFu);
-        const float dl = d_all * scale;
-        const float ml = d_min * scale;
+        int sc, mn;
+        if (sb < 4) {
+            sc = int(w.scales[sb]) & 0x3F;
+            mn = int(w.scales[sb + 4]) & 0x3F;
+        } else {
+            sc = (int(w.scales[sb + 4]) & 0xF) | ((int(w.scales[sb - 4]) & 0xC0) >> 2);
+            mn = (int(w.scales[sb + 4]) >> 4) | ((int(w.scales[sb]) & 0xC0) >> 2);
+        }
+        const float dl = d_all * float(sc);
+        const float ml = d_min * float(mn);
 
         for (int j = 0; j < 32; j++) {
             const int idx = sb * 32 + j;
@@ -99,7 +118,7 @@ float dot_block_q4_K(const block_q4_K w, const block_q8_1 a) {
 
 float dot_block_q6_K(const block_q6_K w, const block_q8_1 a) {
     const float d_all = float(w.d);
-    const float d_a = float(a.d);
+    const float d_a = float(a.ds.x);
 
     float sum = 0.0f;
     for (int i = 0; i < 256; i++) {
@@ -120,39 +139,39 @@ float dot_block_q6_K(const block_q6_K w, const block_q8_1 a) {
 }
 
 void main() {
-    const uint global_id = gl_GlobalInvocationID.x;
+    // One thread per (hit, output row) pair, like the Metal kernel.
+    const uint id = gl_GlobalInvocationID.x;
+    const uint total = uint(p.n_hits) * uint(p.n_out);
+    if (id >= total) return;
 
-    if (global_id >= p.n_hits) return;
+    const uint hit = id / uint(p.n_out);
+    const uint row = id - hit * uint(p.n_out);
 
-    const int slot = data_ids[global_id];
+    const int slot = data_ids[hit];
     if (slot < 0) {
-        data_dst[global_id] = 0.0f;
+        data_dst[id] = 0.0f;
         return;
     }
 
-    const uint slab_base = uint(int64_t(slot) * p.expert_stride);
-    const uint local_id = gl_LocalInvocationID.x;
-    const uint n_out_u = uint(p.n_out);
+    // All byte offsets are exact multiples of the weight block size, so the
+    // block index is an exact integer division.
+    const int64_t byte_off = int64_t(slot) * p.expert_stride + int64_t(row) * p.row_stride;
+    const uint block_base = uint(byte_off / int64_t(WBLOCK_BYTES));
+    const uint act_base = hit * uint(p.padded_n_in / int64_t(32));
+
     const int nb = int(p.n_in / int64_t(WBLOCK_QK));
-    const uint act_base = uint(global_id) * uint(p.padded_n_in / int64_t(32));
-
-    for (uint row = local_id; row < n_out_u; row += gl_WorkGroupSize.x) {
-        const uint row_off = slab_base + uint(int64_t(row) * p.row_stride);
-        const WBLOCK_T * w_blocks = (const WBLOCK_T *)(data_slab + row_off);
-        const block_q8_1 * a_blocks = data_act + act_base;
-
-        float sum = 0.0f;
-        for (int ib = 0; ib < nb; ib++) {
-#if MOE_CACHE_WTYPE == Q8_0
-            sum += dot_block_q8_0(w_blocks[ib], a_blocks[ib]);
-#elif MOE_CACHE_WTYPE == Q4_0
-            sum += dot_block_q4_0(w_blocks[ib], a_blocks[ib]);
-#elif MOE_CACHE_WTYPE == Q4_K
-            sum += dot_block_q4_K(w_blocks[ib], a_blocks[ib]);
-#elif MOE_CACHE_WTYPE == Q6_K
-            sum += dot_block_q6_K(w_blocks[ib], a_blocks[ib]);
+    float sum = 0.0f;
+    for (int ib = 0; ib < nb; ib++) {
+        const uint ab = act_base + uint(ib) * ACT_BLOCKS_PER_WBLOCK;
+#if MOE_CACHE_WTYPE == 1
+        sum += dot_block_q8_0(data_slab[block_base + uint(ib)], data_act[ab]);
+#elif MOE_CACHE_WTYPE == 2
+        sum += dot_block_q4_0(data_slab[block_base + uint(ib)], data_act[ab]);
+#elif MOE_CACHE_WTYPE == 3
+        sum += dot_block_q4_K(data_slab[block_base + uint(ib)], data_act[ab]);
+#elif MOE_CACHE_WTYPE == 4
+        sum += dot_block_q6_K(data_slab[block_base + uint(ib)], data_act[ab]);
 #endif
-        }
-        data_dst[global_id * n_out_u + row] = sum;
     }
+    data_dst[id] = sum;
 }

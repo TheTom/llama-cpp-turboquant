@@ -5561,7 +5561,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
 
         initialized = true;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        ggml_moe_cache_register(&reg);
+        ggml_cuda_moe_cache_register(&reg);
 #endif
     }
 

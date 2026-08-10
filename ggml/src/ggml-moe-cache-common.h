@@ -651,3 +651,5 @@ inline int moe_cache_find_pool(
     }
     return -1;
 }
+
+#endif // GGML_MOE_CACHE_COMMON_H

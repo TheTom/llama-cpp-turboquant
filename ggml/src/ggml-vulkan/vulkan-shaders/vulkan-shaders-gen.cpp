@@ -1273,6 +1273,13 @@ void process_shaders() {
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
+    // MoE expert cache matvec variants (Q8_0/Q4_0/Q4_K/Q6_K weights).
+    // Compiled separately per weight type; see moe_cache_mv.comp.
+    string_to_spv("moe_cache_mv_q8_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "1"}});
+    string_to_spv("moe_cache_mv_q4_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "2"}});
+    string_to_spv("moe_cache_mv_q4_K", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "3"}});
+    string_to_spv("moe_cache_mv_q6_K", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "4"}});
+
     for (auto &c : compiles) {
         c.wait();
     }
