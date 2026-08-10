@@ -410,6 +410,9 @@ llama_kv_cache::llama_kv_cache(
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_idx_stream;
+
+        ggml_tensor * k_idx = nullptr;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
@@ -624,7 +627,7 @@ void llama_kv_cache::clear(bool data) {
         }
 
         // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
-        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr) {
+        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
             #include "turbo-rotation-data.h"
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
@@ -1576,6 +1579,23 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size),                         // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),            // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_idx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * k_idx = layers[ikv].k_idx;
+    GGML_ASSERT(k_idx);
+
+    const uint64_t kv_size = get_size();
+    const int64_t  n_idx   = k_idx->ne[0];
+    const uint32_t ns      = sinfo.s1 - sinfo.s0 + 1;
+
+    return ggml_view_4d(ctx, k_idx,
+            n_idx, 1, n_kv, ns,
+            ggml_row_size(k_idx->type, n_idx),
+            ggml_row_size(k_idx->type, n_idx),
+            ggml_row_size(k_idx->type, n_idx*kv_size),
+            ggml_row_size(k_idx->type, n_idx*kv_size)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
