@@ -153,7 +153,13 @@ llama_kv_cache::llama_kv_cache(
             const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
             const bool disabled = (env && env[0] == '0');
 
-            if (!disabled && gqa_ratio >= 6 && type_k == type_v) {
+            // MLA models (DeepSeek) must keep K and V cache types identical,
+            // so the upgrade is skipped for them; llama-context.cpp enforces
+            // this, but that check runs before this rewrite and would see the
+            // pre-rewrite (symmetric) types.
+            const bool is_mla = hparams.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4;
+
+            if (!disabled && !is_mla && gqa_ratio >= 6 && type_k == type_v) {
                 LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
                                "upgrading K from %s to q8_0 to prevent quality degradation. "
                                "Disable with TURBO_AUTO_ASYMMETRIC=0\n",

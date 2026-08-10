@@ -2810,7 +2810,7 @@ int main() {
     ggml_backend_dev_t cuda_device = find_cuda_device();
     if (!cuda_device) {
         printf("SKIP: CUDA backend unavailable\n");
-        return 0;
+        return 77; // ctest SKIP_RETURN_CODE: a hard skip must not read as a pass
     }
     ggml_backend_reg_t cuda_reg =
         ggml_backend_dev_backend_reg(cuda_device);

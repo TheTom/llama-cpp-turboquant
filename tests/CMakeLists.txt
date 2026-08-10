@@ -270,7 +270,7 @@ llama_build_and_test(test-backend-ops.cpp)
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build(test-moe-cache.cpp)
     llama_test(test-moe-cache LABEL "main;backend")
-    set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120)
+    set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
