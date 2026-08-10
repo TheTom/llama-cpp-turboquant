@@ -447,6 +447,7 @@ enum common_moe_cache_mode {
     COMMON_MOE_CACHE_MODE_OFF,
     COMMON_MOE_CACHE_MODE_AUTO,
     COMMON_MOE_CACHE_MODE_ON,
+    COMMON_MOE_CACHE_MODE_SOFT,
 };
 
 struct common_moe_cache_params {

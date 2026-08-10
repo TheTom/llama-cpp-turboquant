@@ -2693,6 +2693,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
         "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "
+        "soft = try spare VRAM first, evict experts only as needed; "
         "off/0 = disabled; N = VRAM budget in MiB per device without weight repacking)",
         [](common_params & params, const std::string & value) {
             params.moe_cache.mode_explicit = true;
@@ -2703,6 +2704,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.moe_cache.budget_mib = 0;
             } else if (value == "auto") {
                 params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_AUTO;
+                params.moe_cache.budget_mib = 0;
+            } else if (value == "soft") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_SOFT;
                 params.moe_cache.budget_mib = 0;
             } else if (value == "on") {
                 params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_ON;

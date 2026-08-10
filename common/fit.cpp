@@ -1177,6 +1177,146 @@ static void common_params_fit_impl(
     if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF) {
         if (!stock_spills_experts) {
             LOG_INF("%s: MoE cache fit kept stock placement because all routed expert weights fit in VRAM\n", __func__);
+        } else if (moe_cache->mode == COMMON_MOE_CACHE_MODE_SOFT) {
+            // Step 1: try spare-VRAM (stock placement, no expert eviction)
+            common_moe_cache_fit_result soft_fit = common_moe_cache_evaluate_fit(
+                    moe_cache, moe_tensors, devs, dmds_full, margins);
+            if (soft_fit.feasible) {
+                moe_cache->fit_selected = true;
+
+                const double coverage = soft_fit.expert_bytes > 0
+                    ? 100.0 * (double)std::min(soft_fit.cache_bytes, soft_fit.expert_bytes) /
+                        (double)soft_fit.expert_bytes
+                    : 0.0;
+                LOG_INF("%s: MoE cache soft mode selected stock placement with %zu MiB projected cache capacity for %zu MiB of routed expert weights (up to %.1f%% coverage, no expert eviction)\n",
+                        __func__,
+                        soft_fit.cache_bytes / MiB, soft_fit.expert_bytes / MiB, coverage);
+                for (const common_moe_cache_fit_device & device : soft_fit.devices) {
+                    LOG_INF("%s: MoE cache fit CUDA%d leaves %zu MiB after reserve; minimum complete pool set is %zu MiB\n",
+                            __func__, device.physical_device, device.cache_bytes / MiB,
+                            soft_fit.minimum_device_bytes / MiB);
+                }
+            } else if (cache_candidate_valid) {
+                // Step 2: spare-VRAM insufficient, try partial expert eviction
+                // Binary search for minimum evicted layers where cache pools fit
+                LOG_INF("%s: MoE cache soft mode: spare-VRAM insufficient (%s), searching for minimum expert eviction\n",
+                        __func__, soft_fit.reason.c_str());
+
+                const int total_layers = (int)(hp_ngl + 1);
+                static std::vector<std::string> pattern_strings;
+                pattern_strings.clear();
+                pattern_strings.reserve(total_layers);
+
+                int lo = 0, hi = total_layers;
+                int best_n_evict = -1;
+                dmds_t best_memory;
+                common_moe_cache_fit_result best_cache_fit;
+
+                while (lo <= hi) {
+                    int mid = lo + (hi - lo) / 2;
+
+                    // Build candidate: all layers on main GPU, first 'mid' layers' experts to CPU
+                    std::vector<float> candidate_split(llama_max_devices(), 0.0f);
+                    std::vector<llama_model_tensor_buft_override> candidate_overrides(ntbo, {nullptr, nullptr});
+                    llama_model_params candidate = *mparams;
+
+                    candidate.n_gpu_layers = 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        if ((uint64_t)candidate.n_gpu_layers + cache_layers[id] > INT32_MAX) break;
+                        candidate.n_gpu_layers += cache_layers[id];
+                        if (nd > 1) candidate_split[id] = (float)cache_layers[id];
+                    }
+                    candidate.tensor_split = candidate_split.data();
+
+                    // Per-layer overrides: evict first 'mid' layers' experts to CPU
+                    pattern_strings.clear();
+                    int n_overrides = 0;
+                    for (int i = 0; i < mid && n_overrides < (int)ntbo - 1; i++) {
+                        pattern_strings.push_back(llm_ffn_exps_block_regex(i));
+                        candidate_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
+                    }
+                    candidate_overrides[n_overrides] = {nullptr, nullptr};
+                    candidate.tensor_buft_overrides = candidate_overrides.data();
+                    candidate.use_extra_bufts = false;
+
+                    // Evaluate memory and cache for this candidate
+                    std::vector<ggml_backend_dev_t> candidate_devs;
+                    uint32_t c_ngl = 0, c_nct = 0, c_nex = 0;
+                    dmds_t candidate_memory = common_get_device_memory_data_impl(
+                            path_model, &candidate, cparams, candidate_devs,
+                            c_ngl, c_nct, c_nex, log_level);
+
+                    bool candidate_valid = (candidate_devs == devs && candidate_memory.size() == nd + 1);
+                    if (candidate_valid) {
+                        for (size_t id = 0; id < nd; id++) {
+                            if (candidate_memory[id].mb.total() > INT64_MAX ||
+                                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+                                candidate_valid = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (candidate_valid) {
+                        common_moe_cache_fit_result cf = common_moe_cache_evaluate_fit(
+                                moe_cache, moe_tensors, devs, candidate_memory, margins);
+                        if (cf.feasible) {
+                            best_n_evict = mid;
+                            best_memory = std::move(candidate_memory);
+                            best_cache_fit = cf;
+                            hi = mid - 1;  // Try fewer evictions
+                        } else {
+                            lo = mid + 1;  // Need more evictions
+                        }
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+
+                if (best_n_evict >= 0) {
+                    // Apply the best placement with minimal expert eviction
+                    std::fill(tensor_split, tensor_split + llama_max_devices(), 0.0f);
+                    mparams->n_gpu_layers = 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        mparams->n_gpu_layers += cache_layers[id];
+                        if (nd > 1) tensor_split[id] = (float)cache_layers[id];
+                    }
+                    mparams->tensor_split = tensor_split;
+
+                    // Generate final per-layer overrides
+                    pattern_strings.clear();
+                    int n_overrides = 0;
+                    for (int i = 0; i < best_n_evict && n_overrides < (int)ntbo - 1; i++) {
+                        pattern_strings.push_back(llm_ffn_exps_block_regex(i));
+                        tensor_buft_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
+                    }
+                    tensor_buft_overrides[n_overrides] = {nullptr, nullptr};
+                    mparams->tensor_buft_overrides = tensor_buft_overrides;
+                    mparams->use_extra_bufts = false;
+                    moe_cache->fit_selected = true;
+
+                    const int n_kept = total_layers - best_n_evict;
+                    const double coverage = best_cache_fit.expert_bytes > 0
+                        ? 100.0 * (double)std::min(best_cache_fit.cache_bytes, best_cache_fit.expert_bytes) /
+                            (double)best_cache_fit.expert_bytes
+                        : 0.0;
+                    LOG_INF("%s: MoE cache soft mode selected partial-eviction placement: %d/%d layers keep experts GPU-resident, "
+                            "%zu MiB projected cache capacity for %zu MiB of routed expert weights (up to %.1f%% coverage)\n",
+                            __func__, n_kept, total_layers,
+                            best_cache_fit.cache_bytes / MiB, best_cache_fit.expert_bytes / MiB, coverage);
+                    for (const common_moe_cache_fit_device & device : best_cache_fit.devices) {
+                        LOG_INF("%s: MoE cache fit CUDA%d leaves %zu MiB after reserve; minimum complete pool set is %zu MiB\n",
+                                __func__, device.physical_device, device.cache_bytes / MiB,
+                                best_cache_fit.minimum_device_bytes / MiB);
+                    }
+                    return;
+                }
+                LOG_INF("%s: MoE cache soft mode kept stock placement (partial eviction could not fit cache pools)\n",
+                        __func__);
+            } else {
+                LOG_INF("%s: MoE cache soft mode kept stock placement (spare-VRAM insufficient): %s\n",
+                        __func__, soft_fit.reason.c_str());
+            }
         } else if (!cache_candidate_valid) {
             LOG_INF("%s: MoE cache fit kept stock placement because canonical dense weights do not meet the fit targets\n", __func__);
         } else {

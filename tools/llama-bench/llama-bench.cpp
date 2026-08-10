@@ -282,7 +282,7 @@ static std::string parse_moe_cache_mode(const std::string & value) {
     if (value == "off" || value == "0") {
         return "off";
     }
-    if (value == "auto" || value == "on") {
+    if (value == "auto" || value == "on" || value == "soft") {
         return value;
     }
 
@@ -297,7 +297,7 @@ static std::string parse_moe_cache_mode(const std::string & value) {
 }
 
 static bool moe_cache_mode_forces_canonical_weights(const std::string & mode) {
-    return mode == "on" || (mode != "auto" && mode != "off");
+    return mode == "on" || (mode != "auto" && mode != "off" && mode != "soft");
 }
 
 static common_moe_cache_params common_moe_cache_from_bench_mode(const std::string & mode) {
@@ -307,6 +307,8 @@ static common_moe_cache_params common_moe_cache_from_bench_mode(const std::strin
         result.mode = COMMON_MOE_CACHE_MODE_OFF;
     } else if (mode == "auto") {
         result.mode = COMMON_MOE_CACHE_MODE_AUTO;
+    } else if (mode == "soft") {
+        result.mode = COMMON_MOE_CACHE_MODE_SOFT;
     } else {
         result.mode = COMMON_MOE_CACHE_MODE_ON;
         if (mode != "on") {
@@ -340,7 +342,7 @@ static void apply_moe_cache_mode(llama_context_params & cparams, const std::stri
     } else if (mode == "auto") {
         cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
         cparams.moe_cache_budget_mib = 0;
-    } else if (mode == "on") {
+    } else if (mode == "on" || mode == "soft") {
         cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
         cparams.moe_cache_budget_mib = 0;
     } else {
@@ -546,7 +548,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  --moe-cache <auto|on|off|0|MiB>                   (default: %s)\n", join(cmd_params_defaults.moe_cache, ",").c_str());
+    printf("  --moe-cache <auto|on|soft|off|0|MiB>                   (default: %s)\n", join(cmd_params_defaults.moe_cache, ",").c_str());
     printf("                                                    on and fixed budgets disable weight repacking\n");
     printf("  --repack <auto|on|off>                            weight repacking policy (default: %s)\n", cmd_params_defaults.repack.c_str());
     printf("  -nr, --no-repack                                  equivalent to --repack off\n");

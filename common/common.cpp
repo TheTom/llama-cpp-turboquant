@@ -1256,7 +1256,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
         const char * mode = params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF ? "off" :
-            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" : "on";
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "on";
         const char * placement = params.moe_cache.fit_selected ? " placement=cache-aware-fit" : "";
         if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF) {
             COM_INF("%s", "MoE cache: mode=off\n");
@@ -1697,6 +1698,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
                 cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_AUTO;
                 break;
             case COMMON_MOE_CACHE_MODE_ON:
+            case COMMON_MOE_CACHE_MODE_SOFT:
                 cparams.moe_cache_mode = LLAMA_MOE_CACHE_MODE_ON;
                 break;
         }
