@@ -19,7 +19,7 @@ extern "C" {
 // the two happen to unify is a property of the platform's symbol resolution
 // (ELF interposition may merge them; two-level-namespace and DLL targets will
 // not), which made the group-size propagation silently link-order dependent.
-GGML_API extern int turbo3_cpu_wht_group_size;
+GGML_API int turbo3_cpu_wht_group_size;
 }
 
 // ggml_compute_forward_dup

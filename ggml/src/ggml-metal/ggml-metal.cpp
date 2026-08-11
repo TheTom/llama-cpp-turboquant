@@ -10,6 +10,8 @@
 #include <mutex>
 #include <string>
 
+extern "C" void ggml_metal_moe_cache_register(void * reg);
+
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
 
@@ -944,6 +946,10 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
         initialized = true;
     }
+
+#ifdef GGML_USE_METAL
+    ggml_metal_moe_cache_register(&reg);
+#endif
 
     return &reg;
 }

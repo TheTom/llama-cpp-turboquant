@@ -1,6 +1,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-dl.h"
+#include "ggml-backend-moe-cache.h"
 #include "ggml-impl.h"
 #include <algorithm>
 #include <cstring>
@@ -277,6 +278,8 @@ struct ggml_backend_registry {
         if (!silent) {
             GGML_LOG_DEBUG("%s: unloading %s backend\n", __func__, ggml_backend_reg_name(reg));
         }
+
+        ggml_moe_cache_unregister(reg);
 
         // remove devices
         devices.erase(
