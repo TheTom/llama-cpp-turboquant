@@ -2224,18 +2224,23 @@ void ggml_backend_sched_set_moe_cache(
     // first one that can create a session, retrying another provider when
     // session_create returns null.
     const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
+    bool provider_tried = false;
     for (const ggml_moe_cache_api & api :
             ggml_moe_cache_provider_candidates(cache_backends, sched->n_backends)) {
         ggml_moe_cache_config config = {};
         if (!api.query_config || !api.query_config(automatic, budget_mib, &config)) {
             continue;
         }
+        provider_tried = true;
         void * session = api.session_create(cache_backends, sched->n_backends, &config);
         if (session) {
             sched->moe_cache_session = session;
             sched->moe_cache_api = api;
             break;
         }
+    }
+    if (provider_tried && !sched->moe_cache_session) {
+        GGML_LOG_INFO("[moe-cache] session creation failed: all candidate providers returned null\n");
     }
 }
 

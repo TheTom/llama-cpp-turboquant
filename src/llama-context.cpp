@@ -598,8 +598,12 @@ static bool llama_model_has_cacheable_moe_weights(
             break;
         }
     }
-    if (mode == LLAMA_MOE_CACHE_MODE_OFF ||
-        !api.query_config || !api.query_device || !api.query_shape) {
+    if (mode == LLAMA_MOE_CACHE_MODE_OFF) {
+        LLAMA_LOG_INFO("%s: MoE cache disabled (mode=off)\n", __func__);
+        return false;
+    }
+    if (!api.query_config || !api.query_device || !api.query_shape) {
+        LLAMA_LOG_INFO("%s: MoE cache disabled (no provider registered)\n", __func__);
         return false;
     }
 
@@ -607,6 +611,7 @@ static bool llama_model_has_cacheable_moe_weights(
     const int automatic = mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED
         ? -1 : mode == LLAMA_MOE_CACHE_MODE_AUTO;
     if (!api.query_config(automatic, budget_mib, &config)) {
+        LLAMA_LOG_INFO("%s: MoE cache disabled (provider query_config returned false)\n", __func__);
         return false;
     }
 
@@ -627,6 +632,9 @@ static bool llama_model_has_cacheable_moe_weights(
         min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
     }
     if ((int) physical_devices.size() < config.min_devices) {
+        LLAMA_LOG_INFO("%s: MoE cache disabled (eligible devices=%d, need=%d, min_cc=%d)\n",
+                __func__, (int) physical_devices.size(), config.min_devices,
+                config.min_compute_capability);
         return false;
     }
 
@@ -662,6 +670,7 @@ static bool llama_model_has_cacheable_moe_weights(
             return true;
         }
     }
+    LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found)\n", __func__);
     return false;
 }
 

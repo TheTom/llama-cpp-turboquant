@@ -47,6 +47,44 @@ extern const uint64_t moe_cache_mv_q4_K_len;
 extern const unsigned char moe_cache_mv_q4_K_data[];
 extern const uint64_t moe_cache_mv_q6_K_len;
 extern const unsigned char moe_cache_mv_q6_K_data[];
+extern const uint64_t moe_cache_mv_q5_K_len;
+extern const unsigned char moe_cache_mv_q5_K_data[];
+extern const uint64_t moe_cache_mv_q1_0_len;
+extern const unsigned char moe_cache_mv_q1_0_data[];
+extern const uint64_t moe_cache_mv_q2_0_len;
+extern const unsigned char moe_cache_mv_q2_0_data[];
+extern const uint64_t moe_cache_mv_q4_1_len;
+extern const unsigned char moe_cache_mv_q4_1_data[];
+extern const uint64_t moe_cache_mv_q5_0_len;
+extern const unsigned char moe_cache_mv_q5_0_data[];
+extern const uint64_t moe_cache_mv_q5_1_len;
+extern const unsigned char moe_cache_mv_q5_1_data[];
+extern const uint64_t moe_cache_mv_q2_K_len;
+extern const unsigned char moe_cache_mv_q2_K_data[];
+extern const uint64_t moe_cache_mv_q3_K_len;
+extern const unsigned char moe_cache_mv_q3_K_data[];
+extern const uint64_t moe_cache_mv_iq2_xxs_len;
+extern const unsigned char moe_cache_mv_iq2_xxs_data[];
+extern const uint64_t moe_cache_mv_iq2_xs_len;
+extern const unsigned char moe_cache_mv_iq2_xs_data[];
+extern const uint64_t moe_cache_mv_iq2_s_len;
+extern const unsigned char moe_cache_mv_iq2_s_data[];
+extern const uint64_t moe_cache_mv_iq3_xxs_len;
+extern const unsigned char moe_cache_mv_iq3_xxs_data[];
+extern const uint64_t moe_cache_mv_iq3_s_len;
+extern const unsigned char moe_cache_mv_iq3_s_data[];
+extern const uint64_t moe_cache_mv_iq1_s_len;
+extern const unsigned char moe_cache_mv_iq1_s_data[];
+extern const uint64_t moe_cache_mv_iq1_m_len;
+extern const unsigned char moe_cache_mv_iq1_m_data[];
+extern const uint64_t moe_cache_mv_iq4_nl_len;
+extern const unsigned char moe_cache_mv_iq4_nl_data[];
+extern const uint64_t moe_cache_mv_iq4_xs_len;
+extern const unsigned char moe_cache_mv_iq4_xs_data[];
+extern const uint64_t moe_cache_mv_mxfp4_len;
+extern const unsigned char moe_cache_mv_mxfp4_data[];
+extern const uint64_t moe_cache_mv_nvfp4_len;
+extern const unsigned char moe_cache_mv_nvfp4_data[];
 
 // Thread-local session stack (owned by this backend; independent of CUDA's).
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
@@ -55,6 +93,10 @@ static thread_local int g_session_suppressed = 0;
 // Global session registry for invalidate()/teardown paths.
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
+// Live-session count, so invalidate() can bail before taking g_registry_mu.
+// invalidate runs on every backend buffer write; with no cache active that was
+// one mutex acquire per write during model load.
+static std::atomic<size_t> g_session_count{0};
 
 // Backend registration object this provider was registered under.
 static const void * g_moe_cache_owner = nullptr;
@@ -86,11 +128,35 @@ struct moe_cache_vulkan_device : public moe_cache_device {
     // true when a DEVICE_LOCAL|HOST_VISIBLE memory type exists (UMA).
     bool host_mapped = false;
 
+    // Command pool and pipelines are created lazily on the first begin, so a
+    // context that never uses the cache allocates no GPU objects.
+    std::once_flag init_once;
+    bool init_ok = false;
+
     // pipelines, one per supported weight type
     VkPipeline pipeline_q8_0 = VK_NULL_HANDLE;
     VkPipeline pipeline_q4_0 = VK_NULL_HANDLE;
     VkPipeline pipeline_q4_K = VK_NULL_HANDLE;
     VkPipeline pipeline_q6_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_q5_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_q1_0 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q2_0 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q4_1 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q5_0 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q5_1 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q2_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_q3_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq2_xxs = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq2_xs = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq2_s = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq3_xxs = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq3_s = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq1_s = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq1_m = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq4_nl = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq4_xs = VK_NULL_HANDLE;
+    VkPipeline pipeline_mxfp4 = VK_NULL_HANDLE;
+    VkPipeline pipeline_nvfp4 = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout ds_layout = VK_NULL_HANDLE;
     VkDescriptorPool ds_pool = VK_NULL_HANDLE;
@@ -135,6 +201,25 @@ struct moe_cache_vulkan_device : public moe_cache_device {
         if (pipeline_q4_0) { vkDestroyPipeline(vk_device, pipeline_q4_0, nullptr); pipeline_q4_0 = VK_NULL_HANDLE; }
         if (pipeline_q4_K) { vkDestroyPipeline(vk_device, pipeline_q4_K, nullptr); pipeline_q4_K = VK_NULL_HANDLE; }
         if (pipeline_q6_K) { vkDestroyPipeline(vk_device, pipeline_q6_K, nullptr); pipeline_q6_K = VK_NULL_HANDLE; }
+        if (pipeline_q5_K) { vkDestroyPipeline(vk_device, pipeline_q5_K, nullptr); pipeline_q5_K = VK_NULL_HANDLE; }
+        if (pipeline_q1_0) { vkDestroyPipeline(vk_device, pipeline_q1_0, nullptr); pipeline_q1_0 = VK_NULL_HANDLE; }
+        if (pipeline_q2_0) { vkDestroyPipeline(vk_device, pipeline_q2_0, nullptr); pipeline_q2_0 = VK_NULL_HANDLE; }
+        if (pipeline_q4_1) { vkDestroyPipeline(vk_device, pipeline_q4_1, nullptr); pipeline_q4_1 = VK_NULL_HANDLE; }
+        if (pipeline_q5_0) { vkDestroyPipeline(vk_device, pipeline_q5_0, nullptr); pipeline_q5_0 = VK_NULL_HANDLE; }
+        if (pipeline_q5_1) { vkDestroyPipeline(vk_device, pipeline_q5_1, nullptr); pipeline_q5_1 = VK_NULL_HANDLE; }
+        if (pipeline_q2_K) { vkDestroyPipeline(vk_device, pipeline_q2_K, nullptr); pipeline_q2_K = VK_NULL_HANDLE; }
+        if (pipeline_q3_K) { vkDestroyPipeline(vk_device, pipeline_q3_K, nullptr); pipeline_q3_K = VK_NULL_HANDLE; }
+        if (pipeline_iq2_xxs) { vkDestroyPipeline(vk_device, pipeline_iq2_xxs, nullptr); pipeline_iq2_xxs = VK_NULL_HANDLE; }
+        if (pipeline_iq2_xs) { vkDestroyPipeline(vk_device, pipeline_iq2_xs, nullptr); pipeline_iq2_xs = VK_NULL_HANDLE; }
+        if (pipeline_iq2_s) { vkDestroyPipeline(vk_device, pipeline_iq2_s, nullptr); pipeline_iq2_s = VK_NULL_HANDLE; }
+        if (pipeline_iq3_xxs) { vkDestroyPipeline(vk_device, pipeline_iq3_xxs, nullptr); pipeline_iq3_xxs = VK_NULL_HANDLE; }
+        if (pipeline_iq3_s) { vkDestroyPipeline(vk_device, pipeline_iq3_s, nullptr); pipeline_iq3_s = VK_NULL_HANDLE; }
+        if (pipeline_iq1_s) { vkDestroyPipeline(vk_device, pipeline_iq1_s, nullptr); pipeline_iq1_s = VK_NULL_HANDLE; }
+        if (pipeline_iq1_m) { vkDestroyPipeline(vk_device, pipeline_iq1_m, nullptr); pipeline_iq1_m = VK_NULL_HANDLE; }
+        if (pipeline_iq4_nl) { vkDestroyPipeline(vk_device, pipeline_iq4_nl, nullptr); pipeline_iq4_nl = VK_NULL_HANDLE; }
+        if (pipeline_iq4_xs) { vkDestroyPipeline(vk_device, pipeline_iq4_xs, nullptr); pipeline_iq4_xs = VK_NULL_HANDLE; }
+        if (pipeline_mxfp4) { vkDestroyPipeline(vk_device, pipeline_mxfp4, nullptr); pipeline_mxfp4 = VK_NULL_HANDLE; }
+        if (pipeline_nvfp4) { vkDestroyPipeline(vk_device, pipeline_nvfp4, nullptr); pipeline_nvfp4 = VK_NULL_HANDLE; }
         if (vk_cmd_pool) {
             vkDestroyCommandPool(vk_device, vk_cmd_pool, nullptr);
             vk_cmd_pool = VK_NULL_HANDLE;
@@ -389,6 +474,17 @@ static VkPipeline vk_create_pipeline(moe_cache_vulkan_device & dev,
     return pipeline;
 }
 
+// Create a moe-cache kernel pipeline, logging the name on failure.
+static VkPipeline vk_moe_pipeline_create(moe_cache_vulkan_device & dev,
+                                         const char * name,
+                                         const unsigned char * spv, uint64_t spv_len) {
+    VkPipeline pipeline = vk_create_pipeline(dev, spv, spv_len);
+    if (!pipeline) {
+        MOE_CACHE_LOG("[moe-cache] Vulkan: moe cache kernel missing: %s\n", name);
+    }
+    return pipeline;
+}
+
 static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
     // descriptor set layout: 4 storage buffers + 1 uniform buffer
     VkDescriptorSetLayoutBinding bindings[5] = {};
@@ -419,11 +515,34 @@ static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
         return false;
     }
 
-    dev.pipeline_q8_0 = vk_create_pipeline(dev, moe_cache_mv_q8_0_data, moe_cache_mv_q8_0_len);
-    dev.pipeline_q4_0 = vk_create_pipeline(dev, moe_cache_mv_q4_0_data, moe_cache_mv_q4_0_len);
-    dev.pipeline_q4_K = vk_create_pipeline(dev, moe_cache_mv_q4_K_data, moe_cache_mv_q4_K_len);
-    dev.pipeline_q6_K = vk_create_pipeline(dev, moe_cache_mv_q6_K_data, moe_cache_mv_q6_K_len);
-    if (!dev.pipeline_q8_0 || !dev.pipeline_q4_0 || !dev.pipeline_q4_K || !dev.pipeline_q6_K) {
+    dev.pipeline_q8_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q8_0", moe_cache_mv_q8_0_data, moe_cache_mv_q8_0_len);
+    dev.pipeline_q4_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q4_0", moe_cache_mv_q4_0_data, moe_cache_mv_q4_0_len);
+    dev.pipeline_q4_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q4_K", moe_cache_mv_q4_K_data, moe_cache_mv_q4_K_len);
+    dev.pipeline_q6_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q6_K", moe_cache_mv_q6_K_data, moe_cache_mv_q6_K_len);
+    dev.pipeline_q5_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q5_K", moe_cache_mv_q5_K_data, moe_cache_mv_q5_K_len);
+    dev.pipeline_q1_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q1_0", moe_cache_mv_q1_0_data, moe_cache_mv_q1_0_len);
+    dev.pipeline_q2_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q2_0", moe_cache_mv_q2_0_data, moe_cache_mv_q2_0_len);
+    dev.pipeline_q4_1 = vk_moe_pipeline_create(dev, "moe_cache_mv_q4_1", moe_cache_mv_q4_1_data, moe_cache_mv_q4_1_len);
+    dev.pipeline_q5_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q5_0", moe_cache_mv_q5_0_data, moe_cache_mv_q5_0_len);
+    dev.pipeline_q5_1 = vk_moe_pipeline_create(dev, "moe_cache_mv_q5_1", moe_cache_mv_q5_1_data, moe_cache_mv_q5_1_len);
+    dev.pipeline_q2_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q2_K", moe_cache_mv_q2_K_data, moe_cache_mv_q2_K_len);
+    dev.pipeline_q3_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q3_K", moe_cache_mv_q3_K_data, moe_cache_mv_q3_K_len);
+    dev.pipeline_iq2_xxs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq2_xxs", moe_cache_mv_iq2_xxs_data, moe_cache_mv_iq2_xxs_len);
+    dev.pipeline_iq2_xs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq2_xs", moe_cache_mv_iq2_xs_data, moe_cache_mv_iq2_xs_len);
+    dev.pipeline_iq2_s = vk_moe_pipeline_create(dev, "moe_cache_mv_iq2_s", moe_cache_mv_iq2_s_data, moe_cache_mv_iq2_s_len);
+    dev.pipeline_iq3_xxs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq3_xxs", moe_cache_mv_iq3_xxs_data, moe_cache_mv_iq3_xxs_len);
+    dev.pipeline_iq3_s = vk_moe_pipeline_create(dev, "moe_cache_mv_iq3_s", moe_cache_mv_iq3_s_data, moe_cache_mv_iq3_s_len);
+    dev.pipeline_iq1_s = vk_moe_pipeline_create(dev, "moe_cache_mv_iq1_s", moe_cache_mv_iq1_s_data, moe_cache_mv_iq1_s_len);
+    dev.pipeline_iq1_m = vk_moe_pipeline_create(dev, "moe_cache_mv_iq1_m", moe_cache_mv_iq1_m_data, moe_cache_mv_iq1_m_len);
+    dev.pipeline_iq4_nl = vk_moe_pipeline_create(dev, "moe_cache_mv_iq4_nl", moe_cache_mv_iq4_nl_data, moe_cache_mv_iq4_nl_len);
+    dev.pipeline_iq4_xs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq4_xs", moe_cache_mv_iq4_xs_data, moe_cache_mv_iq4_xs_len);
+    dev.pipeline_mxfp4 = vk_moe_pipeline_create(dev, "moe_cache_mv_mxfp4", moe_cache_mv_mxfp4_data, moe_cache_mv_mxfp4_len);
+    dev.pipeline_nvfp4 = vk_moe_pipeline_create(dev, "moe_cache_mv_nvfp4", moe_cache_mv_nvfp4_data, moe_cache_mv_nvfp4_len);
+    if (!dev.pipeline_q8_0 || !dev.pipeline_q4_0 || !dev.pipeline_q4_K || !dev.pipeline_q6_K || !dev.pipeline_q5_K ||
+        !dev.pipeline_q1_0 || !dev.pipeline_q2_0 || !dev.pipeline_q4_1 || !dev.pipeline_q5_0 || !dev.pipeline_q5_1 ||
+        !dev.pipeline_q2_K || !dev.pipeline_q3_K || !dev.pipeline_iq2_xxs || !dev.pipeline_iq2_xs || !dev.pipeline_iq2_s ||
+        !dev.pipeline_iq3_xxs || !dev.pipeline_iq3_s || !dev.pipeline_iq1_s || !dev.pipeline_iq1_m || !dev.pipeline_iq4_nl ||
+        !dev.pipeline_iq4_xs || !dev.pipeline_mxfp4 || !dev.pipeline_nvfp4) {
         return false;
     }
 
@@ -451,6 +570,32 @@ static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
         return false;
     }
     return true;
+}
+
+// Create the command pool and compile the moe-cache pipelines on first use.
+// session_create only keeps bookkeeping state, so a context that never uses
+// the cache pays no GPU setup cost.
+static bool vk_device_ensure_ready(moe_cache_vulkan_device & dev, size_t budget_mb) {
+    std::call_once(dev.init_once, [&]() {
+        VkCommandPoolCreateInfo cpci = {};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = dev.vk_queue_family;
+        if (vkCreateCommandPool(dev.vk_device, &cpci, nullptr, &dev.vk_cmd_pool) != VK_SUCCESS) {
+            dev.dead.store(true);
+            return;
+        }
+        if (!vk_load_pipelines(dev)) {
+            MOE_CACHE_LOG("[moe-cache] Vulkan pipeline creation failed\n");
+            dev.free_resources();
+            dev.dead.store(true);
+            return;
+        }
+        dev.init_ok = true;
+        MOE_CACHE_LOG("[moe-cache] Vulkan session ready (budget=%zu MiB, %s)\n",
+                budget_mb, dev.host_mapped ? "host-mapped" : "device-local");
+    });
+    return dev.init_ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -547,8 +692,8 @@ static int vk_moe_query_shape(int wtype, int64_t n_in, int64_t n_out,
     if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) {
         return 0;
     }
-    if (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) {
+    // canonical list from ggml-backend-moe-cache.h; single source of truth
+    if (!ggml_moe_cache_wtype_supported(wtype)) {
         return 0;
     }
 
@@ -580,11 +725,17 @@ static int vk_moe_query_shape(int wtype, int64_t n_in, int64_t n_out,
 // ---------------------------------------------------------------------------
 
 static moe_cache_pool * vk_moe_find_or_create_pool(
-        moe_cache_vulkan_device & dev, size_t expert_size, int wtype,
-        int64_t n_expert, size_t budget_bytes) {
+        moe_cache_vulkan_device & dev, moe_cache_session & session,
+        size_t expert_size, int wtype, int64_t n_expert, size_t budget_bytes) {
     const int existing = moe_cache_find_pool(dev, expert_size, wtype);
     if (existing >= 0) {
         return dev.pools[existing].get();
+    }
+
+    if (moe_cache_fail(session, "slab")) {
+        MOE_CACHE_LOG("[moe-cache] Vulkan: skipped %zu KiB expert pool: allocation failed\n",
+                expert_size >> 10);
+        return nullptr;
     }
 
     size_t slots = budget_bytes / expert_size;
@@ -634,9 +785,17 @@ static moe_cache_pool * vk_moe_find_or_create_pool(
         dev.allocated_bytes += slab_bytes;
         dev.pools.push_back(std::move(pool));
         dev.pool_buffers.push_back(slab_buf);
-        MOE_CACHE_LOG("[moe-cache] Vulkan pool: type=%s expert=%zu KiB slots=%zu total=%zu MiB\n",
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d pool[%d]: type=%s expert=%zu KiB slots=%zu entries=%lld coverage=%s total=%zu MiB\n",
+                dev.physical, (int)dev.pools.size() - 1,
                 ggml_type_name((ggml_type)wtype), expert_size >> 10,
-                slots, slab_bytes >> 20);
+                slots, (long long)n_expert,
+                dev.pools.back()->covers_all_entries ? "complete" : "partial",
+                slab_bytes >> 20);
+        bool expected = false;
+        if (session.enabled_announced.compare_exchange_strong(expected, true)) {
+            MOE_CACHE_LOG("[moe-cache] enabled: first pool allocated on Vulkan%d\n",
+                    dev.physical);
+        }
         return dev.pools.back().get();
     } catch (...) {
         vk_buf_destroy(dev, slab_buf);
@@ -681,6 +840,11 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
             config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
         }
         if (!config.enabled) {
+            return nullptr;
+        }
+        // A zero budget can never create a pool; bail before querying
+        // VkPhysicalDeviceMemoryProperties and creating the device object.
+        if (!supplied_config && config.budget_mb == 0) {
             return nullptr;
         }
 
@@ -739,29 +903,15 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
             }
         }
 
-        VkCommandPoolCreateInfo cpci = {};
-        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        cpci.queueFamilyIndex = queue_family;
-        if (vkCreateCommandPool(vk_device, &cpci, nullptr, &dev->vk_cmd_pool) != VK_SUCCESS) {
-            return nullptr;
-        }
-
-        if (!vk_load_pipelines(*dev)) {
-            MOE_CACHE_LOG("[moe-cache] Vulkan pipeline creation failed\n");
-            return nullptr;
-        }
-
+        // GPU resources (command pool, pipelines) are created lazily on the
+        // first begin; a context that never uses the cache allocates none.
         session->devices.push_back(std::move(dev));
 
-        MOE_CACHE_LOG("[moe-cache] Vulkan session created (budget=%zu MiB, %s)\n",
-                session->config.budget_mb,
-                static_cast<moe_cache_vulkan_device &>(*session->devices[0]).host_mapped
-                    ? "host-mapped" : "device-local");
         moe_cache_session * result = session.get();
         try {
             std::lock_guard<std::mutex> lock(g_registry_mu);
             g_sessions.insert(result);
+            g_session_count.store(g_sessions.size(), std::memory_order_release);
         } catch (...) {
             return nullptr;
         }
@@ -771,6 +921,25 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
         MOE_CACHE_LOG("[moe-cache] Vulkan session creation failed\n");
         return nullptr;
     }
+}
+
+// Teardown statistics, same field names as CUDA so the log contract is
+// backend-independent. Only logged when the session did any cache work.
+static void vk_moe_log_stats(moe_cache_vulkan_device & dev) {
+    size_t used = 0;
+    size_t slots = 0;
+    for (const auto & pool_ptr : dev.pools) {
+        const moe_cache_pool & pool = *pool_ptr;
+        slots += pool.n_slots;
+        used += pool.n_slots - pool.free_slots.size();
+    }
+    const long long total = dev.hits + dev.misses;
+    MOE_CACHE_LOG("[moe-cache] Vulkan%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld dispatch-fail=%lld collect-fail=%lld bypass=%lld\n",
+            dev.physical, dev.hits, total,
+            total ? 100.0 * (double)dev.hits / (double)total : 0.0,
+            used, slots, dev.inserts, dev.fills, dev.fill_failures,
+            dev.evictions, dev.insert_skips, dev.admission_skips,
+            dev.dispatch_failures, dev.collect_failures, dev.contention_bypasses);
 }
 
 static void vk_moe_session_destroy(void * opaque) {
@@ -791,6 +960,15 @@ static void vk_moe_session_destroy(void * opaque) {
     {
         std::lock_guard<std::mutex> lock(g_registry_mu);
         g_sessions.erase(session);
+        g_session_count.store(g_sessions.size(), std::memory_order_release);
+    }
+    for (auto & dev_ptr : session->devices) {
+        moe_cache_vulkan_device & dev =
+            static_cast<moe_cache_vulkan_device &>(*dev_ptr);
+        if (dev.nodes > 0 || dev.dispatch_failures > 0 ||
+            dev.collect_failures > 0) {
+            vk_moe_log_stats(dev);
+        }
     }
     delete session;
 }
@@ -866,8 +1044,7 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     if (!name || !host_base || !moe_cache_tensor_name_supported(name) ||
         n_tokens < 1 || expert_size < session->config.min_expert_bytes ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
-        (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-         wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K)) {
+        !ggml_moe_cache_wtype_supported(wtype)) {
         return nullptr;
     }
     if (n_rows < n_tokens || n_rows % n_tokens != 0 ||
@@ -888,6 +1065,15 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     }
     moe_cache_vulkan_device & dev =
         static_cast<moe_cache_vulkan_device &>(*session->devices[0]);
+    // A zero budget can never create a pool; skip GPU setup entirely.
+    if (session->config.budget_mb == 0) {
+        return nullptr;
+    }
+    // Create the command pool and compile the pipelines on first use, before
+    // the dispatch lock so a one-time compile does not block other workers.
+    if (!vk_device_ensure_ready(dev, session->config.budget_mb)) {
+        return nullptr;
+    }
 
     std::unique_lock<std::mutex> dispatch_lock;
     try {
@@ -905,9 +1091,10 @@ static void * vk_moe_begin(const char * name, const void * host_base,
         return nullptr;
     }
 
+    moe_cache_log_configuration(*session);
     const size_t budget_bytes = session->config.budget_mb << 20;
     moe_cache_pool * pool = vk_moe_find_or_create_pool(
-            dev, expert_size, wtype, n_expert, budget_bytes);
+            dev, *session, expert_size, wtype, n_expert, budget_bytes);
     if (!pool) {
         return nullptr;
     }
@@ -1041,6 +1228,10 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
 
         // miss
         dev.misses++;
+        if (moe_cache_fail(session, "insert")) {
+            dev.fill_failures++;
+            continue;
+        }
         if (fills_done >= fill_budget) {
             continue; // CPU handles this row
         }
@@ -1168,7 +1359,9 @@ static int vk_moe_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out
 
     moe_cache_vulkan_device & dev =
         static_cast<moe_cache_vulkan_device &>(*node->device);
-    if (dev.dead.load()) {
+    if (dev.dead.load() || moe_cache_fail(*node->session, "dispatch")) {
+        std::lock_guard<std::mutex> lock(node->session->mu);
+        dev.dispatch_failures++;
         return 0;
     }
     const size_t pool_index = (size_t)node->pool_index >= 0
@@ -1210,9 +1403,29 @@ static int vk_moe_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out
     // select pipeline by weight type
     VkPipeline pipeline = dev.pipeline_q8_0;
     switch (wtype) {
+        case GGML_TYPE_Q8_0: pipeline = dev.pipeline_q8_0; break;
         case GGML_TYPE_Q4_0: pipeline = dev.pipeline_q4_0; break;
         case GGML_TYPE_Q4_K: pipeline = dev.pipeline_q4_K; break;
         case GGML_TYPE_Q6_K: pipeline = dev.pipeline_q6_K; break;
+        case GGML_TYPE_Q5_K: pipeline = dev.pipeline_q5_K; break;
+        case GGML_TYPE_Q1_0: pipeline = dev.pipeline_q1_0; break;
+        case GGML_TYPE_Q2_0: pipeline = dev.pipeline_q2_0; break;
+        case GGML_TYPE_Q4_1: pipeline = dev.pipeline_q4_1; break;
+        case GGML_TYPE_Q5_0: pipeline = dev.pipeline_q5_0; break;
+        case GGML_TYPE_Q5_1: pipeline = dev.pipeline_q5_1; break;
+        case GGML_TYPE_Q2_K: pipeline = dev.pipeline_q2_K; break;
+        case GGML_TYPE_Q3_K: pipeline = dev.pipeline_q3_K; break;
+        case GGML_TYPE_IQ2_XXS: pipeline = dev.pipeline_iq2_xxs; break;
+        case GGML_TYPE_IQ2_XS: pipeline = dev.pipeline_iq2_xs; break;
+        case GGML_TYPE_IQ2_S: pipeline = dev.pipeline_iq2_s; break;
+        case GGML_TYPE_IQ3_XXS: pipeline = dev.pipeline_iq3_xxs; break;
+        case GGML_TYPE_IQ3_S: pipeline = dev.pipeline_iq3_s; break;
+        case GGML_TYPE_IQ1_S: pipeline = dev.pipeline_iq1_s; break;
+        case GGML_TYPE_IQ1_M: pipeline = dev.pipeline_iq1_m; break;
+        case GGML_TYPE_IQ4_NL: pipeline = dev.pipeline_iq4_nl; break;
+        case GGML_TYPE_IQ4_XS: pipeline = dev.pipeline_iq4_xs; break;
+        case GGML_TYPE_MXFP4: pipeline = dev.pipeline_mxfp4; break;
+        case GGML_TYPE_NVFP4: pipeline = dev.pipeline_nvfp4; break;
         default: break;
     }
     if (!pipeline) {
@@ -1372,40 +1585,49 @@ static int vk_moe_collect(void * opaque, int n_hits, float * const * dst_rows,
 
     moe_cache_vulkan_device & dev =
         static_cast<moe_cache_vulkan_device &>(*node->device);
-    if (dev.dead.load()) {
-        node->dispatched = false;
-        return 0;
+    moe_cache_session & session = *node->session;
+    bool ok = !dev.dead.load() && !moe_cache_fail(session, "collect");
+    if (ok) {
+        const size_t out_bytes = (size_t)n_hits * (size_t)n_out * sizeof(float);
+        if (dev.host_mapped) {
+            // results already in the host-visible out buffer
+            const float * out = (const float *)dev.out_buf.mapped;
+            for (int index = 0; index < n_hits; index++) {
+                memcpy(dst_rows[index], out + (size_t)index * n_out,
+                       (size_t)n_out * sizeof(float));
+            }
+        } else {
+            // copy-back already landed in staging during dispatch
+            if (dev.staging.size < out_bytes || !dev.staging.mapped) {
+                ok = false;
+            } else {
+                const size_t padded_n_in =
+                    ((size_t)node->n_in + QK8_1 - 1) / QK8_1 * QK8_1;
+                const size_t act_bytes =
+                    (size_t)node->n_pins * (padded_n_in / QK8_1) * sizeof(block_q8_1);
+                const size_t out_stage_offset =
+                    (size_t)node->n_pins * sizeof(int32_t) + act_bytes;
+                const float * out = (const float *)dev.staging.mapped + out_stage_offset / sizeof(float);
+                for (int index = 0; index < n_hits; index++) {
+                    memcpy(dst_rows[index], out + (size_t)index * n_out,
+                           (size_t)n_out * sizeof(float));
+                }
+            }
+        }
     }
-
-    const size_t out_bytes = (size_t)n_hits * (size_t)n_out * sizeof(float);
-    if (dev.host_mapped) {
-        // results already in the host-visible out buffer
-        const float * out = (const float *)dev.out_buf.mapped;
-        for (int index = 0; index < n_hits; index++) {
-            memcpy(dst_rows[index], out + (size_t)index * n_out,
-                   (size_t)n_out * sizeof(float));
-        }
-    } else {
-        // copy-back already landed in staging during dispatch
-        if (dev.staging.size < out_bytes || !dev.staging.mapped) {
-            node->dispatched = false;
-            return 0;
-        }
-        const size_t padded_n_in =
-            ((size_t)node->n_in + QK8_1 - 1) / QK8_1 * QK8_1;
-        const size_t act_bytes =
-            (size_t)node->n_pins * (padded_n_in / QK8_1) * sizeof(block_q8_1);
-        const size_t out_stage_offset =
-            (size_t)node->n_pins * sizeof(int32_t) + act_bytes;
-        const float * out = (const float *)dev.staging.mapped + out_stage_offset / sizeof(float);
-        for (int index = 0; index < n_hits; index++) {
-            memcpy(dst_rows[index], out + (size_t)index * n_out,
-                   (size_t)n_out * sizeof(float));
-        }
-    }
-    dev.collect_calls++;
     node->dispatched = false;
-    return 1;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        if (!ok) {
+            dev.collect_failures++;
+        }
+        dev.collect_calls++;
+        if (session.config.stats_every > 0 &&
+            dev.collect_calls % session.config.stats_every == 0) {
+            vk_moe_log_stats(dev);
+        }
+    }
+    return ok ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,6 +1680,9 @@ static void * vk_moe_fused_begin(const ggml_moe_cache_tensor_desc * up,
 
 static void vk_moe_invalidate(const void * base, size_t size) {
     if (!base || size == 0) {
+        return;
+    }
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
         return;
     }
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);

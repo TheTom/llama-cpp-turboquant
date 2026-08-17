@@ -93,7 +93,24 @@ static __global__ void flash_attn_ext_vec(
     // Turbo KQ dot does byte extraction + centroid lookup + scalar mul, not vectorized f16 loads.
     // nthreads_KQ=1: each thread computes a full KQ product alone — eliminates warp_reduce_sum
     // shuffle and halves KQ loop iterations. Each thread holds full Q vector in registers.
-    constexpr int nthreads_KQ = K_is_turbo ? 1 : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
+    //
+    // That last property is what makes it unaffordable in general: Q_reg below is
+    // [ncols][(D/2)/nthreads_KQ], so at nthreads_KQ=1 the per-lane Q working set is the whole
+    // Q vector. Measured spill for turbo K (issue #294): ~4.3 KB/lane at ncols=2 on SM 86,
+    // 295-786 VGPRs across CDNA/RDNA2/RDNA3/RDNA4, at both hsk=128 and hsk=256.
+    //
+    // The shared-memory LUT paths below are the exception. They compute the full D-length dot
+    // per lane with no nthreads_KQ striding and never call warp_reduce_sum, so they structurally
+    // require nthreads_KQ==1; raising it there makes every lane redundantly recompute the whole
+    // dot (correct, but measured at -12.6% / -31.1% turbo2 decode at 8K / 32K on SM 86).
+    // Those same shapes are also the ones that do not spill. So the split is gated on the LUT
+    // being inactive rather than on D: keep 1 exactly where the LUT runs, split everywhere else.
+    //
+    // Kept in sync with n_centroids_lut below; turbo4 never gets a LUT (shmem budget).
+    constexpr bool turbo_lut_active = (ncols == 1) && (D <= 256) &&
+        (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0);
+    constexpr int nthreads_KQ = K_is_turbo ? (turbo_lut_active ? 1 : 128 / cpy_nb)
+                                           : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
     constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
     // Turbo V dequant is scalar (byte extract + LUT), not vectorized loads.
     // Halve nthreads_V to double V_cols_per_iter (process 2 V rows per loop iteration),
@@ -148,8 +165,8 @@ static __global__ void flash_attn_ext_vec(
     // then the hot loop does turbo_lut[d][idx] (shmem read, no multiply).
     // turbo4 excluded: 16 centroids × D exceeds shmem budget.
     // Stride = n_centroids+1 to avoid bank conflicts.
-    constexpr int n_centroids_lut = (D <= 256 && type_K == GGML_TYPE_TURBO3_0) ? 8 :
-                                    (D <= 256 && type_K == GGML_TYPE_TURBO2_0) ? 4 : 0;
+    constexpr int n_centroids_lut = !turbo_lut_active ? 0 :
+                                    (type_K == GGML_TYPE_TURBO3_0) ? 8 : 4;
     constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
     __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
 

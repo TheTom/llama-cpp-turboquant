@@ -1537,6 +1537,7 @@ static void * moe_cache_session_create(
             config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
         }
         if (!config.enabled) {
+            MOE_CACHE_LOG("[moe-cache] disabled by environment (GGML_CUDA_MOE_CACHE=0 or GGML_CUDA_MOE_CACHE_MODE=off)\n");
             return nullptr;
         }
 
@@ -1584,6 +1585,8 @@ static void * moe_cache_session_create(
         }
 
         if (session->devices.empty()) {
+            MOE_CACHE_LOG("[moe-cache] session creation failed: no devices meet the compute capability floor (%d)\n",
+                    session->config.min_compute_capability);
             return nullptr;
         }
         if (!session->config.min_expert_explicit) {
@@ -1594,6 +1597,7 @@ static void * moe_cache_session_create(
                 session->devices.size() < 2 || minimum_capability < moe_cache_cc_ampere;
         }
         if (!moe_cache_budget_register(*session)) {
+            MOE_CACHE_LOG("[moe-cache] session creation failed: budget registration failed\n");
             return nullptr;
         }
 

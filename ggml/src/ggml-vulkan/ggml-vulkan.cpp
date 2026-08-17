@@ -19031,9 +19031,9 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
     };
     try {
         ggml_vk_instance_init();
-#ifdef GGML_USE_VULKAN
+        // No GGML_USE_* guard: see the Metal backend; that macro is not defined
+        // for this target, so the registration was compiled out.
         ggml_vulkan_moe_cache_register(&reg);
-#endif
         return &reg;
     } catch (const vk::SystemError& e) {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());

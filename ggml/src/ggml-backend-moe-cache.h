@@ -62,6 +62,10 @@ struct ggml_moe_cache_api {
     int (*query_config)(int automatic, size_t budget_mib, struct ggml_moe_cache_config * config);
     int (*query_device)(void * device, const struct ggml_moe_cache_config * config, struct ggml_moe_cache_device_caps * caps);
     int (*query_shape)(int wtype, int64_t n_in, int64_t n_out, int64_t n_expert, size_t expert_size, struct ggml_moe_cache_shape_caps * caps);
+    // Fused SwiGLU path: 1 when this provider can fuse up * GLU(gate) for the
+    // weight type. CUDA implements this and covers the canonical list exactly;
+    // providers without a fused path leave it NULL.
+    int (*query_fused)(int wtype);
 
     // The scheduler owns one cache session. backends contains the scheduler's actual backend set, so the provider can use only selected CUDA devices.
     void * (*session_create)(void * const * backends, int n_backends, const struct ggml_moe_cache_config * config);
@@ -100,6 +104,58 @@ struct ggml_moe_cache_api {
     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
 };
+
+// Canonical expert weight type set for the MoE cache. Every provider
+// (CUDA/HIP, Vulkan, Metal) must accept exactly this set in query_shape and
+// begin; a provider that silently accepts less produces silent partial
+// coverage. Keep in sync with the CUDA kernel case tables in
+// ggml-cuda/mmvq.cu: the plain dispatch tables
+// (ggml_cuda_moe_cache_mmv_supported) and the fused SwiGLU tables
+// (ggml_cuda_moe_cache_mmv_fused_supported) must both equal this list - a
+// canonical type missing from the fused tables silently skips the fusion
+// optimization. moe-cache.cu asserts both directions at registration time.
+// enum tag form: ggml.h declares the type without a typedef, so bare
+// ggml_type is invalid in C (ggml-cpu.c includes this header as C).
+static const enum ggml_type ggml_moe_cache_types[] = {
+    GGML_TYPE_Q1_0,
+    GGML_TYPE_Q2_0,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_MXFP4,
+    GGML_TYPE_NVFP4,
+    GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K,
+    GGML_TYPE_IQ2_XXS,
+    GGML_TYPE_IQ2_XS,
+    GGML_TYPE_IQ2_S,
+    GGML_TYPE_IQ3_XXS,
+    GGML_TYPE_IQ3_S,
+    GGML_TYPE_IQ1_S,
+    GGML_TYPE_IQ1_M,
+    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_IQ4_XS,
+};
+
+static inline int ggml_moe_cache_wtype_count(void) {
+    return (int) (sizeof(ggml_moe_cache_types) / sizeof(ggml_moe_cache_types[0]));
+}
+
+// Single source of truth for cacheable weight types. Providers call this from
+// both query_shape and begin so the two gates cannot drift apart.
+static inline int ggml_moe_cache_wtype_supported(int wtype) {
+    for (int i = 0; i < ggml_moe_cache_wtype_count(); i++) {
+        if ((int) ggml_moe_cache_types[i] == wtype) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 GGML_API void ggml_moe_cache_register(const struct ggml_moe_cache_api * api);
 GGML_API void ggml_moe_cache_unregister(const void * owner);

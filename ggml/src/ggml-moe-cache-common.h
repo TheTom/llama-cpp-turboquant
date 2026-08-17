@@ -497,6 +497,36 @@ inline bool moe_cache_fail(const moe_cache_session & session, const char * stage
     return false;
 }
 
+// Print the session configuration once, on first eligible use. Shared by the
+// Metal and Vulkan providers so their observable log contract matches CUDA.
+inline void moe_cache_log_configuration(moe_cache_session & session) {
+    bool expected = false;
+    if (!session.config_announced.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    const std::string budget = session.config.budget_mb > 0
+        ? std::to_string(session.config.budget_mb) + " MiB cap"
+        : "free-minus-reserve";
+    const std::string overlap_cpu_rows = session.config.overlap_cpu_rows < 0
+        ? "auto" : std::to_string(session.config.overlap_cpu_rows);
+    const std::string admission = session.config.admit_after_explicit
+        ? std::to_string(session.config.admit_after) + "-fixed/" +
+            std::to_string(session.config.readmit_after) + "-replace"
+        : "1-complete/" + std::to_string(session.config.admit_after) +
+            "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
+    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s\n",
+            session.config.automatic ? "auto" : "on",
+            session.devices.size(), budget.c_str(),
+            session.config.reserve_mb,
+            session.config.minimum_slab_bytes >> 20,
+            session.config.min_expert_bytes >> 10,
+            session.config.max_batch,
+            admission.c_str(),
+            overlap_cpu_rows.c_str(),
+            session.config.serial_fill ? "serial" : "parallel");
+}
+
 inline bool moe_cache_ranges_overlap(
         const void * lhs, size_t lhs_size, const void * rhs, size_t rhs_size) {
     if (!lhs || !rhs || lhs_size == 0 || rhs_size == 0) {

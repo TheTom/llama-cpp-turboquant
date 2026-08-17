@@ -5815,7 +5815,6 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                          op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) &&
                         op->src[0]->type == GGML_TYPE_F32 &&
                         (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32));
-                return res;
             }
             break;
         case GGML_OP_CPY:

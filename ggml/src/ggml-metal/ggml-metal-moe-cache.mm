@@ -40,6 +40,10 @@ static thread_local int g_session_suppressed = 0;
 // Global session registry for invalidate()/teardown paths.
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
+// Live-session count, so invalidate() can bail before taking g_registry_mu.
+// invalidate runs on every backend buffer write; with no cache active that was
+// one mutex acquire per write during model load.
+static std::atomic<size_t> g_session_count{0};
 
 // Backend registration object this provider was registered under.
 static const void * g_moe_cache_owner = nullptr;
@@ -49,10 +53,9 @@ static const void * g_moe_cache_owner = nullptr;
 // ---------------------------------------------------------------------------
 
 struct moe_cache_metal_device : public moe_cache_device {
-    moe_cache_metal_device(id<MTLDevice> dev, id<MTLCommandQueue> q)
-        : moe_cache_device(0, 0), mtl_device(dev), mtl_queue(q) {
+    moe_cache_metal_device(id<MTLDevice> dev, ggml_metal_device_t ctx)
+        : moe_cache_device(0, 0), mtl_device(dev), ctx_dev(ctx) {
         [mtl_device retain];
-        [mtl_queue retain];
     }
 
     ~moe_cache_metal_device() {
@@ -61,17 +64,45 @@ struct moe_cache_metal_device : public moe_cache_device {
             [out_buffer release];
             out_buffer = nil;
         }
-        [mtl_queue release];
+        if (mtl_queue) {
+            [mtl_queue release];
+            mtl_queue = nil;
+        }
         [mtl_device release];
     }
 
     id<MTLDevice> mtl_device;
-    id<MTLCommandQueue> mtl_queue;
+    // Backend device context; the library is compiled from it on first use.
+    ggml_metal_device_t ctx_dev = nullptr;
+    // Command queue, library, and pipelines are created lazily on the first
+    // begin, so a context that never uses the cache allocates no GPU objects.
+    id<MTLCommandQueue> mtl_queue = nil;
+    std::once_flag init_once;
+    bool init_ok = false;
     ggml_metal_library_t lib = nullptr;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q8_0;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q4_0;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q4_K;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q6_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q5_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q1_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q2_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q4_1;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q5_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q5_1;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q2_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q3_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq2_xxs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq2_xs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq2_s;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq3_xxs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq3_s;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq1_s;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq1_m;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq4_nl;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq4_xs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_mxfp4;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_nvfp4;
 
     // Tracked MTLBuffers for slab pools.
     std::vector<id<MTLBuffer>> slab_buffers;
@@ -167,8 +198,8 @@ static int metal_query_shape(int wtype, int64_t n_in, int64_t n_out,
     if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) {
         return 0;
     }
-    if (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) {
+    // canonical list from ggml-backend-moe-cache.h; single source of truth
+    if (!ggml_moe_cache_wtype_supported(wtype)) {
         return 0;
     }
 
@@ -200,11 +231,17 @@ static int metal_query_shape(int wtype, int64_t n_in, int64_t n_out,
 // ---------------------------------------------------------------------------
 
 static moe_cache_pool * metal_find_or_create_pool(
-        moe_cache_metal_device & dev, size_t expert_size, int wtype,
-        int64_t n_expert, size_t budget_bytes) {
+        moe_cache_metal_device & dev, moe_cache_session & session,
+        size_t expert_size, int wtype, int64_t n_expert, size_t budget_bytes) {
     const int existing = moe_cache_find_pool(dev, expert_size, wtype);
     if (existing >= 0) {
         return dev.pools[existing].get();
+    }
+
+    if (moe_cache_fail(session, "slab")) {
+        MOE_CACHE_LOG("[moe-cache] Metal: skipped %zu KiB expert pool: allocation failed\n",
+                expert_size >> 10);
+        return nullptr;
     }
 
     size_t slots = budget_bytes / expert_size;
@@ -244,9 +281,17 @@ static moe_cache_pool * metal_find_or_create_pool(
         }
         dev.allocated_bytes += slab_bytes;
         dev.pools.push_back(std::move(pool));
-        MOE_CACHE_LOG("[moe-cache] Metal pool: type=%s expert=%zu KiB slots=%zu total=%zu MiB\n",
+        MOE_CACHE_LOG("[moe-cache] Metal%d pool[%d]: type=%s expert=%zu KiB slots=%zu entries=%lld coverage=%s total=%zu MiB\n",
+                dev.physical, (int)dev.pools.size() - 1,
                 ggml_type_name((ggml_type)wtype), expert_size >> 10,
-                slots, slab_bytes >> 20);
+                slots, (long long)n_expert,
+                dev.pools.back()->covers_all_entries ? "complete" : "partial",
+                slab_bytes >> 20);
+        bool expected = false;
+        if (session.enabled_announced.compare_exchange_strong(expected, true)) {
+            MOE_CACHE_LOG("[moe-cache] enabled: first pool allocated on Metal%d\n",
+                    dev.physical);
+        }
         return dev.pools.back().get();
     } catch (...) {
         // remove the tracked buffer and restore the pool list
@@ -263,6 +308,131 @@ static moe_cache_pool * metal_find_or_create_pool(
 // ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
+
+// Get-or-compile a moe-cache kernel pipeline, logging the name on failure.
+// The backend caches pipelines lazily; get_pipeline alone only returns
+// already-compiled ones, so every lookup on a fresh library would miss.
+static struct ggml_metal_pipeline_with_params metal_pipeline_get(
+        ggml_metal_library_t lib, const char * name) {
+    struct ggml_metal_pipeline_with_params res =
+        ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    if (!res.pipeline) {
+        MOE_CACHE_LOG("[moe-cache] Metal: moe cache kernel missing: %s\n", name);
+    }
+    return res;
+}
+
+// Compile the moe-cache pipelines and create the command queue on first use.
+// session_create only keeps bookkeeping state, so a context that never uses
+// the cache pays no GPU setup cost.
+static bool metal_device_ensure_ready(moe_cache_metal_device & dev, size_t budget_mb) {
+    std::call_once(dev.init_once, [&]() {
+        // Load the shared kernel library (same embedded source as the
+        // backend; contains kernel_moe_cache_mv_* from ggml-metal.metal).
+        ggml_metal_library_t lib = ggml_metal_library_init(dev.ctx_dev);
+        if (!lib) {
+            MOE_CACHE_LOG("[moe-cache] Metal library init failed\n");
+            dev.dead.store(true);
+            return;
+        }
+
+        struct ggml_metal_pipeline_with_params p_q8_0 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q8_0_f32");
+        struct ggml_metal_pipeline_with_params p_q4_0 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q4_0_f32");
+        struct ggml_metal_pipeline_with_params p_q4_K =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q4_K_f32");
+        struct ggml_metal_pipeline_with_params p_q6_K =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q6_K_f32");
+        struct ggml_metal_pipeline_with_params p_q5_K =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q5_K_f32");
+        struct ggml_metal_pipeline_with_params p_q1_0 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q1_0_f32");
+        struct ggml_metal_pipeline_with_params p_q2_0 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q2_0_f32");
+        struct ggml_metal_pipeline_with_params p_q4_1 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q4_1_f32");
+        struct ggml_metal_pipeline_with_params p_q5_0 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q5_0_f32");
+        struct ggml_metal_pipeline_with_params p_q5_1 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q5_1_f32");
+        struct ggml_metal_pipeline_with_params p_q2_K =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q2_K_f32");
+        struct ggml_metal_pipeline_with_params p_q3_K =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q3_K_f32");
+        struct ggml_metal_pipeline_with_params p_iq2_xxs =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq2_xxs_f32");
+        struct ggml_metal_pipeline_with_params p_iq2_xs =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq2_xs_f32");
+        struct ggml_metal_pipeline_with_params p_iq2_s =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq2_s_f32");
+        struct ggml_metal_pipeline_with_params p_iq3_xxs =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq3_xxs_f32");
+        struct ggml_metal_pipeline_with_params p_iq3_s =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq3_s_f32");
+        struct ggml_metal_pipeline_with_params p_iq1_s =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq1_s_f32");
+        struct ggml_metal_pipeline_with_params p_iq1_m =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq1_m_f32");
+        struct ggml_metal_pipeline_with_params p_iq4_nl =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq4_nl_f32");
+        struct ggml_metal_pipeline_with_params p_iq4_xs =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq4_xs_f32");
+        struct ggml_metal_pipeline_with_params p_mxfp4 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_mxfp4_f32");
+        struct ggml_metal_pipeline_with_params p_nvfp4 =
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_nvfp4_f32");
+        if (!p_q8_0.pipeline || !p_q4_0.pipeline ||
+            !p_q4_K.pipeline || !p_q6_K.pipeline || !p_q5_K.pipeline ||
+            !p_q1_0.pipeline || !p_q2_0.pipeline || !p_q4_1.pipeline ||
+            !p_q5_0.pipeline || !p_q5_1.pipeline || !p_q2_K.pipeline ||
+            !p_q3_K.pipeline || !p_iq2_xxs.pipeline || !p_iq2_xs.pipeline ||
+            !p_iq2_s.pipeline || !p_iq3_xxs.pipeline || !p_iq3_s.pipeline ||
+            !p_iq1_s.pipeline || !p_iq1_m.pipeline || !p_iq4_nl.pipeline ||
+            !p_iq4_xs.pipeline || !p_mxfp4.pipeline || !p_nvfp4.pipeline) {
+            MOE_CACHE_LOG("[moe-cache] Metal: one or more moe cache kernels missing\n");
+            ggml_metal_library_free(lib);
+            dev.dead.store(true);
+            return;
+        }
+
+        id<MTLCommandQueue> queue = [dev.mtl_device newCommandQueue];
+        if (!queue) {
+            ggml_metal_library_free(lib);
+            dev.dead.store(true);
+            return;
+        }
+
+        dev.mtl_queue = queue;
+        dev.lib = lib;
+        dev.mmv_pipeline_q8_0 = p_q8_0;
+        dev.mmv_pipeline_q4_0 = p_q4_0;
+        dev.mmv_pipeline_q4_K = p_q4_K;
+        dev.mmv_pipeline_q6_K = p_q6_K;
+        dev.mmv_pipeline_q5_K = p_q5_K;
+        dev.mmv_pipeline_q1_0 = p_q1_0;
+        dev.mmv_pipeline_q2_0 = p_q2_0;
+        dev.mmv_pipeline_q4_1 = p_q4_1;
+        dev.mmv_pipeline_q5_0 = p_q5_0;
+        dev.mmv_pipeline_q5_1 = p_q5_1;
+        dev.mmv_pipeline_q2_K = p_q2_K;
+        dev.mmv_pipeline_q3_K = p_q3_K;
+        dev.mmv_pipeline_iq2_xxs = p_iq2_xxs;
+        dev.mmv_pipeline_iq2_xs = p_iq2_xs;
+        dev.mmv_pipeline_iq2_s = p_iq2_s;
+        dev.mmv_pipeline_iq3_xxs = p_iq3_xxs;
+        dev.mmv_pipeline_iq3_s = p_iq3_s;
+        dev.mmv_pipeline_iq1_s = p_iq1_s;
+        dev.mmv_pipeline_iq1_m = p_iq1_m;
+        dev.mmv_pipeline_iq4_nl = p_iq4_nl;
+        dev.mmv_pipeline_iq4_xs = p_iq4_xs;
+        dev.mmv_pipeline_mxfp4 = p_mxfp4;
+        dev.mmv_pipeline_nvfp4 = p_nvfp4;
+        dev.init_ok = true;
+        MOE_CACHE_LOG("[moe-cache] Metal session ready (budget=%zu MiB)\n", budget_mb);
+    });
+    return dev.init_ok;
+}
 
 static void * metal_session_create(void * const * backends, int n_backends,
                                     const ggml_moe_cache_config * supplied_config) {
@@ -299,6 +469,12 @@ static void * metal_session_create(void * const * backends, int n_backends,
         if (!config.enabled) {
             return nullptr;
         }
+        // A zero budget can never create a pool; bail before retaining the
+        // MTLDevice, which would trigger an AppleParavirtCommandQueue retain
+        // cycle reported by `leaks` on macOS CI.
+        if (!supplied_config && config.budget_mb == 0) {
+            return nullptr;
+        }
 
         // Find the Metal backend among the scheduler's backends.
         ggml_metal_device_t ctx_dev = nullptr;
@@ -321,63 +497,27 @@ static void * metal_session_create(void * const * backends, int n_backends,
             return nullptr;
         }
 
-        // Load the shared kernel library (same embedded source as the
-        // backend; contains kernel_moe_cache_mv_* from ggml-metal.metal).
-        ggml_metal_library_t lib = ggml_metal_library_init(ctx_dev);
-        if (!lib) {
-            MOE_CACHE_LOG("[moe-cache] Metal library init failed\n");
-            return nullptr;
-        }
-
-        struct ggml_metal_pipeline_with_params p_q8_0 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q8_0_f32");
-        struct ggml_metal_pipeline_with_params p_q4_0 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_0_f32");
-        struct ggml_metal_pipeline_with_params p_q4_K =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_K_f32");
-        struct ggml_metal_pipeline_with_params p_q6_K =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q6_K_f32");
-        if (!p_q8_0.pipeline || !p_q4_0.pipeline ||
-            !p_q4_K.pipeline || !p_q6_K.pipeline) {
-            MOE_CACHE_LOG("[moe-cache] Metal: one or more moe cache kernels missing\n");
-            ggml_metal_library_free(lib);
-            return nullptr;
-        }
-
-        id<MTLCommandQueue> queue = [mtl_dev newCommandQueue];
-        if (!queue) {
-            ggml_metal_library_free(lib);
-            return nullptr;
-        }
-
+        // GPU resources (command queue, library, pipelines) are created
+        // lazily on the first begin; a context that never uses the cache
+        // allocates none of them.
         std::unique_ptr<moe_cache_session> session(new (std::nothrow) moe_cache_session());
         if (!session) {
-            [queue release];
-            ggml_metal_library_free(lib);
             return nullptr;
         }
         session->config = std::move(config);
 
         std::unique_ptr<moe_cache_metal_device> dev(new (std::nothrow)
-                moe_cache_metal_device(mtl_dev, queue));
-        [queue release];
+                moe_cache_metal_device(mtl_dev, ctx_dev));
         if (!dev) {
-            ggml_metal_library_free(lib);
             return nullptr;
         }
-        dev->lib = lib;
-        dev->mmv_pipeline_q8_0 = p_q8_0;
-        dev->mmv_pipeline_q4_0 = p_q4_0;
-        dev->mmv_pipeline_q4_K = p_q4_K;
-        dev->mmv_pipeline_q6_K = p_q6_K;
         session->devices.push_back(std::move(dev));
 
-        MOE_CACHE_LOG("[moe-cache] Metal session created (budget=%zu MiB)\n",
-                session->config.budget_mb);
         moe_cache_session * result = session.get();
         try {
             std::lock_guard<std::mutex> lock(g_registry_mu);
             g_sessions.insert(result);
+            g_session_count.store(g_sessions.size(), std::memory_order_release);
         } catch (...) {
             return nullptr;
         }
@@ -387,6 +527,25 @@ static void * metal_session_create(void * const * backends, int n_backends,
         MOE_CACHE_LOG("[moe-cache] Metal session creation failed\n");
         return nullptr;
     }
+}
+
+// Teardown statistics, same field names as CUDA so the log contract is
+// backend-independent. Only logged when the session did any cache work.
+static void metal_log_stats(moe_cache_metal_device & dev) {
+    size_t used = 0;
+    size_t slots = 0;
+    for (const auto & pool_ptr : dev.pools) {
+        const moe_cache_pool & pool = *pool_ptr;
+        slots += pool.n_slots;
+        used += pool.n_slots - pool.free_slots.size();
+    }
+    const long long total = dev.hits + dev.misses;
+    MOE_CACHE_LOG("[moe-cache] Metal%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld dispatch-fail=%lld collect-fail=%lld bypass=%lld\n",
+            dev.physical, dev.hits, total,
+            total ? 100.0 * (double)dev.hits / (double)total : 0.0,
+            used, slots, dev.inserts, dev.fills, dev.fill_failures,
+            dev.evictions, dev.insert_skips, dev.admission_skips,
+            dev.dispatch_failures, dev.collect_failures, dev.contention_bypasses);
 }
 
 static void metal_session_destroy(void * opaque) {
@@ -407,10 +566,15 @@ static void metal_session_destroy(void * opaque) {
     {
         std::lock_guard<std::mutex> lock(g_registry_mu);
         g_sessions.erase(session);
+        g_session_count.store(g_sessions.size(), std::memory_order_release);
     }
     for (auto & dev_ptr : session->devices) {
         moe_cache_metal_device & dev =
             static_cast<moe_cache_metal_device &>(*dev_ptr);
+        if (dev.nodes > 0 || dev.dispatch_failures > 0 ||
+            dev.collect_failures > 0) {
+            metal_log_stats(dev);
+        }
         if (dev.lib) {
             ggml_metal_library_free(dev.lib);
             dev.lib = nullptr;
@@ -519,8 +683,7 @@ static void * metal_begin(const char * name, const void * host_base,
     if (!name || !host_base || !moe_cache_tensor_name_supported(name) ||
         n_tokens < 1 || expert_size < session->config.min_expert_bytes ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
-        (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-         wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K)) {
+        !ggml_moe_cache_wtype_supported(wtype)) {
         return nullptr;
     }
     if (n_rows < n_tokens || n_rows % n_tokens != 0 ||
@@ -541,6 +704,15 @@ static void * metal_begin(const char * name, const void * host_base,
     }
     moe_cache_metal_device & dev =
         static_cast<moe_cache_metal_device &>(*session->devices[0]);
+    // A zero budget can never create a pool; skip GPU setup entirely.
+    if (session->config.budget_mb == 0) {
+        return nullptr;
+    }
+    // Compile the pipelines and create the command queue on first use, before
+    // the dispatch lock so a one-time compile does not block other workers.
+    if (!metal_device_ensure_ready(dev, session->config.budget_mb)) {
+        return nullptr;
+    }
 
     std::unique_lock<std::mutex> dispatch_lock;
     try {
@@ -558,9 +730,10 @@ static void * metal_begin(const char * name, const void * host_base,
         return nullptr;
     }
 
+    moe_cache_log_configuration(*session);
     const size_t budget_bytes = session->config.budget_mb << 20;
     moe_cache_pool * pool = metal_find_or_create_pool(
-            dev, expert_size, wtype, n_expert, budget_bytes);
+            dev, *session, expert_size, wtype, n_expert, budget_bytes);
     if (!pool) {
         return nullptr;
     }
@@ -642,6 +815,10 @@ static int metal_plan(void * opaque, const int32_t * ids, int n_ids,
 
         // miss: evict LRU if full, then sync-fill
         device.misses++;
+        if (moe_cache_fail(session, "insert")) {
+            device.fill_failures++;
+            continue;
+        }
         int slot_index = -1;
         if (!pool.free_slots.empty()) {
             slot_index = pool.free_slots.back();
@@ -708,7 +885,9 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
 
     moe_cache_metal_device & dev =
         static_cast<moe_cache_metal_device &>(*node->device);
-    if (dev.dead.load()) {
+    if (dev.dead.load() || moe_cache_fail(*node->session, "dispatch")) {
+        std::lock_guard<std::mutex> lock(node->session->mu);
+        dev.dispatch_failures++;
         return 0;
     }
 
@@ -753,9 +932,29 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
     // Select pipeline by weight type.
     struct ggml_metal_pipeline_with_params pipeline = dev.mmv_pipeline_q8_0;
     switch (wtype) {
+        case GGML_TYPE_Q8_0: pipeline = dev.mmv_pipeline_q8_0; break;
         case GGML_TYPE_Q4_0: pipeline = dev.mmv_pipeline_q4_0; break;
         case GGML_TYPE_Q4_K: pipeline = dev.mmv_pipeline_q4_K; break;
         case GGML_TYPE_Q6_K: pipeline = dev.mmv_pipeline_q6_K; break;
+        case GGML_TYPE_Q5_K: pipeline = dev.mmv_pipeline_q5_K; break;
+        case GGML_TYPE_Q1_0: pipeline = dev.mmv_pipeline_q1_0; break;
+        case GGML_TYPE_Q2_0: pipeline = dev.mmv_pipeline_q2_0; break;
+        case GGML_TYPE_Q4_1: pipeline = dev.mmv_pipeline_q4_1; break;
+        case GGML_TYPE_Q5_0: pipeline = dev.mmv_pipeline_q5_0; break;
+        case GGML_TYPE_Q5_1: pipeline = dev.mmv_pipeline_q5_1; break;
+        case GGML_TYPE_Q2_K: pipeline = dev.mmv_pipeline_q2_K; break;
+        case GGML_TYPE_Q3_K: pipeline = dev.mmv_pipeline_q3_K; break;
+        case GGML_TYPE_IQ2_XXS: pipeline = dev.mmv_pipeline_iq2_xxs; break;
+        case GGML_TYPE_IQ2_XS: pipeline = dev.mmv_pipeline_iq2_xs; break;
+        case GGML_TYPE_IQ2_S: pipeline = dev.mmv_pipeline_iq2_s; break;
+        case GGML_TYPE_IQ3_XXS: pipeline = dev.mmv_pipeline_iq3_xxs; break;
+        case GGML_TYPE_IQ3_S: pipeline = dev.mmv_pipeline_iq3_s; break;
+        case GGML_TYPE_IQ1_S: pipeline = dev.mmv_pipeline_iq1_s; break;
+        case GGML_TYPE_IQ1_M: pipeline = dev.mmv_pipeline_iq1_m; break;
+        case GGML_TYPE_IQ4_NL: pipeline = dev.mmv_pipeline_iq4_nl; break;
+        case GGML_TYPE_IQ4_XS: pipeline = dev.mmv_pipeline_iq4_xs; break;
+        case GGML_TYPE_MXFP4: pipeline = dev.mmv_pipeline_mxfp4; break;
+        case GGML_TYPE_NVFP4: pipeline = dev.mmv_pipeline_nvfp4; break;
         default: break;
     }
     if (!pipeline.pipeline) {
@@ -784,7 +983,9 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
         return 0;
     }
 
-    id<MTLCommandBuffer> cmd_buf = [dev.mtl_queue newCommandBuffer];
+    // MTLCommandQueue has no -newCommandBuffer; the selector is -commandBuffer,
+    // which returns an autoreleased buffer (+0), so it must not be released here.
+    id<MTLCommandBuffer> cmd_buf = [dev.mtl_queue commandBuffer];
     if (!cmd_buf) {
         [ids_buf release];
         [act_buf release];
@@ -794,7 +995,6 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
     ggml_metal_encoder_t enc = ggml_metal_encoder_init(
             (ggml_metal_cmd_buf_t)cmd_buf, true);
     if (!enc) {
-        [cmd_buf release];
         [ids_buf release];
         [act_buf release];
         [out_buf release];
@@ -830,7 +1030,6 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
                       dev.physical, (long)[cmd_buf status],
                       mtl_err ? [[mtl_err localizedDescription] UTF8String] : "none");
     }
-    [cmd_buf release];
 
     [ids_buf release];
     [act_buf release];
@@ -871,18 +1070,29 @@ static int metal_collect(void * opaque, int n_hits, float * const * dst_rows,
 
     moe_cache_metal_device & dev =
         static_cast<moe_cache_metal_device &>(*node->device);
-    if (!dev.out_buffer || !dev.d_out) {
-        node->dispatched = false;
-        return 0;
-    }
-
-    float * out = (float *)dev.d_out;
-    for (int index = 0; index < n_hits; index++) {
-        memcpy(dst_rows[index], out + (size_t)index * n_out,
-               (size_t)n_out * sizeof(float));
+    moe_cache_session & session = *node->session;
+    const bool ok = !dev.dead.load() && dev.out_buffer && dev.d_out &&
+        !moe_cache_fail(session, "collect");
+    if (ok) {
+        float * out = (float *)dev.d_out;
+        for (int index = 0; index < n_hits; index++) {
+            memcpy(dst_rows[index], out + (size_t)index * n_out,
+                   (size_t)n_out * sizeof(float));
+        }
     }
     node->dispatched = false;
-    return 1;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        if (!ok) {
+            dev.collect_failures++;
+        }
+        dev.collect_calls++;
+        if (session.config.stats_every > 0 &&
+            dev.collect_calls % session.config.stats_every == 0) {
+            metal_log_stats(dev);
+        }
+    }
+    return ok ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +1147,9 @@ static void metal_invalidate(const void * base, size_t size) {
     if (!base || size == 0) {
         return;
     }
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);
     for (moe_cache_session * session : g_sessions) {
         std::lock_guard<std::mutex> lock(session->mu);
@@ -983,6 +1196,9 @@ static void metal_register(const void * owner) {
     api.invalidate = metal_invalidate;
     ggml_moe_cache_register(&api);
 }
+
+// Prior declaration so the definition below does not trip -Wmissing-prototypes.
+extern "C" void ggml_metal_moe_cache_register(void * reg);
 
 extern "C" void ggml_metal_moe_cache_register(void * reg) {
     metal_register(reg);

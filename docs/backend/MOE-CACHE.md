@@ -1,8 +1,59 @@
-# CUDA MoE expert cache
+# MoE expert cache
 
-The CUDA MoE expert cache accelerates decode when routed expert weights remain in host memory. A cache hit runs the selected expert matvec on CUDA while the CPU computes the miss rows through the normal `MUL_MAT_ID` kernel. Exact gate/up/SwiGLU subgraphs can fuse rows resident in both weight tensors while half-resident and missing rows stay on the stock CPU path. The cache belongs to one backend scheduler and persists until that scheduler is destroyed.
+The MoE expert cache accelerates decode for Mixture-of-Experts (MoE) models when routed expert weights remain in host (CPU) memory. A cache hit runs the selected expert matvec on the GPU while the CPU computes the miss rows through the normal `MUL_MAT_ID` kernel. Exact gate/up/SwiGLU subgraphs can fuse rows resident in both weight tensors while half-resident and missing rows stay on the stock CPU path. The cache belongs to one backend scheduler and persists until that scheduler is destroyed.
 
-This is an opportunistic path. Unsupported nodes, unavailable cache capacity, contention, and cache failures fall back to CPU execution.
+This is an opportunistic path. Unsupported nodes, unavailable cache capacity, contention, and cache failures fall back to CPU execution. The same provider interface is implemented by the CUDA, Metal, and Vulkan backends (HIP builds share the CUDA implementation); the detailed controls documented here are read by each backend when it creates its cache session.
+
+## What is it for
+
+MoE models can be far too large to fit entirely in VRAM, so `llama.cpp` keeps the routed expert weights in host memory and reads them across the PCIe link on every decode step. The expert cache keeps the *working set* of recently-used experts resident in VRAM, so decode no longer pays the host-memory round trip for the experts the model is actually routing to right now. Over a decode-heavy workload, most tokens route to a small recurring set of experts, so a modest cache can serve most matvec rows from the GPU.
+
+The cache is for **models whose routed experts do not fit in VRAM**, or for configurations that deliberately keep experts in host memory. The typical beneficiary is a large MoE model loaded across a few GPUs where the dense weights fit but the experts spill to CPU:
+
+| Model | Cache off | Cache on | Change |
+| --- | ---: | ---: | ---: |
+| OLMoE-1B-7B Q4_K_M | 200.52 t/s | 254.12 t/s | +26.7% |
+| ERNIE-4.5-21B-A3B Q4_K_M | 79.66 t/s | 127.40 t/s | +59.9% |
+| Qwen3-30B-A3B Q4_K_XL | 71.93 t/s | 73.43 t/s | +2.1% |
+| Qwen3.6-35B-A3B Q4_K_XL | 77.60 t/s | 84.04 t/s | +8.3% |
+| DeepSeek-V2-Lite Q4_K_M | 65.04 t/s | 81.61 t/s | +25.5% |
+| Llama-4 Scout Q4_K_XL | 25.97 t/s | 46.90 t/s | +80.6% |
+| MiniMax M2.7 IQ2_XXS | 37.76 t/s | 47.81 t/s | +26.6% |
+
+This matrix is evidence for the tested hardware, not a guarantee that every eligible GPU and model will improve.
+
+### When it does not help
+
+- **A model that fits completely in VRAM is not the target.** When every expert is already GPU-resident, there is nothing to cache: `auto` resolves to `off`, the cache stays dormant, and decode runs on the stock path. This is by design and costs nothing measurable (a dense control measured `182.05 t/s` in `auto` versus `182.68 t/s` off; a fully resident Qwen3.6-35B measured `144.80 t/s` off versus `144.68 t/s` auto).
+- **Small models with tiny expert weights** can be below the minimum expert-size floor (see `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB`) and remain dormant because the transfer overhead would exceed the compute saved.
+- **Prompt processing** is not cached. Prompt nodes above the token limit bypass the cache entirely; the benefit is decode, not prompt ingestion.
+- **Dense (non-MoE) models** never engage the cache.
+
+## Quick start
+
+`auto` is the default, so a plain `llama-cli`/`llama-server`/`llama-bench` run already probes for cacheable CPU-resident experts. When the model fits in VRAM, nothing happens (see above); when experts spill, the cache engages with the automatic budget.
+
+To get cache-aware placement (the recommended setup for a model that needs it), combine fit with the cache:
+
+```sh
+./build/bin/llama-server -m /path/to/model.gguf \
+    --fit on --moe-cache auto \
+    -c 8192 -ngl 99 -fa on
+```
+
+To force canonical CPU experts and a cache session regardless of placement:
+
+```sh
+./build/bin/llama-server -m /path/to/model.gguf --moe-cache on -ngl 99
+```
+
+To cap the per-device budget:
+
+```sh
+./build/bin/llama-server -m /path/to/model.gguf --moe-cache 4096 -ngl 99
+```
+
+To verify the cache actually engaged, look for `[moe-cache] enabled` in the log. If the cache was disabled, the eligibility probe prints the reason at normal verbosity: `MoE cache disabled (...)` lines name the blocking gate (device capability, expert size, budget, or the absence of cacheable host tensors), and `[moe-cache] session creation failed: ...` lines name a backend-side failure.
 
 ## Configuration
 
@@ -13,23 +64,26 @@ Use `--moe-cache MODE` with programs that use the common argument parser:
 | `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least one eligible selected CUDA device that clears the 1 GiB automatic slab floor, compute capability 8.0 or newer |
 | `on` | Free VRAM minus the reserve | Disabled | At least one eligible selected CUDA device, compute capability 7.0 or newer |
 | `N` | At most `N` MiB per device, after the reserve | Disabled | Same as `on` |
+| `soft` | Fit first tries spare VRAM with stock placement, evicting experts only as needed | Preserved unless cache-aware fit selects canonical CPU experts | Same as `on` |
 | `off` or `0` | No cache session | Preserved unless changed separately | None |
 
-`auto` is the default. When the complete model fits, or dense weights do not fit without routed experts, normal placement and repacking are preserved. When routed experts must spill and a cache is feasible, cache-aware fit keeps canonical expert weights in host memory, puts all dense layers on the main GPU when possible, and preserves the remaining VRAM for cache pools. Use `on` or a positive budget to force canonical CPU weights when automatic placement is not wanted.
+`auto` is the default. When the complete model fits, or dense weights do not fit without routed experts, normal placement and repacking are preserved. When routed experts must spill and a cache is feasible, cache-aware fit keeps canonical expert weights in host memory, puts all dense layers on the main GPU when possible, and preserves the remaining VRAM for cache pools. Use `on` or a positive budget to force canonical CPU weights when automatic placement is not wanted. `soft` is like `on` with a gentler fit: it first tries to keep stock placement and fit the cache into spare VRAM, evicting experts only as needed. Compute capability floors are evaluated by CUDA and HIP devices; the Metal and Vulkan providers always report Ampere-class capability (800).
+
+A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
 
 A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
 
 The cache only sees experts assigned to host memory. Cache-aware fit uses a no-allocation model load to inventory exact expert shapes, aliases, model memory, context memory, and compute memory before choosing between stock and cache placement. Explicit `--cpu-moe`, `--n-cpu-moe`, tensor overrides, GPU layers, or tensor splits remain authoritative and can prevent fit from changing placement.
 
-The cache considers only CUDA backends selected for the scheduler. It does not discover or use an unselected device.
+The cache considers only backends selected for the scheduler. It does not discover or use an unselected device.
 
 ## Eligibility and allocation
 
 With default settings, a node must satisfy all of these conditions:
 
 - The operation is the regular CPU `MUL_MAT_ID` path with F32 activations, optionally in an exact supported gate/up/SwiGLU subgraph.
-- The weight tensor name contains `_exps`.
-- The weight type is supported by the CUDA quantized matvec kernel.
+- The weight tensor name contains `_exps` or `_chexps`.
+- The weight type is supported by the backend quantized matvec kernel.
 - One expert meets the selected devices' effective size floor. The default is 512 KiB when every selected device is compute capability 8.0 or newer and 1 MiB otherwise. An explicit threshold remains authoritative.
 - The graph node contains no more than the configured maximum token batch and no more than 64 routed rows. The default maximum is eight tokens in every active mode.
 - The selected device can hold a pool of at least 64 experts of that shape. Entries are aggregated across same-shape tensors, so an individual tensor may contain fewer than 64 experts.
@@ -45,9 +99,9 @@ The configured-budget term is omitted for `auto` and `on`. A fixed `N` is a cap 
 
 Tensor shapes are collected before pools are allocated. Allocation waits for at least as many repeat visits as tensors observed so early graph discovery does not give all capacity to the first tensor shape. Capacity is divided among discovered shapes. A layer is assigned once to a selected device and keeps that assignment while the device remains usable. If that device cannot host a different tensor shape from the layer, the tensor receives its own stable assignment. Initial assignments are deterministic and weighted by usable slab capacity after existing pools and dispatch scratch are accounted for.
 
-When every routed row is resident, the cache keeps a bounded amount of work on the CPU while CUDA computes the other rows. The automatic work budget is 8 MiB of expert weights per token, then capped by token count, routing width, and one quarter of the node. Four-GPU sweeps found the automatic result at or within 0.6% of the best tested fixed row count on Qwen3-30B, DeepSeek V4 target-only and DSpark, and GLM-5.2 MTP. Nodes with an actual miss are unchanged.
+When every routed row is resident, the cache keeps a bounded amount of work on the CPU while the GPU computes the other rows. The automatic work budget is 8 MiB of expert weights per token, then capped by token count, routing width, and one quarter of the node. Four-GPU sweeps found the automatic result at or within 0.6% of the best tested fixed row count on Qwen3-30B, DeepSeek V4 target-only and DSpark, and GLM-5.2 MTP. Nodes with an actual miss are unchanged.
 
-Common applications report an explicit or cache-aware-fit-selected mode at normal verbosity. Detailed backend messages use trace verbosity, so pass `-lv 4` when validating cache behavior. The `[moe-cache] enabled` message is printed only after the first pool is allocated. If it is absent from a trace log, the cache did not become active.
+Common applications report an explicit or cache-aware-fit-selected mode at normal verbosity. The eligibility probe and session creation print the reason whenever the cache is disabled or cannot engage: `MoE cache disabled (...)` lines name the blocking gate, and `[moe-cache] session creation failed: ...` lines name a backend-side failure. Detailed backend messages use trace verbosity, so pass `-lv 4` for per-pool and statistics detail. The `[moe-cache] enabled` message is printed only after the first pool is allocated. If it is absent from a log at `-lv 4`, the cache did not become active, and the earlier reason lines explain which gate blocked it.
 
 ## Demand fill and eviction
 
@@ -58,7 +112,7 @@ By default:
 - A pool that can hold every discovered entry admits an expert after its first miss. A capacity-constrained pool admits after the second miss.
 - At most 8 fills are enqueued by one node.
 - A device queue is limited to 128 jobs and 512 MiB.
-- Each device has one low-priority CUDA fill stream.
+- Each device has one low-priority fill stream.
 - Independent device workers run concurrently when at least two compute capability 8.0 or newer devices are selected. Fills remain serialized on single-device or older-device configurations.
 - Full pools use LRU eviction. After a successful fill, that expert needs eight fresh misses before it can replace another entry.
 
@@ -158,7 +212,7 @@ These matched canonical-weight decode checks force routed experts to CPU memory.
 | Llama-4 Scout Q4_K_XL | 25.97 t/s | 46.90 t/s | +80.6% |
 | MiniMax M2.7 IQ2_XXS | 37.76 t/s | 47.81 t/s | +26.6% |
 
-The updated hardware-aware threshold made the Qwen3.6 experts eligible on four RTX 3090 devices. Its row uses 512 warmup and 512 measured generation tokens with canonical CPU experts in both arms. A fixed 4096 MiB cache reached 83.89 t/s in the same run. Llama-4 has only 16 experts per tensor, but 48 layers contribute enough entries to its shared-shape pool. Aggregating those entries instead of applying the 64-slot floor to each tensor restored cache eligibility. With 512 warmup and 512 measured generation tokens, five same-binary samples reached `25.966 +/- 0.006` t/s off, `33.541 +/- 0.320` t/s with a fixed 4096 MiB cache, and `46.901 +/- 0.235` t/s with the automatic budget. The literal default `--moe-cache auto` and default repacking reached `46.803 +/- 0.230` t/s over three samples. This exceeds the older branch's 45.03 t/s result without restoring redirect, backfill, or persistent state. This matrix is evidence for the tested hardware, not a guarantee that every eligible GPU and model will improve.
+The updated hardware-aware threshold made the Qwen3.6 experts eligible on four RTX 3090 devices. Its row uses 512 warmup and 512 measured generation tokens with canonical CPU experts in both arms. A fixed 4096 MiB cache reached 83.89 t/s in the same run. Llama-4 has only 16 experts per tensor, but 48 layers contribute enough entries to its shared-shape pool. Aggregating those entries instead of applying the 64-slot floor to each tensor restored cache eligibility. With 512 warmup and 512 measured generation tokens, five same-binary samples reached `25.966 +/- 0.006` t/s off, `33.541 +/- 0.320` t/s with a fixed 4096 MiB cache, and `46.901 +/- 0.235` t/s with the automatic budget. The literal default `--moe-cache auto` and default repacking reached `46.803 +/- 0.230` t/s over three samples. This exceeds the older branch's 45.03 t/s result without restoring redirect, backfill, or persistent state.
 
 The real OLMoE model also exercised the available quant families from Q2_K through Q8_0. The matched off versus fixed 4096 MiB results were 251.54 versus 263.34 t/s for Q2_K, 215.12 versus 257.65 t/s for Q3_K_M, 200.12 versus 265.97 t/s for Q4_0, 173.49 versus 256.55 t/s for Q5_K_M, 157.75 versus 236.78 t/s for Q6_K, and 130.60 versus 224.03 t/s for Q8_0. F16 remained dormant because that cache matvec type is unsupported and preserved parity at 74.43 versus 74.78 t/s. A fully resident Qwen3.6-35B control preserved repacking and remained dormant at 144.80 t/s off versus 144.68 t/s auto.
 
@@ -176,17 +230,17 @@ A two-slot DeepSeek server test generated unrelated Saturn and photosynthesis an
 
 Valid slots are pinned for the lifetime of a node. Miss rows remain in the normal CPU work set. Hit rows are removed from that set only after the complete GPU dispatch has been accepted.
 
-If dispatch fails, every planned hit row is restored to the CPU work set before worker threads begin. If collection fails, every skipped row is recomputed with the stock CPU helper. A fatal CUDA cache error disables and trims the affected device, after which nodes continue on CPU.
+If dispatch fails, every planned hit row is restored to the CPU work set before worker threads begin. If collection fails, every skipped row is recomputed with the stock CPU helper. A fatal backend cache error disables and trims the affected device, after which nodes continue on CPU.
 
-CUDA output can differ slightly from CPU output because the hit path uses CUDA activation quantization and matvec arithmetic. Do not expect bit-identical logits or token streams. In particular, a small rounding difference can change a near-tie greedy token.
+Output can differ slightly from CPU output because the hit path uses activation quantization and matvec arithmetic on the backend. Do not expect bit-identical logits or token streams. In particular, a small rounding difference can change a near-tie greedy token.
 
 Public writes to a cached host weight buffer invalidate the affected byte range before the write begins. Invalidation cancels overlapping queued fills, waits for overlapping active reads and transfers, and removes overlapping slots and demand records. The same process runs before a host allocation is released or stops being a weight buffer. Callers must still obey the normal backend synchronization rules when mutating a weight used by concurrent graph execution. Scheduler teardown stops admission, cancels queued work, waits for active graph scopes and nodes, joins fill workers, and then frees device storage.
 
-The normal CUDA allocator may trim an active expert cache as a last attempt to satisfy an allocation. Trimming frees all cache storage on that device and leaves it disabled for the rest of the session. Device scratch growth also retries once after releasing the superseded scratch allocation when replacement overlap causes an out-of-memory result. A session becomes permanently dormant when no nonzero device budget remains, or when `auto` has no device that satisfies its slab floor; any remaining cache devices are then trimmed as well.
+The normal backend allocator may trim an active expert cache as a last attempt to satisfy an allocation. Trimming frees all cache storage on that device and leaves it disabled for the rest of the session. Device scratch growth also retries once after releasing the superseded scratch allocation when replacement overlap causes an out-of-memory result. A session becomes permanently dormant when no nonzero device budget remains, or when `auto` has no device that satisfies its slab floor; any remaining cache devices are then trimmed as well.
 
 ## Diagnostics and developer controls
 
-At normal verbosity, common applications report modes selected explicitly or by cache-aware fit. Pass `-lv 4` to see the context's requested and resolved mode and all backend diagnostics. If model shape, placement, or a fixed budget cannot satisfy automatic policy, `auto` resolves to `off` before graph execution. Backend messages are per scheduler session. With MTP or another draft context, the active target can print pools and `[moe-cache] enabled` before the secondary scheduler prints `session dormant`; that later message does not disable or trim the target session. An active backend prints its full configuration only on first eligible use, so a transient scheduler session cannot make an `off` arm look enabled. Each pool log reports the physical CUDA device, weight type, expert size, slot count, discovered entry count, complete or partial coverage, and allocated bytes. A node above the configured token limit or fixed 64-row execution bound prints one bypass warning per session and continues on the stock CPU path. Session teardown reports hits, misses, queue activity, fills, evictions, CPU-overlap rows, activation deduplication, and fallback counters for devices that processed cache nodes. `hits` and its denominator count tensor-expert residency probes. On a fused gate/up candidate, a half-resident pair therefore records one hit and one miss even though that row stays on the CPU. `fusion=A/B` separately reports the rows actually dispatched through the fused CUDA path over the candidate rows in successfully dispatched fused nodes. `pairs=both/up-only/gate-only/neither` classifies every valid gate/up candidate at the residency probe, including nodes with no dispatchable pair. Set `GGML_CUDA_MOE_CACHE_STATS=N` to print the same counters every `N` collection calls.
+At normal verbosity, common applications report modes selected explicitly or by cache-aware fit, and the eligibility probe prints the reason whenever `auto` resolves to `off` (`MoE cache disabled (...)`). Pass `-lv 4` to see the context's requested and resolved mode and all backend diagnostics. If model shape, placement, or a fixed budget cannot satisfy automatic policy, `auto` resolves to `off` before graph execution. Backend messages are per scheduler session. With MTP or another draft context, the active target can print pools and `[moe-cache] enabled` before the secondary scheduler prints `session dormant`; that later message does not disable or trim the target session. An active backend prints its full configuration only on first eligible use, so a transient scheduler session cannot make an `off` arm look enabled. Each pool log reports the physical device, weight type, expert size, slot count, discovered entry count, complete or partial coverage, and allocated bytes. A node above the configured token limit or fixed 64-row execution bound prints one bypass warning per session and continues on the stock CPU path. Session teardown reports hits, misses, queue activity, fills, evictions, CPU-overlap rows, activation deduplication, and fallback counters for devices that processed cache nodes. `hits` and its denominator count tensor-expert residency probes. On a fused gate/up candidate, a half-resident pair therefore records one hit and one miss even though that row stays on the CPU. `fusion=A/B` separately reports the rows actually dispatched through the fused path over the candidate rows in successfully dispatched fused nodes. `pairs=both/up-only/gate-only/neither` classifies every valid gate/up candidate at the residency probe, including nodes with no dispatchable pair. Set `GGML_CUDA_MOE_CACHE_STATS=N` to print the same counters every `N` collection calls.
 
 The following environment variables are implementation controls, not a stable command-line interface. They are read when a scheduler creates its cache session.
 
@@ -201,7 +255,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_QUEUE` | `128` | Maximum queued jobs per device |
 | `GGML_CUDA_MOE_CACHE_QUEUE_MB` | `512` | Maximum queued source bytes per device |
 | `GGML_CUDA_MOE_CACHE_STATS` | `0` | Collection-call interval for periodic statistics, or `0` for teardown only |
-| `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum selected CUDA devices used by a session |
+| `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum selected devices used by a session |
 | `GGML_CUDA_MOE_CACHE_SERIAL_FILL` | hardware dependent | Serialize fills across devices; defaults to `0` with at least two compute capability 8.0 or newer devices and `1` otherwise |
 | `GGML_CUDA_MOE_CACHE_DEDICATED_MMV` | `0` | Force the cache-specific activation-map matvec; compatible routing uses the existing modulo-index MMV path by default |
 | `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; an explicit value from `0` through `8` overrides the size-aware policy |
@@ -209,7 +263,7 @@ The following environment variables are implementation controls, not a stable co
 
 Directly setting `GGML_CUDA_MOE_CACHE_MODE`, `GGML_CUDA_MOE_CACHE`, or `GGML_CUDA_MOE_CACHE_BUDGET_MB` controls the provider only when a program leaves the mode unspecified. Common applications do this for their implicit `auto` default, so provider settings affect fit and runtime consistently. An explicit `--moe-cache` or `LLAMA_ARG_MOE_CACHE` value takes precedence and also controls the model loader's repacking choice. `llama-bench` applies its selected cache arm before every model instance and overwrites the three raw backend variables; use `--moe-cache` or `LLAMA_ARG_MOE_CACHE` to select its benchmark mode.
 
-Keep `GGML_OP_OFFLOAD_MIN_BATCH` above the decode batch size. Setting it to `1` can make the scheduler offload the complete `MUL_MAT_ID` operation to CUDA before the CPU path can split cache hits from misses.
+Keep `GGML_OP_OFFLOAD_MIN_BATCH` above the decode batch size. Setting it to `1` can make the scheduler offload the complete `MUL_MAT_ID` operation to the GPU before the CPU path can split cache hits from misses.
 
 `GGML_CUDA_MOE_CACHE_FAIL` is for fallback testing only. It accepts `dispatch`, `collect`, `insert`, or `slab`; comma-separated stages and `all` are also accepted. A CUDA build can exercise the synthetic success and failure paths with:
 
@@ -243,7 +297,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 ./build/bin/llama-bench \
     -sm layer -ts 1/0/0 --moe-cache off,4096 --repack off -v -o json
 ```
 
-Adjust `4096` to the intended per-device MiB cap. A layer split with trailing zero shares keeps dense work on the first GPU while still creating every selected CUDA backend for cache use. `-sm none` creates only the main CUDA backend and is not a valid multi-GPU cache-capacity comparison. `llama-bench` records the effective repack setting and rejects repacking with cache `on` or a fixed budget.
+Adjust `4096` to the intended per-device MiB cap. A layer split with trailing zero shares keeps dense work on the first GPU while still creating every selected backend for cache use. `-sm none` creates only the main backend and is not a valid multi-GPU cache-capacity comparison. `llama-bench` records the effective repack setting and rejects repacking with cache `on` or a fixed budget.
 
 Use a long enough timed generation to amortize graph discovery and inspect both throughput variation and the final cache counters. Repeat the process after a cold process start when cold-start behavior matters. Do not infer a gain from hit rate alone: activation transfers, result transfers, fill traffic, GPU speed, PCIe speed, and CPU memory bandwidth all affect the result.
 
@@ -251,13 +305,13 @@ An `off` versus `on` comparison without `--repack off` includes the intended rep
 
 ## Current limitations
 
-- CUDA only. HIP, MUSA, Metal, Vulkan, and other backends do not register an implementation.
+- The CUDA, HIP, Metal, and Vulkan backends register a provider (HIP builds share the CUDA implementation). MUSA builds compile the CUDA source to stubs and do not provide the cache. Other backends do not register a provider.
 - CPU-resident expert `MUL_MAT_ID` only. Exact gate/up/SwiGLU graphs, including DeepSeek's per-input clamps, can fuse for up to the configured token batch and 64 flattened routed rows. Other GLU graphs use the stock path. There is no GPU-resident output handoff.
 - Demand fill only. There is no predictive prefetch or separate prompt-time population path.
 - No hot-set file or persistence across scheduler sessions or process restarts.
 - Direct writes through a raw host pointer bypass invalidation. Mutate cached weight buffers through the backend tensor and buffer APIs.
 - No runtime performance bail-out. An eligible but unprofitable cache remains active unless it fails, is trimmed, or is disabled by configuration.
 - Every scheduler owns independent residency state. Process-wide physical-device coordination prevents those sessions from claiming the same free VRAM, but it does not share expert slots between them.
-- Unloading a dynamic CUDA backend while a scheduler or cache session created by it is still alive is unsupported. Destroy those objects before unloading the backend module.
+- Unloading a dynamic backend while a scheduler or cache session created by it is still alive is unsupported. Destroy those objects before unloading the backend module.
 - Generic operation offload can bypass the cache if `GGML_OP_OFFLOAD_MIN_BATCH` is set low enough to offload decode nodes.
 - Performance depends strongly on model shape, quantization, CPU memory bandwidth, PCIe link, CUDA device, spare VRAM, and routing locality.

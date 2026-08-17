@@ -3,6 +3,10 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
 
+#ifdef GGML_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -11,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <mutex>
@@ -101,11 +106,13 @@ static void test_provider_session_destroy(void * session) { (void) session; }
 static void test_provider_session_enter(void * session) { (void) session; }
 static void test_provider_session_leave(void * session) { (void) session; }
 
-// The tests exercise the active (first registered) provider directly. The
-// registry is the source of truth; snapshot the table once per process.
+// The tests exercise the selected device's provider directly, so a machine
+// with several providers (CUDA + Vulkan, say) always tests a consistent
+// pair of session creator and session callbacks. Populated in main().
+static ggml_moe_cache_api g_test_api;
+
 static ggml_moe_cache_api & active_api() {
-    static ggml_moe_cache_api api = ggml_moe_cache_active();
-    return api;
+    return g_test_api;
 }
 
 struct reset_buffer_context {
@@ -316,34 +323,38 @@ static size_t count_occurrences(const std::string & text, const char * pattern) 
     return result;
 }
 
-static ggml_backend_dev_t find_cuda_device() {
+// Any GPU/IGPU device whose backend registered a moe-cache provider. The
+// test exercises the selected device's provider (see g_test_api below).
+static ggml_backend_dev_t find_provider_device() {
     ggml_backend_load_all();
     for (size_t index = 0; index < ggml_backend_dev_count(); index++) {
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-            strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+        if ((ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+             ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+            ggml_moe_cache_get(reg).owner != nullptr) {
             return device;
         }
     }
     return nullptr;
 }
 
-static ggml_backend_dev_t find_other_cuda_device(
+static ggml_backend_dev_t find_other_provider_device(
         ggml_backend_dev_t excluded) {
     for (size_t index = 0; index < ggml_backend_dev_count(); index++) {
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         if (device != excluded &&
-            ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-            strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+             ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+            ggml_moe_cache_get(reg).owner != nullptr) {
             return device;
         }
     }
     return nullptr;
 }
 
-static long cuda_physical_device(ggml_backend_dev_t device) {
+static long provider_physical_device(ggml_backend_dev_t device) {
     const char * description = ggml_backend_dev_description(device);
     const char * marker = description ? strstr(description, "(physical device ") : nullptr;
     if (!marker) {
@@ -422,9 +433,9 @@ static void configure_cache(
 }
 
 static bool run_capability_queries(
-        ggml_backend_dev_t cuda_device, ggml_backend_t cpu) {
+        ggml_backend_dev_t provider_device, ggml_backend_t cpu) {
     const ggml_moe_cache_api api =
-        ggml_moe_cache_get(ggml_backend_dev_backend_reg(cuda_device));
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(provider_device));
     if (!api.query_config || !api.query_device || !api.query_shape) {
         fprintf(stderr, "cache-capabilities: query API is incomplete\n");
         return false;
@@ -442,7 +453,7 @@ static bool run_capability_queries(
     ok &= config.overlap_cpu_rows == 0;
 
     ggml_moe_cache_device_caps device = {};
-    ok &= api.query_device(cuda_device, &config, &device) == 1;
+    ok &= api.query_device(provider_device, &config, &device) == 1;
     ok &= device.logical_device >= 0;
     ok &= device.physical_device >= 0;
     ok &= device.compute_capability >= config.min_compute_capability;
@@ -484,7 +495,7 @@ static bool run_capability_queries(
     ok &= config.min_expert_explicit == 0;
     ok &= config.max_batch == 8;
     ok &= config.overlap_cpu_rows == -1;
-    ok &= api.query_device(cuda_device, &config, &device) == 1;
+    ok &= api.query_device(provider_device, &config, &device) == 1;
     ok &= device.min_expert_bytes == 512u * 1024;
 
     ok &= api.query_config(0, 0, &config) == 1;
@@ -495,7 +506,7 @@ static bool run_capability_queries(
     ok &= config.min_expert_explicit == 0;
     ok &= config.max_batch == 8;
     ok &= config.overlap_cpu_rows == -1;
-    ok &= api.query_device(cuda_device, &config, &device) == 1;
+    ok &= api.query_device(provider_device, &config, &device) == 1;
     ok &= device.min_expert_bytes == (device.compute_capability >= 800
             ? 512u * 1024 : 1024u * 1024);
     configure_cache(nullptr);
@@ -615,7 +626,7 @@ static void free_graph(test_graph & graph) {
 static bool run_scenario(
         const char * name,
         const char * fail_stage,
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         test_graph & graph,
         const std::vector<float> & reference,
@@ -626,7 +637,7 @@ static bool run_scenario(
     configure_cache(fail_stage, max_batch, dedicated_mmv);
     capture.clear();
 
-    ggml_backend_t backends[] = { cuda, cpu };
+    ggml_backend_t backends[] = { gpu, cpu };
     ggml_backend_sched_t scheduler = ggml_backend_sched_new(
             backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
     if (!scheduler) {
@@ -697,11 +708,13 @@ static bool run_scenario(
 }
 
 static bool run_multi_token_scenario(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         ggml_tensor * weights,
         ggml_tensor * gate_weights,
-        log_capture & capture) {
+        log_capture & capture,
+        bool fused_enabled,
+        bool dedup_enabled) {
     const ggml_init_params params = {
         4 * ggml_tensor_overhead(),
         nullptr,
@@ -753,9 +766,11 @@ static bool run_multi_token_scenario(
             cpu, weights, gate_weights, activations, ids);
     test_graph clamped_fused_graph = make_clamped_fused_graph(
             cpu, weights, gate_weights, activations, ids);
-    bool ok = graph.ctx && graph.buffer &&
-        fused_graph.ctx && fused_graph.buffer &&
-        clamped_fused_graph.ctx && clamped_fused_graph.buffer;
+    bool ok = graph.ctx && graph.buffer;
+    if (fused_enabled) {
+        ok = ok && fused_graph.ctx && fused_graph.buffer &&
+            clamped_fused_graph.ctx && clamped_fused_graph.buffer;
+    }
     if (!ok) {
         fprintf(stderr, "cache-multi-token: failed to create graphs\n");
     } else {
@@ -784,16 +799,22 @@ static bool run_multi_token_scenario(
                     "cache-fused-clamped-multi-token",
                     clamped_fused_graph, clamped_fused_reference);
         ok = ok && run_scenario(
-                "cache-multi-token", nullptr, cuda, cpu,
-                graph, reference, capture, nullptr, "act-dedup=");
-        ok = ok && run_scenario(
-                "cache-fused-multi-token", nullptr, cuda, cpu,
-                fused_graph, fused_reference, capture,
-                nullptr, "fusion-nodes=");
-        ok = ok && run_scenario(
-                "cache-fused-clamped-multi-token", nullptr, cuda, cpu,
-                clamped_fused_graph, clamped_fused_reference, capture,
-                nullptr, "fusion-nodes=");
+                "cache-multi-token", nullptr, gpu, cpu,
+                graph, reference, capture, nullptr,
+                dedup_enabled ? "act-dedup=" : nullptr);
+        if (!fused_enabled) {
+            printf("cache-fused-multi-token: SKIP (provider-specific)\n");
+            printf("cache-fused-clamped-multi-token: SKIP (provider-specific)\n");
+        } else {
+            ok = ok && run_scenario(
+                    "cache-fused-multi-token", nullptr, gpu, cpu,
+                    fused_graph, fused_reference, capture,
+                    nullptr, "fusion-nodes=");
+            ok = ok && run_scenario(
+                    "cache-fused-clamped-multi-token", nullptr, gpu, cpu,
+                    clamped_fused_graph, clamped_fused_reference, capture,
+                    nullptr, "fusion-nodes=");
+        }
     }
 
     free_graph(clamped_fused_graph);
@@ -915,7 +936,7 @@ static bool init_mxfp4_fixture(
 }
 
 static bool run_mxfp4_shared_pool(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         log_capture & capture) {
     mxfp4_fixture up;
@@ -940,7 +961,7 @@ static bool run_mxfp4_shared_pool(
 
     configure_cache(nullptr);
     capture.clear();
-    ggml_backend_t backends[] = { cuda, cpu };
+    ggml_backend_t backends[] = { gpu, cpu };
     ggml_backend_sched_t scheduler = ggml_backend_sched_new(
             backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
     if (!scheduler) {
@@ -1017,7 +1038,7 @@ static bool run_mxfp4_shared_pool(
 }
 
 static bool run_invalidation_scenario(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         test_graph & graph,
         ggml_tensor * weights,
@@ -1027,7 +1048,7 @@ static bool run_invalidation_scenario(
     configure_cache(nullptr);
     capture.clear();
 
-    ggml_backend_t backends[] = { cuda, cpu };
+    ggml_backend_t backends[] = { gpu, cpu };
     ggml_backend_sched_t scheduler = ggml_backend_sched_new(
             backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
     if (!scheduler) {
@@ -1251,10 +1272,10 @@ static bool init_stress_fixture(stress_fixture & fixture, ggml_backend_t cpu) {
 
 static ggml_backend_sched_t make_scheduler(
         const char * name,
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         test_graph & graph) {
-    ggml_backend_t backends[] = { cuda, cpu };
+    ggml_backend_t backends[] = { gpu, cpu };
     ggml_backend_sched_t scheduler = ggml_backend_sched_new(
             backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
     if (!scheduler) {
@@ -1295,7 +1316,7 @@ static bool compute_matches(
 }
 
 static bool run_precensus_invalidation(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         test_graph & graph,
         ggml_tensor * weights,
@@ -1307,7 +1328,7 @@ static bool run_precensus_invalidation(
     capture.clear();
 
     ggml_backend_sched_t scheduler = make_scheduler(
-            "cache-precensus-invalidate", cuda, cpu, graph);
+            "cache-precensus-invalidate", gpu, cpu, graph);
     if (!scheduler) {
         return false;
     }
@@ -1343,8 +1364,8 @@ static bool run_precensus_invalidation(
 }
 
 static bool run_concurrent_sessions(
-        ggml_backend_dev_t cuda_device,
-        ggml_backend_t cuda,
+        ggml_backend_dev_t provider_device,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         stress_fixture & fixture,
         log_capture & capture) {
@@ -1352,13 +1373,13 @@ static bool run_concurrent_sessions(
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 
-    ggml_backend_t cuda_second =
-        ggml_backend_dev_init(cuda_device, nullptr);
+    ggml_backend_t gpu_second =
+        ggml_backend_dev_init(provider_device, nullptr);
     ggml_backend_t cpu_second = init_cpu_backend();
-    if (!cuda_second || !cpu_second) {
+    if (!gpu_second || !cpu_second) {
         fprintf(stderr, "cache-concurrent: failed to create second backends\n");
-        if (cuda_second) {
-            ggml_backend_free(cuda_second);
+        if (gpu_second) {
+            ggml_backend_free(gpu_second);
         }
         if (cpu_second) {
             ggml_backend_free(cpu_second);
@@ -1370,15 +1391,15 @@ static bool run_concurrent_sessions(
     if (!second_graph.ctx || !second_graph.buffer) {
         fprintf(stderr, "cache-concurrent: failed to create second graph\n");
         free_graph(second_graph);
-        ggml_backend_free(cuda_second);
+        ggml_backend_free(gpu_second);
         ggml_backend_free(cpu_second);
         return false;
     }
 
     ggml_backend_sched_t first = make_scheduler(
-            "cache-concurrent-1", cuda, cpu, fixture.graph);
+            "cache-concurrent-1", gpu, cpu, fixture.graph);
     ggml_backend_sched_t second = make_scheduler(
-            "cache-concurrent-2", cuda_second, cpu_second, second_graph);
+            "cache-concurrent-2", gpu_second, cpu_second, second_graph);
     if (!first || !second) {
         if (first) {
             ggml_backend_sched_free(first);
@@ -1387,7 +1408,7 @@ static bool run_concurrent_sessions(
             ggml_backend_sched_free(second);
         }
         free_graph(second_graph);
-        ggml_backend_free(cuda_second);
+        ggml_backend_free(gpu_second);
         ggml_backend_free(cpu_second);
         return false;
     }
@@ -1438,7 +1459,7 @@ static bool run_concurrent_sessions(
     }
 
     free_graph(second_graph);
-    ggml_backend_free(cuda_second);
+    ggml_backend_free(gpu_second);
     ggml_backend_free(cpu_second);
     printf("cache-concurrent: %s\n",
             output_ok.load() && cache_ok ? "OK" : "FAIL");
@@ -1446,8 +1467,8 @@ static bool run_concurrent_sessions(
 }
 
 static bool run_fused_concurrent_sessions(
-        ggml_backend_dev_t cuda_device,
-        ggml_backend_t cuda,
+        ggml_backend_dev_t provider_device,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         ggml_tensor * up_weights,
         ggml_tensor * gate_weights,
@@ -1461,13 +1482,13 @@ static bool run_fused_concurrent_sessions(
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 
-    ggml_backend_t cuda_second =
-        ggml_backend_dev_init(cuda_device, nullptr);
+    ggml_backend_t gpu_second =
+        ggml_backend_dev_init(provider_device, nullptr);
     ggml_backend_t cpu_second = init_cpu_backend();
-    if (!cuda_second || !cpu_second) {
+    if (!gpu_second || !cpu_second) {
         fprintf(stderr, "cache-fused-concurrent: failed to create second backends\n");
-        if (cuda_second) {
-            ggml_backend_free(cuda_second);
+        if (gpu_second) {
+            ggml_backend_free(gpu_second);
         }
         if (cpu_second) {
             ggml_backend_free(cpu_second);
@@ -1480,15 +1501,15 @@ static bool run_fused_concurrent_sessions(
     if (!second_graph.ctx || !second_graph.buffer) {
         fprintf(stderr, "cache-fused-concurrent: failed to create second graph\n");
         free_graph(second_graph);
-        ggml_backend_free(cuda_second);
+        ggml_backend_free(gpu_second);
         ggml_backend_free(cpu_second);
         return false;
     }
 
     ggml_backend_sched_t first = make_scheduler(
-            "cache-fused-concurrent-1", cuda, cpu, first_graph);
+            "cache-fused-concurrent-1", gpu, cpu, first_graph);
     ggml_backend_sched_t second = make_scheduler(
-            "cache-fused-concurrent-2", cuda_second, cpu_second,
+            "cache-fused-concurrent-2", gpu_second, cpu_second,
             second_graph);
     if (!first || !second) {
         if (first) {
@@ -1498,7 +1519,7 @@ static bool run_fused_concurrent_sessions(
             ggml_backend_sched_free(second);
         }
         free_graph(second_graph);
-        ggml_backend_free(cuda_second);
+        ggml_backend_free(gpu_second);
         ggml_backend_free(cpu_second);
         return false;
     }
@@ -1550,7 +1571,7 @@ static bool run_fused_concurrent_sessions(
     }
 
     free_graph(second_graph);
-    ggml_backend_free(cuda_second);
+    ggml_backend_free(gpu_second);
     ggml_backend_free(cpu_second);
     configure_cache(nullptr);
     printf("cache-fused-concurrent: %s\n",
@@ -1559,7 +1580,7 @@ static bool run_fused_concurrent_sessions(
 }
 
 static bool run_fused_repeated_lifecycle(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         test_graph & graph,
         const std::vector<float> & reference,
@@ -1570,7 +1591,7 @@ static bool run_fused_repeated_lifecycle(
     for (int cycle = 0; cycle < cycles && ok; cycle++) {
         capture.clear();
         ggml_backend_sched_t scheduler = make_scheduler(
-                "cache-fused-lifecycle", cuda, cpu, graph);
+                "cache-fused-lifecycle", gpu, cpu, graph);
         if (!scheduler) {
             ok = false;
             break;
@@ -1596,7 +1617,7 @@ static bool run_fused_repeated_lifecycle(
 }
 
 static bool run_repeated_lifecycle(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         stress_fixture & fixture,
         log_capture & capture) {
@@ -1608,7 +1629,7 @@ static bool run_repeated_lifecycle(
     bool output_ok = true;
     for (int cycle = 0; cycle < cycles && output_ok; cycle++) {
         ggml_backend_sched_t scheduler = make_scheduler(
-                "cache-lifecycle", cuda, cpu, fixture.graph);
+                "cache-lifecycle", gpu, cpu, fixture.graph);
         if (!scheduler) {
             output_ok = false;
             break;
@@ -1653,7 +1674,7 @@ static bool run_repeated_lifecycle(
 }
 
 static bool run_fill_invalidation(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         stress_fixture & fixture,
         log_capture & capture) {
@@ -1661,7 +1682,7 @@ static bool run_fill_invalidation(
     capture.clear();
 
     ggml_backend_sched_t scheduler = make_scheduler(
-            "cache-fill-invalidate", cuda, cpu, fixture.graph);
+            "cache-fill-invalidate", gpu, cpu, fixture.graph);
     if (!scheduler) {
         return false;
     }
@@ -1783,21 +1804,21 @@ static bool run_fill_invalidation(
 }
 
 static void * create_direct_session(
-        ggml_backend_t cuda, ggml_backend_t cpu) {
+        ggml_backend_t gpu, ggml_backend_t cpu) {
     const ggml_moe_cache_api api =
-        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)));
     if (!api.session_create) {
         return nullptr;
     }
-    void * backends[] = { cuda, cpu };
+    void * backends[] = { gpu, cpu };
     return api.session_create(backends, 2, nullptr);
 }
 
 static bool run_explicit_session_config(
-        ggml_backend_t cuda, ggml_backend_t cpu) {
+        ggml_backend_t gpu, ggml_backend_t cpu) {
     configure_cache(nullptr);
     const ggml_moe_cache_api api =
-        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)));
     ggml_moe_cache_config config = {};
     if (!api.query_config ||
         !api.query_config(0, 4, &config)) {
@@ -1807,7 +1828,7 @@ static bool run_explicit_session_config(
 
     set_env("GGML_CUDA_MOE_CACHE", "0");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "off");
-    void * backends[] = { cuda, cpu };
+    void * backends[] = { gpu, cpu };
     void * session = api.session_create(backends, 2, &config);
     const bool ok = session != nullptr;
     if (session) {
@@ -1869,12 +1890,12 @@ static bool wait_for_direct_pool(
 }
 
 static bool run_policy_diagnostics(
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * weights, log_capture & capture) {
     configure_cache(nullptr);
     capture.clear();
 
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         fprintf(stderr, "cache-policy-diagnostics: failed to create session\n");
         return false;
@@ -1882,7 +1903,7 @@ static bool run_policy_diagnostics(
 
     const size_t expert_size = ggml_nbytes(weights) / weights->ne[2];
     const ggml_moe_cache_api api =
-        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)));
     api.session_enter(session);
     void * first = api.begin(
             weights->name, weights->data, expert_size,
@@ -2002,7 +2023,7 @@ static bool wait_for_direct_resident(
 }
 
 static bool run_fused_partial_invalidation(
-        ggml_backend_t cuda,
+        ggml_backend_t gpu,
         ggml_backend_t cpu,
         ggml_tensor * up_weights,
         ggml_tensor * gate_weights,
@@ -2012,7 +2033,7 @@ static bool run_fused_partial_invalidation(
         const std::vector<float> & reference,
         log_capture & capture) {
     const ggml_moe_cache_api api =
-        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)));
     if (!api.fused_begin || !api.collect || !api.end) {
         fprintf(stderr, "cache-fused-partial: incomplete cache API\n");
         return false;
@@ -2020,7 +2041,7 @@ static bool run_fused_partial_invalidation(
 
     configure_cache(nullptr);
     capture.clear();
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         fprintf(stderr, "cache-fused-partial: failed to create session\n");
         return false;
@@ -2163,13 +2184,13 @@ static bool run_fused_partial_invalidation(
 }
 
 static bool run_cpu_overlap_policy(
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * weights, log_capture & capture) {
     configure_cache(nullptr);
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", "1");
     capture.clear();
 
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         fprintf(stderr, "cache-cpu-overlap: failed to create session\n");
         configure_cache(nullptr);
@@ -2216,13 +2237,13 @@ static bool run_cpu_overlap_policy(
 }
 
 static bool run_adaptive_cpu_overlap_policy(
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * weights, log_capture & capture) {
     configure_cache(nullptr, "8");
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", nullptr);
     capture.clear();
 
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         fprintf(stderr, "cache-cpu-overlap-auto: failed to create session\n");
         configure_cache(nullptr);
@@ -2285,7 +2306,7 @@ static bool run_adaptive_cpu_overlap_policy(
 }
 
 static bool run_scope_isolation(
-        ggml_backend_t cuda, ggml_backend_t cpu, ggml_tensor * weights) {
+        ggml_backend_t gpu, ggml_backend_t cpu, ggml_tensor * weights) {
     if (!active_api().session_enter || !active_api().session_leave ||
         !active_api().begin || !active_api().end ||
         !active_api().invalidate || !active_api().session_destroy) {
@@ -2294,7 +2315,7 @@ static bool run_scope_isolation(
     }
 
     configure_cache(nullptr);
-    void * outer = create_direct_session(cuda, cpu);
+    void * outer = create_direct_session(gpu, cpu);
     if (!outer) {
         fprintf(stderr, "cache-scope: failed to create outer session\n");
         return false;
@@ -2308,7 +2329,7 @@ static bool run_scope_isolation(
     active_api().session_leave(outer);
 
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "1048576");
-    void * dormant = create_direct_session(cuda, cpu);
+    void * dormant = create_direct_session(gpu, cpu);
     if (!dormant) {
         fprintf(stderr, "cache-scope: failed to create dormant session\n");
         active_api().session_destroy(outer);
@@ -2354,10 +2375,10 @@ static bool run_scope_isolation(
 }
 
 static bool run_shape_liveness(
-        ggml_backend_t cuda, ggml_backend_t cpu) {
+        ggml_backend_t gpu, ggml_backend_t cpu) {
     configure_cache(nullptr);
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         fprintf(stderr, "cache-shape-liveness: failed to create session\n");
         return false;
@@ -2394,7 +2415,7 @@ static bool run_shape_liveness(
 }
 
 static bool run_exact_shape_inventory(
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         log_capture & capture) {
     configure_cache(nullptr);
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
@@ -2403,7 +2424,7 @@ static bool run_exact_shape_inventory(
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         fprintf(stderr, "cache-shape-inventory: failed to create session\n");
         return false;
@@ -2476,10 +2497,10 @@ static bool run_exact_shape_inventory(
 }
 
 static bool run_complete_pool_allocation(
-        ggml_backend_t cuda, ggml_backend_t cpu) {
+        ggml_backend_t gpu, ggml_backend_t cpu) {
     configure_cache(nullptr);
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "4");
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         fprintf(stderr, "cache-complete-pools: failed to create session\n");
         return false;
@@ -2522,12 +2543,53 @@ static bool run_complete_pool_allocation(
 }
 
 static bool run_shared_budget(
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         log_capture & capture) {
     configure_cache(nullptr);
     size_t free_bytes = 0;
     size_t total_bytes = 0;
-    ggml_backend_dev_memory(cuda->device, &free_bytes, &total_bytes);
+#ifdef GGML_CUDA
+    // The cache's budget path queries cudaMemGetInfo, not the backend device
+    // memory API. On UMA devices (Grace Blackwell, Jetson/Orin) the backend
+    // reports /proc/meminfo while cudaMemGetInfo reports the CUDA view, and
+    // the two disagree. Match the cache's query so the reserve leaves the
+    // expected remainder on every device class.
+    {
+        int prev_device = 0;
+        cudaError_t err = cudaGetDevice(&prev_device);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "cache-shared-budget: cudaGetDevice failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        // Restore the device afterwards: run_route_override runs next and
+        // exercises routing across two devices, so the current device must
+        // not leak out of this test. Fall back to the current device rather
+        // than device 0 when the physical device is not reported.
+        const long physical = provider_physical_device(gpu->device);
+        const int target = physical >= 0 ? (int) physical : prev_device;
+        if (target != prev_device) {
+            err = cudaSetDevice(target);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "cache-shared-budget: cudaSetDevice failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
+        }
+        err = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "cache-shared-budget: cudaMemGetInfo failed: %s\n",
+                    cudaGetErrorString(err));
+            cudaSetDevice(prev_device);
+            return false;
+        }
+        if (target != prev_device) {
+            cudaSetDevice(prev_device);
+        }
+    }
+#else
+    ggml_backend_dev_memory(gpu->device, &free_bytes, &total_bytes);
+#endif
     const size_t free_mib = free_bytes >> 20;
     if (free_mib < 64) {
         printf("cache-shared-budget: SKIP (insufficient free VRAM)\n");
@@ -2539,8 +2601,8 @@ static bool run_shared_budget(
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
     capture.clear();
 
-    void * first = create_direct_session(cuda, cpu);
-    void * second = create_direct_session(cuda, cpu);
+    void * first = create_direct_session(gpu, cpu);
+    void * second = create_direct_session(gpu, cpu);
     if (!first || !second) {
         fprintf(stderr, "cache-shared-budget: failed to create sessions\n");
         if (first) {
@@ -2580,7 +2642,7 @@ static bool run_shared_budget(
         max_field_value(shared_log, "granted=") <= 16;
 
     capture.clear();
-    void * replacement = create_direct_session(cuda, cpu);
+    void * replacement = create_direct_session(gpu, cpu);
     bool replacement_ready = false;
     if (replacement) {
         active_api().session_enter(replacement);
@@ -2596,13 +2658,13 @@ static bool run_shared_budget(
     capture.clear();
     const std::string high_reserve = std::to_string(free_mib - 8);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", high_reserve.c_str());
-    void * high = create_direct_session(cuda, cpu);
+    void * high = create_direct_session(gpu, cpu);
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
-    void * low = create_direct_session(cuda, cpu);
+    void * low = create_direct_session(gpu, cpu);
     if (high) {
         active_api().session_destroy(high);
     }
-    void * after_high = create_direct_session(cuda, cpu);
+    void * after_high = create_direct_session(gpu, cpu);
 
     bool low_ready = false;
     if (low) {
@@ -2644,23 +2706,23 @@ static bool run_shared_budget(
 
 static bool run_route_override(
         ggml_backend_dev_t first_device,
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         log_capture & capture) {
     ggml_backend_dev_t second_device =
-        find_other_cuda_device(first_device);
+        find_other_provider_device(first_device);
     if (!second_device) {
         printf("cache-route-override: SKIP (one CUDA device)\n");
         return true;
     }
-    const long first_physical = cuda_physical_device(first_device);
+    const long first_physical = provider_physical_device(first_device);
     if (first_physical >= 0 &&
-        first_physical == cuda_physical_device(second_device)) {
+        first_physical == provider_physical_device(second_device)) {
         printf("cache-route-override: SKIP (one physical CUDA device)\n");
         return true;
     }
-    ggml_backend_t second_cuda =
+    ggml_backend_t second_gpu =
         ggml_backend_dev_init(second_device, nullptr);
-    if (!second_cuda) {
+    if (!second_gpu) {
         fprintf(stderr,
                 "cache-route-override: failed to initialize second device\n");
         return false;
@@ -2670,12 +2732,12 @@ static bool run_route_override(
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
     set_env("GGML_CUDA_MOE_CACHE_NDEV", "2");
     capture.clear();
-    void * backends[] = { cuda, second_cuda, cpu };
+    void * backends[] = { gpu, second_gpu, cpu };
     void * session = active_api().session_create(backends, 3, nullptr);
     if (!session) {
         fprintf(stderr,
                 "cache-route-override: failed to create session\n");
-        ggml_backend_free(second_cuda);
+        ggml_backend_free(second_gpu);
         return false;
     }
 
@@ -2730,7 +2792,7 @@ static bool run_route_override(
     }
     const bool slab_floor = dormant_created && !dormant_begin &&
         capture.get().find("automatic slab floor") != std::string::npos;
-    ggml_backend_free(second_cuda);
+    ggml_backend_free(second_gpu);
 
     const bool ok = shape_a_ready && shape_b_ready && queried && fill_policy &&
         automatic_queried && slab_floor;
@@ -2739,10 +2801,10 @@ static bool run_route_override(
 }
 
 static bool run_single_gpu_auto(
-        ggml_backend_dev_t cuda_device, ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_dev_t provider_device, ggml_backend_t gpu, ggml_backend_t cpu,
         log_capture & capture) {
     const ggml_moe_cache_api api =
-        ggml_moe_cache_get(ggml_backend_dev_backend_reg(cuda_device));
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(provider_device));
     if (!api.query_config || !api.session_create || !api.session_destroy) {
         printf("cache-single-gpu-auto: FAIL (incomplete cache API)\n");
         return false;
@@ -2750,7 +2812,7 @@ static bool run_single_gpu_auto(
 
     size_t free_bytes = 0;
     size_t total_bytes = 0;
-    ggml_backend_dev_memory(cuda_device, &free_bytes, &total_bytes);
+    ggml_backend_dev_memory(provider_device, &free_bytes, &total_bytes);
     if (free_bytes < 1024u * 1024 * 1024 + 64u * 1024 * 1024) {
         printf("cache-single-gpu-auto: SKIP (device free memory below the auto slab floor)\n");
         return true;
@@ -2770,7 +2832,7 @@ static bool run_single_gpu_auto(
     bool ok = config.min_devices == 1 &&
         config.minimum_slab_bytes == 1024u * 1024 * 1024;
 
-    void * backends[] = { cuda, cpu };
+    void * backends[] = { gpu, cpu };
     void * session = api.session_create(backends, 2, &config);
     ok &= session != nullptr;
     if (session) {
@@ -2800,7 +2862,7 @@ static bool run_single_gpu_auto(
 }
 
 static bool run_admission_policy_once(
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         int new_expert_misses, log_capture & capture) {
     configure_cache(nullptr);
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
@@ -2809,7 +2871,7 @@ static bool run_admission_policy_once(
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
     capture.clear();
 
-    void * session = create_direct_session(cuda, cpu);
+    void * session = create_direct_session(gpu, cpu);
     if (!session) {
         return false;
     }
@@ -2895,15 +2957,26 @@ static bool run_admission_policy_once(
 }
 
 static bool run_admission_policy(
-        ggml_backend_t cuda, ggml_backend_t cpu,
+        ggml_backend_t gpu, ggml_backend_t cpu,
         log_capture & capture) {
     const bool seven = run_admission_policy_once(
-            cuda, cpu, 7, capture);
+            gpu, cpu, 7, capture);
     const bool eight = run_admission_policy_once(
-            cuda, cpu, 8, capture);
+            gpu, cpu, 8, capture);
     const bool ok = seven && eight;
     printf("cache-admission-policy: %s\n", ok ? "OK" : "FAIL");
     return ok;
+}
+
+// Run a test only when the provider supports the behavior it checks; on
+// other providers print a skip line so CI shows the coverage gap explicitly.
+static bool run_optional(
+        bool enabled, const char * name, std::function<bool()> test) {
+    if (!enabled) {
+        printf("%s: SKIP (provider-specific)\n", name);
+        return true;
+    }
+    return test();
 }
 
 } // namespace
@@ -2912,20 +2985,25 @@ int main() {
     log_capture capture;
     ggml_log_set(log_callback, &capture);
 
-    ggml_backend_dev_t cuda_device = find_cuda_device();
-    if (!cuda_device) {
-        printf("SKIP: CUDA backend unavailable\n");
-        return 77; // ctest SKIP_RETURN_CODE: a hard skip must not read as a pass
+    ggml_backend_dev_t provider_device = find_provider_device();
+    if (!provider_device) {
+        printf("SKIP: no moe-cache provider device available\n");
+        return 77; // ctest interprets 77 as SKIP_RETURN_CODE
     }
-    ggml_backend_reg_t cuda_reg =
-        ggml_backend_dev_backend_reg(cuda_device);
+    ggml_backend_reg_t provider_reg =
+        ggml_backend_dev_backend_reg(provider_device);
+    g_test_api = ggml_moe_cache_get(provider_reg);
+    const bool provider_is_cuda =
+        strcmp(ggml_backend_reg_name(provider_reg), "CUDA") == 0;
+    printf("test-moe-cache: provider=%s\n",
+            ggml_backend_reg_name(provider_reg));
 
-    ggml_backend_t cuda = ggml_backend_dev_init(cuda_device, nullptr);
+    ggml_backend_t gpu = ggml_backend_dev_init(provider_device, nullptr);
     ggml_backend_t cpu = init_cpu_backend();
-    if (!cuda || !cpu) {
-        fprintf(stderr, "failed to initialize CUDA and CPU backends\n");
-        if (cuda) {
-            ggml_backend_free(cuda);
+    if (!gpu || !cpu) {
+        fprintf(stderr, "failed to initialize provider and CPU backends\n");
+        if (gpu) {
+            ggml_backend_free(gpu);
         }
         if (cpu) {
             ggml_backend_free(cpu);
@@ -2940,7 +3018,7 @@ int main() {
     ggml_context * static_ctx = ggml_init(static_params);
     if (!static_ctx) {
         fprintf(stderr, "failed to create tensor context\n");
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -2963,7 +3041,7 @@ int main() {
     if (!static_buffer) {
         fprintf(stderr, "failed to allocate CPU tensors\n");
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -2985,7 +3063,7 @@ int main() {
                 quantized, weights_q4.size());
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3007,7 +3085,7 @@ int main() {
                 gate_quantized, gate_weights_q4.size());
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3033,7 +3111,7 @@ int main() {
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3044,7 +3122,7 @@ int main() {
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3060,7 +3138,7 @@ int main() {
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3072,7 +3150,7 @@ int main() {
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3090,7 +3168,7 @@ int main() {
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3103,7 +3181,7 @@ int main() {
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
-        ggml_backend_free(cuda);
+        ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return 1;
     }
@@ -3113,51 +3191,68 @@ int main() {
             clamped_fused_graph.out, clamped_fused_reference.data(), 0,
             clamped_fused_reference.size() * sizeof(float));
 
-    bool ok = run_capability_queries(cuda_device, cpu);
+    bool ok = run_capability_queries(provider_device, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
-    ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
+    ok &= run_scenario("cache-hit", nullptr, gpu, cpu, graph, reference, capture);
     ok &= run_scenario(
-            "cache-generic-mmv", nullptr, cuda, cpu, graph, reference,
+            "cache-generic-mmv", nullptr, gpu, cpu, graph, reference,
             capture, "1", nullptr, "0");
-    ok &= run_scenario("dispatch-fallback", "dispatch", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario("collect-fallback", "collect", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario("insert-fallback", "insert", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario("slab-fallback", "slab", cuda, cpu, graph, reference, capture);
-    ok &= run_scenario(
-            "cache-fused-swiglu", nullptr, cuda, cpu,
-            fused_graph, fused_reference, capture,
-            "1", "fusion-nodes=");
-    ok &= run_scenario(
-            "cache-fused-dispatch-fallback", "dispatch", cuda, cpu,
-            fused_graph, fused_reference, capture,
-            "1", "fusion-attempts=");
-    ok &= run_scenario(
-            "cache-fused-collect-fallback", "collect", cuda, cpu,
-            fused_graph, fused_reference, capture,
-            "1", "fusion-nodes=");
-    ok &= run_scenario(
-            "cache-fused-clamped-swiglu", nullptr, cuda, cpu,
-            clamped_fused_graph, clamped_fused_reference, capture,
-            "1", "fusion-nodes=");
-    ok &= run_scenario(
-            "cache-fused-clamped-collect-fallback", "collect", cuda, cpu,
-            clamped_fused_graph, clamped_fused_reference, capture,
-            "1", "fusion-nodes=");
-    ok &= run_fused_partial_invalidation(
-            cuda, cpu, weights, gate_weights, activations,
-            weights_q4.data(), gate_weights_q4.data(),
-            fused_reference, capture);
-    ok &= run_fused_concurrent_sessions(
-            cuda_device, cuda, cpu, weights, gate_weights,
-            activations, ids, fused_graph, fused_reference, capture);
-    ok &= run_fused_repeated_lifecycle(
-            cuda, cpu, fused_graph, fused_reference, capture);
+    ok &= run_scenario("dispatch-fallback", "dispatch", gpu, cpu, graph, reference, capture);
+    ok &= run_scenario("collect-fallback", "collect", gpu, cpu, graph, reference, capture);
+    ok &= run_scenario("insert-fallback", "insert", gpu, cpu, graph, reference, capture);
+    ok &= run_scenario("slab-fallback", "slab", gpu, cpu, graph, reference, capture);
+    ok &= run_optional(provider_is_cuda, "cache-fused-swiglu", [&] {
+        return run_scenario(
+                "cache-fused-swiglu", nullptr, gpu, cpu,
+                fused_graph, fused_reference, capture,
+                "1", "fusion-nodes=");
+    });
+    ok &= run_optional(provider_is_cuda, "cache-fused-dispatch-fallback", [&] {
+        return run_scenario(
+                "cache-fused-dispatch-fallback", "dispatch", gpu, cpu,
+                fused_graph, fused_reference, capture,
+                "1", "fusion-attempts=");
+    });
+    ok &= run_optional(provider_is_cuda, "cache-fused-collect-fallback", [&] {
+        return run_scenario(
+                "cache-fused-collect-fallback", "collect", gpu, cpu,
+                fused_graph, fused_reference, capture,
+                "1", "fusion-nodes=");
+    });
+    ok &= run_optional(provider_is_cuda, "cache-fused-clamped-swiglu", [&] {
+        return run_scenario(
+                "cache-fused-clamped-swiglu", nullptr, gpu, cpu,
+                clamped_fused_graph, clamped_fused_reference, capture,
+                "1", "fusion-nodes=");
+    });
+    ok &= run_optional(provider_is_cuda, "cache-fused-clamped-collect-fallback", [&] {
+        return run_scenario(
+                "cache-fused-clamped-collect-fallback", "collect", gpu, cpu,
+                clamped_fused_graph, clamped_fused_reference, capture,
+                "1", "fusion-nodes=");
+    });
+    ok &= run_optional(provider_is_cuda, "cache-fused-partial-duplicate", [&] {
+        return run_fused_partial_invalidation(
+                gpu, cpu, weights, gate_weights, activations,
+                weights_q4.data(), gate_weights_q4.data(),
+                fused_reference, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-fused-concurrent", [&] {
+        return run_fused_concurrent_sessions(
+                provider_device, gpu, cpu, weights, gate_weights,
+                activations, ids, fused_graph, fused_reference, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-fused-lifecycle", [&] {
+        return run_fused_repeated_lifecycle(
+                gpu, cpu, fused_graph, fused_reference, capture);
+    });
     ok &= run_multi_token_scenario(
-            cuda, cpu, weights, gate_weights, capture);
-    ok &= run_mxfp4_shared_pool(cuda, cpu, capture);
+            gpu, cpu, weights, gate_weights, capture,
+            provider_is_cuda, provider_is_cuda);
+    ok &= run_mxfp4_shared_pool(gpu, cpu, capture);
     const size_t expert_size = ggml_nbytes(weights) / n_expert;
     ok &= run_precensus_invalidation(
-            cuda, cpu, graph, weights,
+            gpu, cpu, graph, weights,
             weights_q4.data() + (n_expert - 1) * expert_size,
             expert_size, reference, capture);
 
@@ -3188,7 +3283,7 @@ int main() {
             ok = false;
         } else {
             ok &= run_invalidation_scenario(
-                    cuda, cpu, graph, weights, replacement_q4,
+                    gpu, cpu, graph, weights, replacement_q4,
                     old_reference, capture);
         }
     }
@@ -3199,54 +3294,79 @@ int main() {
         ok = false;
     } else {
         ok &= run_concurrent_sessions(
-                cuda_device, cuda, cpu, stress, capture);
-        ok &= run_repeated_lifecycle(cuda, cpu, stress, capture);
-        ok &= run_fill_invalidation(cuda, cpu, stress, capture);
+                provider_device, gpu, cpu, stress, capture);
+        ok &= run_repeated_lifecycle(gpu, cpu, stress, capture);
+        ok &= run_fill_invalidation(gpu, cpu, stress, capture);
     }
     free_stress_fixture(stress);
-    ok &= run_scope_isolation(cuda, cpu, weights);
-    ok &= run_explicit_session_config(cuda, cpu);
-    ok &= run_policy_diagnostics(cuda, cpu, weights, capture);
-    ok &= run_cpu_overlap_policy(cuda, cpu, weights, capture);
-    ok &= run_adaptive_cpu_overlap_policy(cuda, cpu, weights, capture);
-    ok &= run_shape_liveness(cuda, cpu);
-    ok &= run_exact_shape_inventory(cuda, cpu, capture);
-    ok &= run_complete_pool_allocation(cuda, cpu);
-    ok &= run_shared_budget(cuda, cpu, capture);
-    ok &= run_route_override(cuda_device, cuda, cpu, capture);
-    ok &= run_single_gpu_auto(cuda_device, cuda, cpu, capture);
-    ok &= run_admission_policy(cuda, cpu, capture);
+    ok &= run_optional(provider_is_cuda, "cache-scope", [&] {
+        return run_scope_isolation(gpu, cpu, weights);
+    });
+    ok &= run_explicit_session_config(gpu, cpu);
+    ok &= run_optional(provider_is_cuda, "cache-policy-diagnostics", [&] {
+        return run_policy_diagnostics(gpu, cpu, weights, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-cpu-overlap", [&] {
+        return run_cpu_overlap_policy(gpu, cpu, weights, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-cpu-overlap-auto", [&] {
+        return run_adaptive_cpu_overlap_policy(gpu, cpu, weights, capture);
+    });
+    ok &= run_shape_liveness(gpu, cpu);
+    ok &= run_optional(provider_is_cuda, "cache-shape-inventory", [&] {
+        return run_exact_shape_inventory(gpu, cpu, capture);
+    });
+    ok &= run_complete_pool_allocation(gpu, cpu);
+    ok &= run_optional(provider_is_cuda, "cache-shared-budget", [&] {
+        return run_shared_budget(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-route-override", [&] {
+        return run_route_override(provider_device, gpu, cpu, capture);
+    });
+    ok &= run_single_gpu_auto(provider_device, gpu, cpu, capture);
+    ok &= run_optional(provider_is_cuda, "cache-admission-policy", [&] {
+        return run_admission_policy(gpu, cpu, capture);
+    });
 
     free_graph(clamped_fused_graph);
     free_graph(fused_graph);
     free_graph(graph);
-    ggml_backend_free(cuda);
+    ggml_backend_free(gpu);
 #ifdef GGML_BACKEND_DL
-    ggml_backend_unload(cuda_reg);
+    ggml_backend_unload(provider_reg);
     ggml_backend_buffer_free(static_buffer);
     static_buffer = nullptr;
     printf("cache-backend-unload: OK\n");
 
-    ggml_backend_dev_t reloaded_device = find_cuda_device();
-    ggml_backend_t reloaded_cuda = reloaded_device
+    ggml_backend_dev_t reloaded_device = find_provider_device();
+    ggml_backend_t reloaded_gpu = reloaded_device
         ? ggml_backend_dev_init(reloaded_device, nullptr) : nullptr;
+    ggml_backend_reg_t reloaded_reg = reloaded_gpu
+        ? ggml_backend_dev_backend_reg(reloaded_device) : nullptr;
     configure_cache(nullptr);
-    void * reloaded_session = reloaded_cuda
-        ? create_direct_session(reloaded_cuda, cpu) : nullptr;
-    const bool reload_ok = reloaded_session != nullptr;
-    if (reloaded_session) {
-        active_api().session_destroy(reloaded_session);
+    void * reloaded_session = nullptr;
+    if (reloaded_gpu) {
+        // The registry re-registers on load; use the fresh api so the
+        // destroy callback comes from the reloaded library, not the
+        // pre-unload snapshot in g_test_api.
+        const ggml_moe_cache_api reloaded_api =
+            ggml_moe_cache_get(reloaded_reg);
+        void * backends[] = { reloaded_gpu, cpu };
+        reloaded_session = reloaded_api.session_create
+            ? reloaded_api.session_create(backends, 2, nullptr) : nullptr;
+        if (reloaded_session) {
+            reloaded_api.session_destroy(reloaded_session);
+        }
     }
-    if (reloaded_cuda) {
-        ggml_backend_reg_t reloaded_reg =
-            ggml_backend_dev_backend_reg(reloaded_device);
-        ggml_backend_free(reloaded_cuda);
+    const bool reload_ok = reloaded_session != nullptr;
+    if (reloaded_gpu) {
+        ggml_backend_free(reloaded_gpu);
         ggml_backend_unload(reloaded_reg);
     }
     printf("cache-backend-reload: %s\n", reload_ok ? "OK" : "FAIL");
     ok &= reload_ok;
 #else
-    (void) cuda_reg;
+    (void) provider_reg;
     printf("cache-backend-unload: SKIP (static backend)\n");
 #endif
     if (static_buffer) {

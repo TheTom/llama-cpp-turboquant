@@ -600,12 +600,19 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            // On OOM, surrender MoE cache storage and retry once. Each vendor
-            // returns its own error enum from cuMemCreate (CUresult on CUDA,
-            // hipError_t on HIP, MUresult on MUSA); auto + the per-vendor
-            // cudaErrorMemoryAllocation alias keeps this portable.
+            // On OOM, surrender MoE cache storage and retry once. cuMemCreate is
+            // a driver-API call, so on CUDA it returns CUresult while
+            // cudaErrorMemoryAllocation is a runtime-API cudaError_t; comparing
+            // them is -Werror=enum-compare even though both happen to be 2. On
+            // HIP and MUSA the vendor headers alias cuMemCreate onto the runtime
+            // error type, so the runtime constant is the correct one there.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            const auto cu_err_out_of_memory = cudaErrorMemoryAllocation;
+#else
+            const CUresult cu_err_out_of_memory = CUDA_ERROR_OUT_OF_MEMORY;
+#endif
             auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
-            if (create_result == cudaErrorMemoryAllocation &&
+            if (create_result == cu_err_out_of_memory &&
                 ggml_moe_cache_trim(device) > 0) {
                 create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
@@ -1969,7 +1976,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // TQ4_1S (dp4a and the AMD scalar variant) is untouched — no model on
     // hand uses it and there's no evidence it shares this bug, so the fast
     // path stays enabled for that type to avoid regressing existing users.
+#if defined(GGML_USE_HIP)
+    // HIP A/B (gfx1100): the TQ3_1S fused-kernel disable was root-caused and
+    // confirmed only on CUDA0 (DeepSeek-V4). Reduction-order cancellation is
+    // hardware-specific, so test the fused path on RDNA3 rather than inheriting
+    // the CUDA disable and forcing the slow dequant+hipBLAS path.
+    // Toggleable for the perplexity A/B: fused-on by default on gfx1100,
+    // TQ3_FUSE_OFF=1 forces the verified dequant+hipBLAS path.
+    static const bool tq3_fuse_off = (getenv("TQ3_FUSE_OFF") != nullptr);
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S) && tq3_fuse_off;
+#else
     const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
+#endif
 
     if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && ne11 <= MMVQ_MAX_BATCH_SIZE) {
         // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
@@ -4295,7 +4313,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
 
+#if defined(GGML_USE_HIP)
+        // RDNA2 (gfx1030) faults (GPF in libamdhip64) capturing in Relaxed mode when
+        // driven from a worker thread; ThreadLocal capture avoids it. Other archs keep Relaxed.
+        const hipStreamCaptureMode capture_mode =
+            GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[cuda_ctx->device].cc)
+                ? hipStreamCaptureModeThreadLocal
+                : hipStreamCaptureModeRelaxed;
+        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), capture_mode));
+#else
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+#endif
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);

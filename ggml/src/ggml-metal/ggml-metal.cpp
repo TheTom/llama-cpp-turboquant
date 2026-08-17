@@ -947,9 +947,10 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
         initialized = true;
     }
 
-#ifdef GGML_USE_METAL
+    // No GGML_USE_* guard: that macro is defined for consumers of the backend
+    // (ggml-backend-reg.cpp), not for this target, so guarding here compiled the
+    // registration out entirely and the provider never installed.
     ggml_metal_moe_cache_register(&reg);
-#endif
 
     return &reg;
 }

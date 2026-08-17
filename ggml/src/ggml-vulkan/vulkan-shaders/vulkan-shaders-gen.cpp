@@ -1273,12 +1273,31 @@ void process_shaders() {
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
-    // MoE expert cache matvec variants (Q8_0/Q4_0/Q4_K/Q6_K weights).
+    // MoE expert cache matvec variants (Q8_0/Q4_0/Q4_K/Q6_K/Q5_K weights).
     // Compiled separately per weight type; see moe_cache_mv.comp.
     string_to_spv("moe_cache_mv_q8_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "1"}});
     string_to_spv("moe_cache_mv_q4_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "2"}});
     string_to_spv("moe_cache_mv_q4_K", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "3"}});
     string_to_spv("moe_cache_mv_q6_K", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "4"}});
+    string_to_spv("moe_cache_mv_q5_K", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "5"}});
+    string_to_spv("moe_cache_mv_q1_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "6"}});
+    string_to_spv("moe_cache_mv_q2_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "7"}});
+    string_to_spv("moe_cache_mv_q4_1", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "8"}});
+    string_to_spv("moe_cache_mv_q5_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "9"}});
+    string_to_spv("moe_cache_mv_q5_1", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "10"}});
+    string_to_spv("moe_cache_mv_q2_K", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "11"}});
+    string_to_spv("moe_cache_mv_q3_K", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "12"}});
+    string_to_spv("moe_cache_mv_iq2_xxs", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "13"}, {"DATA_A_IQ2_XXS", "1"}});
+    string_to_spv("moe_cache_mv_iq2_xs", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "14"}, {"DATA_A_IQ2_XS", "1"}});
+    string_to_spv("moe_cache_mv_iq2_s", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "15"}, {"DATA_A_IQ2_S", "1"}});
+    string_to_spv("moe_cache_mv_iq3_xxs", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "16"}, {"DATA_A_IQ3_XXS", "1"}});
+    string_to_spv("moe_cache_mv_iq3_s", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "17"}, {"DATA_A_IQ3_S", "1"}});
+    string_to_spv("moe_cache_mv_iq1_s", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "18"}, {"DATA_A_IQ1_S", "1"}, {"NEEDS_IQ1S_GRID_GPU", "1"}});
+    string_to_spv("moe_cache_mv_iq1_m", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "19"}, {"DATA_A_IQ1_M", "1"}, {"NEEDS_IQ1S_GRID_GPU", "1"}});
+    string_to_spv("moe_cache_mv_iq4_nl", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "20"}, {"DATA_A_IQ4_NL", "1"}});
+    string_to_spv("moe_cache_mv_iq4_xs", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "21"}, {"DATA_A_IQ4_XS", "1"}});
+    string_to_spv("moe_cache_mv_mxfp4", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "22"}, {"DATA_A_MXFP4", "1"}});
+    string_to_spv("moe_cache_mv_nvfp4", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "23"}, {"DATA_A_NVFP4", "1"}});
 
     for (auto &c : compiles) {
         c.wait();
