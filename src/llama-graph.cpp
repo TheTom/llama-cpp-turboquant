@@ -2195,8 +2195,13 @@ ggml_tensor * llm_graph_context::build_attn(
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
-            // Reshape to 4D, extract original head_dim, reshape back to 2D
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            // Reshape to 4D, extract original head_dim, reshape back to 2D.
+            // The output carries one row per QUERY head, so the head count must
+            // come from the tensor, not n_head_kv — GQA models with misaligned
+            // V head_dim (gpt-oss: 64->128, 64 q-heads over 8 kv-heads) hit an
+            // nelements mismatch otherwise.
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v = cur->ne[0] / padded_v_head;
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             // ggml_view_3d to extract first orig_v_head elements per head
@@ -2311,8 +2316,11 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t orig_v_head = v_cur->ne[0];  // original V head_dim from model
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
-            // cur is 2D: (padded_v_head * n_head, n_tokens) after build_attn_mha
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            // cur is 2D: (padded_v_head * n_head, n_tokens) after build_attn_mha.
+            // Head count from the tensor (query heads), not n_head_kv — see the
+            // matching block in the input_attn_kv overload.
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v = cur->ne[0] / padded_v_head;
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
@@ -2421,7 +2429,10 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
-            const int64_t n_head_v = hparams.n_head_kv(il);
+            // Head count from the tensor (query heads), not n_head_kv — see the
+            // matching block in the input_attn_kv overload.
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v = cur->ne[0] / padded_v_head;
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
