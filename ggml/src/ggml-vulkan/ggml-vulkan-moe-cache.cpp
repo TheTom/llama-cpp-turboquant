@@ -1217,6 +1217,7 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
             const int slot_index = found->second;
             moe_cache_slot & slot = pool.slots[slot_index];
             slot.readers++;
+            slot.uses++;
             moe_cache_lru_remove(pool, slot_index);
             moe_cache_lru_push_back(pool, slot_index);
             node->pins[node->n_pins++] = {&pool, slot_index};
@@ -1242,16 +1243,18 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
             slot_index = pool.free_slots.back();
             pool.free_slots.pop_back();
         } else {
-            int candidate = pool.lru_head;
-            while (candidate >= 0 && pool.slots[candidate].readers > 0) {
-                candidate = pool.slots[candidate].next;
-            }
+            int candidate = moe_cache_pick_victim(pool, session.config.hot_uses);
             if (candidate < 0) {
                 continue; // all slots pinned; CPU handles this row
             }
             slot_index = candidate;
+            const bool sacrificed_hot =
+                (int)pool.slots[slot_index].uses > session.config.hot_uses;
             moe_cache_slot_reset(pool, slot_index, false);
             dev.evictions++;
+            if (sacrificed_hot) {
+                dev.heat_evictions++;
+            }
         }
 
         moe_cache_slot & slot = pool.slots[slot_index];

@@ -2889,11 +2889,15 @@ ggml_tensor * llm_graph_context::build_attn(
         if (padded_v_head != orig_v_head) {
             // Reshape to 4D, extract original head_dim, reshape back to 2D
             // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
-            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
-            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
-            // Qwen2.5-0.5B head_dim=64 padded → 128) don't fail the element
-            // count check in ggml_reshape_3d.
-            const int64_t n_head_v = hparams.n_head(il);
+            // not (n_embd_head * n_head_kv, n_tokens). The output carries one
+            // row per Q head, so derive the head count from the tensor itself:
+            // hparams.n_head(il) is correct but is a second source of truth
+            // that has to agree with cur — ne[0]/padded_v_head cannot disagree,
+            // and the assert turns a silent nelements mismatch (observed live:
+            // gpt-oss 64->128 V pad, 64q/8kv, abort in ggml_reshape_3d during
+            // graph reserve) into a loud failure at the exact site.
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v = cur->ne[0] / padded_v_head;
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             // ggml_view_3d to extract first orig_v_head elements per head
@@ -3016,11 +3020,15 @@ ggml_tensor * llm_graph_context::build_attn(
         if (padded_v_head != orig_v_head) {
             // cur is 2D: (padded_v_head * n_head, n_tokens) after build_attn_mha
             // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
-            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
-            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
-            // Qwen2.5-0.5B head_dim=64 padded → 128) don't fail the element
-            // count check in ggml_reshape_3d.
-            const int64_t n_head_v = hparams.n_head(il);
+            // not (n_embd_head * n_head_kv, n_tokens). The output carries one
+            // row per Q head, so derive the head count from the tensor itself:
+            // hparams.n_head(il) is correct but is a second source of truth
+            // that has to agree with cur — ne[0]/padded_v_head cannot disagree,
+            // and the assert turns a silent nelements mismatch (observed live:
+            // gpt-oss 64->128 V pad, 64q/8kv, abort in ggml_reshape_3d during
+            // graph reserve) into a loud failure at the exact site.
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v = cur->ne[0] / padded_v_head;
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
@@ -3212,11 +3220,15 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
             // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
-            // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
-            // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
-            // Qwen2.5-0.5B head_dim=64 padded → 128) don't fail the element
-            // count check in ggml_reshape_3d.
-            const int64_t n_head_v = hparams.n_head(il);
+            // not (n_embd_head * n_head_kv, n_tokens). The output carries one
+            // row per Q head, so derive the head count from the tensor itself:
+            // hparams.n_head(il) is correct but is a second source of truth
+            // that has to agree with cur — ne[0]/padded_v_head cannot disagree,
+            // and the assert turns a silent nelements mismatch (observed live:
+            // gpt-oss 64->128 V pad, 64q/8kv, abort in ggml_reshape_3d during
+            // graph reserve) into a loud failure at the exact site.
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v = cur->ne[0] / padded_v_head;
             const int64_t n_tokens_cur = cur->ne[1];
             cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
             cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,

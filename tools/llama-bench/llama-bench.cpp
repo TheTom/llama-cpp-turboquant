@@ -1696,8 +1696,16 @@ struct test {
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
         poll           = inst.poll;
-        type_k         = inst.type_k;
-        type_v         = inst.type_v;
+        // report the *effective* cache types, not just what was requested: some memory
+        // implementations silently rewrite the requested type at context-creation time
+        // (e.g. TurboQuant auto-asymmetric upgrading K to q8_0 for high-GQA-ratio models
+        // - see llama_kv_cache's ctor). fall back to the requested type when the memory
+        // object has no single meaningful K/V type (llama_get_kv_cache_type_k/v returns
+        // GGML_TYPE_COUNT in that case, e.g. recurrent-only or composite DSV4 memory).
+        const ggml_type eff_type_k = llama_get_kv_cache_type_k(ctx);
+        const ggml_type eff_type_v = llama_get_kv_cache_type_v(ctx);
+        type_k         = eff_type_k != GGML_TYPE_COUNT ? eff_type_k : inst.type_k;
+        type_v         = eff_type_v != GGML_TYPE_COUNT ? eff_type_v : inst.type_v;
         n_gpu_layers   = mparams.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         moe_cache      = inst.moe_cache;

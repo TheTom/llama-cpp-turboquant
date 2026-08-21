@@ -100,6 +100,9 @@ struct moe_cache_slot {
     int prev = -1;
     int next = -1;
     int readers = 0;
+    // Resident hit count since the slot was populated. Used by the heat-aware
+    // eviction policy to keep frequently-used experts resident.
+    uint32_t uses = 0;
     moe_cache_slot_state state = moe_cache_slot_state::free;
 };
 
@@ -161,6 +164,9 @@ struct moe_cache_config {
     int admit_after = 2;
     bool admit_after_explicit = false;
     int readmit_after = 8;
+    // An expert with this many or more resident uses is "hot" and is only
+    // evicted when every other eligible slot is hot too.
+    int hot_uses = 4;
     int queue_max = 128;
     size_t queue_mb = 512;
     int stats_every = 0;
@@ -243,6 +249,9 @@ struct moe_cache_device {
     // wait or per-device FIFO can be justified with data.
     long long contention_bypasses = 0;
     long long evictions = 0;
+    // Evictions that sacrificed a hot (frequently-used) expert because every
+    // eligible slot was hot. A steady zero means hot experts stay resident.
+    long long heat_evictions = 0;
     long long insert_skips = 0;
     long long admission_skips = 0;
     long long dispatch_failures = 0;
@@ -440,6 +449,9 @@ inline moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_THROTTLE", 1, 1024, value)) {
         config.readmit_after = (int)value;
     }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_HOT_USES", 0, 1 << 30, value)) {
+        config.hot_uses = (int)value;
+    }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_QUEUE", 1, 65536, value)) {
         config.queue_max = (int)value;
     }
@@ -515,7 +527,7 @@ inline void moe_cache_log_configuration(moe_cache_session & session) {
             std::to_string(session.config.readmit_after) + "-replace"
         : "1-complete/" + std::to_string(session.config.admit_after) +
             "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
-    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s\n",
+    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s hot=%d cpu-overlap=%s fills=%s\n",
             session.config.automatic ? "auto" : "on",
             session.devices.size(), budget.c_str(),
             session.config.reserve_mb,
@@ -523,6 +535,7 @@ inline void moe_cache_log_configuration(moe_cache_session & session) {
             session.config.min_expert_bytes >> 10,
             session.config.max_batch,
             admission.c_str(),
+            session.config.hot_uses,
             overlap_cpu_rows.c_str(),
             session.config.serial_fill ? "serial" : "parallel");
 }
@@ -653,12 +666,35 @@ inline void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     slot.key = {};
     slot.generation++;
     slot.readers = 0;
+    slot.uses = 0;
     slot.state = moe_cache_slot_state::free;
     slot.prev = -1;
     slot.next = -1;
     if (add_to_free) {
         pool.free_slots.push_back(index);
     }
+}
+
+// Pick the slot to evict from a full pool. Prefer the least-recently-used slot
+// whose uses is at or below the hot threshold, so a frequently-used (hot) expert
+// stays resident; fall back to the LRU head when every slot is hot. Returns -1
+// when every eligible slot has an active reader.
+inline int moe_cache_pick_victim(const moe_cache_pool & pool, int hot_uses) {
+    int fallback = -1;
+    for (int candidate = pool.lru_head; candidate >= 0;
+         candidate = pool.slots[candidate].next) {
+        const moe_cache_slot & slot = pool.slots[candidate];
+        if (slot.readers > 0) {
+            continue;
+        }
+        if (fallback < 0) {
+            fallback = candidate;
+        }
+        if ((int)slot.uses <= hot_uses) {
+            return candidate;
+        }
+    }
+    return fallback;
 }
 
 // ---------------------------------------------------------------------------

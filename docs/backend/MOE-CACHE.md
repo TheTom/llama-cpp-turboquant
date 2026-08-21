@@ -114,7 +114,8 @@ By default:
 - A device queue is limited to 128 jobs and 512 MiB.
 - Each device has one low-priority fill stream.
 - Independent device workers run concurrently when at least two compute capability 8.0 or newer devices are selected. Fills remain serialized on single-device or older-device configurations.
-- Full pools use LRU eviction. After a successful fill, that expert needs eight fresh misses before it can replace another entry.
+- Full pools use heat-aware eviction. The victim is the least-recently-used expert whose resident hit count is at or below `GGML_CUDA_MOE_CACHE_HOT_USES` (default 4); only when every eligible slot is hot does the policy fall back to the LRU head. A frequently-used expert therefore stays resident instead of being evicted just because a few tokens skipped it.
+- Replacement admission is throttled independently: after a successful fill, an expert needs `GGML_CUDA_MOE_CACHE_THROTTLE` (default 8) fresh misses before it can replace another full-pool entry.
 
 The default maximum is eight tokens. Larger prompt-processing nodes bypass the cache, while single-token decode and current speculative verification batches remain eligible in `auto`, `on`, and fixed-budget modes.
 
@@ -252,6 +253,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_INSERTS` | `8` | Maximum admissions per node |
 | `GGML_CUDA_MOE_CACHE_ADMIT_AFTER` | adaptive | Override the initial miss count; by default it is `1` for complete pools and `2` for capacity-constrained pools |
 | `GGML_CUDA_MOE_CACHE_THROTTLE` | `8` | Fresh misses required before replacing a full-pool entry |
+| `GGML_CUDA_MOE_CACHE_HOT_USES` | `4` | Resident hit count at or below which a full-pool expert may be evicted; hotter entries are kept unless every slot is hot |
 | `GGML_CUDA_MOE_CACHE_QUEUE` | `128` | Maximum queued jobs per device |
 | `GGML_CUDA_MOE_CACHE_QUEUE_MB` | `512` | Maximum queued source bytes per device |
 | `GGML_CUDA_MOE_CACHE_STATS` | `0` | Collection-call interval for periodic statistics, or `0` for teardown only |
@@ -308,6 +310,7 @@ An `off` versus `on` comparison without `--repack off` includes the intended rep
 - The CUDA, HIP, Metal, and Vulkan backends register a provider (HIP builds share the CUDA implementation). MUSA builds compile the CUDA source to stubs and do not provide the cache. Other backends do not register a provider.
 - CPU-resident expert `MUL_MAT_ID` only. Exact gate/up/SwiGLU graphs, including DeepSeek's per-input clamps, can fuse for up to the configured token batch and 64 flattened routed rows. Other GLU graphs use the stock path. There is no GPU-resident output handoff.
 - Demand fill only. There is no predictive prefetch or separate prompt-time population path.
+- Heat-aware eviction keeps frequently-used experts resident, but there is no strict per-layer top-K slot reservation yet; that is the planned next increment.
 - No hot-set file or persistence across scheduler sessions or process restarts.
 - Direct writes through a raw host pointer bypass invalidation. Mutate cached weight buffers through the backend tensor and buffer APIs.
 - No runtime performance bail-out. An eligible but unprofitable cache remains active unless it fails, is trimmed, or is disabled by configuration.

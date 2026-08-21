@@ -583,6 +583,19 @@ extern "C" {
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
+    // Return the *effective* K/V cache tensor type currently used by the context's memory.
+    // This can differ from the type_k/type_v requested via llama_context_params: some memory
+    // implementations silently rewrite the requested type at construction time (e.g. TurboQuant
+    // "auto-asymmetric" upgrades K to q8_0 for models with GQA ratio >= 6 when a symmetric turbo
+    // K+V cache was requested, to avoid catastrophic quality loss - see llama_kv_cache's ctor and
+    // its "auto-asymmetric" LLAMA_LOG_WARN).
+    //
+    // Returns GGML_TYPE_COUNT if ctx is NULL, if the memory has no K/V cache at all (e.g. pure
+    // recurrent/Mamba-style memory), or if the memory is a composite of multiple sub-caches that
+    // can legitimately hold different effective types (e.g. DSV4's raw/CSA/HCA/indexer caches).
+    LLAMA_API enum ggml_type llama_get_kv_cache_type_k(const struct llama_context * ctx);
+    LLAMA_API enum ggml_type llama_get_kv_cache_type_v(const struct llama_context * ctx);
+
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 

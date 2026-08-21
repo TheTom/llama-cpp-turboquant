@@ -168,6 +168,49 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    // speculative draft defaults and adaptive floor
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    common_params spec_defaults;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_defaults, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(spec_defaults.speculative.draft.n_max == 3);
+    assert(spec_defaults.speculative.draft.n_min_adaptive == 3);
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-n-min-adaptive", "5"};
+    common_params adaptive_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(adaptive_params.speculative.draft.n_min_adaptive == 5);
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-chain", "8"};
+    common_params chain_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), chain_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(chain_params.speculative.draft.chain);
+    assert(chain_params.speculative.draft.n_max == 8);
+
+    chain_params.n_batch = 8;
+    chain_params.n_ubatch = 8;
+    chain_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    const llama_context_params chain_ctx_params = common_context_params_to_llama(chain_params);
+    assert(chain_ctx_params.n_rs_seq == 8);
+    assert(chain_ctx_params.n_batch == 10);
+    assert(chain_ctx_params.n_ubatch == 10);
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-chain", "0"};
+    common_params no_chain_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), no_chain_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(!no_chain_params.speculative.draft.chain);
+    assert(no_chain_params.speculative.draft.n_max == 3);
+
+    // the adaptive MTP type parses to the dedicated enum value
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive"};
+    common_params spec_params;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), spec_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(std::find(spec_params.speculative.types.begin(), spec_params.speculative.types.end(),
+                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != spec_params.speculative.types.end());
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "draft-mtp-adaptive", "--spec-draft-n-max", "2"};
+    common_params invalid_adaptive_params;
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_adaptive_params, LLAMA_EXAMPLE_SPECULATIVE));
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
