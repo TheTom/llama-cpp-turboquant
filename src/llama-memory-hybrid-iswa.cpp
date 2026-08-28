@@ -29,7 +29,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                            /* experimental block KV cache streaming, attn kv_base component only */
+                 uint64_t   kv_stream_stage_bytes) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -48,7 +50,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        kv_stream_stage_bytes
     )),
     mem_recr(new llama_memory_recurrent(
         model,

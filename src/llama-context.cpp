@@ -92,15 +92,21 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
-// True when `arch` (with the given SWA setting) is built on a plain unified
-// llama_kv_cache - either directly, or as the attention component of a
-// recurrent+attention hybrid cache - whose simple per-token region layout the
-// KV streaming planner models. False for the specialized attention caches
-// (DSA/DSV4 MLA-style compression, MSA indexer) and for the dual full+SWA
-// cache (llama_kv_cache_iswa, used standalone or inside a hybrid), both of
-// which need their own region-planning logic that block KV streaming does
-// not implement yet.
-static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch, llama_swa_type swa_type) {
+// True when `arch` is built on a plain unified llama_kv_cache - either
+// directly, as the attention component of a recurrent+attention hybrid
+// cache, or (for SWA architectures) as the kv_base component of the dual
+// full+SWA cache (llama_kv_cache_iswa / llama_memory_hybrid_iswa) - whose
+// simple per-token region layout the KV streaming planner models. kv_base
+// is always constructed with swa_type == LLAMA_SWA_TYPE_NONE regardless of
+// the model's own SWA setting (see llama-kv-cache-iswa.cpp), so the model's
+// swa_type does not need to gate this: streaming only ever targets kv_base,
+// never the bounded-size kv_swa component, which doesn't need it anyway.
+//
+// False for the specialized attention caches that need their own
+// region-planning logic block KV streaming does not implement yet:
+// DSA/DSV4 MLA-style compression, MSA indexer, and DFLASH's MLA-style
+// single-K-per-position DSpark stages.
+static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch) {
     if (llm_arch_is_recurrent(arch)) {
         return false;
     }
@@ -109,11 +115,11 @@ static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch, llama_swa_typ
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DFLASH:
             return false;
         default:
-            break;
+            return true;
     }
-    return swa_type == LLAMA_SWA_TYPE_NONE;
 }
 
 llama_context::llama_context(
@@ -473,7 +479,7 @@ llama_context::llama_context(
         const llama_kv_stream_config stream_config = {
             /*.stage_bytes         =*/ kv_stream_stage_bytes,
             /*.minimum_stage_bytes =*/ kv_stream_minimum_stage_bytes,
-            /*.unified_kv_cache    =*/ llama_kv_stream_arch_uses_unified_cache(model.arch, hparams.swa_type),
+            /*.unified_kv_cache    =*/ llama_kv_stream_arch_uses_unified_cache(model.arch),
             /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
             /*.flash_attention     =*/ cparams.flash_attn,

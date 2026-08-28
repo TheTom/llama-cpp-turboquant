@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* experimental block KV cache streaming, attn kv_base component only */
+                 uint64_t   kv_stream_stage_bytes = 0);
 
     ~llama_memory_hybrid_iswa() = default;
 
