@@ -436,6 +436,7 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
+    std::vector<uint32_t>            kv_stream_stage_mib;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -486,6 +487,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
+    /* kv_stream_stage_mib  */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -555,6 +557,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
+    printf("  --kv-stream <n>                                   [EXPERIMENTAL] KV streaming stage pool MiB, 0=off (default: %s)\n", join(cmd_params_defaults.kv_stream_stage_mib, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
@@ -947,6 +950,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_kv_offload.insert(params.no_kv_offload.end(), p.begin(), p.end());
+            } else if (arg == "--kv-stream") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                for (int v : p) {
+                    params.kv_stream_stage_mib.push_back(v < 0 ? 0 : uint32_t(v));
+                }
             } else if (arg == "--numa") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1338,6 +1350,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
+    if (params.kv_stream_stage_mib.empty()) {
+        params.kv_stream_stage_mib = cmd_params_defaults.kv_stream_stage_mib;
+    }
     if (params.no_warmup) {
         params.n_gen_warmup = 0;
     }
@@ -1384,6 +1399,7 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    uint32_t           kv_stream_stage_mib;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1460,6 +1476,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.kv_stream_stage_mib = kv_stream_stage_mib;
 
         return cparams;
     }
@@ -1490,6 +1507,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
+    for (const auto & kvs : params.kv_stream_stage_mib)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
@@ -1531,6 +1549,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_stream_stage_mib  = */ kvs,
             };
             instances.push_back(instance);
         }
@@ -1570,6 +1589,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_stream_stage_mib  = */ kvs,
             };
             instances.push_back(instance);
         }
@@ -1609,6 +1629,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_stream_stage_mib  = */ kvs,
             };
             instances.push_back(instance);
         }
@@ -1653,6 +1674,7 @@ struct test {
     bool                     no_host;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
+    uint32_t                 kv_stream_stage_mib;
     int                      n_prompt;
     int                      n_gen;
     int                      n_gen_warmup;
@@ -1718,6 +1740,7 @@ struct test {
         no_host        = inst.no_host;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
+        kv_stream_stage_mib = inst.kv_stream_stage_mib;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_gen_warmup   = inst.n_gen_warmup;
@@ -1777,7 +1800,7 @@ struct test {
             "moe_cache_fit",  "repack",         "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
-            "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
+            "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",   "kv_stream_stage_mib",
             "n_prompt",       "n_gen",          "n_gen_warmup",  "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1792,7 +1815,8 @@ struct test {
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_gen_warmup" ||
             field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "kv_stream_stage_mib" ||
+            field == "flash_attn") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1880,6 +1904,7 @@ struct test {
                                             std::to_string(no_host),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
+                                            std::to_string(kv_stream_stage_mib),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_gen_warmup),
@@ -2146,6 +2171,9 @@ struct markdown_printer : public printer {
         if (field == "fit_min_ctx") {
             return "fitc";
         }
+        if (field == "kv_stream_stage_mib") {
+            return "kvs";
+        }
         return field;
     }
 
@@ -2247,6 +2275,9 @@ struct markdown_printer : public printer {
         }
         if (params.fit_params_min_ctx.size() > 1 || params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx) {
             fields.emplace_back("fit_min_ctx");
+        }
+        if (params.kv_stream_stage_mib.size() > 1 || params.kv_stream_stage_mib != cmd_params_defaults.kv_stream_stage_mib) {
+            fields.emplace_back("kv_stream_stage_mib");
         }
         if (params.n_gen_warmup_explicit ||
             params.n_gen_warmup != cmd_params_defaults.n_gen_warmup) {
