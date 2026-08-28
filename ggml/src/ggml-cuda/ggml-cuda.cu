@@ -5669,6 +5669,27 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Whether experimental block KV cache streaming (src/llama-kv-stream-config.h)
+// has an execution backend for `dev` at all - true for any valid CUDA/HIP/MUSA
+// device, since the pinned buffer type and device pool (ggml-cuda/kv-stream.cu)
+// use only ordinary cudaMalloc/cudaHostAlloc/streams/events, no device feature
+// beyond what every supported GPU already has.
+static bool ggml_backend_cuda_kv_stream_supported(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    auto * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    return dev_ctx != nullptr && dev_ctx->device >= 0 && dev_ctx->device < ggml_cuda_info().device_count;
+}
+
+static bool ggml_backend_cuda_kv_stream_type_pair_supported(
+        ggml_backend_dev_t dev, ggml_type type_k, ggml_type type_v) {
+    if (!ggml_backend_cuda_kv_stream_supported(dev)) {
+        return false;
+    }
+    return ggml_cuda_fattn_kv_type_pair_supported(type_k, type_v);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5688,6 +5709,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_kv_stream_supported") == 0) {
+        return (void *)ggml_backend_cuda_kv_stream_supported;
+    }
+    if (strcmp(name, "ggml_backend_kv_stream_type_pair_supported") == 0) {
+        return (void *)ggml_backend_cuda_kv_stream_type_pair_supported;
     }
     return nullptr;
 }
