@@ -167,6 +167,7 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
     cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
+    cparams.kv_stream_auto          = params.kv_stream_auto;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -448,24 +449,71 @@ llama_context::llama_context(
     // implements the streaming pool/transfer-ring execution path, so the
     // feature stays inert (logged, not enabled) even when the config is
     // otherwise valid. See llama-kv-stream-config.h.
-    const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
+    uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
     bool kv_stream_enabled = false;
 
     if (!hparams.vocab_only) {
         uint64_t kv_stream_minimum_stage_bytes = 0;
+        uint32_t kv_stream_layer_count = 0;
         ggml_backend_dev_t kv_stream_dev = nullptr;
-        if (kv_stream_stage_bytes != 0) {
+        if (kv_stream_stage_bytes != 0 || cparams.kv_stream_auto) {
             for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
                 if (hparams.has_kv(il) && !hparams.is_recr(il)) {
-                    kv_stream_minimum_stage_bytes = 256ULL*(
-                        ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il)) +
-                        ggml_row_size(params.type_v, hparams.n_embd_v_gqa(il)));
-                    if (cparams.offload_kqv) {
-                        kv_stream_dev = model.dev_layer(il);
+                    if (kv_stream_layer_count == 0) {
+                        kv_stream_minimum_stage_bytes = 256ULL*(
+                            ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il)) +
+                            ggml_row_size(params.type_v, hparams.n_embd_v_gqa(il)));
+                        if (cparams.offload_kqv) {
+                            kv_stream_dev = model.dev_layer(il);
+                        }
                     }
-                    break;
+                    ++kv_stream_layer_count;
                 }
             }
+        }
+
+        // --kv-stream auto: derive the staging budget from n_ctx instead of
+        // a fixed MiB value. The pool is deliberately much smaller than the
+        // full context's KV cache - that bound is the entire point of
+        // streaming - so this targets a fixed *percentage* of the context
+        // staying resident per layer, not the full context size, clamped to
+        // a sane floor/ceiling. Resolved once here, then treated exactly
+        // like a manually-picked --kv-stream MiB value below.
+        if (cparams.kv_stream_auto) {
+            cparams.kv_stream_auto = false;
+
+            if (kv_stream_layer_count == 0 || kv_stream_minimum_stage_bytes == 0) {
+                LLAMA_LOG_WARN("%s: block KV streaming auto: no eligible KV layer found, disabling\n", __func__);
+                cparams.kv_stream_stage_mib = 0;
+            } else {
+                constexpr double   kv_stream_auto_resident_frac = 0.10;
+                constexpr uint32_t kv_stream_auto_floor_tokens  = 2048;
+                constexpr uint32_t kv_stream_auto_scratch_pages = 4;
+                constexpr uint64_t kv_stream_auto_max_mib       = 8192;
+
+                uint32_t resident_tokens = uint32_t(double(cparams.n_ctx) * kv_stream_auto_resident_frac);
+                resident_tokens = std::max(resident_tokens, kv_stream_auto_floor_tokens);
+                resident_tokens = std::min(resident_tokens, cparams.n_ctx);
+
+                const uint32_t resident_pages = (resident_tokens + 255U) / 256U;
+                // kv_stream_minimum_stage_bytes is already exactly one 256-token
+                // page (K+V) for the first eligible layer - reuse it as the
+                // per-layer, per-page byte cost for this sizing estimate.
+                const uint64_t stage_bytes_auto = kv_stream_minimum_stage_bytes *
+                        uint64_t(kv_stream_layer_count) * uint64_t(resident_pages + kv_stream_auto_scratch_pages);
+
+                uint64_t stage_mib_auto = (stage_bytes_auto + 1024*1024 - 1) / (1024*1024);
+                stage_mib_auto = std::min(stage_mib_auto, kv_stream_auto_max_mib);
+
+                cparams.kv_stream_stage_mib = uint32_t(stage_mib_auto);
+
+                LLAMA_LOG_INFO("%s: block KV streaming auto: n_ctx=%u resident=%u tokens/layer (%.0f%%) "
+                        "layers=%u -> stage=%u MiB\n",
+                        __func__, cparams.n_ctx, resident_pages*256U,
+                        kv_stream_auto_resident_frac*100.0, kv_stream_layer_count, cparams.kv_stream_stage_mib);
+            }
+
+            kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
         }
 
         // The backend hosting the KV cache reports whether it implements
@@ -3913,6 +3961,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_stream_auto              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

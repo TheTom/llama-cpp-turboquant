@@ -2411,13 +2411,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
-        {"--kv-stream"}, "N",
+        {"--kv-stream"}, "N|auto",
         "[EXPERIMENTAL] block-granular KV cache streaming staging pool size in MiB, "
-        "0 = disabled (default: 0). Requires Flash Attention, GPU KV offload, a single "
-        "sequence (-np 1), a standard unified KV cache, and a backend-supported cache "
-        "type pair.",
-        [](common_params & params, int value) {
-            params.kv_stream_stage_mib = value < 0 ? 0 : uint32_t(value);
+        "0 = disabled (default: 0). 'auto' derives the pool size from -c/--ctx-size "
+        "instead (a fixed percentage of the context stays resident, not the full "
+        "size - that would defeat the point of streaming). Requires Flash Attention, "
+        "GPU KV offload, a single sequence (-np 1), a standard unified KV cache, and "
+        "a backend-supported cache type pair.",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.kv_stream_auto = true;
+                params.kv_stream_stage_mib = 0;
+                return;
+            }
+            params.kv_stream_auto = false;
+            const int mib = std::stoi(value);
+            params.kv_stream_stage_mib = mib < 0 ? 0 : uint32_t(mib);
         }
     ).set_env("LLAMA_ARG_KV_STREAM"));
     add_opt(common_arg(
