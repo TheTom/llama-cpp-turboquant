@@ -15,6 +15,7 @@
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-msa.h"
+#include "llama-kv-stream-config.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -90,6 +91,38 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// True when `arch` (with the given SWA setting) is built on a plain unified
+// llama_kv_cache - either directly, or as the attention component of a
+// recurrent+attention hybrid cache - whose simple per-token region layout the
+// KV streaming planner models. False for the specialized attention caches
+// (DSA/DSV4 MLA-style compression, MSA indexer) and for the dual full+SWA
+// cache (llama_kv_cache_iswa, used standalone or inside a hybrid), both of
+// which need their own region-planning logic that block KV streaming does
+// not implement yet.
+static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch, llama_swa_type swa_type) {
+    if (llm_arch_is_recurrent(arch)) {
+        return false;
+    }
+    switch (arch) {
+        case LLM_ARCH_MINIMAX_M3:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
+            return false;
+        default:
+            break;
+    }
+    return swa_type == LLAMA_SWA_TYPE_NONE;
+}
+
+// True when the (K, V) cache type pair has a known-working streamed
+// FlashAttention path. TODO: replace with a per-backend capability query
+// (the backend's own (K,V)-pair FlashAttention dispatch table) instead of
+// this fixed allowlist once a streaming execution backend is wired in.
+static bool llama_kv_stream_type_pair_supported(ggml_type type_k, ggml_type type_v) {
+    return type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q4_0;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -134,6 +167,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
+    cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -405,6 +439,48 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buffer_name    (buf_output.get()),
                     ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
+        }
+    }
+
+    // experimental block KV cache streaming: validate the requested
+    // configuration now, so misconfiguration is reported immediately rather
+    // than surfacing later as a confusing allocation or decode failure.
+    // Note: this only validates the feature gate for now - no backend yet
+    // implements the streaming pool/transfer-ring execution path, so the
+    // feature stays inert (logged, not enabled) even when the config is
+    // otherwise valid. See llama-kv-stream-config.h.
+    if (!hparams.vocab_only) {
+        const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
+        uint64_t kv_stream_minimum_stage_bytes = 0;
+        if (kv_stream_stage_bytes != 0) {
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                if (hparams.has_kv(il) && !hparams.is_recr(il)) {
+                    kv_stream_minimum_stage_bytes = 256ULL*(
+                        ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il)) +
+                        ggml_row_size(params.type_v, hparams.n_embd_v_gqa(il)));
+                    break;
+                }
+            }
+        }
+
+        const llama_kv_stream_config stream_config = {
+            /*.stage_bytes         =*/ kv_stream_stage_bytes,
+            /*.minimum_stage_bytes =*/ kv_stream_minimum_stage_bytes,
+            /*.unified_kv_cache    =*/ llama_kv_stream_arch_uses_unified_cache(model.arch, hparams.swa_type),
+            /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
+            /*.single_sequence     =*/ cparams.n_seq_max == 1,
+            /*.flash_attention     =*/ cparams.flash_attn,
+            /*.kv_offload          =*/ cparams.offload_kqv,
+            /*.type_pair_supported =*/ llama_kv_stream_type_pair_supported(params.type_k, params.type_v),
+        };
+        const auto stream_validation = llama_kv_stream_config_validate(stream_config);
+        if (!stream_validation.valid) {
+            throw std::runtime_error(stream_validation.error);
+        }
+        if (stream_validation.enabled) {
+            LLAMA_LOG_INFO("%s: experimental block KV streaming config validated, pool = %.2f MiB "
+                    "(no execution backend wired in yet - inert in this build)\n",
+                    __func__, kv_stream_stage_bytes/1024.0/1024.0);
         }
     }
 
@@ -3800,6 +3876,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kv_stream_stage_mib         =*/ 0,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.abort_callback              =*/ nullptr,

@@ -1724,6 +1724,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    cparams.kv_stream_stage_mib = params.kv_stream_stage_mib;
+
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {
             case COMMON_MOE_CACHE_MODE_OFF:
