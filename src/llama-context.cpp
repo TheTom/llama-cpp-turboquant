@@ -486,6 +486,18 @@ llama_context::llama_context(
             /*.kv_offload          =*/ cparams.offload_kqv,
             /*.type_pair_supported =*/ kv_stream_caps.type_pair_supported,
         };
+
+        if (kv_stream_stage_bytes != 0) {
+            LLAMA_LOG_INFO("%s: block KV streaming gate: stage_bytes=%.2f MiB minimum_stage_bytes=%.2f MiB "
+                    "unified_kv_cache=%d context_default=%d single_sequence=%d flash_attention=%d "
+                    "kv_offload=%d type_pair_supported=%d (dev=%s)\n",
+                    __func__,
+                    stream_config.stage_bytes/1024.0/1024.0, stream_config.minimum_stage_bytes/1024.0/1024.0,
+                    stream_config.unified_kv_cache, stream_config.context_default, stream_config.single_sequence,
+                    stream_config.flash_attention, stream_config.kv_offload, stream_config.type_pair_supported,
+                    kv_stream_dev != nullptr ? ggml_backend_dev_name(kv_stream_dev) : "(none)");
+        }
+
         const auto stream_validation = llama_kv_stream_config_validate(stream_config);
         if (!stream_validation.valid) {
             throw std::runtime_error(stream_validation.error);
