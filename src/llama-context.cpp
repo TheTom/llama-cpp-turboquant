@@ -442,8 +442,10 @@ llama_context::llama_context(
     // implements the streaming pool/transfer-ring execution path, so the
     // feature stays inert (logged, not enabled) even when the config is
     // otherwise valid. See llama-kv-stream-config.h.
+    const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
+    bool kv_stream_enabled = false;
+
     if (!hparams.vocab_only) {
-        const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
         uint64_t kv_stream_minimum_stage_bytes = 0;
         ggml_backend_dev_t kv_stream_dev = nullptr;
         if (kv_stream_stage_bytes != 0) {
@@ -483,8 +485,8 @@ llama_context::llama_context(
             throw std::runtime_error(stream_validation.error);
         }
         if (stream_validation.enabled) {
-            LLAMA_LOG_INFO("%s: experimental block KV streaming config validated, pool = %.2f MiB "
-                    "(no execution backend wired in yet - inert in this build)\n",
+            kv_stream_enabled = true;
+            LLAMA_LOG_INFO("%s: experimental block KV streaming config validated, pool = %.2f MiB\n",
                     __func__, kv_stream_stage_bytes/1024.0/1024.0);
         }
     }
@@ -498,6 +500,7 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
+        params_mem.kv_stream_stage_bytes = kv_stream_enabled ? kv_stream_stage_bytes : 0;
 
         memory.reset(model.create_memory(params_mem, cparams));
     }

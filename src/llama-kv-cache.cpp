@@ -5,6 +5,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -117,7 +119,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                 uint64_t   kv_stream_stage_bytes) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -241,6 +244,102 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // Experimental block KV cache streaming: build one runtime (if eligible)
+    // before the layer loop, shared by every streaming-eligible layer on its
+    // target device. Falls back silently to the ordinary per-layer buffer
+    // type on any ineligibility or failure - kv_stream_stage_bytes == 0 (the
+    // default) skips all of this without touching the rest of construction.
+    //
+    // Conservatively excludes configurations where TURBO_LAYER_ADAPTIVE
+    // (below, in the main loop) could give layers different K/V types and
+    // therefore different byte-per-token sizes: the streaming pool assumes
+    // one uniform page size across all layers it manages. That override
+    // only ever changes anything when a turbo K or V type is combined with
+    // >= 8 layers (see the mode dispatch below), so anything outside that
+    // is provably safe to stream without needing to duplicate the dispatch
+    // logic itself here.
+    ggml_backend_buffer_type_t kv_stream_buft = nullptr;
+    ggml_backend_dev_t kv_stream_dev = nullptr;
+    if (kv_stream_stage_bytes > 0 && offload &&
+            !hparams.is_n_embd_k_gqa_variable() && !hparams.is_n_embd_v_gqa_variable()) {
+        const bool kv_stream_type_k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+        const bool kv_stream_type_v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+        const bool kv_stream_adaptive_possible = (kv_stream_type_k_is_turbo || kv_stream_type_v_is_turbo) && hparams.n_layer() >= 8;
+
+        uint32_t kv_stream_layer_count = 0;
+        int32_t  kv_stream_il_first = -1;
+
+        if (!kv_stream_adaptive_possible) {
+            for (uint32_t il = 0; il < n_layer; il++) {
+                if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                    continue;
+                }
+                if (share && other && share(il) >= 0) {
+                    continue; // shares another cache's tensors, no new allocation
+                }
+
+                auto * dev = model.dev_layer(il);
+                if (kv_stream_dev == nullptr) {
+                    kv_stream_dev = dev;
+                    kv_stream_il_first = int32_t(il);
+                }
+                if (dev == kv_stream_dev) {
+                    ++kv_stream_layer_count;
+                }
+            }
+        }
+
+        if (kv_stream_dev != nullptr && kv_stream_layer_count > 0) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(kv_stream_dev);
+
+            int kv_stream_device_index = -1;
+            if (reg != nullptr) {
+                for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                    if (ggml_backend_reg_dev_get(reg, i) == kv_stream_dev) {
+                        kv_stream_device_index = int(i);
+                        break;
+                    }
+                }
+            }
+
+            auto runtime_new_fn = reg ? (ggml_backend_kv_stream_runtime_new_for_device_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_runtime_new_for_device") : nullptr;
+            auto buffer_type_fn = reg ? (ggml_backend_kv_stream_buffer_type_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_buffer_type") : nullptr;
+            kv_stream_runtime_free_fn = reg ? (ggml_backend_kv_stream_runtime_free_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_runtime_free") : nullptr;
+
+            if (kv_stream_device_index >= 0 && runtime_new_fn != nullptr && buffer_type_fn != nullptr &&
+                    kv_stream_runtime_free_fn != nullptr) {
+                const uint32_t il = uint32_t(kv_stream_il_first);
+                const uint32_t page_n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
+                const uint32_t page_n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+                const size_t page_bytes =
+                    256U*ggml_row_size(type_k, page_n_embd_k_gqa) +
+                    256U*ggml_row_size(type_v, page_n_embd_v_gqa);
+
+                kv_stream_runtime = runtime_new_fn(
+                        kv_stream_device_index, size_t(kv_stream_stage_bytes), page_bytes,
+                        /*stage_slots=*/2, kv_stream_layer_count);
+                if (kv_stream_runtime != nullptr) {
+                    kv_stream_buft = buffer_type_fn(kv_stream_runtime);
+                }
+            }
+
+            if (kv_stream_buft == nullptr) {
+                // ineligible on this backend, or creation/layout failed - fall back cleanly
+                if (kv_stream_runtime != nullptr && kv_stream_runtime_free_fn != nullptr) {
+                    kv_stream_runtime_free_fn(kv_stream_runtime);
+                }
+                kv_stream_runtime = nullptr;
+                kv_stream_runtime_free_fn = nullptr;
+                kv_stream_dev = nullptr;
+                LLAMA_LOG_WARN("%s: block KV streaming requested but not available on this backend/device; "
+                        "falling back to the ordinary KV cache\n", __func__);
+            }
+        }
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -299,7 +398,8 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+            buft = (kv_stream_buft != nullptr && dev == kv_stream_dev) ?
+                kv_stream_buft : ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -618,6 +718,12 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    if (kv_stream_runtime != nullptr && kv_stream_runtime_free_fn != nullptr) {
+        kv_stream_runtime_free_fn(kv_stream_runtime);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {

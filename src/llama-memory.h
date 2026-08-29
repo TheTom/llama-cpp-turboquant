@@ -25,6 +25,12 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // experimental block KV cache streaming staging budget, 0 = disabled
+    // [EXPERIMENTAL] - see src/llama-kv-stream-config.h. Placed last and
+    // defaulted so existing positional-style aggregate initializers of this
+    // struct don't need updating.
+    uint64_t kv_stream_stage_bytes = 0;
 };
 
 enum llama_memory_status {

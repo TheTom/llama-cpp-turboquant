@@ -2327,7 +2327,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_stream_stage_bytes */ params.kv_stream_stage_bytes);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2429,7 +2430,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                params.kv_stream_stage_bytes);
                     }
                 }
             }

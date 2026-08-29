@@ -112,9 +112,10 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                     uint64_t   kv_stream_stage_bytes = 0);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -302,6 +303,15 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // Experimental block KV cache streaming (see llama-kv-stream-config.h):
+    // when non-null, kv_stream_runtime is an opaque backend-owned handle
+    // (resolved via ggml_backend_reg_get_proc_address, matching the plugin
+    // pattern below) providing the pinned host buffer type that layers on
+    // its device use instead of the ordinary device buffer type.
+    // kv_stream_runtime_free_fn releases it in the destructor.
+    void * kv_stream_runtime = nullptr;
+    void (*kv_stream_runtime_free_fn)(void *) = nullptr;
 
     size_t total_size() const;
 

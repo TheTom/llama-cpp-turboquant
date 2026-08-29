@@ -148,6 +148,17 @@ void ggml_backend_cuda_kv_stream_runtime_free(ggml_backend_cuda_kv_stream_runtim
     ggml_backend_cuda_kv_stream_runtime_release(runtime);
 }
 
+void * ggml_backend_cuda_kv_stream_runtime_new_for_device(
+        int device, size_t pool_bytes, size_t page_bytes, uint32_t stage_slots, uint32_t layer_count) {
+    ggml_backend_cuda_kv_stream_params params;
+    params.device      = device;
+    params.pool_bytes  = pool_bytes;
+    params.page_bytes  = page_bytes;
+    params.stage_slots = stage_slots;
+    params.layer_count = layer_count;
+    return ggml_backend_cuda_kv_stream_runtime_new(params);
+}
+
 ggml_backend_buffer_type_t ggml_backend_cuda_kv_stream_buffer_type(ggml_backend_cuda_kv_stream_runtime_t runtime) {
     return runtime == nullptr ? nullptr : &runtime->buffer_type;
 }

@@ -27,6 +27,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/kv-stream.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -5715,6 +5716,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kv_stream_type_pair_supported") == 0) {
         return (void *)ggml_backend_cuda_kv_stream_type_pair_supported;
+    }
+    if (strcmp(name, "ggml_backend_kv_stream_runtime_new_for_device") == 0) {
+        return (void *)ggml_backend_cuda_kv_stream_runtime_new_for_device;
+    }
+    if (strcmp(name, "ggml_backend_kv_stream_runtime_free") == 0) {
+        return (void *)ggml_backend_cuda_kv_stream_runtime_free;
+    }
+    if (strcmp(name, "ggml_backend_kv_stream_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_kv_stream_buffer_type;
     }
     return nullptr;
 }

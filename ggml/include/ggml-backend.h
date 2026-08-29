@@ -231,6 +231,20 @@ extern "C" {
     // ggml_backend_kv_stream_supported_t already returned true.
     typedef bool (*ggml_backend_kv_stream_type_pair_supported_t)(
         ggml_backend_dev_t device, enum ggml_type type_k, enum ggml_type type_v);
+    // Allocates a block KV cache streaming runtime (the pinned host buffer
+    // type plus the fixed-size device pool) for one device. `layer_count`
+    // KV-bearing layers share the pool, each contributing `page_bytes` per
+    // resident page; `stage_slots` sets the async transfer ring depth.
+    // Returns an opaque handle, or NULL on any allocation/layout failure -
+    // the caller should fall back to the ordinary non-streaming KV cache
+    // buffer type in that case.
+    typedef void * (*ggml_backend_kv_stream_runtime_new_for_device_t)(
+        int device, size_t pool_bytes, size_t page_bytes, uint32_t stage_slots, uint32_t layer_count);
+    typedef void   (*ggml_backend_kv_stream_runtime_free_t)(void * runtime);
+    // The pinned host buffer type backing the authoritative KV cache tensors
+    // for a streaming runtime - request this instead of the device's
+    // ordinary buffer type for a layer's K/V tensors when streaming.
+    typedef ggml_backend_buffer_type_t (*ggml_backend_kv_stream_buffer_type_t)(void * runtime);
 
     //
     // Backend registry
