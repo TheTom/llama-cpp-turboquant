@@ -100,6 +100,27 @@ template <typename T, typename F> static std::vector<std::string> transform_to_s
     return str_values;
 }
 
+// a --kv-stream sweep value: either a fixed MiB budget or "auto" (derive from -c)
+struct kv_stream_spec {
+    uint32_t mib        = 0;
+    bool     auto_size  = false;
+
+    bool operator==(const kv_stream_spec & other) const {
+        return mib == other.mib && auto_size == other.auto_size;
+    }
+    bool operator!=(const kv_stream_spec & other) const {
+        return !(*this == other);
+    }
+};
+
+static std::ostream & operator<<(std::ostream & os, const kv_stream_spec & v) {
+    return v.auto_size ? (os << "auto") : (os << v.mib);
+}
+
+static std::string kv_stream_spec_str(const kv_stream_spec & v) {
+    return v.auto_size ? "auto" : std::to_string(v.mib);
+}
+
 template <typename T> static T avg(const std::vector<T> & v) {
     if (v.empty()) {
         return 0;
@@ -436,7 +457,7 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
-    std::vector<uint32_t>            kv_stream_stage_mib;
+    std::vector<kv_stream_spec>       kv_stream_stage_mib;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -487,7 +508,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
-    /* kv_stream_stage_mib  */ { 0 },
+    /* kv_stream_stage_mib  */ { kv_stream_spec{} },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -557,7 +578,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
-    printf("  --kv-stream <n>                                   [EXPERIMENTAL] KV streaming stage pool MiB, 0=off (default: %s)\n", join(cmd_params_defaults.kv_stream_stage_mib, ",").c_str());
+    printf("  --kv-stream <n|auto>                              [EXPERIMENTAL] KV streaming stage pool MiB, 0=off, auto=derive from -c (default: %s)\n", join(cmd_params_defaults.kv_stream_stage_mib, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
@@ -955,9 +976,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto p = parse_int_range(argv[i]);
-                for (int v : p) {
-                    params.kv_stream_stage_mib.push_back(v < 0 ? 0 : uint32_t(v));
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & tok : p) {
+                    if (tok == "auto") {
+                        params.kv_stream_stage_mib.push_back({ 0, true });
+                    } else {
+                        int v = std::stoi(tok);
+                        params.kv_stream_stage_mib.push_back({ v < 0 ? 0u : uint32_t(v), false });
+                    }
                 }
             } else if (arg == "--numa") {
                 if (++i >= argc) {
@@ -1399,7 +1425,7 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
-    uint32_t           kv_stream_stage_mib;
+    kv_stream_spec     kv_stream_stage_mib;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1476,7 +1502,8 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
-        cparams.kv_stream_stage_mib = kv_stream_stage_mib;
+        cparams.kv_stream_stage_mib = kv_stream_stage_mib.mib;
+        cparams.kv_stream_auto      = kv_stream_stage_mib.auto_size;
 
         return cparams;
     }
@@ -1674,7 +1701,7 @@ struct test {
     bool                     no_host;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
-    uint32_t                 kv_stream_stage_mib;
+    kv_stream_spec           kv_stream_stage_mib;
     int                      n_prompt;
     int                      n_gen;
     int                      n_gen_warmup;
@@ -1815,7 +1842,7 @@ struct test {
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_gen_warmup" ||
             field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "kv_stream_stage_mib" ||
+            field == "fit_target" || field == "fit_min_ctx" ||
             field == "flash_attn") {
             return INT;
         }
@@ -1825,6 +1852,10 @@ struct test {
         }
         if (field == "avg_ts" || field == "stddev_ts") {
             return FLOAT;
+        }
+        if (field == "kv_stream_stage_mib") {
+            // usually numeric, but can be the literal "auto" - always format as a string
+            return STRING;
         }
         if (field == "load_mode") {
             return STRING;
@@ -1904,7 +1935,7 @@ struct test {
                                             std::to_string(no_host),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
-                                            std::to_string(kv_stream_stage_mib),
+                                            kv_stream_spec_str(kv_stream_stage_mib),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_gen_warmup),
