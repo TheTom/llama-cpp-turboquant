@@ -305,13 +305,22 @@ private:
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
     // Experimental block KV cache streaming (see llama-kv-stream-config.h):
-    // when non-null, kv_stream_runtime is an opaque backend-owned handle
-    // (resolved via ggml_backend_reg_get_proc_address, matching the plugin
-    // pattern below) providing the pinned host buffer type that layers on
-    // its device use instead of the ordinary device buffer type.
-    // kv_stream_runtime_free_fn releases it in the destructor.
-    void * kv_stream_runtime = nullptr;
-    void (*kv_stream_runtime_free_fn)(void *) = nullptr;
+    // one entry per device that ends up hosting streaming-eligible layers -
+    // a tensor-split model spreads layers across multiple devices, and each
+    // gets its own independently-sized runtime/pool (kv_stream_stage_bytes
+    // is a per-device budget, not a total split across devices). `runtime`
+    // is an opaque backend-owned handle (resolved via
+    // ggml_backend_reg_get_proc_address, matching the plugin pattern below)
+    // providing the pinned host buffer type that layers on `dev` use
+    // instead of the ordinary device buffer type. `free_fn` releases it in
+    // the destructor.
+    struct kv_stream_device_entry {
+        ggml_backend_dev_t dev = nullptr;
+        ggml_backend_buffer_type_t buft = nullptr;
+        void * runtime = nullptr;
+        void (*free_fn)(void *) = nullptr;
+    };
+    std::vector<kv_stream_device_entry> kv_stream_entries;
 
     size_t total_size() const;
 

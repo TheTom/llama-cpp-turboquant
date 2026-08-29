@@ -106,7 +106,7 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 // region-planning logic block KV streaming does not implement yet:
 // DSA/DSV4 MLA-style compression, MSA indexer, and DFLASH's MLA-style
 // single-K-per-position DSpark stages.
-static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch) {
+static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch, const llama_hparams & hparams) {
     if (llm_arch_is_recurrent(arch)) {
         return false;
     }
@@ -115,8 +115,15 @@ static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch) {
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_DFLASH:
             return false;
+        case LLM_ARCH_DFLASH:
+            // DSV4 DSpark stages (dsv4_hc_mult > 0) store a single MLA-style K
+            // per position via llama_kv_cache_iswa with a custom filter - not a
+            // standard cache. Without that (dsv4_hc_mult == 0) DFLASH falls
+            // through to the same plain llama_kv_cache/hybrid/recurrent
+            // construction as any other architecture (llama-model.cpp's
+            // create_memory switch), so it's just as streamable as those.
+            return hparams.dsv4_hc_mult == 0;
         default:
             return true;
     }
@@ -452,7 +459,21 @@ llama_context::llama_context(
     uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
     bool kv_stream_enabled = false;
 
-    if (!hparams.vocab_only) {
+    // hparams.no_alloc marks a dry-run "probe" construction (e.g.
+    // common_fit_params' memory-fitting search loads models with
+    // no_alloc=true purely to measure sizes without doing real work).
+    // A failing gate below throws by design for a real, explicit
+    // --kv-stream request - but a probe must never throw here: every
+    // candidate configuration fit-params measures would otherwise abort
+    // the whole fit operation over a gate this particular probe doesn't
+    // even control (e.g. a trial n_seq_max or offload_kqv). Skipping
+    // entirely during a probe is equivalent to leaving kv_stream_enabled
+    // false, matching the real construction's own type-pair/size-based
+    // fallback for cases the feature simply doesn't apply to.
+    if ((kv_stream_stage_bytes != 0 || cparams.kv_stream_auto) && hparams.no_alloc) {
+        LLAMA_LOG_INFO("%s: block KV streaming: skipped, no_alloc probe (memory-fit dry run)\n", __func__);
+        cparams.kv_stream_auto = false;
+    } else if (!hparams.vocab_only) {
         uint64_t kv_stream_minimum_stage_bytes = 0;
         uint32_t kv_stream_layer_count = 0;
         ggml_backend_dev_t kv_stream_dev = nullptr;
@@ -527,7 +548,7 @@ llama_context::llama_context(
         const llama_kv_stream_config stream_config = {
             /*.stage_bytes         =*/ kv_stream_stage_bytes,
             /*.minimum_stage_bytes =*/ kv_stream_minimum_stage_bytes,
-            /*.unified_kv_cache    =*/ llama_kv_stream_arch_uses_unified_cache(model.arch),
+            /*.unified_kv_cache    =*/ llama_kv_stream_arch_uses_unified_cache(model.arch, hparams),
             /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
             /*.flash_attention     =*/ cparams.flash_attn,

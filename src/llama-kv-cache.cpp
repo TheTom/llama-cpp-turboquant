@@ -309,9 +309,24 @@ llama_kv_cache::llama_kv_cache(
     // TURBO_LAYER_ADAPTIVE override) streams normally even with >= 8 layers -
     // only a resolved mode that actually varies types for this K/V pair is
     // excluded.
-    ggml_backend_buffer_type_t kv_stream_buft = nullptr;
-    ggml_backend_dev_t kv_stream_dev = nullptr;
-    if (kv_stream_stage_bytes > 0) {
+    //
+    // Tensor-split / multi-GPU: eligible layers are grouped by device, and
+    // each device that hosts any gets its own independently-created runtime
+    // (kv_stream_stage_bytes is a per-device MiB budget, not split across
+    // devices - a 4-GPU tensor split with --kv-stream 2304 reserves 2304 MiB
+    // on *each* GPU that has eligible layers). A device whose runtime fails
+    // to create just falls back to the ordinary per-device buffer type for
+    // its own layers; that doesn't affect other devices' pools.
+    // hparams.no_alloc marks a dry-run "probe" construction (e.g. common_fit_params'
+    // memory-fitting search, which loads models with no_alloc=true purely to measure
+    // sizes without doing real work - same convention the turbo rotation matrices
+    // below already follow). The streaming runtime below does a real backend
+    // allocation (e.g. cudaMalloc for the device pool), which must not run during a
+    // probe: every candidate configuration fit-params tries would otherwise perform
+    // a real device allocation it never frees between trials.
+    if (kv_stream_stage_bytes > 0 && hparams.no_alloc) {
+        LLAMA_LOG_INFO("%s: block KV streaming: skipped, no_alloc probe (memory-fit dry run)\n", __func__);
+    } else if (kv_stream_stage_bytes > 0) {
         LLAMA_LOG_INFO("%s: block KV streaming requested (%.2f MiB): offload=%d "
                 "adaptive_possible=%d n_layer=%u\n",
                 __func__, kv_stream_stage_bytes/1024.0/1024.0, offload,
@@ -329,6 +344,8 @@ llama_kv_cache::llama_kv_cache(
             uint32_t kv_stream_n_embd_v_gqa_first = 0;
             bool     kv_stream_uniform = true;
 
+            std::map<ggml_backend_dev_t, uint32_t> kv_stream_layers_per_dev;
+
             for (uint32_t il = 0; il < n_layer; il++) {
                 if (!hparams.has_kv(il) || (filter && !filter(il))) {
                     continue;
@@ -340,91 +357,90 @@ llama_kv_cache::llama_kv_cache(
                 const uint32_t layer_n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
                 const uint32_t layer_n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
 
-                auto * dev = model.dev_layer(il);
-                if (kv_stream_dev == nullptr) {
-                    kv_stream_dev = dev;
+                if (kv_stream_il_first < 0) {
                     kv_stream_il_first = int32_t(il);
                     kv_stream_n_embd_k_gqa_first = layer_n_embd_k_gqa;
                     kv_stream_n_embd_v_gqa_first = layer_n_embd_v_gqa;
                 }
-                if (dev == kv_stream_dev) {
-                    if (layer_n_embd_k_gqa != kv_stream_n_embd_k_gqa_first ||
-                            layer_n_embd_v_gqa != kv_stream_n_embd_v_gqa_first) {
-                        kv_stream_uniform = false;
-                    }
-                    ++kv_stream_layer_count;
+                if (layer_n_embd_k_gqa != kv_stream_n_embd_k_gqa_first ||
+                        layer_n_embd_v_gqa != kv_stream_n_embd_v_gqa_first) {
+                    kv_stream_uniform = false;
                 }
+
+                ++kv_stream_layers_per_dev[model.dev_layer(il)];
+                ++kv_stream_layer_count;
             }
 
             if (!kv_stream_uniform) {
                 LLAMA_LOG_INFO("%s: block KV streaming: skipped, K or V byte-per-token size varies "
                         "across this cache's %u eligible layer(s)\n", __func__, kv_stream_layer_count);
-                kv_stream_dev = nullptr;
-                kv_stream_layer_count = 0;
+                kv_stream_layers_per_dev.clear();
             }
 
-            LLAMA_LOG_INFO("%s: block KV streaming: pre-scan found %u eligible layer(s) on device %s\n",
-                    __func__, kv_stream_layer_count,
-                    kv_stream_dev != nullptr ? ggml_backend_dev_name(kv_stream_dev) : "(none)");
+            LLAMA_LOG_INFO("%s: block KV streaming: pre-scan found %u eligible layer(s) across %zu device(s)\n",
+                    __func__, kv_stream_layer_count, kv_stream_layers_per_dev.size());
 
-            if (kv_stream_dev != nullptr && kv_stream_layer_count > 0) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(kv_stream_dev);
+            if (!kv_stream_layers_per_dev.empty()) {
+                const uint32_t il = uint32_t(kv_stream_il_first);
+                const uint32_t page_n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
+                const uint32_t page_n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+                const size_t page_bytes =
+                    256U*ggml_row_size(type_k, page_n_embd_k_gqa) +
+                    256U*ggml_row_size(type_v, page_n_embd_v_gqa);
 
-                int kv_stream_device_index = -1;
-                if (reg != nullptr) {
-                    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
-                        if (ggml_backend_reg_dev_get(reg, i) == kv_stream_dev) {
-                            kv_stream_device_index = int(i);
-                            break;
+                for (const auto & [dev, dev_layer_count] : kv_stream_layers_per_dev) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+
+                    int device_index = -1;
+                    if (reg != nullptr) {
+                        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                            if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                                device_index = int(i);
+                                break;
+                            }
                         }
                     }
-                }
 
-                auto runtime_new_fn = reg ? (ggml_backend_kv_stream_runtime_new_for_device_t)
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_runtime_new_for_device") : nullptr;
-                auto buffer_type_fn = reg ? (ggml_backend_kv_stream_buffer_type_t)
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_buffer_type") : nullptr;
-                kv_stream_runtime_free_fn = reg ? (ggml_backend_kv_stream_runtime_free_t)
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_runtime_free") : nullptr;
+                    auto runtime_new_fn = reg ? (ggml_backend_kv_stream_runtime_new_for_device_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_runtime_new_for_device") : nullptr;
+                    auto buffer_type_fn = reg ? (ggml_backend_kv_stream_buffer_type_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_buffer_type") : nullptr;
+                    auto free_fn = reg ? (ggml_backend_kv_stream_runtime_free_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_runtime_free") : nullptr;
 
-                LLAMA_LOG_INFO("%s: block KV streaming: device_index=%d runtime_new=%d buffer_type=%d free=%d\n",
-                        __func__, kv_stream_device_index, runtime_new_fn != nullptr,
-                        buffer_type_fn != nullptr, kv_stream_runtime_free_fn != nullptr);
+                    LLAMA_LOG_INFO("%s: block KV streaming: device %s (index=%d) layers=%u "
+                            "runtime_new=%d buffer_type=%d free=%d\n",
+                            __func__, ggml_backend_dev_name(dev), device_index, dev_layer_count,
+                            runtime_new_fn != nullptr, buffer_type_fn != nullptr, free_fn != nullptr);
 
-                if (kv_stream_device_index >= 0 && runtime_new_fn != nullptr && buffer_type_fn != nullptr &&
-                        kv_stream_runtime_free_fn != nullptr) {
-                    const uint32_t il = uint32_t(kv_stream_il_first);
-                    const uint32_t page_n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
-                    const uint32_t page_n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
-                    const size_t page_bytes =
-                        256U*ggml_row_size(type_k, page_n_embd_k_gqa) +
-                        256U*ggml_row_size(type_v, page_n_embd_v_gqa);
-
-                    kv_stream_runtime = runtime_new_fn(
-                            kv_stream_device_index, size_t(kv_stream_stage_bytes), page_bytes,
-                            /*stage_slots=*/2, kv_stream_layer_count);
-                    if (kv_stream_runtime != nullptr) {
-                        kv_stream_buft = buffer_type_fn(kv_stream_runtime);
+                    if (device_index < 0 || runtime_new_fn == nullptr || buffer_type_fn == nullptr ||
+                            free_fn == nullptr) {
+                        LLAMA_LOG_WARN("%s: block KV streaming not available on device %s; "
+                                "its layers fall back to the ordinary KV cache\n",
+                                __func__, ggml_backend_dev_name(dev));
+                        continue;
                     }
 
-                    LLAMA_LOG_INFO("%s: block KV streaming: page_bytes=%zu runtime=%d buft=%d\n",
-                            __func__, page_bytes, kv_stream_runtime != nullptr, kv_stream_buft != nullptr);
-                }
+                    void * runtime = runtime_new_fn(
+                            device_index, size_t(kv_stream_stage_bytes), page_bytes,
+                            /*stage_slots=*/2, dev_layer_count);
+                    ggml_backend_buffer_type_t buft = runtime != nullptr ? buffer_type_fn(runtime) : nullptr;
 
-                if (kv_stream_buft == nullptr) {
-                    // ineligible on this backend, or creation/layout failed - fall back cleanly
-                    if (kv_stream_runtime != nullptr && kv_stream_runtime_free_fn != nullptr) {
-                        kv_stream_runtime_free_fn(kv_stream_runtime);
+                    if (buft == nullptr) {
+                        if (runtime != nullptr) {
+                            free_fn(runtime);
+                        }
+                        LLAMA_LOG_WARN("%s: block KV streaming pool creation failed on device %s; "
+                                "its layers fall back to the ordinary KV cache\n",
+                                __func__, ggml_backend_dev_name(dev));
+                        continue;
                     }
-                    kv_stream_runtime = nullptr;
-                    kv_stream_runtime_free_fn = nullptr;
-                    kv_stream_dev = nullptr;
-                    LLAMA_LOG_WARN("%s: block KV streaming requested but not available on this backend/device; "
-                            "falling back to the ordinary KV cache\n", __func__);
-                } else {
+
                     LLAMA_LOG_INFO("%s: block KV streaming pool created: %.2f MiB, %u layer(s), device %s\n",
-                            __func__, kv_stream_stage_bytes/1024.0/1024.0, kv_stream_layer_count,
-                            ggml_backend_dev_name(kv_stream_dev));
+                            __func__, kv_stream_stage_bytes/1024.0/1024.0, dev_layer_count,
+                            ggml_backend_dev_name(dev));
+
+                    kv_stream_entries.push_back({ dev, buft, runtime, free_fn });
                 }
             }
         }
@@ -488,8 +504,15 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = (kv_stream_buft != nullptr && dev == kv_stream_dev) ?
-                kv_stream_buft : ggml_backend_dev_buffer_type(dev);
+
+            ggml_backend_buffer_type_t stream_buft = nullptr;
+            for (const auto & entry : kv_stream_entries) {
+                if (entry.dev == dev) {
+                    stream_buft = entry.buft;
+                    break;
+                }
+            }
+            buft = stream_buft != nullptr ? stream_buft : ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -787,8 +810,10 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
-    if (kv_stream_runtime != nullptr && kv_stream_runtime_free_fn != nullptr) {
-        kv_stream_runtime_free_fn(kv_stream_runtime);
+    for (const auto & entry : kv_stream_entries) {
+        if (entry.runtime != nullptr && entry.free_fn != nullptr) {
+            entry.free_fn(entry.runtime);
+        }
     }
 }
 
