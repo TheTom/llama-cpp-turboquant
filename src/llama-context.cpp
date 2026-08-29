@@ -15,6 +15,7 @@
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-msa.h"
+#include "llama-kv-stream-backend.h"
 #include "llama-kv-stream-config.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -113,14 +114,6 @@ static bool llama_kv_stream_arch_uses_unified_cache(llm_arch arch, llama_swa_typ
             break;
     }
     return swa_type == LLAMA_SWA_TYPE_NONE;
-}
-
-// True when the (K, V) cache type pair has a known-working streamed
-// FlashAttention path. TODO: replace with a per-backend capability query
-// (the backend's own (K,V)-pair FlashAttention dispatch table) instead of
-// this fixed allowlist once a streaming execution backend is wired in.
-static bool llama_kv_stream_type_pair_supported(ggml_type type_k, ggml_type type_v) {
-    return type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q4_0;
 }
 
 llama_context::llama_context(
@@ -452,16 +445,28 @@ llama_context::llama_context(
     if (!hparams.vocab_only) {
         const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
         uint64_t kv_stream_minimum_stage_bytes = 0;
+        ggml_backend_dev_t kv_stream_dev = nullptr;
         if (kv_stream_stage_bytes != 0) {
             for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
                 if (hparams.has_kv(il) && !hparams.is_recr(il)) {
                     kv_stream_minimum_stage_bytes = 256ULL*(
                         ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il)) +
                         ggml_row_size(params.type_v, hparams.n_embd_v_gqa(il)));
+                    if (cparams.offload_kqv) {
+                        kv_stream_dev = model.dev_layer(il);
+                    }
                     break;
                 }
             }
         }
+
+        // The backend hosting the KV cache reports whether it implements
+        // streaming at all, and whether it does so for this specific (K, V)
+        // cache type pair - not a fixed allowlist here. A backend with no
+        // streaming support (which is every backend, until one wires in an
+        // execution path) simply reports type_pair_supported = false.
+        const auto kv_stream_caps = llama_kv_stream_backend_caps_query(
+                kv_stream_dev, params.type_k, params.type_v);
 
         const llama_kv_stream_config stream_config = {
             /*.stage_bytes         =*/ kv_stream_stage_bytes,
@@ -471,7 +476,7 @@ llama_context::llama_context(
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
             /*.flash_attention     =*/ cparams.flash_attn,
             /*.kv_offload          =*/ cparams.offload_kqv,
-            /*.type_pair_supported =*/ llama_kv_stream_type_pair_supported(params.type_k, params.type_v),
+            /*.type_pair_supported =*/ kv_stream_caps.type_pair_supported,
         };
         const auto stream_validation = llama_kv_stream_config_validate(stream_config);
         if (!stream_validation.valid) {

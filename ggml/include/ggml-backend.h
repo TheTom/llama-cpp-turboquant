@@ -221,6 +221,16 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+    // Query whether the device implements experimental block-granular KV cache
+    // streaming (host-pinned authoritative cache + a bounded, runtime-adaptive
+    // device pool). A backend with no streaming support simply does not
+    // export this symbol.
+    typedef bool (*ggml_backend_kv_stream_supported_t)(ggml_backend_dev_t device);
+    // Query whether a specific (K, V) KV cache type pair has a streamed
+    // FlashAttention path on this device. Only meaningful when
+    // ggml_backend_kv_stream_supported_t already returned true.
+    typedef bool (*ggml_backend_kv_stream_type_pair_supported_t)(
+        ggml_backend_dev_t device, enum ggml_type type_k, enum ggml_type type_v);
 
     //
     // Backend registry
