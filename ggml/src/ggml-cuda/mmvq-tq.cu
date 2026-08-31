@@ -75,37 +75,24 @@ static constexpr float TQ4_CENTROID_I8_RESCALE = 2.733f / 127.0f;
 // Register-based centroid lookup: maps 4 qs bytes (1 uint32) to 2 packed 4× centroid_i8 for dp4a.
 // Processes a full uint32 at once, sharing nibble extraction across both byte pairs.
 __device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, int &c0, int &c1) {
-    // Centroid i8 values packed into 4 registers (little-endian byte order):
-    // [-127,-96,-75,-58] [-44,-31,-18,-6] [6,18,31,44] [58,75,96,127]
-    constexpr uint32_t CR03 = 0xC6B5A081u;
-    constexpr uint32_t CR47 = 0xFAEEE1D4u;
-    constexpr uint32_t CR8B = 0x2C1F1206u;
-    constexpr uint32_t CRCF = 0x7F604B3Au;
+    // 4 qs bytes -> 8 nibble indices -> 8 int8 centroids, in natural element order
+    // (element 2k = low nibble of byte k, element 2k+1 = high nibble of byte k).
+    //
+    // This uses the hardware byte-permute (v_perm_b32) through get_int_from_table_16, the same
+    // path IQ4_NL/MXFP4 use on ROCm. NOTE: do NOT express this with HIP's __byte_perm() wrapper
+    // -- with a runtime selector its generic fallback lowers through a dynamically indexed byte
+    // union that PromoteAlloca turns into a 32KB LDS staging area plus ds_read_u8 chains, which
+    // caps occupancy and costs ~3x. __builtin_amdgcn_perm maps 1:1 to the instruction.
+    //
+    // The previous shift-based fallback avoided that bug but cost ~100 ALU ops per call (~400
+    // per 32-weight block), which made the TQ decode kernels ALU-bound rather than
+    // bandwidth-bound on CDNA.
+    const int2 v = get_int_from_table_16((int) four_bytes, kvalues_tq4);
 
-    // element j: qs byte j/2, nibble (j&1) — even → low nibble, odd → high nibble
-    const uint32_t lo = four_bytes & 0x0F0F0F0Fu;
-    const uint32_t hi = (four_bytes >> 4) & 0x0F0F0F0Fu;
-
-    // Interleave: bytes 0-1 -> sel0 [n0,n1,n2,n3], bytes 2-3 -> sel1 [n4,n5,n6,n7].
-    // __byte_perm is NOT used for the interleave/LUT: its selector encoding is
-    // compiler-dependent (constant selectors fold differently from runtime ones),
-    // which silently broke the original permute chain on some toolchains.
-    // Plain shifts are deterministic.
-    uint32_t sel0 = (lo & 0xFFu) | ((hi & 0xFFu) << 8) | ((lo & 0xFF00u) << 8) | ((hi & 0xFF00u) << 16);
-    uint32_t sel1 = ((lo >> 16) & 0xFFu) | (((hi >> 16) & 0xFFu) << 8) | (((lo >> 24) & 0xFFu) << 16) | (((hi >> 24) & 0xFFu) << 24);
-
-    // nibble v in 0..15 -> centroid_i8 byte: v<8 selects CR03/CR47, v>=8 selects CR8B/CRCF,
-    // v&4 picks the second register of the pair, byte offset is v&3.
-    auto cent = [&](uint32_t v) -> uint32_t {
-        const uint32_t lo_reg = (v & 4u) ? CR47 : CR03;
-        const uint32_t hi_reg = (v & 4u) ? CRCF : CR8B;
-        return (((v & 8u) ? hi_reg : lo_reg) >> (8u * (v & 3u))) & 0xFFu;
-    };
-
-    c0 = (int)(cent(sel0 & 0xFFu) | (cent((sel0 >> 8) & 0xFFu) << 8)
-             | (cent((sel0 >> 16) & 0xFFu) << 16) | (cent((sel0 >> 24) & 0xFFu) << 24));
-    c1 = (int)(cent(sel1 & 0xFFu) | (cent((sel1 >> 8) & 0xFFu) << 8)
-             | (cent((sel1 >> 16) & 0xFFu) << 16) | (cent((sel1 >> 24) & 0xFFu) << 24));
+    // v.x = centroids for even elements (0,2,4,6), v.y = odd elements (1,3,5,7).
+    // Interleave back to natural order: c0 = [e0,e1,e2,e3], c1 = [e4,e5,e6,e7].
+    c0 = (int) __builtin_amdgcn_perm(v.y, v.x, 0x05010400);
+    c1 = (int) __builtin_amdgcn_perm(v.y, v.x, 0x07030602);
 }
 
 // ============================================================================
