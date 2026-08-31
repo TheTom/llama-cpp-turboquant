@@ -3666,6 +3666,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         } while (0);
     }
 
+    // Fuse a same-shape residual ADD into the matvec epilogue:  MUL_MAT -> ADD  ==>  one kernel.
+    // Every transformer layer has two of these (attention-out and FFN-out residuals), so this is
+    // ~80 kernels per token on a 40-layer model. The mmvq fused path already indexes x_bias
+    // exactly like dst (per row and per column), so a full same-shape tensor works, not just a
+    // broadcast bias -- it simply was never wired up for a bare MUL_MAT->ADD.
+    //
+    // Placed after all gate/up/GLU patterns so it can never preempt them (their bias variant
+    // also begins MUL_MAT, ADD); those return earlier on a match.
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ADD) {
+        static bool disable_res = getenv("GGML_CUDA_FUSE_RESIDUAL") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_RESIDUAL")) == 0;
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        ggml_tensor * res = add->src[0] == node ? add->src[1] : (add->src[1] == node ? add->src[0] : nullptr);
+
+        const ggml_op ops_res[2] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+        const int     out_res[1] = { i + 1 };
+
+        if (!disable_res && res != nullptr && res->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(node, add) && ggml_are_same_shape(res, add) &&
+            ggml_is_contiguous(res) && ggml_is_contiguous(add) &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(node) &&
+            ggml_can_fuse_subgraph(cgraph, i, 2, ops_res, out_res, 1) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_res, 1)) {
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_bias = res;
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, add, &fusion_data);
+            return 1;
+        }
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
