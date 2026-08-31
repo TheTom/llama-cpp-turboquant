@@ -857,6 +857,187 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
     }
 }
 
+// Plain kernel-node zero fill: cudaMemsetAsync would insert a MEMSET node into CUDA graph
+// capture, which the graph-update path cannot patch (kernel nodes only) — that forces a full
+// re-capture every step and erases the fusion win. A kernel node updates fine.
+static __global__ void tq_zero_f32(float * __restrict__ dst, const int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = 0.0f;
+    }
+}
+
+// Stage packed copies of the expert weights + ids into pool scratch. Runs BEFORE the output is
+// zeroed: the graph allocator routinely aliases the fused output onto these dying tensors, so
+// the fused kernel must never read the originals after the zero.
+static __global__ void tq_pack_w_ids(
+        const float   * __restrict__ w_src,
+        const int32_t * __restrict__ ids_src,
+        float         * __restrict__ w_dst,
+        int32_t       * __restrict__ ids_dst,
+        const int n_used, const int n_tokens,
+        const int64_t w_stride_slot, const int64_t w_stride_tok, const int64_t ids_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_used * n_tokens) return;
+    const int s   = i % n_used;
+    const int tok = i / n_used;
+    w_dst[i]   = w_src[tok * w_stride_tok + s * w_stride_slot];
+    ids_dst[i] = ids_src[tok * ids_stride + s];
+}
+
+// ============================================================================
+// Fused MoE down-proj + expert-weighted sum (decode).
+// Replaces MUL_MAT_ID -> MUL(weights) -> (n_used-1) x ADD with one kernel.
+// Expert slots stay parallel on grid.y (a slot-serial loop loses more to the
+// 8x-smaller grid than the fusion saves); each slot atomically accumulates its
+// weighted dot into dst, which the host zeroes beforehand. 8 float atomics per
+// output element is negligible contention.
+// ============================================================================
+static __global__ void mul_mat_tq4_1s_dp4a_moe_wsum(
+        const void       * __restrict__ vx,
+        const block_q8_1 * __restrict__ vy_q8,      // pre-rotated activations (q8_1)
+        const float      * __restrict__ weights,    // normalized expert weights
+        float            * __restrict__ dst,        // [nrows, 1, ntok] summed output
+        const int32_t    * __restrict__ ids,
+        const int     ncols_x,
+        const int     nrows_x,
+        const int64_t nb_expert,
+        const int     ids_stride,
+        const int     nchannels_y,
+        const int64_t stride_channel_y,             // q8_1 blocks to next y-channel
+        const int64_t stride_sample_y,              // q8_1 blocks to next sample
+        const int64_t w_stride_slot,                // f32 elems between weight slots
+        const int64_t w_stride_tok,                 // f32 elems between weight tokens
+        const int64_t stride_sample_dst) {
+
+    const int row = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
+    if (row >= nrows_x) return;
+
+    const int s      = blockIdx.y;
+    const int sample = blockIdx.z;
+    const int lane   = threadIdx.x;
+    const int blocks_per_row = ncols_x / QK_TQ4_1S;
+
+    const int expert    = ids[sample * ids_stride + s];
+    const int channel_y = s % nchannels_y;
+    const block_tq4_1s * x_row =
+        (const block_tq4_1s *) ((const char *) vx + (int64_t) expert * nb_expert)
+        + (int64_t) row * blocks_per_row;
+    const block_q8_1 * a_base = vy_q8 + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
+
+    float sumf = 0.0f;
+    for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
+        const block_tq4_1s * blk = &x_row[ib];
+        const float fd0 = __half2float(blk->d0);
+        const float fd1 = __half2float(blk->d1);
+
+        const uint32_t * qs32 = (const uint32_t *)(blk->qs);
+        const uint32_t w0 = qs32[0], w1 = qs32[1], w2 = qs32[2], w3 = qs32[3];
+
+        int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
+        tq4_cents8_reg(w0, c0_0, c1_0);
+        tq4_cents8_reg(w1, c0_1, c1_1);
+        tq4_cents8_reg(w2, c0_2, c1_2);
+        tq4_cents8_reg(w3, c0_3, c1_3);
+
+        const block_q8_1 * a_blk = &a_base[ib];
+        const float d_act = __half2float((__half)a_blk->ds.x);
+        const int * a_qs = (const int *)(a_blk->qs);
+
+        const int s0 = ggml_cuda_dp4a(c0_0, a_qs[0], ggml_cuda_dp4a(c1_0, a_qs[1],
+                       ggml_cuda_dp4a(c0_1, a_qs[2], ggml_cuda_dp4a(c1_1, a_qs[3], 0))));
+        const int s1 = ggml_cuda_dp4a(c0_2, a_qs[4], ggml_cuda_dp4a(c1_2, a_qs[5],
+                       ggml_cuda_dp4a(c0_3, a_qs[6], ggml_cuda_dp4a(c1_3, a_qs[7], 0))));
+
+        sumf += d_act * (fd0 * (float)s0 + fd1 * (float)s1);
+    }
+
+    const float w = weights[sample * w_stride_tok + (int64_t) s * w_stride_slot];
+    float total = w * sumf * TQ4_CENTROID_I8_RESCALE;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        total += __shfl_xor_sync(0xffffffff, total, offset);
+    }
+
+    if (lane == 0) {
+        atomicAdd(&dst[sample * stride_sample_dst + row], total);
+    }
+}
+
+void ggml_cuda_mul_mat_id_tq_wsum(ggml_backend_cuda_context & ctx,
+                                  const ggml_tensor * src0,
+                                  const ggml_tensor * src1,
+                                  const ggml_tensor * ids,
+                                  const ggml_tensor * weights,
+                                  ggml_tensor * dst_final) {
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst_final->type == GGML_TYPE_F32);
+
+    const int ncols_x = src0->ne[0];   // hidden size
+    const int nrows_x = src0->ne[1];   // output features per expert
+    GGML_ASSERT(ncols_x % 32 == 0);
+
+    const int n_used      = weights->ne[1];
+    const int n_tokens    = src1->ne[2];
+    const int nchannels_y = src1->ne[1];
+
+    cudaStream_t stream = ctx.stream();
+    const int id = ggml_cuda_get_device();
+
+    const float   * src1_d = (const float *)   src1->data;
+    const int32_t * ids_d  = (const int32_t *) ids->data;
+
+    const int64_t nb_expert  = src0->nb[2];
+    const int     ids_stride = ids->nb[1] / ggml_type_size(ids->type);
+
+    // Pre-rotate activations to q8_1, contiguous [ncols_x, nchannels_y, n_tokens].
+    const int n_act_elements = ncols_x * nchannels_y * n_tokens;
+    const int n_blocks_total = n_act_elements / 32;
+    ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id), n_blocks_total);
+    {
+        const int wpb = 4;
+        const dim3 pblock(32, wpb);
+        const dim3 pgrid((n_blocks_total + wpb - 1) / wpb);
+        tq_prerotate_q8_1<<<pgrid, pblock, 0, stream>>>(src1_d, q8_buf.get(), n_act_elements);
+    }
+
+    // The graph allocator routinely hands dst_final the memory of weights/ids (both die inside
+    // the fused range), and the kernel reads them after dst is zeroed. Stage packed copies in
+    // pool scratch BEFORE the zero so the kernel never touches the originals.
+    const int n_wi = n_used * n_tokens;
+    ggml_cuda_pool_alloc<float>   w_scr(ctx.pool(id), n_wi);
+    ggml_cuda_pool_alloc<int32_t> ids_scr(ctx.pool(id), n_wi);
+    {
+        const int64_t w_ss = weights->nb[1] / sizeof(float);
+        const int64_t w_st = weights->nb[2] / sizeof(float);
+        tq_pack_w_ids<<<(n_wi + 63) / 64, 64, 0, stream>>>(
+            (const float *) weights->data, ids_d, w_scr.get(), ids_scr.get(),
+            n_used, n_tokens, w_ss, w_st, ids_stride);
+    }
+
+    // dst accumulates via atomics: zero it after the staging copy (tiny: nrows * ntok floats).
+    // Kernel node, not cudaMemsetAsync — see tq_zero_f32.
+    {
+        const int n_out = nrows_x * n_tokens;
+        tq_zero_f32<<<(n_out + 255) / 256, 256, 0, stream>>>((float *) dst_final->data, n_out);
+    }
+
+    const int64_t stride_channel_y = ncols_x / 32;
+    const int64_t stride_sample_y  = (int64_t) nchannels_y * (ncols_x / 32);
+    const int64_t stride_sample_dst = dst_final->nb[2] / sizeof(float);
+
+    const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
+    const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS, n_used, n_tokens);
+    mul_mat_tq4_1s_dp4a_moe_wsum<<<grid, block, 0, stream>>>(
+        src0->data, q8_buf.get(), w_scr.get(), (float *) dst_final->data, ids_scr.get(),
+        ncols_x, nrows_x, nb_expert, /*ids_stride=*/n_used, nchannels_y,
+        stride_channel_y, stride_sample_y, /*w_stride_slot=*/1, /*w_stride_tok=*/n_used, stride_sample_dst);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Small-batch (decode / light speculative) TQ MoE: single fused, graph-capturable launch.
 // Requires contiguous src1 (checked by the caller) so the flat WHT pre-rotation is valid.
 void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,

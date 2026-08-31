@@ -3589,6 +3589,53 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Fused TQ4_1S MoE down-proj + expert-weighted sum (decode):
+    // MUL_MAT_ID(TQ4_1S) -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS  ==>  one kernel.
+    // The CONT alone is a full transpose copy of the per-slot output (64KB per layer at
+    // decode); fusing removes ~330KB of read/write traffic per MoE layer.
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->type == GGML_TYPE_TQ4_1S) {
+        static bool disable_wsum = getenv("GGML_TQ_MOE_FUSE") != nullptr && std::atoi(getenv("GGML_TQ_MOE_FUSE")) == 0;
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const bool dp4a_ok = !GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        const int64_t n_used = node->ne[1];
+        const int64_t nrows  = node->ne[0];
+        const int64_t ntok   = node->ne[2];
+        do {
+            if (disable_wsum || !dp4a_ok || n_used < 2 || i + 5 > cgraph->n_nodes) break;
+            if (ntok > MMVQ_MAX_BATCH_SIZE) break;
+            if (node->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(node->src[1])) break;
+            if (node->src[2]->type != GGML_TYPE_I32) break;
+
+            const ggml_op ops[5] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS };
+            int out_node = i + 4;
+            if (!ggml_can_fuse_subgraph(cgraph, i, 5, ops, &out_node, 1)) break;
+
+            ggml_tensor * mul  = cgraph->nodes[i + 1];
+            ggml_tensor * perm = cgraph->nodes[i + 2];
+            ggml_tensor * cont = cgraph->nodes[i + 3];
+            ggml_tensor * out  = cgraph->nodes[i + 4];
+
+            if (mul->src[0] != node) break;
+            ggml_tensor * w = mul->src[1];
+            if (w->type != GGML_TYPE_F32 || w->ne[0] != 1 || w->ne[1] != n_used || w->ne[2] != ntok) break;
+
+            // permute swaps rows/slots: [nrows, n_used, ntok] -> [n_used, nrows, ntok]
+            if (perm->src[0] != mul || perm->ne[0] != n_used || perm->ne[1] != nrows || perm->ne[2] != ntok) break;
+            if (cont->src[0] != perm || !ggml_is_contiguous(cont)) break;
+            // sum over the slot axis: [n_used, nrows, ntok] -> [1, nrows, ntok]
+            if (out->src[0] != cont || out->ne[0] != 1 || out->ne[1] != nrows || out->ne[2] != ntok) break;
+            if (!ggml_is_contiguous(out)) break;
+
+            // Aliasing safety needs no veto: the entry stages packed copies of weights/ids into
+            // pool scratch before the output is zeroed (the allocator routinely hands the fused
+            // output the memory of those dying tensors), and src1 is consumed by the
+            // pre-rotation before the zero. The mul/permute/cont intermediates are never
+            // materialized.
+            ggml_cuda_mul_mat_id_tq_wsum(*cuda_ctx, node->src[0], node->src[1], node->src[2], w, out);
+            return 4;
+        } while (0);
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
