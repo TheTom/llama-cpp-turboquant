@@ -776,6 +776,7 @@ static __global__ void mul_mat_tq4_1s_scalar_moe(
 // NVIDIA TQ4_1S dp4a MoE variant: same device-side ids routing as the scalar kernels above, but
 // the int8 dp4a inner loop of mul_mat_tq4_1s_dp4a_multi (warp-strided over blocks, q8_1 activations,
 // packed-centroid LUT). One dot product per (row, expert_slot, sample) output element.
+template <int LPR>   // lanes cooperating on one output row (must divide WARP_SIZE)
 static __global__ void mul_mat_tq4_1s_dp4a_moe(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,      // pre-rotated activations (q8_1)
@@ -791,7 +792,15 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
         const int64_t stride_channel_dst,
         const int64_t stride_sample_dst) {
 
-    const int row = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
+    // One row per LPR lanes: each lane covers blocks_per_row/LPR blocks and the cross-lane
+    // reduction is log2(LPR) rounds instead of 5. With LPR == WARP_SIZE this is the classic
+    // one-row-per-warp mapping.
+    constexpr int rows_per_warp = WARP_SIZE / LPR;
+
+    const int lane_in_row = threadIdx.x % LPR;
+    const int row_in_warp = threadIdx.x / LPR;
+
+    const int row = (blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y) * rows_per_warp + row_in_warp;
     if (row >= nrows_x) return;
 
     const int expert_slot = blockIdx.y;
@@ -799,7 +808,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
     const int expert      = ids[sample * ids_stride + expert_slot];
     const int channel_y   = expert_slot % nchannels_y;
 
-    const int lane = threadIdx.x;
+    const int lane = lane_in_row;
     const int blocks_per_row = ncols_x / QK_TQ4_1S;
     const block_tq4_1s * x_row =
         (const block_tq4_1s *) ((const char *) vx + (int64_t) expert * nb_expert)
@@ -807,7 +816,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
     const block_q8_1 * a_base = vy_q8 + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
     float sumf = 0.0f;
-    for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
+    for (int ib = lane; ib < blocks_per_row; ib += LPR) {
         const block_tq4_1s * blk = &x_row[ib];
         const float fd0 = __half2float(blk->d0);
         const float fd1 = __half2float(blk->d1);
@@ -835,8 +844,8 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
 
     sumf *= TQ4_CENTROID_I8_RESCALE;
     #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sumf += __shfl_xor_sync(0xffffffff, sumf, offset);
+    for (int offset = LPR / 2; offset > 0; offset >>= 1) {
+        sumf += __shfl_xor_sync(0xffffffff, sumf, offset, LPR);
     }
 
     if (lane == 0) {
@@ -1125,10 +1134,44 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         const block_q8_1 * q8_act = tq_prerotate_q8_1_cached(ctx, src1, src1_d, n_act_elements, q8_buf);
         const int64_t stride_channel_y = ncols_x / 32;                           // q8_1 blocks to next y-channel
         const int64_t stride_sample_y  = (int64_t) nchannels_y * (ncols_x / 32); // q8_1 blocks to next token
-        mul_mat_tq4_1s_dp4a_moe<<<grid, block, 0, stream>>>(
-            src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x,
-            nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
-            stride_channel_dst, stride_sample_dst);
+
+        // Pick lanes-per-row so every lane gets a useful number of blocks (>= 4) while keeping
+        // the reduction short. GGML_TQ_LPR overrides for experiments.
+        const int blocks_per_row_h = ncols_x / 32;
+        static const int lpr_env = getenv("GGML_TQ_LPR") ? atoi(getenv("GGML_TQ_LPR")) : 0;
+        int lpr = lpr_env;
+        if (lpr == 0) {
+            // 16 measured best on CDNA: 4 reduction rounds instead of 5, while the warp still
+            // reads only two contiguous weight regions (smaller LPR scatters reads across more
+            // rows and loses more to coalescing than it saves on the reduction).
+            // 16 measured best on CDNA: 4 reduction rounds instead of 5, while the warp still
+            // reads only two contiguous weight regions. Never assign more lanes than there are
+            // blocks, so no lane sits idle on narrow projections.
+            lpr = 16;
+            while (lpr > 1 && blocks_per_row_h < lpr) {
+                lpr /= 2;
+            }
+        }
+
+        const int rows_per_warp_h = WARP_SIZE / lpr;
+        const int rows_per_wg     = MMVQ_TQ_NWARPS * rows_per_warp_h;
+        const dim3 grid_l((unsigned) ((nrows_x + rows_per_wg - 1) / rows_per_wg),
+                          (unsigned) n_expert_used, (unsigned) n_tokens);
+
+        #define TQ_LAUNCH_MOE(L) mul_mat_tq4_1s_dp4a_moe<L><<<grid_l, block, 0, stream>>>( \
+            src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x, \
+            nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y, \
+            stride_channel_dst, stride_sample_dst)
+
+        switch (lpr) {
+            case 32: TQ_LAUNCH_MOE(32); break;
+            case 16: TQ_LAUNCH_MOE(16); break;
+            case  8: TQ_LAUNCH_MOE( 8); break;
+            case  4: TQ_LAUNCH_MOE( 4); break;
+            case  2: TQ_LAUNCH_MOE( 2); break;
+            default: TQ_LAUNCH_MOE(32); break;
+        }
+        #undef TQ_LAUNCH_MOE
     } else {
         // Pre-rotate activations to float (WHT), contiguous [ncols_x, nchannels_y, n_tokens].
         ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_act_elements);
