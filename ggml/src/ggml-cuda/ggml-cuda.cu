@@ -67,6 +67,7 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
+#include "ggml-cuda/chain.cuh"
 #include "ggml-cuda/moe-reduce.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
@@ -3693,6 +3694,131 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_bias = res;
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, add, &fusion_data);
             return 1;
+        }
+    }
+
+    // Elementwise chain ("midi-kernel"): collapse a run of consecutive same-shape elementwise
+    // ops into a single kernel that keeps the value in a register across the whole run. Saves a
+    // dispatch AND a full HBM round trip per elided op. Typical runs on hybrid MoE graphs are
+    // SIGMOID->MUL->ADD->ADD, ADD->SOFTPLUS->MUL, CLAMP->DIV, SILU->MUL.
+    if (i + 1 < cgraph->n_nodes) {
+        static bool disable_chain = getenv("GGML_CUDA_FUSE_CHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_CHAIN")) == 0;
+
+        auto chain_code = [](const ggml_tensor * t, int & code, float & p0, float & p1) -> bool {
+            switch (t->op) {
+                case GGML_OP_ADD:   code = TQ_CHAIN_ADD;   return true;
+                case GGML_OP_MUL:   code = TQ_CHAIN_MUL;   return true;
+                case GGML_OP_DIV:   code = TQ_CHAIN_DIV;   return true;
+                case GGML_OP_SCALE: code = TQ_CHAIN_SCALE;
+                    p0 = ((const float *) t->op_params)[0];
+                    p1 = ((const float *) t->op_params)[1];
+                    return true;
+                case GGML_OP_CLAMP: code = TQ_CHAIN_CLAMP;
+                    p0 = ((const float *) t->op_params)[0];
+                    p1 = ((const float *) t->op_params)[1];
+                    return true;
+                case GGML_OP_UNARY:
+                    switch (ggml_get_unary_op(t)) {
+                        case GGML_UNARY_OP_SILU:     code = TQ_CHAIN_SILU;     return true;
+                        case GGML_UNARY_OP_SIGMOID:  code = TQ_CHAIN_SIGMOID;  return true;
+                        case GGML_UNARY_OP_SOFTPLUS: code = TQ_CHAIN_SOFTPLUS; return true;
+                        case GGML_UNARY_OP_GELU:     code = TQ_CHAIN_GELU;     return true;
+                        case GGML_UNARY_OP_RELU:     code = TQ_CHAIN_RELU;     return true;
+                        case GGML_UNARY_OP_NEG:      code = TQ_CHAIN_NEG;      return true;
+                        default: return false;
+                    }
+                default: return false;
+            }
+        };
+
+        auto chain_ok_tensor = [](const ggml_tensor * t) -> bool {
+            return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+        };
+
+        tq_chain_desc desc = {};
+        const ggml_tensor * head_src = nullptr;
+        int len = 0;
+
+        if (!disable_chain) {
+            const ggml_tensor * prev = nullptr;
+            for (int j = i; j < cgraph->n_nodes && len < TQ_CHAIN_MAX_OPS; ++j) {
+                ggml_tensor * nd = cgraph->nodes[j];
+                int code = 0; float p0 = 0.0f, p1 = 0.0f;
+
+                if (!chain_ok_tensor(nd) || !chain_code(nd, code, p0, p1)) break;
+                if (len > 0 && !ggml_are_same_shape(nd, cgraph->nodes[i])) break;
+
+                const bool binary = (nd->op == GGML_OP_ADD || nd->op == GGML_OP_MUL || nd->op == GGML_OP_DIV);
+                const ggml_tensor * a = nd->src[0];
+                const ggml_tensor * b = binary ? nd->src[1] : nullptr;
+
+                if (!chain_ok_tensor(a)) break;
+                if (binary && !chain_ok_tensor(b)) break;
+                // operand may be same-shape, or a single value broadcast over the run
+                const bool a_b = chain_ok_tensor(a) && (ggml_are_same_shape(a, nd) || ggml_nelements(a) == 1);
+                const bool b_b = !binary || (chain_ok_tensor(b) && (ggml_are_same_shape(b, nd) || ggml_nelements(b) == 1));
+                if (!a_b || !b_b) break;
+
+                const ggml_tensor * other = nullptr;
+                int chain_lhs = 1;
+
+                if (len == 0) {
+                    // the value we carry must be a full-size tensor, not the broadcast scalar
+                    if (ggml_nelements(a) != ggml_nelements(nd)) break;
+                    head_src = a;
+                    other    = b;
+                } else {
+                    // must consume the previous node's output
+                    if (a == prev)              { other = b; chain_lhs = 1; }
+                    else if (binary && b == prev) { other = a; chain_lhs = 0; }
+                    else break;
+                }
+
+                desc.bcast[len]         = other ? (ggml_nelements(other) == 1 ? 1 : 0) : 0;
+                desc.code[len]          = code;
+                desc.other[len]         = other ? (const float *) other->data : nullptr;
+                desc.chain_is_lhs[len]  = chain_lhs;
+                desc.p0[len]            = p0;
+                desc.p1[len]            = p1;
+                len++;
+                prev = nd;
+            }
+        }
+
+        if (len >= 2) {
+            ggml_tensor * out = cgraph->nodes[i + len - 1];
+            std::vector<ggml_op> ops_ch;
+            for (int k = 0; k < len; ++k) {
+                ops_ch.push_back(cgraph->nodes[i + k]->op);
+            }
+            const int out_ch[1] = { i + len - 1 };
+
+            // Aliasing: every same-shape operand is read at index i and dst is written at
+            // index i after those reads, so an in-place output (galloc does this constantly for
+            // residual adds) is safe and must NOT be vetoed. Only a broadcast operand, read at
+            // index 0 by every thread, can be clobbered by this kernel's own writes.
+            bool bcast_alias = false;
+            for (int k = 0; k < len && !bcast_alias; ++k) {
+                if (!desc.bcast[k] || !desc.other[k]) {
+                    continue;
+                }
+                const char * ob = (const char *) desc.other[k];
+                const char * db = (const char *) out->data;
+                const size_t dn = ggml_nbytes(out);
+                if (ob >= db && ob < db + dn) {
+                    bcast_alias = true;
+                }
+            }
+
+            if (!bcast_alias &&
+                ggml_are_same_shape(out, cgraph->nodes[i]) &&
+                ggml_can_fuse_subgraph(cgraph, i, len, ops_ch.data(), out_ch, 1)) {
+
+                desc.n_ops = len;
+                ggml_cuda_op_elem_chain(*cuda_ctx, (const float *) head_src->data,
+                                        (float *) out->data, ggml_nelements(out), desc);
+                return len - 1;
+            }
         }
     }
 
