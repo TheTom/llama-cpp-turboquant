@@ -743,6 +743,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         pool(q8_cache.dev).free(q8_cache.ptr, q8_cache.cap);
         q8_cache.ptr = nullptr;
     }
+    if (tq_rot_cache.ptr != nullptr) {
+        pool(tq_rot_cache.dev).free(tq_rot_cache.ptr, tq_rot_cache.cap);
+        tq_rot_cache.ptr = nullptr;
+    }
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));

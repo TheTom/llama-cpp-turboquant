@@ -1461,6 +1461,20 @@ struct ggml_backend_cuda_context {
         int64_t             ne10_padded = 0;     // layout keys
         ggml_type           type = GGML_TYPE_COUNT;
     } q8_cache;
+
+    // Same idea for the TQ activation pre-rotation (forward block WHT + q8_1 quantize): the MoE
+    // gate and up projections consume the same normed activation, so the rotation ran twice per
+    // layer. Keyed identically; main-stream only.
+    struct {
+        char *              ptr  = nullptr;
+        size_t              cap  = 0;
+        int                 dev  = -1;
+        const ggml_tensor * src1 = nullptr;
+        const void *        data = nullptr;
+        uint64_t            epoch = 0;
+        size_t              size = 0;
+    } tq_rot_cache;
+
     uint64_t graph_epoch = 1;
 
 #ifdef USE_CUDA_GRAPH

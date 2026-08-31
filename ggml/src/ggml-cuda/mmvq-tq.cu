@@ -964,6 +964,58 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe_wsum(
     }
 }
 
+// Shared activation pre-rotation (forward block WHT -> q8_1). The MoE gate and up projections
+// consume the same normed activation, so without caching the rotation ran once per projection.
+// Keyed by tensor identity, data pointer, size and graph-eval epoch; main stream only (a sibling
+// stream could otherwise consume the buffer with no cross-stream ordering). Returns a device
+// pointer valid for the rest of this graph eval.
+static const block_q8_1 * tq_prerotate_q8_1_cached(ggml_backend_cuda_context & ctx,
+                                                   const ggml_tensor * src1,
+                                                   const float * src1_d,
+                                                   int n_act_elements,
+                                                   ggml_cuda_pool_alloc<block_q8_1> & fallback) {
+    const int    id       = ggml_cuda_get_device();
+    cudaStream_t stream   = ctx.stream();
+    const int    n_blocks = n_act_elements / 32;
+    const size_t bytes    = (size_t) n_blocks * sizeof(block_q8_1);
+
+    static const bool disabled = getenv("GGML_TQ_ROTCACHE") != nullptr && atoi(getenv("GGML_TQ_ROTCACHE")) == 0;
+
+    auto & rc = ctx.tq_rot_cache;
+    const bool cacheable = !disabled && ctx.curr_stream_no == 0 && bytes <= (1u << 20);
+
+    if (cacheable && rc.epoch == ctx.graph_epoch && rc.src1 == src1 && rc.data == src1->data &&
+        rc.size == bytes && rc.dev == ctx.device) {
+        return (const block_q8_1 *) rc.ptr;
+    }
+
+    block_q8_1 * dst = nullptr;
+    if (cacheable) {
+        if (rc.dev != ctx.device || rc.cap < bytes) {
+            if (rc.ptr != nullptr && rc.dev == ctx.device) {
+                ctx.pool(rc.dev).free(rc.ptr, rc.cap);
+            }
+            size_t actual = 0;
+            rc.ptr = (char *) ctx.pool(id).alloc(bytes, &actual);
+            rc.cap = actual;
+            rc.dev = ctx.device;
+        }
+        dst      = (block_q8_1 *) rc.ptr;
+        rc.src1  = src1;
+        rc.data  = src1->data;
+        rc.epoch = ctx.graph_epoch;
+        rc.size  = bytes;
+    } else {
+        dst = fallback.alloc(n_blocks);
+    }
+
+    const int  wpb = 4;
+    const dim3 pblock(32, wpb);
+    const dim3 pgrid((n_blocks + wpb - 1) / wpb);
+    tq_prerotate_q8_1<<<pgrid, pblock, 0, stream>>>(src1_d, dst, n_act_elements);
+    return dst;
+}
+
 void ggml_cuda_mul_mat_id_tq_wsum(ggml_backend_cuda_context & ctx,
                                   const ggml_tensor * src0,
                                   const ggml_tensor * src1,
@@ -996,13 +1048,8 @@ void ggml_cuda_mul_mat_id_tq_wsum(ggml_backend_cuda_context & ctx,
     // Pre-rotate activations to q8_1, contiguous [ncols_x, nchannels_y, n_tokens].
     const int n_act_elements = ncols_x * nchannels_y * n_tokens;
     const int n_blocks_total = n_act_elements / 32;
-    ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id), n_blocks_total);
-    {
-        const int wpb = 4;
-        const dim3 pblock(32, wpb);
-        const dim3 pgrid((n_blocks_total + wpb - 1) / wpb);
-        tq_prerotate_q8_1<<<pgrid, pblock, 0, stream>>>(src1_d, q8_buf.get(), n_act_elements);
-    }
+    ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id));
+    const block_q8_1 * q8_act = tq_prerotate_q8_1_cached(ctx, src1, src1_d, n_act_elements, q8_buf);
 
     // The graph allocator routinely hands dst_final the memory of weights/ids (both die inside
     // the fused range), and the kernel reads them after dst is zeroed. Stage packed copies in
@@ -1087,17 +1134,12 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
     if (use_dp4a) {
         // Pre-rotate activations to q8_1, contiguous [ncols_x, nchannels_y, n_tokens].
         const int n_blocks_total = n_act_elements / 32;
-        ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id), n_blocks_total);
-        {
-            const int wpb = 4;
-            const dim3 pblock(32, wpb);
-            const dim3 pgrid((n_blocks_total + wpb - 1) / wpb);
-            tq_prerotate_q8_1<<<pgrid, pblock, 0, stream>>>(src1_d, q8_buf.get(), n_act_elements);
-        }
+        ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id));
+        const block_q8_1 * q8_act = tq_prerotate_q8_1_cached(ctx, src1, src1_d, n_act_elements, q8_buf);
         const int64_t stride_channel_y = ncols_x / 32;                           // q8_1 blocks to next y-channel
         const int64_t stride_sample_y  = (int64_t) nchannels_y * (ncols_x / 32); // q8_1 blocks to next token
         mul_mat_tq4_1s_dp4a_moe<<<grid, block, 0, stream>>>(
-            src0->data, q8_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+            src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x,
             nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
             stride_channel_dst, stride_sample_dst);
     } else {
