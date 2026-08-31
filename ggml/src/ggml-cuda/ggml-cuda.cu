@@ -67,6 +67,7 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
+#include "ggml-cuda/moe-reduce.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -3596,22 +3597,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Fused TQ4_1S MoE down-proj + expert-weighted sum (decode):
-    // MUL_MAT_ID(TQ4_1S) -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS  ==>  one kernel.
-    // The CONT alone is a full transpose copy of the per-slot output (64KB per layer at
-    // decode); fusing removes ~330KB of read/write traffic per MoE layer.
-    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->type == GGML_TYPE_TQ4_1S) {
+    // Fused MoE expert-reduce (any weight type):
+    // MUL_MAT_ID -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS  ==>  weighted sum over slots.
+    // The CONT alone is a full transpose copy of the per-slot output; fusing the tail removes
+    // ~330KB of read/write traffic per MoE layer at decode, for every MoE model. TQ4_1S on
+    // dp4a-capable devices additionally folds the matmul itself into the reduce.
+    if (node->op == GGML_OP_MUL_MAT_ID) {
         static bool disable_wsum = getenv("GGML_TQ_MOE_FUSE") != nullptr && std::atoi(getenv("GGML_TQ_MOE_FUSE")) == 0;
-        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-        const bool dp4a_ok = !GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc);
         const int64_t n_used = node->ne[1];
         const int64_t nrows  = node->ne[0];
         const int64_t ntok   = node->ne[2];
         do {
-            if (disable_wsum || !dp4a_ok || n_used < 2 || i + 5 > cgraph->n_nodes) break;
-            if (ntok > MMVQ_MAX_BATCH_SIZE) break;
-            if (node->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(node->src[1])) break;
-            if (node->src[2]->type != GGML_TYPE_I32) break;
+            if (disable_wsum || n_used < 2 || i + 5 > cgraph->n_nodes) break;
+            if (node->type != GGML_TYPE_F32) break;
+            if ((size_t) nrows * ntok * sizeof(float) > (64u << 20)) break;   // scratch cap
 
             const ggml_op ops[5] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS };
             int out_node = i + 4;
@@ -3633,12 +3632,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (out->src[0] != cont || out->ne[0] != 1 || out->ne[1] != nrows || out->ne[2] != ntok) break;
             if (!ggml_is_contiguous(out)) break;
 
-            // Aliasing safety needs no veto: the entry stages packed copies of weights/ids into
-            // pool scratch before the output is zeroed (the allocator routinely hands the fused
-            // output the memory of those dying tensors), and src1 is consumed by the
-            // pre-rotation before the zero. The mul/permute/cont intermediates are never
-            // materialized.
-            ggml_cuda_mul_mat_id_tq_wsum(*cuda_ctx, node->src[0], node->src[1], node->src[2], w, out);
+            const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+            // The generic tail measured FASTER than the deep TQ fuse on MI210 (100.0 vs 99.0
+            // tg128): the atomic accumulation + zero + staging costs more than the mmid-dst
+            // write it saves. Default to generic everywhere; GGML_TQ_MOE_FULLFUSE=1 re-enables
+            // the folded-matmul variant for experiments.
+            static bool want_full_fuse = getenv("GGML_TQ_MOE_FULLFUSE") != nullptr && std::atoi(getenv("GGML_TQ_MOE_FULLFUSE")) == 1;
+            const bool tq_full_fuse = want_full_fuse &&
+                                      node->src[0]->type == GGML_TYPE_TQ4_1S &&
+                                      (!GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc)) &&
+                                      ntok <= MMVQ_MAX_BATCH_SIZE &&
+                                      node->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[1]) &&
+                                      node->src[2]->type == GGML_TYPE_I32;
+
+            if (tq_full_fuse) {
+                // Fold the matmul into the reduce as well. Aliasing safety needs no veto: the
+                // entry stages packed copies of weights/ids into pool scratch before the output
+                // is zeroed (the allocator routinely hands the fused output the memory of those
+                // dying tensors), and src1 is consumed by the pre-rotation before the zero.
+                ggml_cuda_mul_mat_id_tq_wsum(*cuda_ctx, node->src[0], node->src[1], node->src[2], w, out);
+            } else {
+                // Generic tail: run the matmul normally, then one weighted-sum pass into pool
+                // scratch and a copy into the graph output (scratch write order resolves every
+                // allocator-aliasing hazard without vetoes).
+                ggml_cuda_mul_mat_id(*cuda_ctx, node);
+                ggml_cuda_op_moe_reduce(*cuda_ctx, node, w, out);
+            }
             return 4;
         } while (0);
     }
