@@ -899,7 +899,9 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
 
     // NVIDIA TQ4_1S: int8 dp4a path (matches the non-MoE dispatch in ggml_cuda_mul_mat_tq).
     // TQ3_1S (all vendors) + TQ4_1S on AMD: scalar float path (dp4a regresses on RDNA4; no dp4a TQ3).
-    const bool use_dp4a = !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_TQ4_1S;
+    // CDNA (gfx90a) has proper v_dot4_i32_i8 throughput, unlike RDNA4 where dp4a regresses --
+    // so enable the int8 dp4a decode path on CDNA too, not just NVIDIA.
+    const bool use_dp4a = (!GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc)) && src0->type == GGML_TYPE_TQ4_1S;
 
     if (use_dp4a) {
         // Pre-rotate activations to q8_1, contiguous [ncols_x, nchannels_y, n_tokens].
@@ -965,7 +967,9 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int n_total_elements = ncols_x * ncols_dst;
-    const bool use_dp4a = !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_TQ4_1S;
+    // CDNA (gfx90a) has proper v_dot4_i32_i8 throughput, unlike RDNA4 where dp4a regresses --
+    // so enable the int8 dp4a decode path on CDNA too, not just NVIDIA.
+    const bool use_dp4a = (!GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc)) && src0->type == GGML_TYPE_TQ4_1S;
 
     if (use_dp4a) {
         // NVIDIA TQ4_1S: dp4a int8 path (optimized for Turing+ dp4a throughput)
