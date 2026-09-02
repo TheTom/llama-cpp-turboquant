@@ -210,6 +210,30 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
+        const uint32_t ple_ngram_size      = 3;
+        const uint32_t ple_heads_per_ngram = 2;
+        const uint32_t ple_n_heads         = (ple_ngram_size - 1)*ple_heads_per_ngram;
+        GGML_ASSERT(n_embd % ple_n_heads == 0);
+        const uint32_t ple_head_dim = n_embd/ple_n_heads;
+
+        std::vector<uint64_t> ple_head_offsets(ple_n_heads);
+        std::vector<uint64_t> ple_head_vocab_sizes(ple_n_heads, n_vocab);
+        for (uint32_t h = 0; h < ple_n_heads; h++) {
+            ple_head_offsets[h] = uint64_t(h)*n_vocab;
+        }
+
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,            uint32_t(0));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  ple_head_dim);
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>({ 1, 3, 5 }));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            ple_head_offsets);
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_DEEPSEEK4 ? n_head : uint32_t(1));
