@@ -521,7 +521,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(layer.nextn.eh_proj     && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm       && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm       && "MTP block missing nextn.hnorm");
-    GGML_ASSERT(layer.nextn.hc_head_norm && "MTP block missing nextn.hc_head_norm");
+    // the MTP head's final mixer is the trunk's own output_hc_* (model.hc_head_*), not a
+    // private per-layer copy: upstream trains one hc mixer, shared between the trunk's last
+    // layer and the draft head, same as the trunk's own final-output call below.
+    GGML_ASSERT(model.hc_head_norm && "QWEN4EXP MTP: model missing hc_head_norm (trunk output mixer)");
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -671,9 +674,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(res_hc, "h_nextn", -1);
     res->t_h_nextn = res_hc;
 
-    // the head's own mixer collapses the streams and doubles as the output norm
+    // the final mixer is shared with the trunk's own output mixer (model.hc_head_*), not a
+    // private per-layer copy -- see the GGML_ASSERT above
     cur = build_hc_mix(res_hc,
-            layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
+            model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
     cb(cur, "mtp_hc_head", -1);
 
