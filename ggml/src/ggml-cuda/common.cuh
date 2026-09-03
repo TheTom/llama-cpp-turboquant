@@ -1484,6 +1484,14 @@ struct ggml_backend_cuda_context {
 
     uint64_t graph_epoch = 1;
 
+    // Fusion hit counters. Read through ggml_backend_cuda_fusion_count(); test-backend-ops uses
+    // them to check that a fusion actually fired, not only that the fused result is right.
+    struct {
+        int64_t elem_chain    = 0;   // elementwise chains launched (ggml_cuda_fuse_elem_chain)
+        int64_t q8_cache_hits = 0;   // mmvq shared-quantize cache hits
+        int64_t fused_binary  = 0;   // tuned multi-ADD/MUL runs (ggml_cuda_op_fused_add/mul)
+    } fusion_stats;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

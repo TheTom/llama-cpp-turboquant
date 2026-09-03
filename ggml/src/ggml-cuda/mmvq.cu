@@ -1276,7 +1276,7 @@ void ggml_cuda_mul_mat_vec_q(
     // consumed again in this graph eval with the same layout (see q8_cache in common.cuh).
     // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
     auto & qc = ctx.q8_cache;
-    static const bool q8_cache_disabled = getenv("GGML_TQ_Q8CACHE") != nullptr && atoi(getenv("GGML_TQ_Q8CACHE")) == 0;
+    static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
     const bool q8_cacheable = !q8_cache_disabled && !convrot && ids == nullptr && q8_bytes <= (1u << 20) &&
                               ctx.curr_stream_no == 0;
@@ -1289,6 +1289,7 @@ void ggml_cuda_mul_mat_vec_q(
     char * src1_q8_1 = nullptr;
 
     if (q8_hit) {
+        ctx.fusion_stats.q8_cache_hits++;
         src1_q8_1 = qc.ptr;
     } else {
         if (q8_cacheable) {

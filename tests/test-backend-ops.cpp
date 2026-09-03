@@ -1234,6 +1234,9 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
+    // the graph runs on the tested backend. Backends without the counter are not checked.
+    virtual const char * required_fusion() { return nullptr; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1507,13 +1510,33 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
+
+        // optional guard that the fusion under test really fired on backend1
+        typedef int64_t (*fusion_count_t)(ggml_backend_t, const char *);
+        fusion_count_t fusion_count  = nullptr;
+        int64_t        fusion_before = -1;
+        if (const char * fusion = required_fusion()) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1));
+            if (reg != nullptr) {
+                fusion_count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+            }
+            if (fusion_count != nullptr) {
+                fusion_before = fusion_count(backend1, fusion);
+            }
+        }
+
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
 
+        bool fusion_ok = true;
+        if (fusion_count != nullptr && fusion_before >= 0) {
+            fusion_ok = fusion_count(backend1, required_fusion()) > fusion_before;
+        }
+
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        bool        test_passed = ud.ok && cmp_ok && fusion_ok;
+        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : !fusion_ok ? "fusion did not fire" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -6530,6 +6553,13 @@ struct test_mul_mat_shared_src1 : public test_case {
     test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k)
         : type(type), m(m), n(n), k(k) {}
 
+    // the shared-quantize cache lives on the mmvq path, which the CUDA backend takes for n <= 8;
+    // native TQ weights quantize their activation on their own path, so those cases are numeric-only
+    const char * required_fusion() override {
+        const bool tq = type == GGML_TYPE_TQ4_1S || type == GGML_TYPE_TQ3_1S;
+        return n <= 8 && !tq ? "q8_cache_hits" : nullptr;
+    }
+
     std::string vars() override {
         return VARS_TO_STR4(type, m, n, k);
     }
@@ -6565,14 +6595,19 @@ struct test_mul_mat_shared_src1 : public test_case {
 struct test_elem_chain_fusion : public test_case {
     const std::array<int64_t, 4> ne;
     const bool with_gelu_softplus;
-    const bool self_mul;   // out = MUL(t0, t0) with t0 = SILU(x): t0 is an elided intermediate used twice
+    const bool self_mul;     // out = MUL(t0, t0) with t0 = SILU(x): t0 is an elided intermediate used twice
+    const bool add_run;      // out = x + o1 + o2 + o3 + o4: the chain hands this run to the tuned multi-ADD kernel
+    const float scale_bias;  // nonzero: SCALE carries a bias (ggml_scale_bias) instead of a plain scale
 
-    test_elem_chain_fusion(std::array<int64_t, 4> ne, bool with_gelu_softplus, bool self_mul = false)
-        : ne(ne), with_gelu_softplus(with_gelu_softplus), self_mul(self_mul) {}
+    test_elem_chain_fusion(std::array<int64_t, 4> ne, bool with_gelu_softplus, bool self_mul = false,
+                           bool add_run = false, float scale_bias = 0.0f)
+        : ne(ne), with_gelu_softplus(with_gelu_softplus), self_mul(self_mul), add_run(add_run), scale_bias(scale_bias) {}
 
     std::string vars() override {
-        return VARS_TO_STR3(ne, with_gelu_softplus, self_mul);
+        return VARS_TO_STR5(ne, with_gelu_softplus, self_mul, add_run, scale_bias);
     }
+
+    const char * required_fusion() override { return add_run ? "fused_binary" : "elem_chain"; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6589,6 +6624,16 @@ struct test_elem_chain_fusion : public test_case {
         ggml_set_name(o1, "o1");
         ggml_set_name(s, "s");
 
+        if (add_run) {
+            ggml_tensor * cur = x;
+            for (int j = 0; j < 4; ++j) {
+                ggml_tensor * o = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+                ggml_set_name(o, ("o" + std::to_string(j + 2)).c_str());
+                cur = ggml_add(ctx, cur, o);
+            }
+            ggml_set_name(cur, "out");
+            return cur;
+        }
         ggml_tensor * cur = ggml_silu(ctx, x);
         if (self_mul) {
             cur = ggml_mul(ctx, cur, cur);
@@ -6603,7 +6648,7 @@ struct test_elem_chain_fusion : public test_case {
             cur = ggml_gelu(ctx, cur);
             cur = ggml_softplus(ctx, cur);
         }
-        cur = ggml_scale(ctx, cur, 0.5f);
+        cur = scale_bias != 0.0f ? ggml_scale_bias(ctx, cur, 0.5f, scale_bias) : ggml_scale(ctx, cur, 0.5f);
         cur = ggml_clamp(ctx, cur, -4.0f, 4.0f);
         ggml_set_name(cur, "out");
         return cur;
@@ -6611,7 +6656,7 @@ struct test_elem_chain_fusion : public test_case {
 };
 
 // MUL_MAT_ID -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS, the MoE expert-reduce tail as
-// llama.cpp builds it, compared against the CPU graph whether or not a backend fuses it.
+// llama.cpp builds it, compared against the CPU graph. Coverage of the tail, not of a fusion.
 struct test_moe_reduce_fusion : public test_case {
     const ggml_type type;
     const int64_t m;
@@ -6631,7 +6676,7 @@ struct test_moe_reduce_fusion : public test_case {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "MOE_REDUCE_FUSION";
+        return "MUL_MAT_ID_REDUCE";
     }
 
     // the graph ends in a quantized matvec, so the same tolerance as test_mul_mat for quantized types
@@ -8701,6 +8746,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
+    test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, false, false, 0.25f));
+    test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
     std::default_random_engine rng(0);
 
     // unary ops
@@ -10649,6 +10696,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
+    test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
+    test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, false, 0.25f));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
