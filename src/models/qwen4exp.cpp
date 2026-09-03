@@ -266,11 +266,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 
-        // the head's own output mixer, mirroring the trunk's hc_head_*: it collapses the
-        // hc streams and stands in for the output norm, of which qwen4exp has none
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
-        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
-        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
+        // unused: graph_mtp reuses the trunk's own model.hc_head_* (see qwen4exp.cpp's
+        // graph_mtp). Kept optional here only so files that still carry this tensor
+        // (e.g. blk.N.nextn.hc_head_* from an older PR 27836-style export) still load.
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
 
         // qwen4exp sets mtp_use_dedicated_embeddings=false, so these are absent and the
         // head falls back to the trunk's embedding table and LM head
@@ -475,14 +476,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         }
     }
 
+    // res_hc is already reduced to the output rows by now -- via the early gather above when
+    // gather_now was true, or the deferred one just above when it wasn't -- inp_out_ids picks
+    // exactly one of those paths every time it's non-null, so no further gather belongs here.
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
-
-    if (inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
