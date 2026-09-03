@@ -1436,13 +1436,13 @@ struct ggml_backend_cuda_context {
     bool fa_f16_use_pool = false;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    static const size_t max_cuda_graphs = 64;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1457,9 +1457,18 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            while (cuda_graphs.size() >= max_cuda_graphs) {
+                auto lru = cuda_graphs.begin();
+                for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
+                    if (c->second->last_used_time < lru->second->last_used_time) {
+                        lru = c;
+                    }
+                }
+                cuda_graphs.erase(lru);
+            }
+            it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
