@@ -313,7 +313,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 1, type_K, type_V>(ctx, dst); // ncols2 = 1 -> (8,1)
 }
 
-// Env latch for the fused turbo4 MMA decode path. DEFAULT OFF.
+// Env latch for the fused turbo MMA decode path. DEFAULT ON.
 //
 // The MMA path is correctness-validated (coherent output, KLD == VEC baseline 0.008396)
 // and faster than VEC at every depth (beats rival "buun"), BUT it is NOT bit/token-identical
@@ -321,8 +321,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
 // reduction trees (tensor-core fragment order vs per-thread VEC order), so a near-tie greedy
 // token can flip (~1 in ~25 tokens on a hard tie). This is the same irreducible f16-order
 // difference that exists between the base f16-MMA and f16-VEC kernels — not a regression — but
-// it fails strict token-identity. We therefore keep VEC the default and expose the faster MMA
-// path as opt-in via GGML_TURBO_MMA_FUSED=1.
+// it fails strict token-identity. GGML_TURBO_MMA_FUSED=0 is the VEC kill-switch for anyone who
+// needs that identity guarantee back.
 static bool ggml_cuda_turbo_mma_fused() {
     static const bool v = []{
         const char * s = getenv("GGML_TURBO_MMA_FUSED");

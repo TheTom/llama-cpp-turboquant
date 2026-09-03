@@ -2247,6 +2247,11 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
         kv_self->set_input_k_shift(k_shift);
     }
 
+    // k_rot is null (not just unallocated) whenever attn_rot_k is false: build_input_k_rot
+    // only allocates a real tensor for quantized K-caches with rotation enabled, or for
+    // DeepSeek32/DeepSeek4's lightning-indexer cache (see attn_rot_k's setup). So a skip
+    // here is either "this cache doesn't rotate" (k_rot == nullptr) or "graph-reserve pass"
+    // (k_rot->buffer == nullptr) -- never a case that should silently drop a real input.
     if (k_rot && k_rot->buffer) {
         kv_self->set_input_k_rot(k_rot);
     }

@@ -781,6 +781,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
+    // n_kv_max bounds the finite (non -INFINITY) mask entries per row that
+    // flash_attn_mask_to_sparse_indices will keep; entries past it are silently dropped.
+    // n_swa == 0 would zero out the raw SWA window and leave only the csa top-k entries,
+    // which is never a valid config for this path.
+    GGML_ASSERT(hparams.n_swa > 0);
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
     GGML_ASSERT(n_kv_max <= k_all->ne[2]); // must not exceed raw_k + csa_k concat length
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
