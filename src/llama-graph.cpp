@@ -1603,6 +1603,12 @@ ggml_tensor * llm_graph_context::build_norm(
     }
 
     if (mw) {
+        // the CUDA broadcast-mul kernel has no path for an F32 activation times an F16 operand
+        // (only the reverse, F16 activation times F32/F16 operand); most checkpoints keep norm
+        // weights in F32 so this is normally a no-op, but some conversions store them narrower
+        if (mw->type != cur->type && cur->type == GGML_TYPE_F32) {
+            mw = ggml_cast(ctx0, mw, GGML_TYPE_F32);
+        }
         cur = ggml_mul(ctx0, cur, mw);
         if (mb) {
             cb(cur, "norm_w", il);
@@ -1610,6 +1616,9 @@ ggml_tensor * llm_graph_context::build_norm(
     }
 
     if (mb) {
+        if (mb->type != cur->type && cur->type == GGML_TYPE_F32) {
+            mb = ggml_cast(ctx0, mb, GGML_TYPE_F32);
+        }
         cur = ggml_add(ctx0, cur, mb);
     }
 

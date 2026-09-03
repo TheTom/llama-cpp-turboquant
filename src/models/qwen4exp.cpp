@@ -304,6 +304,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    // the CUDA broadcast-mul kernel has no path for an F32 activation times an F16 operand
+    if (w_norm->type != xn->type && xn->type == GGML_TYPE_F32) {
+        w_norm = ggml_cast(ctx0, w_norm, GGML_TYPE_F32);
+    }
     xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
@@ -554,7 +558,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
     ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
     h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
-    h_norm = ggml_mul(ctx0, h_norm, layer.nextn.hnorm);
+    ggml_tensor * hnorm_w = layer.nextn.hnorm;
+    if (hnorm_w->type != h_norm->type && h_norm->type == GGML_TYPE_F32) {
+        hnorm_w = ggml_cast(ctx0, hnorm_w, GGML_TYPE_F32);
+    }
+    h_norm = ggml_mul(ctx0, h_norm, hnorm_w);
     h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
     cb(h_norm, "mtp_hnorm", il);
 
@@ -1478,6 +1486,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         ggml_tensor * t = ggml_reshape_3d(ctx0, x, n_embd, hc, n_tokens);
         t = ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps);
         t = ggml_reshape_2d(ctx0, t, hc_dim, n_tokens);
+        if (w->type != t->type && t->type == GGML_TYPE_F32) {
+            w = ggml_cast(ctx0, w, GGML_TYPE_F32);
+        }
         t = ggml_mul(ctx0, t, w);
         return ggml_reshape_3d(ctx0, t, n_embd, hc, n_tokens);
     };
