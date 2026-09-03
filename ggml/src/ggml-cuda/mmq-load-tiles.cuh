@@ -539,7 +539,13 @@ static __device__ __forceinline__ int tq4_1s_qs_to_int8x4(const uint8_t * __rest
     // reinterleaves them to natural order (source[0-3]=v.x, source[4-7]=v.y; sel picks 0,4,1,5).
     const int  q4 = qs[2*kqsx + 0] | (qs[2*kqsx + 1] << 8);
     const int2 v  = get_int_from_table_16(q4, kvalues_tq4);
+#if defined(GGML_USE_HIP)
     return __builtin_amdgcn_perm(v.y, v.x, 0x05010400);
+#else
+    // nvcc / MUSA: prmt selector nibbles pick bytes 0-3 from the first operand and 4-7 from
+    // the second, so [v.x0, v.y0, v.x1, v.y1] is selector 0x5140. Same result as the HIP form.
+    return __byte_perm(v.x, v.y, 0x5140);
+#endif
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq4_1s(
