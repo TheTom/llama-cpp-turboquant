@@ -923,12 +923,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    // Fused turbo MMA decode gate (DEFAULT ON — see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
-    // Routes turbo4-K==turbo4-V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed
+    // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
+    // Routes turbo2/3/4 K==V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed
     // MMA path (KV read once per head-group instead of per query head). Q is ALREADY
-    // graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there — this
-    // path does NO inline FWHT and NO src swap. Default OFF (env unset / !=1) falls straight
-    // GGML_TURBO_MMA_FUSED=0 falls straight through to the original VEC dispatch (kill-switch).
+    // graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there, so this
+    // path does NO inline FWHT and NO src swap. GGML_TURBO_MMA_FUSED=0 falls straight through
+    // to the original VEC dispatch (kill-switch).
     {
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
