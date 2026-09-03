@@ -8,19 +8,29 @@
 #include <atomic>
 #include <cstring>
 
-// cudaHostAlloc() itself resolves on all three backends (CUDA/HIP/MUSA
-// already translate the function name), but the flag constants below are
-// CUDA-only spellings with no equivalent macro in vendors/hip.h or
-// vendors/musa.h - HIP's are named hipHostMalloc* (not hipHostAlloc*), and
-// MUSA mirrors CUDA's naming under a musa* prefix. Same pattern as
-// allreduce.cu's #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) split.
+// Neither the cudaHostAlloc() function name nor its flag constants have a
+// mapping in vendors/hip.h or vendors/musa.h (confirmed by CI: fixing just
+// the flags in an earlier pass surfaced "use of undeclared identifier
+// 'cudaHostAlloc'; did you mean 'hipHostAlloc'?" - the compiler hadn't
+// even gotten far enough to check the callee name while the args were also
+// unresolved). HIP names both the function and flags with a "Malloc" stem
+// (hipHostMalloc, hipHostMallocMapped/WriteCombined - "hipHostAlloc" exists
+// too as a verified-equivalent alias, but "Malloc" matches this repo's
+// existing cudaMallocHost -> hipHostMalloc(...) convention in vendors/hip.h).
+// MUSA mirrors CUDA's naming 1:1 under a musa* prefix, matching the existing
+// cudaFreeHost -> musaFreeHost / cudaMallocHost -> musaMallocHost mappings
+// already in vendors/musa.h. Same file-local per-backend branching pattern
+// already used in allreduce.cu.
 #if defined(GGML_USE_HIP)
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC                 hipHostMalloc
 #define GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED          hipHostMallocMapped
 #define GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED  hipHostMallocWriteCombined
 #elif defined(GGML_USE_MUSA)
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC                 musaHostAlloc
 #define GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED          musaHostAllocMapped
 #define GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED  musaHostAllocWriteCombined
 #else
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC                 cudaHostAlloc
 #define GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED          cudaHostAllocMapped
 #define GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED  cudaHostAllocWriteCombined
 #endif
@@ -125,7 +135,7 @@ ggml_backend_buffer_t ggml_backend_cuda_kv_stream_buffer_alloc(ggml_backend_buff
     ggml_cuda_set_device(runtime->device);
 
     void * host_data = nullptr;
-    const cudaError_t error = cudaHostAlloc(
+    const cudaError_t error = GGML_CUDA_KV_STREAM_HOST_ALLOC(
         &host_data, size, GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED | GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED);
     if (error != cudaSuccess) {
         (void) cudaGetLastError();
