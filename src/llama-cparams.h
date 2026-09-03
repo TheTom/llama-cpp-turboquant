@@ -14,6 +14,7 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+    bool     gdn_replay;      // DRC: ingredient-replay rollback instead of full K-snapshots (opt-in)
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t kv_stream_stage_mib; // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
     bool     kv_stream_auto;      // derive kv_stream_stage_mib from n_ctx instead of using it directly [EXPERIMENTAL]

@@ -2305,6 +2305,71 @@ static bool run_adaptive_cpu_overlap_policy(
     return ok;
 }
 
+// Drives the adaptive cpu-overlap calibration in moe-cache.cu
+// (moe_cache_calibration_on_enter/on_leave) through a full convergence:
+// enough single-token decode scopes to exhaust the unmeasured global
+// warm-up, then the whole round-robin candidate sweep, then confirms it
+// locks in and stops adjusting. Each scope is one session_enter/plan/leave
+// cycle over a single already-resident expert -- moe_cache_plan() updates
+// the calibration scope stats unconditionally per planned node, so neither
+// multiple experts nor a hit are required, only n_tokens == 1 per scope.
+static bool run_adaptive_cpu_overlap_calibration(
+        ggml_backend_t gpu, ggml_backend_t cpu,
+        ggml_tensor * weights, log_capture & capture) {
+    configure_cache(nullptr, "8");
+    set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", nullptr);
+    capture.clear();
+
+    void * session = create_direct_session(gpu, cpu);
+    if (!session) {
+        fprintf(stderr, "cache-cpu-overlap-calibration: failed to create session\n");
+        configure_cache(nullptr);
+        return false;
+    }
+
+    const size_t expert_size = ggml_nbytes(weights) / weights->ne[2];
+    active_api().session_enter(session);
+    bool ok = wait_for_direct_pool(
+            weights->name, weights->data, expert_size,
+            weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
+    for (int attempt = 0; attempt < 100 && ok; attempt++) {
+        if (direct_plan_one(
+                weights->name, weights->data, expert_size,
+                weights->ne[0], weights->ne[1], weights->type,
+                weights->ne[2], /* expert */ 0) == 1) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    active_api().session_leave(session);
+
+    // moe-cache.cu: moe_cache_calib_global_warmup_scopes (64) +
+    // moe_cache_calib_rounds (3) x moe_cache_calib_candidate_count (6) x
+    // (moe_cache_calib_round_warmup_scopes (1) + _measured_scopes (4)) = 154.
+    // Run comfortably past that so calibration has definitely completed,
+    // then a few more to confirm it stays locked in afterward.
+    constexpr int total_scopes = 170;
+    constexpr int expected_round_lines = 18; // 3 rounds x 6 candidates
+    for (int step = 0; step < total_scopes && ok; step++) {
+        active_api().session_enter(session);
+        direct_plan_one(
+                weights->name, weights->data, expert_size,
+                weights->ne[0], weights->ne[1], weights->type,
+                weights->ne[2], /* expert */ 0);
+        active_api().session_leave(session);
+    }
+    active_api().session_destroy(session);
+
+    const std::string log = capture.get();
+    ok &= log.find("cpu-overlap calibration: warm-up complete") != std::string::npos;
+    ok &= count_occurrences(log, "cpu-overlap calibration: round=") == expected_round_lines;
+    ok &= count_occurrences(log, "cpu-overlap calibration complete:") == 1;
+
+    configure_cache(nullptr);
+    printf("cache-cpu-overlap-calibration: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool run_scope_isolation(
         ggml_backend_t gpu, ggml_backend_t cpu, ggml_tensor * weights) {
     if (!active_api().session_enter || !active_api().session_leave ||
@@ -3311,6 +3376,9 @@ int main() {
     });
     ok &= run_optional(provider_is_cuda, "cache-cpu-overlap-auto", [&] {
         return run_adaptive_cpu_overlap_policy(gpu, cpu, weights, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-cpu-overlap-calibration", [&] {
+        return run_adaptive_cpu_overlap_calibration(gpu, cpu, weights, capture);
     });
     ok &= run_shape_liveness(gpu, cpu);
     ok &= run_optional(provider_is_cuda, "cache-shape-inventory", [&] {

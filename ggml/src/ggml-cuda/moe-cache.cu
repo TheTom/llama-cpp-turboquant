@@ -23,6 +23,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -54,6 +55,27 @@ static constexpr int    moe_cache_pool_slots_min              = 64;
 static constexpr size_t moe_cache_slab_bytes_auto_min         = 1ull << 30;
 static constexpr int    moe_cache_node_rows_max               = 64;
 static constexpr size_t moe_cache_overlap_bytes_per_token     = 8u << 20;
+
+// Adaptive cpu-overlap calibration (see moe_cache_calibration_on_enter/leave):
+// only runs while overlap_cpu_rows is left automatic. Candidate -1 means
+// "use the existing byte-budget formula below" and is tried first, so a
+// session that never runs enough single-token decode scopes to finish
+// calibrating (e.g. every unit test, or a prefill-only run) behaves exactly
+// as before this change. Candidates are tried in order, each over a window
+// of real decode scopes; whichever measures the lowest average wall time
+// wins and is locked in for the rest of the session.
+static constexpr int    moe_cache_calib_candidates[]           = { -1, 0, 1, 2, 4, 8 };
+static constexpr int    moe_cache_calib_candidate_count        = 6;
+// Absorbs one-time cold-start cost (CUDA kernel JIT, page cache fill, thread/
+// frequency governor settling) before any candidate timing counts -- this
+// dwarfs the row-count effect being measured if skipped.
+static constexpr int    moe_cache_calib_global_warmup_scopes   = 64;
+// Round-robin sweep: each candidate gets `rounds` short trials rather than
+// one long block, so residual drift after warm-up spreads evenly instead of
+// biasing whichever candidate happens to run first.
+static constexpr int    moe_cache_calib_rounds                 = 3;
+static constexpr int    moe_cache_calib_round_warmup_scopes    = 1;
+static constexpr int    moe_cache_calib_round_measured_scopes  = 4;
 
 enum class moe_cache_slot_state : uint8_t {
     free,
@@ -271,6 +293,37 @@ struct moe_cache_session {
         int references = 0;
     };
     std::unordered_map<const void *, active_source> active_sources;
+
+    // Adaptive cpu-overlap calibration state, guarded by `mu` (same lock
+    // session_enter/session_leave/moe_cache_plan already hold). Unused
+    // whenever overlap_cpu_rows is explicitly configured.
+    //
+    // Two-phase: a long unmeasured global warm-up first (CUDA kernel JIT,
+    // page cache fill, thread/frequency governor settling all cost far more
+    // than the row-count effect being measured, so they must fully drain
+    // before any timing counts), then a round-robin sweep -- one short trial
+    // per candidate per round, cycling through all candidates several times
+    // and averaging each candidate's trials across rounds -- rather than one
+    // long block per candidate, so any *residual* drift after warm-up is
+    // spread evenly across every candidate instead of biasing whichever one
+    // happened to run first.
+    bool     calib_started            = false;
+    bool     calib_done               = false;
+    bool     calib_global_warmup_done = false;
+    int      calib_global_warmup_seen = 0;
+    int      calib_round              = 0;
+    int      calib_slot               = 0; // rotated by calib_round; see moe_cache_calibration_on_leave
+    int      calib_current_rows       = -1; // what moe_cache_overlap_rows() should use right now (-1 = formula)
+    int      calib_scopes_seen        = 0;
+    double   calib_time_sum_ms        = 0.0;
+    int      calib_time_count         = 0;
+    double   calib_candidate_sum_ms[moe_cache_calib_candidate_count]  = {};
+    int      calib_candidate_samples[moe_cache_calib_candidate_count] = {};
+    int      calib_best_rows          = -1;
+    double   calib_best_avg_ms        = -1.0;
+    std::chrono::steady_clock::time_point calib_scope_start{};
+    int64_t  calib_scope_max_tokens = 0;
+    int      calib_scope_nodes      = 0;
 };
 
 struct moe_cache_pin {
@@ -1750,6 +1803,120 @@ static void moe_cache_session_destroy(void * opaque) {
     delete session;
 }
 
+// Which real candidate index the current (calib_slot, calib_round) trial
+// refers to. Rotating by calib_round means candidate 0 doesn't always go
+// first within a round, so any residual (post-warm-up) drift across a round
+// lands on a different candidate each time instead of always the same one.
+static int moe_cache_calibration_candidate_index(const moe_cache_session & session) {
+    return (session.calib_slot + session.calib_round) % moe_cache_calib_candidate_count;
+}
+
+// Called under session.mu at the start of every scope (one
+// ggml_backend_sched_compute_splits call, i.e. one decode step during
+// generation) while overlap_cpu_rows is left automatic. Starts calibration
+// on the first call and stamps the scope start time; per-node scope stats
+// are accumulated by moe_cache_plan().
+static void moe_cache_calibration_on_enter(moe_cache_session & session) {
+    if (session.config.overlap_cpu_rows >= 0 || session.calib_done) {
+        return;
+    }
+    if (!session.calib_started) {
+        session.calib_started            = true;
+        session.calib_global_warmup_done = false;
+        session.calib_global_warmup_seen = 0;
+        session.calib_round              = 0;
+        session.calib_slot               = 0;
+        session.calib_scopes_seen        = 0;
+        session.calib_time_sum_ms        = 0.0;
+        session.calib_time_count         = 0;
+        for (int i = 0; i < moe_cache_calib_candidate_count; i++) {
+            session.calib_candidate_sum_ms[i]  = 0.0;
+            session.calib_candidate_samples[i] = 0;
+        }
+        session.calib_best_rows    = -1;
+        session.calib_best_avg_ms  = -1.0;
+        session.calib_current_rows = -1; // formula, for the duration of the global warm-up
+    }
+    session.calib_scope_start      = std::chrono::steady_clock::now();
+    session.calib_scope_max_tokens = 0;
+    session.calib_scope_nodes      = 0;
+}
+
+// Called under session.mu at the end of every scope. Only scopes that
+// actually dispatched a single-token decode step through the cache count --
+// prefill/batched scopes have very different timing and would corrupt the
+// comparison, so they're silently skipped (calibration just takes longer).
+static void moe_cache_calibration_on_leave(moe_cache_session & session) {
+    if (session.config.overlap_cpu_rows >= 0 || session.calib_done || !session.calib_started) {
+        return;
+    }
+    if (session.calib_scope_nodes <= 0 || session.calib_scope_max_tokens != 1) {
+        return;
+    }
+
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - session.calib_scope_start).count();
+
+    if (!session.calib_global_warmup_done) {
+        session.calib_global_warmup_seen++;
+        if (session.calib_global_warmup_seen < moe_cache_calib_global_warmup_scopes) {
+            return;
+        }
+        session.calib_global_warmup_done = true;
+        session.calib_current_rows = moe_cache_calib_candidates[moe_cache_calibration_candidate_index(session)];
+        MOE_CACHE_LOG("[moe-cache] cpu-overlap calibration: warm-up complete, starting sweep\n");
+        return;
+    }
+
+    session.calib_scopes_seen++;
+    if (session.calib_scopes_seen <= moe_cache_calib_round_warmup_scopes) {
+        return; // per-round settle for this candidate
+    }
+    session.calib_time_sum_ms += elapsed_ms;
+    session.calib_time_count++;
+    if (session.calib_scopes_seen < moe_cache_calib_round_warmup_scopes + moe_cache_calib_round_measured_scopes) {
+        return; // still measuring this (candidate, round) trial
+    }
+
+    const int candidate_index = moe_cache_calibration_candidate_index(session);
+    const int candidate_rows  = moe_cache_calib_candidates[candidate_index];
+    const double avg_ms = session.calib_time_sum_ms / std::max(1, session.calib_time_count);
+    session.calib_candidate_sum_ms[candidate_index]  += avg_ms;
+    session.calib_candidate_samples[candidate_index] += 1;
+    MOE_CACHE_LOG("[moe-cache] cpu-overlap calibration: round=%d candidate=%s avg=%.3f ms/decode\n",
+            session.calib_round,
+            candidate_rows < 0 ? "formula" : std::to_string(candidate_rows).c_str(), avg_ms);
+
+    session.calib_scopes_seen = 0;
+    session.calib_time_sum_ms = 0.0;
+    session.calib_time_count  = 0;
+    session.calib_slot++;
+    if (session.calib_slot >= moe_cache_calib_candidate_count) {
+        session.calib_slot = 0;
+        session.calib_round++;
+    }
+
+    if (session.calib_round >= moe_cache_calib_rounds) {
+        for (int i = 0; i < moe_cache_calib_candidate_count; i++) {
+            if (session.calib_candidate_samples[i] <= 0) {
+                continue;
+            }
+            const double avg = session.calib_candidate_sum_ms[i] / session.calib_candidate_samples[i];
+            if (session.calib_best_avg_ms < 0.0 || avg < session.calib_best_avg_ms) {
+                session.calib_best_avg_ms = avg;
+                session.calib_best_rows   = moe_cache_calib_candidates[i];
+            }
+        }
+        session.calib_current_rows = session.calib_best_rows;
+        session.calib_done = true;
+        MOE_CACHE_LOG("[moe-cache] cpu-overlap calibration complete: rows=%s (%.3f ms/decode avg)\n",
+                session.calib_best_rows < 0 ? "formula" : std::to_string(session.calib_best_rows).c_str(),
+                session.calib_best_avg_ms);
+    } else {
+        session.calib_current_rows = moe_cache_calib_candidates[moe_cache_calibration_candidate_index(session)];
+    }
+}
+
 static void moe_cache_session_enter(void * opaque) {
     if (g_session_suppressed > 0) {
         g_session_suppressed++;
@@ -1798,6 +1965,7 @@ static void moe_cache_session_enter(void * opaque) {
         return;
     }
     session->active_scopes++;
+    moe_cache_calibration_on_enter(*session);
 }
 
 static void moe_cache_session_leave(void * opaque) {
@@ -1818,6 +1986,7 @@ static void moe_cache_session_leave(void * opaque) {
     g_session_stack.erase(std::next(found).base());
     if (active) {
         std::lock_guard<std::mutex> lock(active->mu);
+        moe_cache_calibration_on_leave(*active);
         if (active->active_scopes > 0) {
             active->active_scopes--;
         }
@@ -2154,6 +2323,24 @@ static void * moe_cache_begin(
     return node.release();
 }
 
+// The original automatic policy: bound CPU overlap work by expert bytes,
+// token count, and one quarter of the node. Still used as calibration
+// candidate -1 (see moe_cache_calib_candidates) and as the fallback for any
+// session that never finishes calibrating.
+static int moe_cache_overlap_rows_formula(
+        const moe_cache_node & node, int n_ids, int n_tokens, int top_k) {
+    const size_t work_budget = moe_cache_overlap_bytes_per_token * (size_t) n_tokens;
+    int rows = (int) std::min<size_t>(work_budget / node.expert_size, INT_MAX);
+    rows = std::max(rows, 1);
+    if (top_k >= 8) {
+        rows = std::max(rows, 2);
+    }
+
+    rows = std::min(rows, std::max(1, n_ids / 4));
+    rows = std::min(rows, std::max(2, n_tokens));
+    return std::min(rows, n_ids - 1);
+}
+
 static int moe_cache_overlap_rows(const moe_cache_node & node, int n_ids) {
     const int configured = node.session->config.overlap_cpu_rows;
     if (configured >= 0) {
@@ -2165,17 +2352,12 @@ static int moe_cache_overlap_rows(const moe_cache_node & node, int n_ids) {
 
     const int n_tokens = (int) node.n_tokens;
     const int top_k = n_ids / n_tokens;
-    // Bound CPU work by expert bytes, token count, and one quarter of the node.
-    const size_t work_budget = moe_cache_overlap_bytes_per_token * (size_t) n_tokens;
-    int rows = (int) std::min<size_t>(work_budget / node.expert_size, INT_MAX);
-    rows = std::max(rows, 1);
-    if (top_k >= 8) {
-        rows = std::max(rows, 2);
-    }
 
-    rows = std::min(rows, std::max(1, n_ids / 4));
-    rows = std::min(rows, std::max(2, n_tokens));
-    return std::min(rows, n_ids - 1);
+    const int candidate = node.session->calib_current_rows;
+    if (candidate >= 0) {
+        return std::min(candidate, n_ids - 1);
+    }
+    return moe_cache_overlap_rows_formula(node, n_ids, n_tokens, top_k);
 }
 
 static int moe_cache_lookup_or_queue_locked(
@@ -2309,6 +2491,10 @@ static int moe_cache_plan(
     std::unique_lock<std::mutex> lock(session.mu);
     if (session.stopping) {
         return 0;
+    }
+    if (session.calib_started && !session.calib_done) {
+        session.calib_scope_max_tokens = std::max(session.calib_scope_max_tokens, node->n_tokens);
+        session.calib_scope_nodes++;
     }
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];

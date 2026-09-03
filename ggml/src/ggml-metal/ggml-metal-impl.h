@@ -976,6 +976,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    // 0 = full state snapshots (default), 1 = per-token replay ingredients (k,v,g,beta).
+    // see ggml_gated_delta_net's emit_mode contract (ggml.h) and the CPU reference
+    // (ggml-cpu/ops.cpp, ggml_compute_forward_gated_delta_net_one_chunk) for the exact layout.
+    int32_t  emit_mode;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {

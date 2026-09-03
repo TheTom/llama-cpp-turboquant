@@ -34,6 +34,14 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  # Keep a skipped placeholder while the real matrix below is disabled. GitHub
+  # rejects workflows with no jobs and reports a failure on every matching push.
+  disabled:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "CANN CI is disabled pending dedicated runners"
+
 # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
 #       in order to enable it again, we have to provision dedicated runners  to run it
 #  openEuler-latest-cann:

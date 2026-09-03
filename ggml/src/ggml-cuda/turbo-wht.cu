@@ -72,7 +72,7 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
     // Intra-warp butterfly (h = 1, 2, 4, 8, 16)
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = __shfl_xor_sync(0xffffffff, val, h, WARP_SIZE);
         val = (lane & h) ? (o - val) : (val + o);
     }
 

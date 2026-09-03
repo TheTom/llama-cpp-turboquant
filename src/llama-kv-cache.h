@@ -113,7 +113,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                     uint64_t   kv_stream_stage_bytes = 0);
+                     uint64_t   kv_stream_stage_bytes = 0,
+                 const char *   name_tag = "");
 
     ~llama_kv_cache();
 
@@ -165,6 +166,22 @@ public:
     ggml_type type_v() const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // state_read, plus the cells the restored tokens were placed in.
+    // a cache that mirrors another one cell for cell (the qwen4exp indexer) cannot search for
+    // its own cells here: a second independent search only happens to agree with the first.
+    //   sinfos_out: if set, resized to n_stream and filled with the layout used; a stream that
+    //               carried no cells leaves an empty entry
+    //   sinfos_in : if set, the layout to use instead of searching for one. it must have one
+    //               entry per stream and the entry must match the cell count in the blob,
+    //               otherwise the read fails as it would on any other corrupt input
+    void state_read_sinfo(
+            llama_io_read_i & io,
+               llama_seq_id   seq_id,
+      llama_state_seq_flags   flags,
+          slot_info_vec_t *   sinfos_out,
+     const slot_info_vec_t *   sinfos_in);
+
     //
     // graph_build API
     //
@@ -351,7 +368,8 @@ private:
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
+    // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "dequantize.hpp"
+#include "turbo-quant.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml.h"
@@ -161,6 +162,41 @@ static void cpy_blck_q2_0_f32(const char * cxi, char * cdsti) {
         const int bit_offset = (j % 4) * 2;
         const int q = (xi->qs[byte_index] >> bit_offset) & 0x3;
         cdstf[j] = (float) (q - 1) * d;
+    }
+}
+
+// Turbo dequant output stays in the WHT-rotated domain; the inverse rotation is a
+// separate graph step (GGML_OP_TURBO_WHT), not part of the copy.
+static void cpy_blck_turbo2_0_f32(const char * cxi, char * cdsti) {
+    const block_turbo2_0 * xi = (const block_turbo2_0 *) cxi;
+    float * cdstf = (float *) cdsti;
+
+    const float norm = (float) xi->norm;
+
+    for (int j = 0; j < QK_TURBO2; ++j) {
+        cdstf[j] = turbo2_dequant_element(xi, j, norm);
+    }
+}
+
+static void cpy_blck_turbo3_0_f32(const char * cxi, char * cdsti) {
+    const block_turbo3_0 * xi = (const block_turbo3_0 *) cxi;
+    float * cdstf = (float *) cdsti;
+
+    const float norm = (float) xi->norm;
+
+    for (int j = 0; j < QK_TURBO3; ++j) {
+        cdstf[j] = turbo3_dequant_element(xi, j, norm);
+    }
+}
+
+static void cpy_blck_turbo4_0_f32(const char * cxi, char * cdsti) {
+    const block_turbo4_0 * xi = (const block_turbo4_0 *) cxi;
+    float * cdstf = (float *) cdsti;
+
+    const float norm = (float) xi->norm;
+
+    for (int j = 0; j < QK_TURBO4; ++j) {
+        cdstf[j] = turbo4_dequant_element(xi, j, norm);
     }
 }
 
@@ -379,6 +415,45 @@ static void ggml_cpy_q2_0_f32_sycl(const char * cx, char * cdst, const int ne, c
         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             cpy_q_f32<cpy_blck_q2_0_f32, QK2_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11,
                                                 ne12, nb10, nb11, nb12, nb13, item_ct1);
+        });
+}
+
+static void ggml_cpy_turbo2_0_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
+                                       const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
+                                       const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
+                                       const int nb12, const int nb13, queue_ptr stream) {
+    const int num_blocks = ne;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            cpy_q_f32<cpy_blck_turbo2_0_f32, QK_TURBO2>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+        });
+}
+
+static void ggml_cpy_turbo3_0_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
+                                       const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
+                                       const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
+                                       const int nb12, const int nb13, queue_ptr stream) {
+    const int num_blocks = ne;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            cpy_q_f32<cpy_blck_turbo3_0_f32, QK_TURBO3>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+        });
+}
+
+static void ggml_cpy_turbo4_0_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
+                                       const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
+                                       const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
+                                       const int nb12, const int nb13, queue_ptr stream) {
+    const int num_blocks = ne;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            cpy_q_f32<cpy_blck_turbo4_0_f32, QK_TURBO4>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
         });
 }
 
@@ -1290,6 +1365,15 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     } else if (src0->type == GGML_TYPE_Q2_0 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_q2_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
                                nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TURBO2_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_turbo2_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
+                                   nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TURBO3_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_turbo3_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
+                                   nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TURBO4_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_turbo4_0_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
+                                   nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q5_0) {
         ggml_cpy_f32_q5_0_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
                                nb11, nb12, nb13, main_stream);

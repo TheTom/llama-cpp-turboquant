@@ -1791,6 +1791,11 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
+    // K (snapshot slot count) is op param 0, read inside ggml_metal_library_get_pipeline_gated_delta_net
+    // as a pipeline-specialization function constant; emit_mode is op param 1 and, unlike K, doesn't
+    // affect S_v/G/K-keyed pipeline selection, so it's threaded as a plain runtime kernel arg instead.
+    const int32_t emit_mode = ggml_get_op_params_i32(op, 1);
+
     int ida = 0;
 
     ggml_metal_kargs_gated_delta_net args = {
@@ -1829,6 +1834,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.emit_mode =*/ emit_mode,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

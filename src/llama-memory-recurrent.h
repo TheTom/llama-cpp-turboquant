@@ -24,6 +24,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                         bool   gdn_replay_req,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -78,6 +79,17 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // DRC phase 2 (opt-in, env-gated by LLAMA_GDN_REPLAY): when true, `s_l` holds only the
+    // authoritative state (no (1+n_rs_seq) widening) and `ingr_l` holds a per-seq ring of
+    // n_rs_seq ggml_gated_delta_net emit_mode==1 ingredient slots instead. Rollback marks
+    // `replay_len[seq]` (steps to replay from the ingredient ring) rather than calling
+    // set_rs_idx. Only meaningful for GDN/KDA-style recurrent layers.
+    bool gdn_replay = false;
+
+    // per-seq pending replay length (0 = no replay pending); parallel to rs_idx, cleared on
+    // full seq_rm/clear so a released slot can't leave a dangling replay for its next occupant.
+    std::vector<uint32_t> replay_len;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -111,6 +123,19 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> p_l;
+
+    // per layer, only allocated when gdn_replay is true: [n_embd_s_ingredient(), mem_size * n_rs_seq]
+    std::vector<ggml_tensor *> ingr_l;
+
+    // per layer, only allocated when gdn_replay is true: [n_embd_s(), mem_size] -- the state as of
+    // n_rs_seq tokens before the end of the last decode (the oldest edge of the retained window).
+    // Replay must start from THIS, not from s_l: by the time a rollback is discovered, s_l already
+    // holds the (now known-wrong) optimistic "everything got accepted" final state, and delta-net's
+    // rank-1 update has no inverse -- there is no way to "undo" trailing tokens from it. Replaying
+    // ingredients only ever moves state forward, so the checkpoint to replay from must predate the
+    // whole uncertain trailing window, not follow it.
+    std::vector<ggml_tensor *> s_ckpt_l;
 
 private:
     //const llama_model & model;
@@ -125,6 +150,7 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
@@ -170,8 +196,15 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_ingr_l(int32_t il) const;    // nullptr unless mem->gdn_replay
+    ggml_tensor * get_s_ckpt_l(int32_t il) const;  // nullptr unless mem->gdn_replay
+    ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // DRC phase 2: pending replay length for the (single, in the n_seq_max==1 case) sequence
+    // in the current ubatch, or 0 if none. Used by can_reuse() and the graph builder.
+    uint32_t get_replay_len() const;
 
 private:
     const llama_memory_status status;
