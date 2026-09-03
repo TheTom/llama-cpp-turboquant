@@ -91,8 +91,15 @@ __device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, int &c0, int
 
     // v.x = centroids for even elements (0,2,4,6), v.y = odd elements (1,3,5,7).
     // Interleave back to natural order: c0 = [e0,e1,e2,e3], c1 = [e4,e5,e6,e7].
+#if defined(GGML_USE_HIP)
     c0 = (int) __builtin_amdgcn_perm(v.y, v.x, 0x05010400);
     c1 = (int) __builtin_amdgcn_perm(v.y, v.x, 0x07030602);
+#else
+    // nvcc / MUSA: prmt selector nibbles pick bytes 0-3 from the first operand and 4-7 from
+    // the second. Same byte order as the HIP form above.
+    c0 = __byte_perm(v.x, v.y, 0x5140);
+    c1 = __byte_perm(v.x, v.y, 0x7362);
+#endif
 }
 
 // ============================================================================
