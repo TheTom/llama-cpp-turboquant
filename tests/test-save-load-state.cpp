@@ -347,6 +347,64 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 }
 
 
+// Test 6: state blob round-trip
+// compares blobs rather than generated text: a partially restored cell still decodes to plausible tokens
+static bool test_state_roundtrip(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+
+    LOG("\n=== Test 6: state blob round-trip ===\n");
+
+    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
+        LOG_ERR("\n%s: failed to decode prompt\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_a(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_a = llama_state_seq_get_data(ctx.get(), blob_a.data(), blob_a.size(), 0);
+    if (n_a != blob_a.size()) {
+        LOG_ERR("\n%s: saved %zu bytes, expected %zu\n", __func__, n_a, blob_a.size());
+        return false;
+    }
+
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
+        LOG_ERR("\n%s: failed to erase seq 0\n", __func__);
+        return false;
+    }
+
+    if (llama_state_seq_set_data(ctx.get(), blob_a.data(), blob_a.size(), 0) != blob_a.size()) {
+        LOG_ERR("\n%s: failed to restore seq 0\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_b(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_b = llama_state_seq_get_data(ctx.get(), blob_b.data(), blob_b.size(), 0);
+    if (n_b != n_a) {
+        LOG_ERR("\n%s: re-saved %zu bytes, expected %zu\n", __func__, n_b, n_a);
+        return false;
+    }
+
+    size_t n_diff = 0;
+    size_t i_diff = 0;
+    for (size_t i = 0; i < n_a; i++) {
+        if (blob_a[i] != blob_b[i]) {
+            if (n_diff == 0) {
+                i_diff = i;
+            }
+            n_diff++;
+        }
+    }
+
+    if (n_diff > 0) {
+        LOG_ERR("\n%s: state changed across a restore: %zu of %zu bytes differ, first at offset %zu\n",
+                __func__, n_diff, n_a, i_diff);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -431,6 +489,11 @@ int main(int argc, char ** argv) {
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return 1;
+    }
+
+    // Test 6: state blob round-trip
+    if (!test_state_roundtrip(model, params, tokens)) {
         return 1;
     }
 

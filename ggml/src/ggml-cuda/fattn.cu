@@ -6,10 +6,143 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_sparse_indices(
+        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
+        const int64_t s31, const int64_t s33) {
+    ggml_cuda_pdl_sync();
+
+    constexpr int values_per_lane = 8;
+    const int tid      = threadIdx.x;
+    const int warp     = tid / WARP_SIZE;
+    const int lane     = tid % WARP_SIZE;
+    const int sequence = blockIdx.y;
+    const int query    = blockIdx.x;
+
+    const half * mask = mask_ptr + sequence*s33 + query*s31;
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_kv_max;
+
+    __shared__ int warp_offsets[256/WARP_SIZE];
+    __shared__ int row_count;
+    __shared__ int chunk_count;
+
+    if (tid == 0) {
+        row_count = 0;
+    }
+    __syncthreads();
+
+    for (int i0 = 0; i0 < ne30; i0 += blockDim.x*values_per_lane) {
+        uint32_t selected_warp[values_per_lane];
+        int warp_count = 0;
+#pragma unroll
+        for (int item = 0; item < values_per_lane; ++item) {
+            const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
+            const bool selected = i < ne30 && isfinite(__half2float(mask[i]));
+            selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
+            warp_count += __popc(selected_warp[item]);
+        }
+
+        if (lane == 0) {
+            warp_offsets[warp] = warp_count;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            int offset = 0;
+#pragma unroll
+            for (int iw = 0; iw < 256/WARP_SIZE; ++iw) {
+                const int count = warp_offsets[iw];
+                warp_offsets[iw] = offset;
+                offset += count;
+            }
+            chunk_count = offset;
+        }
+        __syncthreads();
+
+        const uint32_t lane_mask = lane == 0 ? 0 : (1u << lane) - 1;
+        int warp_item_offset = 0;
+#pragma unroll
+        for (int item = 0; item < values_per_lane; ++item) {
+            const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
+            const int dst = row_count + warp_offsets[warp] + warp_item_offset + __popc(selected_warp[item] & lane_mask);
+            if ((selected_warp[item] & (uint32_t(1) << lane)) && dst < n_kv_max) {
+                indices[dst] = i;
+            }
+            warp_item_offset += __popc(selected_warp[item]);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            row_count += chunk_count;
+        }
+        __syncthreads();
+    }
+
+    const int count = row_count;
+    for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
+        indices[i] = -1;
+    }
+    __syncthreads();
+
+    // the dependent grid reads indices, signal once the row is complete
+    ggml_cuda_pdl_lc();
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void ggml_cuda_flash_attn_ext_compact_mask(
+        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+#else
+    const int64_t s31 = mask->nb[1] / sizeof(half);
+    const int64_t s33 = mask->nb[3] / sizeof(half);
+    const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
+    const dim3 block_dim(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
+        (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
+    CUDA_CHECK(cudaGetLastError());
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#else
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+        K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
+        if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
+            return;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
@@ -47,7 +180,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
-    //     are put into the template specialization without GQA optimizations.
+    //     are put into the template specialization without GQA optimizations. Quantized tensors
+    //     (incl. turbo2/3/4) are skipped here: their loaders dequantize into SMEM via the
+    //     swizzled/padded tile helpers rather than reading nb[] directly, so the 16-byte-stride
+    //     alignment this loop checks for doesn't apply to them.
     bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
@@ -177,7 +313,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 1, type_K, type_V>(ctx, dst); // ncols2 = 1 -> (8,1)
 }
 
-// Env latch for the fused turbo4 MMA decode path. DEFAULT OFF.
+// Env latch for the fused turbo MMA decode path. DEFAULT ON.
 //
 // The MMA path is correctness-validated (coherent output, KLD == VEC baseline 0.008396)
 // and faster than VEC at every depth (beats rival "buun"), BUT it is NOT bit/token-identical
@@ -185,8 +321,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
 // reduction trees (tensor-core fragment order vs per-thread VEC order), so a near-tie greedy
 // token can flip (~1 in ~25 tokens on a hard tie). This is the same irreducible f16-order
 // difference that exists between the base f16-MMA and f16-VEC kernels — not a regression — but
-// it fails strict token-identity. We therefore keep VEC the default and expose the faster MMA
-// path as opt-in via GGML_TURBO_MMA_FUSED=1.
+// it fails strict token-identity. GGML_TURBO_MMA_FUSED=0 is the VEC kill-switch for anyone who
+// needs that identity guarantee back.
 static bool ggml_cuda_turbo_mma_fused() {
     static const bool v = []{
         const char * s = getenv("GGML_TURBO_MMA_FUSED");

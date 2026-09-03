@@ -4081,6 +4081,10 @@ bool llama_model_supports_mtp_chain(const llama_model * model) {
     return model != nullptr && model->arch == LLM_ARCH_QWEN35;
 }
 
+bool llama_model_uses_shared_position_draft(const llama_model * model) {
+    return model != nullptr && model->arch == LLM_ARCH_GEMMA4_ASSISTANT;
+}
+
 void llama_set_mtp_chain(llama_context * ctx, bool value) {
     ctx->set_mtp_chain(value);
 }

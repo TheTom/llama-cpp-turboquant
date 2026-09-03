@@ -634,7 +634,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
 
-            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, kq_scale, il);
+            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
             cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);

@@ -118,6 +118,13 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 
 LLAMA_API bool llama_model_supports_mtp_chain(const struct llama_model * model);
 
+// True only for architectures whose "draft" is a same-position early-exit of the
+// target's own trunk (gemma4-assistant), where every drafted token in a round shares
+// llama_pos n_past. A dedicated trained NextN/MTP head (qwen35, qwen4exp, deepseek, ...)
+// still needs an incrementing position per draft step even when it shares KV memory
+// with the target (no separate -md model given).
+LLAMA_API bool llama_model_uses_shared_position_draft(const struct llama_model * model);
+
 // Run the DECODER_MTP graph in chained mode: the batch's first row carries the
 // real (token, h) inputs and each following row's inputs come from the previous
 // row's in-graph argmax and hidden state. One decode drafts n_tokens tokens.
