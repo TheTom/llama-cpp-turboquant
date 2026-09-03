@@ -2241,7 +2241,9 @@ public:
 void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    if (k_shift) {
+    // buffer check guards the graph-reserve pass, where tensors exist but backends aren't
+    // allocated yet; set_input_k_shift asserts on dst->buffer, so this must not be dropped.
+    if (k_shift && k_shift->buffer) {
         kv_self->set_input_k_shift(k_shift);
     }
 

@@ -782,6 +782,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+    GGML_ASSERT(n_kv_max <= k_all->ne[2]); // must not exceed raw_k + csa_k concat length
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);

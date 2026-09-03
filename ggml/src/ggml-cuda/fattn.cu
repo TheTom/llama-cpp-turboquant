@@ -180,7 +180,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
-    //     are put into the template specialization without GQA optimizations.
+    //     are put into the template specialization without GQA optimizations. Quantized tensors
+    //     (incl. turbo2/3/4) are skipped here: their loaders dequantize into SMEM via the
+    //     swizzled/padded tile helpers rather than reading nb[] directly, so the 16-byte-stride
+    //     alignment this loop checks for doesn't apply to them.
     bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
