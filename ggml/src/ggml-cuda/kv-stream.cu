@@ -22,6 +22,26 @@ struct ggml_backend_cuda_kv_stream_buffer_context {
     void * host_data = nullptr;
 };
 
+// Forward declarations so -Wmissing-declarations doesn't fire on these
+// definitions: some compilers (seen in CI, not reproduced with this repo's
+// default local build flags) still want a prior declaration for functions
+// in an unnamed namespace, even though their linkage is already internal.
+void ggml_backend_cuda_kv_stream_runtime_release(ggml_backend_cuda_kv_stream_runtime_t runtime);
+const char * ggml_backend_cuda_kv_stream_buffer_type_name(ggml_backend_buffer_type_t buft);
+void ggml_backend_cuda_kv_stream_buffer_free(ggml_backend_buffer_t buffer);
+void * ggml_backend_cuda_kv_stream_buffer_base(ggml_backend_buffer_t buffer);
+void ggml_backend_cuda_kv_stream_buffer_memset(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
+void ggml_backend_cuda_kv_stream_buffer_set(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+void ggml_backend_cuda_kv_stream_buffer_get(
+        ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size);
+void ggml_backend_cuda_kv_stream_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value);
+ggml_backend_buffer_t ggml_backend_cuda_kv_stream_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size);
+size_t ggml_backend_cuda_kv_stream_buffer_alignment(ggml_backend_buffer_type_t buft);
+size_t ggml_backend_cuda_kv_stream_buffer_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);
+bool ggml_backend_cuda_kv_stream_buffer_is_host(ggml_backend_buffer_type_t buft);
+
 void ggml_backend_cuda_kv_stream_runtime_release(ggml_backend_cuda_kv_stream_runtime_t runtime) {
     if (runtime == nullptr || runtime->references.fetch_sub(1, std::memory_order_acq_rel) != 1) {
         return;
