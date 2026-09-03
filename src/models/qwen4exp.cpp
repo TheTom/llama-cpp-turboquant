@@ -645,15 +645,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
 
-    if (inp_out_ids) {
-        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-
-        res_hc = ggml_reshape_2d(ctx0, res_hc, hc_dim, res_hc->ne[2]);
-        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
-        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
-    }
-
     res_hc = build_hc_combine(res_hc, cur, inject, il);
     cb(res_hc, "mtp_hc_attn_post", il);
 
@@ -669,10 +660,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res_hc = build_hc_combine(res_hc, cur, inject, il);
     cb(res_hc, "mtp_hc_ffn_post", il);
 
-    // The next draft step re-enters here, so export the wide stream before it is collapsed.
+    // The next draft step re-enters here, so export the wide stream before it is collapsed --
+    // and before the inp_out_ids gather below, so the driver's per-token shift-by-one handoff
+    // always gets one row per input token, not just the requested-output rows (a catch-up /
+    // prefill decode requests logits for none of its rows, which would otherwise export zero).
     // As in the trunk, export the combine result rather than a reshape view of it.
     cb(res_hc, "h_nextn", -1);
     res->t_h_nextn = res_hc;
+
+    if (inp_out_ids) {
+        res_hc = ggml_reshape_2d(ctx0, res_hc, hc_dim, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+    }
 
     // the final mixer is shared with the trunk's own output mixer (model.hc_head_*), not a
     // private per-layer copy -- see the GGML_ASSERT above
