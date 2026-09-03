@@ -8,6 +8,23 @@
 #include <atomic>
 #include <cstring>
 
+// cudaHostAlloc() itself resolves on all three backends (CUDA/HIP/MUSA
+// already translate the function name), but the flag constants below are
+// CUDA-only spellings with no equivalent macro in vendors/hip.h or
+// vendors/musa.h - HIP's are named hipHostMalloc* (not hipHostAlloc*), and
+// MUSA mirrors CUDA's naming under a musa* prefix. Same pattern as
+// allreduce.cu's #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) split.
+#if defined(GGML_USE_HIP)
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED          hipHostMallocMapped
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED  hipHostMallocWriteCombined
+#elif defined(GGML_USE_MUSA)
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED          musaHostAllocMapped
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED  musaHostAllocWriteCombined
+#else
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED          cudaHostAllocMapped
+#define GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED  cudaHostAllocWriteCombined
+#endif
+
 struct ggml_backend_cuda_kv_stream_runtime {
     int device = 0;
 
@@ -109,7 +126,7 @@ ggml_backend_buffer_t ggml_backend_cuda_kv_stream_buffer_alloc(ggml_backend_buff
 
     void * host_data = nullptr;
     const cudaError_t error = cudaHostAlloc(
-        &host_data, size, cudaHostAllocMapped | cudaHostAllocWriteCombined);
+        &host_data, size, GGML_CUDA_KV_STREAM_HOST_ALLOC_MAPPED | GGML_CUDA_KV_STREAM_HOST_ALLOC_WRITE_COMBINED);
     if (error != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_ERROR("%s: allocating %.2f MiB pinned KV storage failed: %s\n",
