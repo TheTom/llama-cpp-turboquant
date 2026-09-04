@@ -460,7 +460,26 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    // gdn_replay rolls the GDN recurrent state back by replaying ingredients, so seq_rm records
+    // replay_len INSTEAD of calling set_rs_idx (llama-memory-recurrent.cpp) -- rs_idx stays pinned
+    // at 0 for the whole run. The conv state has no replay path: it still keeps its (1 + n_rs_seq)
+    // rollback groups and is selected purely by rs_idx through s_copy_idx(). With rs_idx stuck at
+    // 0, build_rs would always hand back the OPTIMISTIC group 0, i.e. a convolution window that
+    // still contains the rejected draft tokens, while the recurrent state around it was correctly
+    // rewound. The wanted depth is the very same `rollback` value seq_rm saw, so select the group
+    // explicitly here.
+    ggml_tensor * conv_src = conv_states_all;
+
+    const uint32_t conv_rollback = mctx_cur->get_replay_len();
+    if (conv_rollback > 0) {
+        GGML_ASSERT((uint32_t) conv_states_all->ne[1] >= (conv_rollback + 1) * mem_size);
+        conv_src = ggml_view_2d(ctx0, conv_states_all,
+                conv_states_all->ne[0], mem_size,
+                conv_states_all->nb[1],
+                (size_t) conv_rollback * mem_size * conv_states_all->nb[1]);
+    }
+
+    ggml_tensor * conv_states = build_rs(inp, conv_src, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -747,6 +766,24 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             ggml_cpy(ctx0, ggml_reshape_2d(ctx0, new_ckpt, hparams.n_embd_s(), n_seqs), ckpt_dst));
     } else {
         // batch shorter than the retained window: base_state itself is still "before the window".
+        //
+        // CBA: that claim only holds when n_seq_tokens == n_rs_seq. For a strictly shorter batch
+        // base_state is the state at (end - n_seq_tokens), i.e. INSIDE the uncertain window, so a
+        // later rollback deeper than n_seq_tokens would replay from a too-recent checkpoint and
+        // there is no way to recover the true one (the ingredient ring only retains the last
+        // n_rs_seq steps, and delta-net's rank-1 update has no inverse). Unreachable with the
+        // current verify-batch shape (n_draft + 1 > n_draft == n_rs_seq); the one-shot warning is
+        // here to catch it if that ever stops being true. Upgrade path: refuse a rollback deeper
+        // than the checkpoint's actual age instead of silently returning a wrong state.
+        if (n_seq_tokens < (int64_t) n_rs_seq) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: gdn_replay: checkpoint taken with n_seq_tokens (%d) < n_rs_seq (%u); "
+                               "a rollback deeper than %d tokens would be incorrect\n",
+                               __func__, (int) n_seq_tokens, n_rs_seq, (int) n_seq_tokens);
+            }
+        }
         ggml_tensor * ckpt_dst = ggml_view_2d(ctx0, ckpt_all, hparams.n_embd_s(), n_seqs,
             ckpt_all->nb[1], (size_t) kv_head * state_row_size_bytes);
         ggml_build_forward_expand(gf,
