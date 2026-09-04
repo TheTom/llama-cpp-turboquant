@@ -206,6 +206,13 @@ public:
     // in the current ubatch, or 0 if none. Used by can_reuse() and the graph builder.
     uint32_t get_replay_len() const;
 
+    // DRC phase 2: mark the pending replay as consumed. Called exactly once per decode, after the
+    // graph has been built (every GDN layer reads get_replay_len() during build). Mirrors
+    // s_copy_idx()'s consume-and-clear of rs_idx: without it the first partial rejection latches a
+    // rollback that is re-applied on every later decode, so the recurrent state permanently trails
+    // the token stream.
+    void consume_replay_len() const;
+
 private:
     const llama_memory_status status;
 
