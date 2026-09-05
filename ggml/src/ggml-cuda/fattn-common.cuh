@@ -1363,7 +1363,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE,
+    float * partial_dst = nullptr, float2 * partial_meta = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1377,6 +1378,9 @@ void launch_fattn(
     const ggml_tensor * sinks = dst->src[4];
 
     ggml_tensor * KQV = dst;
+    const bool output_partial = partial_dst != nullptr;
+    GGML_ASSERT(output_partial == (partial_meta != nullptr));
+    GGML_ASSERT(!output_partial || !stream_k);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1596,14 +1600,15 @@ void launch_fattn(
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        parallel_blocks = output_partial ? 1 : std::min(parallel_blocks, ntiles_KV);
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks;
+                !output_partial && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
@@ -1620,9 +1625,19 @@ void launch_fattn(
             }
         }
 
-        blocks_num.x = ntiles_x;
-        blocks_num.y = parallel_blocks;
-        blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+        if (output_partial) {
+            // MMA kernels flatten Q tiles, GQA groups, KV heads, and sequences
+            // into blockIdx.x. A multidimensional grid would duplicate every
+            // tile once per KV head. One block per complete tile also avoids
+            // fixups while preserving exact partial numerator/meta output.
+            blocks_num.x = ntiles_dst;
+            blocks_num.y = 1;
+            blocks_num.z = 1;
+        } else {
+            blocks_num.x = ntiles_x;
+            blocks_num.y = parallel_blocks;
+            blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+        }
 
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
@@ -1659,7 +1674,8 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        output_partial ? partial_dst : (!stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data),
+        output_partial ? partial_meta : dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
