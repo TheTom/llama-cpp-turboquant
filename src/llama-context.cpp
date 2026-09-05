@@ -426,6 +426,7 @@ llama_context::llama_context(
         // multi-head-K variant behaves like an ordinary unified cache.
         const bool kv_stream_unified_kv_cache =
             !llm_arch_is_recurrent(model.arch) &&
+            !hparams.is_swa_any() &&
             model.arch != LLM_ARCH_MINIMAX_M3 &&
             model.arch != LLM_ARCH_GLM_DSA &&
             model.arch != LLM_ARCH_DEEPSEEK32 &&
