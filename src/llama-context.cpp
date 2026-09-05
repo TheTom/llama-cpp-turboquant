@@ -481,7 +481,15 @@ llama_context::llama_context(
         if (!stream_validation.valid) {
             throw std::runtime_error(stream_validation.error);
         }
-        if (stream_validation.enabled) {
+        // TurboQuant: a no_alloc context (e.g. common_get_device_memory_data's
+        // no_alloc=true measurement pass, used to size the parent model for
+        // MTP) never actually allocates backend buffers, so llama_kv_cache's
+        // own streaming-attach loop skips it (see the matching !hparams.no_alloc
+        // guard in llama-kv-cache.cpp). Building the phase arena here anyway
+        // would leave it with no cache ever attached, and kv_stream_switch_phase
+        // would then fail closed with a confusing "requires a memory type with
+        // a streamable KV cache" error on every no_alloc measurement pass.
+        if (stream_validation.enabled && !hparams.no_alloc) {
             using page_bytes_fn_t = bool (*)(
                 ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
             using arena_new_fn_t = void * (*)(ggml_backend_dev_t, size_t);
