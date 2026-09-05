@@ -1,9 +1,5 @@
 # Adaptive KV streaming benchmark
 
-See [`docs/kv-stream.md`](../docs/kv-stream.md) for what block KV streaming
-is, how to enable it, its requirements and known limitations. This document
-covers only the benchmark/sweep tooling.
-
 `benchmark_kv_stream.py` performs the complete context-matched benchmark and
 creates its graph. The only required inputs are the GGUF model and the largest
 context capacity to test:
