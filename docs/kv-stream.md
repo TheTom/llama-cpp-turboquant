@@ -107,3 +107,35 @@ most reliable signs it's working:
   streaming was attempted and rejected for a named reason.
 - Absent any error, and the model architecture is on the supported list
   above, streaming is active.
+
+## Known inefficiency: MTP verification batches use the prompt-phase layout
+
+`tools/server/server-context.cpp` never calls `llama_set_decode_phase()`, so
+phase classification always falls back to automatic batch-size detection
+(`llama_kv_stream_phase_is_generation()`): exactly one token is "generation",
+anything else is "prompt". A speculative-decoding (MTP) verification batch is
+several tokens wide (`--spec-chain N` produces up to `N+1`), so every
+verification step gets classified as "prompt" and the arena stays in its
+prefill-shaped (compute-heavy, KV-light) layout for the entire session -
+the "generation" (KV-heavy, compute-light) layout is only reached on a true
+single-token step, which barely happens once MTP is active.
+
+Measured on a real MTP+streaming request (Qwen3.8-27B, `-c 22000`, 8192 MiB
+arena, `--spec-chain 8`, 200 generated tokens / 90 decode steps): 89 of 90
+steps ran in the prompt-phase layout (1246 resident pages/layer, 10 ring
+slots); the one true single-token step got the generation-phase layout
+(1273 resident pages/layer, 12 ring slots). That is a real but modest gap at
+this context size (+2.2% resident pages, +20% ring slots) - measure again at
+larger contexts before assuming it stays this small.
+
+Fixing this is not just wiring up `llama_set_decode_phase()` in the server:
+the "generation" phase's compute-buffer reservation is sized via
+`graph_reserve(n_seqs, n_seqs, n_seqs, ...)` in `sched_reserve()` - built for
+exactly `n_seq_max` (1) token per step. A multi-token verification batch
+correctly classified as "generation" would immediately hit the existing
+guard at `llama_context.cpp` ("phase arena currently supports TG1 without
+speculative batches") and fail decode. Making this work requires resizing
+the generation-phase reservation to the true max speculative width, not
+just relaxing that guard. Not attempted - left as a known, quantified,
+low-priority inefficiency rather than risk the arena-repartitioning logic
+while the feature is stable.
