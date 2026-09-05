@@ -242,6 +242,36 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // Layer-adaptive: use higher precision for quality-sensitive layers.
+    // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
+    //   0 = uniform (default)
+    //   1 = q8_0 K+V for first+last 4 layers
+    //   2 = q8_0 K+V for last 8 layers
+    //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
+    //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
+    //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+    //
+    // Resolved once per construction rather than as a function-local static:
+    // a process that constructs caches for more than one type_v in turn (e.g.
+    // llama-bench sweeping --cache-type-v) must not have the first
+    // construction's mode silently pin the strategy for every later one.
+    const int kv_adaptive_mode = [&]() {
+        const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+        if (env) {
+            int mode = atoi(env);
+            if (mode > 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
+            }
+            return mode;
+        }
+        // Auto-enable Boundary V (mode 7) when V is turbo2
+        if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
+            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+            return 7;
+        }
+        return 0;
+    }();
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -322,60 +352,38 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // Layer-adaptive: use higher precision for quality-sensitive layers
-        // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
-        //   0 = uniform (default)
-        //   1 = q8_0 K+V for first+last 4 layers
-        //   2 = q8_0 K+V for last 8 layers
-        //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
-        //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
-        //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+        // Layer-adaptive: use higher precision for quality-sensitive layers.
+        // See kv_adaptive_mode above for the mode legend and env var.
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            static const int adaptive_mode = [&]() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-                    }
-                    return mode;
-                }
-                // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
-                }
-                return 0;
-            }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
             const uint32_t n_layer = hparams.n_layer();
-            if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
+            if (kv_adaptive_mode == 1 && is_turbo && n_layer >= 8) {
                 if (il < 4 || il >= n_layer - 4) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 2 && is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 2 && is_turbo && n_layer >= 8) {
                 if (il >= n_layer - 8) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2
                 const bool is_boundary = (il < 2 || il >= n_layer - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
                 // V-only: last 8 V=turbo4, rest V=turbo2
                 layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
+            } else if (kv_adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
                 const bool is_boundary = (il < 2 || il >= n_layer - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
