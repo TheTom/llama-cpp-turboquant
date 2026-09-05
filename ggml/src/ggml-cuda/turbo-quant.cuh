@@ -66,6 +66,19 @@ static __constant__ float TURBO_WHT_SIGNS2[128] = {
     -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f
 };
 
+// ---- Packed sign bits, same signs as TURBO_WHT_SIGNS1/2 ----
+//
+// Element e is bit (e & 31) of word (e >> 5); a set bit means -1.0f.
+// Reading SIGNS1[t] makes a warp touch 32 constant addresses, which the
+// constant cache serializes. Packed, a lane owning 4 elements reads 1 word.
+static __constant__ unsigned TURBO_WHT_SIGNBITS1[4] = {
+    0xE46A0359u, 0x42F85949u, 0xA4C63BBBu, 0x49F250A9u
+};
+
+static __constant__ unsigned TURBO_WHT_SIGNBITS2[4] = {
+    0x16ACEE90u, 0x3F628FDCu, 0xB7A5357Au, 0xBEA56562u
+};
+
 // ---- 64-element WHT sign arrays (first 64 of the 128-element arrays) ----
 
 static __constant__ float TURBO_WHT_SIGNS1_64[64] = {
