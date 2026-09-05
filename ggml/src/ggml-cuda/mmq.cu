@@ -6,6 +6,24 @@
 
 #include <cstdint>
 
+// Some opt-in callers bypass ggml_cuda_should_use_mmq() after doing their own
+// activation preparation. Check that the selected architecture actually has
+// a launchable table entry before entering MMQ so unsupported combinations
+// can use their existing fallback instead of reaching J_best == 0 and aborting.
+bool ggml_cuda_mmq_has_config(
+        const ggml_type type, const int64_t nrows_x, const int cc, const size_t smpbo) {
+    const bool fallback = nrows_x % 128 != 0;
+
+    for (int J = 8; J <= 128; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:

@@ -1611,3 +1611,5 @@ void ggml_cuda_mul_mat_q(
         const ggml_tensor * ids, ggml_tensor * dst, bool convrot = false);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+bool ggml_cuda_mmq_has_config(enum ggml_type type, int64_t nrows_x, int cc, size_t smpbo);
