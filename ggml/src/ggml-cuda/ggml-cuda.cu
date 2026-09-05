@@ -1929,7 +1929,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // GGML_TQ_MMQ gates the native TQ MMQ prefill path. Read it once: getenv() is short-circuited
 // away on NVIDIA but is a libc call per mul_mat node on the AMD path.
 static bool ggml_cuda_tq_mmq_enabled() {
-    static const bool enabled = ggml_cuda_tq_mmq_enabled();
+    static const bool enabled = getenv("GGML_TQ_MMQ") != nullptr;
     return enabled;
 }
 
