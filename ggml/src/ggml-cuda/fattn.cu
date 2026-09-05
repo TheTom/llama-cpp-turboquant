@@ -981,6 +981,22 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        // TurboQuant: WHT-rotated, per-group nearest-centroid quantized K/V
+        // types. Real backing storage (storage=true falls out below, since
+        // they aren't the Q8_1/Q8_K auxiliary types), writable directly from
+        // F32 via set_rows_cuda_turbo{2,3,4} (set-rows.cu), and dequantizable
+        // to F16 via ggml_get_to_fp16_cuda (convert.cu) - so they qualify for
+        // ATTENTION_F16 mode below. Not direct_attention: that would need a
+        // bespoke native kernel understanding the raw rotated+quantized
+        // format directly, which doesn't exist and isn't needed here - the
+        // F16 round-trip is correct as-is because Q is unconditionally
+        // pre-rotated at the graph level whenever K/V is a turbo type
+        // (llama-graph.cpp), and turbo's dequantize functions deliberately
+        // do not invert that rotation, so <dequantized-to-F16 K, pre-rotated
+        // Q> is exactly right with no extra work.
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             result.classified = true;
             break;
         default:
@@ -999,6 +1015,9 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             result.online_write = true;
             break;
         default:
@@ -1032,6 +1051,9 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             result.decode_f16 = true;
             break;
         default:
@@ -1079,6 +1101,20 @@ ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_
     return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED;
 }
 
+// TurboQuant K/V storage zero-pads non-128-aligned head dims to the next
+// multiple of 128 (see llama-kv-cache.cpp) so the WHT rotation always sees
+// full 128-wide groups. Streaming page/workspace geometry must size rows
+// off that padded width, not the raw model head_dim, or pages allocated
+// here would be too small for what llama-kv-cache.cpp actually writes.
+static inline uint32_t ggml_cuda_kv_stream_padded_head_dim(ggml_type type, uint32_t head_dim) {
+    const bool is_turbo =
+        type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+    if (!is_turbo) {
+        return head_dim;
+    }
+    return ((head_dim + 127) / 128) * 128;
+}
+
 bool ggml_cuda_kv_stream_page_bytes(
         ggml_type type_k, ggml_type type_v,
         uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
@@ -1093,16 +1129,19 @@ bool ggml_cuda_kv_stream_page_bytes(
         return false;
     }
 
+    const uint32_t stored_head_dim_k = ggml_cuda_kv_stream_padded_head_dim(type_k, head_dim_k);
+    const uint32_t stored_head_dim_v = ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
+
     const uint32_t block_size_k = ggml_blck_size(type_k);
     const uint32_t block_size_v = ggml_blck_size(type_v);
     if (block_size_k == 0 || block_size_v == 0 ||
-            head_dim_k % block_size_k != 0 || head_dim_v % block_size_v != 0) {
+            stored_head_dim_k % block_size_k != 0 || stored_head_dim_v % block_size_v != 0) {
         return false;
     }
 
     const size_t maximum = std::numeric_limits<size_t>::max();
-    const size_t row_bytes_k = ggml_row_size(type_k, head_dim_k);
-    const size_t row_bytes_v = ggml_row_size(type_v, head_dim_v);
+    const size_t row_bytes_k = ggml_row_size(type_k, stored_head_dim_k);
+    const size_t row_bytes_v = ggml_row_size(type_v, stored_head_dim_v);
     if (row_bytes_k > maximum/head_count || row_bytes_v > maximum/head_count) {
         return false;
     }
@@ -1141,9 +1180,14 @@ bool ggml_cuda_kv_stream_workspace_bytes(
     if (mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16) {
         return false;
     }
+    // The F16 conversion workspace must match the row width Q is padded/rotated
+    // to at the graph level, which for turbo K/V is the padded (not raw) head
+    // dim - see ggml_cuda_kv_stream_padded_head_dim().
+    const uint32_t stored_head_dim_k = ggml_cuda_kv_stream_padded_head_dim(type_k, head_dim_k);
+    const uint32_t stored_head_dim_v = ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
     return ggml_cuda_kv_stream_page_bytes(
         GGML_TYPE_F16, GGML_TYPE_F16,
-        head_dim_k, head_dim_v, head_count, page_tokens, workspace_bytes);
+        stored_head_dim_k, stored_head_dim_v, head_count, page_tokens, workspace_bytes);
 }
 
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes) {

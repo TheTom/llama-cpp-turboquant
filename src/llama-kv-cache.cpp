@@ -103,6 +103,28 @@ TURBO_IQ_IMPORT void turbo_innerq_mark_tensor_updated(void);
 // llama_kv_cache
 //
 
+ggml_type llama_kv_cache_resolve_stream_type_k(
+        const llama_model & model, const llama_hparams & hparams,
+        ggml_type type_k, ggml_type type_v) {
+    const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+    if (!k_is_turbo || hparams.is_mla()) {
+        return type_k;
+    }
+    const uint32_t n_head    = hparams.n_head(0);
+    const uint32_t n_head_kv = hparams.n_head_kv(0);
+    const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
+
+    const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
+    const bool disabled = (env && env[0] == '0');
+
+    const bool is_mla = hparams.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4;
+
+    if (!disabled && !is_mla && gqa_ratio >= 6 && type_k == type_v) {
+        return GGML_TYPE_Q8_0;
+    }
+    return type_k;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -152,28 +174,16 @@ llama_kv_cache::llama_kv_cache(
     // MLA models (DeepSeek-V4) have no separate V cache (V = view of K),
     // so K and V types must be identical — skip auto-asymmetric for MLA.
     {
-        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-        if (k_is_turbo && !hparams.is_mla()) {
+        const ggml_type resolved_type_k = llama_kv_cache_resolve_stream_type_k(model, hparams, type_k, type_v);
+        if (resolved_type_k != type_k) {
             const uint32_t n_head    = hparams.n_head(0);
             const uint32_t n_head_kv = hparams.n_head_kv(0);
             const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
-
-            const char * env = getenv("TURBO_AUTO_ASYMMETRIC");
-            const bool disabled = (env && env[0] == '0');
-
-            // MLA models (DeepSeek) must keep K and V cache types identical,
-            // so the upgrade is skipped for them; llama-context.cpp enforces
-            // this, but that check runs before this rewrite and would see the
-            // pre-rewrite (symmetric) types.
-            const bool is_mla = hparams.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4;
-
-            if (!disabled && !is_mla && gqa_ratio >= 6 && type_k == type_v) {
-                LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
-                               "upgrading K from %s to q8_0 to prevent quality degradation. "
-                               "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
-                               __func__, gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
-                type_k = GGML_TYPE_Q8_0;
-            }
+            LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
+                           "upgrading K from %s to q8_0 to prevent quality degradation. "
+                           "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
+                           __func__, gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
+            type_k = resolved_type_k;
         }
     }
 

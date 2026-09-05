@@ -3326,6 +3326,14 @@ static bool ggml_cuda_kv_stream_staged_set_rows_range(
         int64_t * first_row, int64_t * row_count) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    // set_rows_cuda_turbo{2,3,4} (set-rows.cu) write F32 -> turbo K/V but don't
+    // accept a row-base offset, which the true page-staging path below relies
+    // on. Force turbo writes through the online_write mirror fallback instead
+    // (two absolute-position ggml_cuda_op_set_rows calls, no offset needed).
+    if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 ||
+            dst->type == GGML_TYPE_TURBO4_0) {
+        return false;
+    }
     if (runtime == nullptr || runtime->resident_cache == nullptr ||
             runtime->dirty_rows_remaining == 0 || runtime->dirty_rows.size() <= 1 ||
             src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_F32 ||

@@ -454,6 +454,15 @@ llama_context::llama_context(
             using arena_buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
             using graph_reset_fn_t = bool (*)(ggml_backend_t);
 
+            // llama_kv_cache's constructor may itself upgrade K away from the
+            // requested type (turbo auto-asymmetric on high-GQA-ratio models -
+            // see llama-kv-cache.cpp). Size this bootstrap pre-scan off the
+            // same effective type it will actually construct with, or the
+            // streaming runtime's internal page-count arithmetic can end up
+            // inconsistent with what gets allocated.
+            const ggml_type stream_type_k =
+                llama_kv_cache_resolve_stream_type_k(model, hparams, params.type_k, params.type_v);
+
             ggml_backend_dev_t stream_device = nullptr;
             size_t page_bytes = 0;
             size_t conversion_bytes = 0;
@@ -481,11 +490,11 @@ llama_context::llama_context(
                 size_t layer_page_bytes = 0;
                 size_t layer_conversion_bytes = 0;
                 if (!page_bytes_fn(
-                        params.type_k, params.type_v,
+                        stream_type_k, params.type_v,
                         hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
                         hparams.n_head_kv(il), 256, &layer_page_bytes) ||
                     !workspace_bytes_fn(
-                        params.type_k, params.type_v,
+                        stream_type_k, params.type_v,
                         hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
                         hparams.n_head_kv(il), 256, &layer_conversion_bytes)) {
                     throw std::runtime_error("invalid block KV streaming page geometry");

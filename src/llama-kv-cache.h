@@ -13,6 +13,18 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// Auto-asymmetric turbo-K upgrade decision (see llama-kv-cache.cpp for the
+// full rationale: high-GQA-ratio models amplify turbo K's quantization
+// error, so symmetric turbo K+V gets K upgraded to q8_0). Exposed so
+// llama-context.cpp's block KV streaming page-geometry pre-scan can size
+// its bootstrap allocation off the same effective K type the llama_kv_cache
+// constructor will actually use, instead of the raw requested type - the
+// two must never diverge or the streaming runtime's bootstrap pool ends up
+// sized for the wrong page geometry.
+ggml_type llama_kv_cache_resolve_stream_type_k(
+        const llama_model & model, const llama_hparams & hparams,
+        ggml_type type_k, ggml_type type_v);
+
 //
 // llama_kv_cache
 //
