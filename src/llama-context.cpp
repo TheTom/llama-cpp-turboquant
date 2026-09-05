@@ -876,12 +876,17 @@ bool llama_context::kv_stream_switch_phase(
         return false;
     }
 
+    // TurboQuant: the source only ever wires the phase arena through
+    // llama_memory_hybrid's attention sub-cache (its one target architecture
+    // is always hybrid). This fork also wires it through a plain
+    // llama_kv_cache (see llama-model.cpp's non-hybrid, non-SWA branch), so
+    // fall back to that when the memory module isn't a hybrid wrapper.
     auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    if (hybrid_memory == nullptr || hybrid_memory->get_mem_attn() == nullptr) {
-        LLAMA_LOG_ERROR("%s: phase arena requires hybrid attention memory\n", __func__);
+    llama_kv_cache * kv = hybrid_memory != nullptr ? hybrid_memory->get_mem_attn() : dynamic_cast<llama_kv_cache *>(memory.get());
+    if (kv == nullptr) {
+        LLAMA_LOG_ERROR("%s: phase arena requires hybrid attention memory or a plain unified KV cache\n", __func__);
         return false;
     }
-    auto * kv = hybrid_memory->get_mem_attn();
     const auto & target = decode ? arena.token_generation : arena.prefill;
 
     synchronize();
