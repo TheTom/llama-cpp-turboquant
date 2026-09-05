@@ -27,9 +27,6 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     if (!config.kv_offload) {
         return invalid("block KV streaming requires GPU KV offload");
     }
-    if (!config.type_pair_supported) {
-        return invalid("block KV streaming is not supported for this K/V cache type pair on the active backend");
-    }
     if (config.minimum_arena_bytes == 0 || config.arena_bytes < config.minimum_arena_bytes) {
         return invalid("block KV streaming arena is too small");
     }

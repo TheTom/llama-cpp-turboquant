@@ -11,13 +11,11 @@ struct llama_kv_stream_config {
     // allowlist with the same "does this cache have a standard, uniform
     // per-layer geometry" test used elsewhere in this fork (MLA/hybrid-SWA
     // caches and recurrent architectures need their own region-planning
-    // logic block KV streaming does not implement).
+    // logic block KV streaming does not implement). Real (type_k, type_v)
+    // backend-capability support is checked later, per-layer, inside
+    // llama_kv_cache's constructor where the actual device is known - not
+    // duplicated here.
     bool unified_kv_cache = false;
-    // TurboQuant: real backend capability check (does the active backend's
-    // flash-attention kernel table actually support this (type_k, type_v)
-    // pair), not assumed true for every architecture the way upstream's
-    // single-arch allowlist implicitly did.
-    bool type_pair_supported = false;
 
     bool context_default = false;
     bool single_sequence = false;

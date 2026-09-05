@@ -113,7 +113,10 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+                          size_t kv_stream_stage_bytes = 0,
+                          void * kv_stream_phase_arena = nullptr,
+                          size_t kv_stream_maximum_pool_bytes = 0);
 
     ~llama_kv_cache() = default;
 
@@ -160,6 +163,10 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
     bool get_v_transposed() const;
+
+    bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
+    bool kv_stream_resize_pool(
+        size_t pool_bytes, uint32_t active_tokens, uint32_t ring_slots);
 
     bool get_has_shift() const;
 
@@ -291,6 +298,47 @@ private:
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
+    struct kv_stream_runtime_owner {
+        using feedback_fn_t = bool (*)(
+            void *, uint64_t *, uint64_t *, double *, uint32_t *,
+            uint32_t *, uint32_t *, uint32_t *);
+        using span_feedback_fn_t = bool (*)(void *, double);
+        using reconfigure_fn_t = bool (*)(void *, uint32_t, uint32_t);
+        using repartition_fn_t = bool (*)(void *, uint32_t);
+        using decode_layout_fn_t = bool (*)(void *, uint32_t);
+        using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
+        using resize_pool_fn_t = bool (*)(void *, size_t, uint32_t, uint32_t);
+
+        void * runtime = nullptr;
+        void (*free_fn)(void *) = nullptr;
+        feedback_fn_t feedback_fn = nullptr;
+        span_feedback_fn_t span_feedback_fn = nullptr;
+        reconfigure_fn_t reconfigure_fn = nullptr;
+        repartition_fn_t repartition_fn = nullptr;
+        decode_layout_fn_t decode_layout_fn = nullptr;
+        mark_dirty_rows_fn_t mark_dirty_rows_fn = nullptr;
+        resize_pool_fn_t resize_pool_fn = nullptr;
+        uint32_t layer_count = 0;
+        uint32_t minimum_ring_slots = 0;
+        uint32_t decode_layout_pages = 0;
+        uint32_t starved_evaluations = 0;
+        uint32_t overprovisioned_evaluations = 0;
+        uint32_t evaluations_since_repartition = UINT32_MAX;
+        uint64_t previous_deadline_samples = 0;
+        uint64_t previous_deadline_misses = 0;
+        int64_t previous_adapt_us = 0;
+        uint32_t previous_query_tokens = UINT32_MAX;
+
+        ~kv_stream_runtime_owner() {
+            if (runtime != nullptr) {
+                free_fn(runtime);
+            }
+        }
+    };
+
+    // Declared before ctxs_bufs so the custom buffers release their runtime
+    // references before this owner releases the initial reference.
+    kv_stream_runtime_owner kv_stream_runtime;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())

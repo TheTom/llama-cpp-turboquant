@@ -16,7 +16,6 @@ int main() {
         config.arena_bytes         = 64ULL*1024ULL*1024ULL;
         config.minimum_arena_bytes = 1664ULL*256ULL;
         config.unified_kv_cache    = true;
-        config.type_pair_supported = true;
         config.context_default    = true;
         config.single_sequence    = true;
         config.flash_attention    = true;
@@ -32,7 +31,6 @@ int main() {
         base.arena_bytes         = 64ULL*1024ULL*1024ULL;
         base.minimum_arena_bytes = 1664ULL*256ULL;
         base.unified_kv_cache    = true;
-        base.type_pair_supported = true;
         base.context_default     = true;
         base.single_sequence     = true;
         base.flash_attention     = true;
@@ -58,9 +56,6 @@ int main() {
         config = base;
         config.kv_offload = false;
         expect_invalid("KV offload disabled", config);
-        config = base;
-        config.type_pair_supported = false;
-        expect_invalid("unsupported K/V type pair", config);
         config = base;
         config.arena_bytes = config.minimum_arena_bytes - 1;
         expect_invalid("arena below its minimum", config);
