@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -13,6 +14,26 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+
+class llama_kv_cache;
+
+// A sub-cache eligible for the shared CUDA phase-arena streaming runtime
+// (block KV streaming - see llama-context.cpp's kv_stream_switch_phase and
+// llama-kv-cache.cpp's kv_stream_runtime). Most memory types have none; a
+// wrapper holding more than one llama_kv_cache (iSWA, DSA, MSA, DSV4)
+// returns whichever of its sub-cache(s) actually got a streaming runtime
+// attached - see llama_memory_i::get_kv_stream_targets().
+struct llama_kv_stream_target {
+    llama_kv_cache * cache = nullptr;
+};
+
+// The per-ubatch live state of one streaming target, used to drive the
+// phase-switch/adapt feedback loop each step - see
+// llama_memory_context_i::get_kv_stream_active_targets().
+struct llama_kv_stream_active_target {
+    llama_kv_cache * cache = nullptr;
+    uint32_t n_kv = 0;
+};
 
 struct llama_memory_params {
     // kv cache
@@ -76,6 +97,13 @@ struct llama_memory_context_i {
     // TurboQuant InnerQ: get per-channel scale_inv tensor for Q/V equalization
     // Returns nullptr when InnerQ is not active. Override in KV cache contexts.
     virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
+
+    // Block KV streaming: this ubatch's live state for whichever of this
+    // memory's sub-cache(s) have a streaming runtime attached. Empty for
+    // every memory type that doesn't stream (the default), or hasn't been
+    // wired up to yet. Drives the per-ubatch phase-switch/adapt call in
+    // llama_context::process_ubatch - see llama-context.cpp.
+    virtual std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const { return {}; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -136,6 +164,17 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // Block KV streaming: the sub-cache(s) of this memory object, if any,
+    // that a CUDA phase-arena streaming runtime should be attached to.
+    // Empty for every memory type that doesn't support streaming (the
+    // default). A plain llama_kv_cache returns itself once it has a
+    // runtime; a multi-cache wrapper (iSWA, DSA, MSA, DSV4) returns
+    // whichever of its sub-cache(s) are the large, context-length-scaled
+    // ones worth streaming - narrow/bounded indexer or compression-state
+    // structures stay always-resident and are never returned here. See
+    // llama-context.cpp's kv_stream_switch_phase and the bootstrap pre-scan.
+    virtual std::vector<llama_kv_stream_target> get_kv_stream_targets() const { return {}; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

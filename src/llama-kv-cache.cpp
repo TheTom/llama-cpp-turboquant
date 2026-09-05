@@ -1138,6 +1138,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     return ret;
 }
 
+std::vector<llama_kv_stream_target> llama_kv_cache::get_kv_stream_targets() const {
+    if (kv_stream_runtime.runtime == nullptr) {
+        return {};
+    }
+    return { { const_cast<llama_kv_cache *>(this) } };
+}
+
 llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
@@ -3360,6 +3367,13 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+std::vector<llama_kv_stream_active_target> llama_kv_cache_context::get_kv_stream_active_targets() const {
+    if (kv->get_kv_stream_targets().empty()) {
+        return {};
+    }
+    return { { kv, n_kv } };
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

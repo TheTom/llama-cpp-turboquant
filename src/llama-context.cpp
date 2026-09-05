@@ -892,15 +892,26 @@ bool llama_context::kv_stream_switch_phase(
         return false;
     }
 
-    // TurboQuant: the source only ever wires the phase arena through
-    // llama_memory_hybrid's attention sub-cache (its one target architecture
-    // is always hybrid). This fork also wires it through a plain
-    // llama_kv_cache (see llama-model.cpp's non-hybrid, non-SWA branch), so
-    // fall back to that when the memory module isn't a hybrid wrapper.
-    auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    llama_kv_cache * kv = hybrid_memory != nullptr ? hybrid_memory->get_mem_attn() : dynamic_cast<llama_kv_cache *>(memory.get());
+    // TurboQuant: memory->get_kv_stream_targets() reports which sub-cache(s)
+    // of this memory object (a plain llama_kv_cache, llama_memory_hybrid's
+    // attention sub-cache, or - once wired up - one of iSWA/DSA/MSA/DSV4's
+    // sub-caches) have a streaming runtime attached. Only one target is
+    // ever produced today; a second concurrent target needs the CUDA phase
+    // arena's single-lease design generalized first (not yet done - see the
+    // multi-cache streaming plan), so more than one here is a hard error
+    // rather than silently only switching the first.
+    const auto stream_targets = memory->get_kv_stream_targets();
+    if (stream_targets.empty()) {
+        LLAMA_LOG_ERROR("%s: phase arena requires a memory type with a streamable KV cache\n", __func__);
+        return false;
+    }
+    if (stream_targets.size() > 1) {
+        LLAMA_LOG_ERROR("%s: phase arena does not yet support more than one concurrent streaming target\n", __func__);
+        return false;
+    }
+    llama_kv_cache * kv = stream_targets[0].cache;
     if (kv == nullptr) {
-        LLAMA_LOG_ERROR("%s: phase arena requires hybrid attention memory or a plain unified KV cache\n", __func__);
+        LLAMA_LOG_ERROR("%s: phase arena requires a memory type with a streamable KV cache\n", __func__);
         return false;
     }
     const auto & target = decode ? arena.token_generation : arena.prefill;
@@ -2091,39 +2102,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Consume feedback from the previous completed decode before building the
     // next graph. Repartition itself synchronizes only when hysteresis selects
     // a new boundary, so steady-state token generation stays asynchronous.
-    if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-        if (auto * hybrid_context = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
-            const llama_kv_cache_context * attn_context = hybrid_context->get_attn();
-            if (attn_context != nullptr) {
-                llama_kv_stream_phase phase =
-                    LLAMA_KV_STREAM_PHASE_AUTOMATIC;
-                if (decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
-                    phase = LLAMA_KV_STREAM_PHASE_PROMPT;
-                } else if (decode_phase == LLAMA_DECODE_PHASE_GENERATION) {
-                    phase = LLAMA_KV_STREAM_PHASE_GENERATION;
-                }
-                const bool generation =
-                    llama_kv_stream_phase_is_generation(
-                        phase, ubatch.n_tokens);
-                if (kv_stream_phase_arena.configured && generation &&
-                        ubatch.n_tokens != cparams.n_seq_max) {
-                    LLAMA_LOG_ERROR(
-                        "%s: phase arena currently supports TG1 without speculative batches\n",
-                        __func__);
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
-                }
-                if (!kv_stream_switch_phase(
-                        generation, attn_context->get_n_kv())) {
-                    LLAMA_LOG_ERROR(
-                        "%s: failed to switch shared CUDA arena phase\n",
-                        __func__);
-                    ret = GGML_STATUS_ALLOC_FAILED;
-                    return nullptr;
-                }
-                (void) hybrid_memory->get_mem_attn()->kv_stream_adapt(
-                    attn_context->get_n_kv(), ubatch.n_tokens);
+    //
+    // TurboQuant: this used to be gated on dynamic_cast<llama_memory_hybrid*>
+    // with no fallback, so for a PLAIN (non-hybrid) llama_kv_cache - what
+    // every model validated on this fork so far actually uses - the phase
+    // never switched past its initial construction-time prefill layout, and
+    // kv_stream_adapt() never ran at all. mctx->get_kv_stream_active_targets()
+    // covers both cases (and, once wired up, iSWA/DSA/MSA/DSV4's sub-caches)
+    // uniformly.
+    if (mctx != nullptr) {
+        for (const auto & active_target : mctx->get_kv_stream_active_targets()) {
+            if (active_target.cache == nullptr) {
+                continue;
             }
+            llama_kv_stream_phase phase =
+                LLAMA_KV_STREAM_PHASE_AUTOMATIC;
+            if (decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
+                phase = LLAMA_KV_STREAM_PHASE_PROMPT;
+            } else if (decode_phase == LLAMA_DECODE_PHASE_GENERATION) {
+                phase = LLAMA_KV_STREAM_PHASE_GENERATION;
+            }
+            const bool generation =
+                llama_kv_stream_phase_is_generation(
+                    phase, ubatch.n_tokens);
+            if (kv_stream_phase_arena.configured && generation &&
+                    ubatch.n_tokens != cparams.n_seq_max) {
+                LLAMA_LOG_ERROR(
+                    "%s: phase arena currently supports TG1 without speculative batches\n",
+                    __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (!kv_stream_switch_phase(generation, active_target.n_kv)) {
+                LLAMA_LOG_ERROR(
+                    "%s: failed to switch shared CUDA arena phase\n",
+                    __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            (void) active_target.cache->kv_stream_adapt(active_target.n_kv, ubatch.n_tokens);
         }
     }
 
