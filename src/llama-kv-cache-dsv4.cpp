@@ -1169,7 +1169,10 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   n_pad,
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                     size_t kv_stream_stage_bytes,
+                     void * kv_stream_phase_arena,
+                     size_t kv_stream_maximum_pool_bytes) :
     hparams_raw(model.hparams),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
@@ -1237,10 +1240,28 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
+    // Block KV streaming: of DSV4's several sub-caches, kv_csa is the one
+    // worth streaming - it's K-only and ratio-bounded (kv_size/CSA_RATIO),
+    // but that ratio is a fixed fraction, so it still scales linearly with
+    // context length and can get large at extreme context. kv_raw's actual
+    // per-layer attention runs entirely on its SWA half (see
+    // llama_kv_cache_dsv4_raw_context's class comment) which is
+    // window-bounded and small regardless of context length, so streaming
+    // it wouldn't help; kv_hca/kv_lid and all comp_state are smaller still
+    // or (for comp_state) not a llama_kv_cache at all - see
+    // get_kv_stream_targets().
+    //
+    // This plumbing is currently unreachable: LLM_ARCH_DEEPSEEK4 is still
+    // excluded in llama-context.cpp because real-model KL-divergence testing
+    // found a genuine correctness bug when streaming is actually enabled
+    // (see the comment there for details and the ruled-out hypothesis).
+    // Left in place since it's harmless dead code until that's root-caused,
+    // not because streaming DSV4 is known to work.
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr,
+            "", kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1530,6 +1551,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+std::vector<llama_kv_stream_target> llama_kv_cache_dsv4::get_kv_stream_targets() const {
+    return kv_csa->get_kv_stream_targets();
 }
 
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -2075,6 +2100,13 @@ const llama_ubatch & llama_kv_cache_dsv4_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
+}
+
+std::vector<llama_kv_stream_active_target> llama_kv_cache_dsv4_context::get_kv_stream_active_targets() const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || !ctx_csa_mem) {
+        return {};
+    }
+    return ctx_csa_mem->get_kv_stream_active_targets();
 }
 
 const llama_kv_cache_dsv4_raw_context * llama_kv_cache_dsv4_context::get_raw() const {

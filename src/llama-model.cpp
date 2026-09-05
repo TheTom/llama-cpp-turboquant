@@ -2355,7 +2355,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             cparams.n_rs_seq,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            params.kv_stream_stage_bytes,
+                            params.kv_stream_phase_arena,
+                            params.kv_stream_maximum_pool_bytes);
                 }
             } break;
         case LLM_ARCH_DFLASH:

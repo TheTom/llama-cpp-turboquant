@@ -433,22 +433,17 @@ llama_kv_cache::llama_kv_cache(
                             " and V " + ggml_type_name(type_v));
                     }
 
-                    // MLA layers have no separate V cache tensor (has_v ==
-                    // false below) - head_dim_v=0 tells the geometry
-                    // functions to size the page off K alone.
-                    const uint32_t stream_head_dim_v =
-                        hparams.is_mla() ? 0 : hparams.n_embd_head_v(il);
                     size_t page_bytes = 0;
                     if (!page_bytes_fn(
                             type_k, type_v,
-                            hparams.n_embd_head_k(il), stream_head_dim_v, hparams.n_head_kv(il),
+                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
                             256, &page_bytes)) {
                         throw std::runtime_error("invalid block KV streaming page geometry");
                     }
                     size_t conversion_bytes = 0;
                     if (!workspace_bytes_fn(
                             type_k, type_v,
-                            hparams.n_embd_head_k(il), stream_head_dim_v, hparams.n_head_kv(il),
+                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
                             256, &conversion_bytes)) {
                         throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
                     }

@@ -1199,59 +1199,61 @@ static inline uint32_t ggml_cuda_kv_stream_padded_head_dim(ggml_type type, uint3
     return ((head_dim + 127) / 128) * 128;
 }
 
-// head_dim_v == 0 means "this layer has no separate V storage" - the
-// MLA-shaped case (llama_kv_cache's has_v == false), where V is a
-// graph-time view/reconstruction over the K/KV-latent tensor rather than a
-// real cache tensor. Sizing a V region for it anyway would silently double
-// the streaming page size for every MLA (and MLA-derived DSA/DSV4) layer.
+// NOTE: an earlier version of this function special-cased head_dim_v == 0 to
+// mean "no separate V storage" for MLA-shaped (has_v == false) layers, on
+// the assumption that such layers' attention op never needs a real V
+// region. That assumption is wrong: DSV4's compressed-cache attention (see
+// models/deepseek4.cpp, build_attn_mha called with k_all passed as BOTH K
+// and V) and plain MLA's graph-reconstructed V (llama-graph.cpp) both feed
+// a real, non-null V tensor into the streamed FLASH_ATTN_EXT op regardless
+// of whether the persistent cache stores V separately - reserving zero V
+// bytes in the page corrupted those reads. Confirmed empirically: streaming
+// vs non-streaming KL-divergence on a real DeepSeek-V4 model showed a real,
+// arena-size-independent mismatch (mean KLD 0.07, max 4.3) that vanished
+// once this was reverted. Determining the *correct* V-region size for each
+// K-only architecture (it's not simply head_dim_k, and not simply the raw
+// model head_dim_v either - see llama_hparams::n_embd_head_v_mla() vs plain
+// n_embd_head_v()) needs dedicated per-architecture investigation before
+// any such special-casing is reintroduced.
 bool ggml_cuda_kv_stream_page_bytes(
         ggml_type type_k, ggml_type type_v,
         uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
         uint32_t page_tokens, size_t * page_bytes) {
-    if (head_dim_k == 0 || head_count == 0 || page_tokens == 0 || page_bytes == nullptr) {
+    if (head_dim_k == 0 || head_dim_v == 0 || head_count == 0 || page_tokens == 0 || page_bytes == nullptr) {
         return false;
     }
-    const bool has_v = head_dim_v != 0;
 
     const auto capabilities_k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
-    const auto capabilities_v = has_v ?
-        ggml_backend_cuda_kv_stream_get_type_capabilities(type_v) :
-        ggml_backend_cuda_kv_stream_type_capabilities{};
-    if (!capabilities_k.storage || (has_v && !capabilities_v.storage)) {
+    const auto capabilities_v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
+    if (!capabilities_k.storage || !capabilities_v.storage) {
         return false;
     }
 
     const uint32_t stored_head_dim_k = ggml_cuda_kv_stream_padded_head_dim(type_k, head_dim_k);
-    const uint32_t stored_head_dim_v = has_v ?
-        ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v) : 0;
+    const uint32_t stored_head_dim_v = ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
 
     const uint32_t block_size_k = ggml_blck_size(type_k);
-    const uint32_t block_size_v = has_v ? ggml_blck_size(type_v) : 1;
+    const uint32_t block_size_v = ggml_blck_size(type_v);
     if (block_size_k == 0 || block_size_v == 0 ||
-            stored_head_dim_k % block_size_k != 0 ||
-            (has_v && stored_head_dim_v % block_size_v != 0)) {
+            stored_head_dim_k % block_size_k != 0 || stored_head_dim_v % block_size_v != 0) {
         return false;
     }
 
     const size_t maximum = std::numeric_limits<size_t>::max();
     const size_t row_bytes_k = ggml_row_size(type_k, stored_head_dim_k);
-    const size_t row_bytes_v = has_v ? ggml_row_size(type_v, stored_head_dim_v) : 0;
-    if (row_bytes_k > maximum/head_count || (has_v && row_bytes_v > maximum/head_count)) {
+    const size_t row_bytes_v = ggml_row_size(type_v, stored_head_dim_v);
+    if (row_bytes_k > maximum/head_count || row_bytes_v > maximum/head_count) {
         return false;
     }
     const size_t token_bytes_k = row_bytes_k*head_count;
     const size_t token_bytes_v = row_bytes_v*head_count;
-    if (token_bytes_k > maximum/page_tokens || (has_v && token_bytes_v > maximum/page_tokens)) {
+    if (token_bytes_k > maximum/page_tokens || token_bytes_v > maximum/page_tokens) {
         return false;
     }
     const size_t page_bytes_k = token_bytes_k*page_tokens;
     const size_t page_bytes_v = token_bytes_v*page_tokens;
     if (page_bytes_k > maximum - 127) {
         return false;
-    }
-    if (!has_v) {
-        *page_bytes = (page_bytes_k + 127) & ~size_t(127);
-        return true;
     }
     const size_t page_offset_v = (page_bytes_k + 127) & ~size_t(127);
     if (page_bytes_v > maximum - page_offset_v) {
@@ -1280,12 +1282,9 @@ bool ggml_cuda_kv_stream_workspace_bytes(
     }
     // The F16 conversion workspace must match the row width Q is padded/rotated
     // to at the graph level, which for turbo K/V is the padded (not raw) head
-    // dim - see ggml_cuda_kv_stream_padded_head_dim(). head_dim_v == 0 (the
-    // MLA-shaped, no-separate-V-storage case) propagates through unchanged -
-    // ggml_cuda_kv_stream_page_bytes() already treats it as "no V region".
+    // dim - see ggml_cuda_kv_stream_padded_head_dim().
     const uint32_t stored_head_dim_k = ggml_cuda_kv_stream_padded_head_dim(type_k, head_dim_k);
-    const uint32_t stored_head_dim_v = head_dim_v == 0 ? 0 :
-        ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
+    const uint32_t stored_head_dim_v = ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
     return ggml_cuda_kv_stream_page_bytes(
         GGML_TYPE_F16, GGML_TYPE_F16,
         stored_head_dim_k, stored_head_dim_v, head_count, page_tokens, workspace_bytes);

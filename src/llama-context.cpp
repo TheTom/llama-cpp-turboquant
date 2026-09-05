@@ -432,6 +432,33 @@ llama_context::llama_context(
         // fixed set of dynamic_casts, so an un-wired memory type (e.g.
         // llama_memory_hybrid_idx) fails closed with a clean error instead
         // of the hard crash this exclusion used to prevent.
+        //
+        // LLM_ARCH_DEEPSEEK4 (llama_kv_cache_dsv4) stays excluded, along with
+        // DEEPSEEK32/GLM_DSA (llama_kv_cache_dsa) and MINIMAX_M3
+        // (llama_kv_cache_msa). kv_csa has streaming plumbing wired up (see
+        // llama-kv-cache-dsv4.cpp), but real-model KL-divergence testing
+        // against a real DeepSeek-V4 model found a genuine, large, and
+        // arena-size-independent correctness regression (mean KLD 0.07, max
+        // 4.3, vs ~0.000000 for every other architecture validated this
+        // way) when streaming is enabled. The initial hypothesis - that the
+        // shared page-geometry function in fattn.cu mis-sizes the V region
+        // for kv_csa's K-only shape, since DSV4's compressed-cache attention
+        // (models/deepseek4.cpp, build_attn_mha with k_all passed as both K
+        // and V) always needs a real V-shaped region even though the
+        // persistent cache doesn't store V - was tested and RULED OUT: the
+        // KLD was bit-identical whether or not that geometry path reserved a
+        // V region at all. The actual root cause is still unidentified;
+        // likely candidates are DSV4's online-compression bookkeeping
+        // (state_pos/state_persist_*/state_snapshot_* row addressing in
+        // llama_kv_cache_dsv4_context::comp_plan) not surviving the
+        // resident-cache/ring-buffer model correctly, but this needs
+        // dedicated investigation into that machinery before re-enabling.
+        // The same K-only cache shape is used by DSA's kv_mla and by plain
+        // MLA, so - although neither has been empirically tested against a
+        // real model - both should be treated as similarly unverified until
+        // this is root-caused, not assumed safe by extension of Phase 4's
+        // (inspection-only, never-tested) conclusion that MLA "just works"
+        // via the generalized single-cache path.
         const bool kv_stream_unified_kv_cache =
             !llm_arch_is_recurrent(model.arch) &&
             model.arch != LLM_ARCH_MINIMAX_M3 &&
@@ -495,21 +522,15 @@ llama_context::llama_context(
                 if (page_bytes_fn == nullptr || workspace_bytes_fn == nullptr) {
                     throw std::runtime_error("block KV streaming requires the CUDA backend");
                 }
-                // MLA layers have no separate V cache tensor (V is a
-                // graph-time view over the K/KV-latent tensor - see
-                // llama-kv-cache.cpp's has_v) - head_dim_v=0 tells the
-                // geometry functions to size the page off K alone.
-                const uint32_t stream_head_dim_v =
-                    hparams.is_mla() ? 0 : hparams.n_embd_head_v(il);
                 size_t layer_page_bytes = 0;
                 size_t layer_conversion_bytes = 0;
                 if (!page_bytes_fn(
                         stream_type_k, params.type_v,
-                        hparams.n_embd_head_k(il), stream_head_dim_v,
+                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
                         hparams.n_head_kv(il), 256, &layer_page_bytes) ||
                     !workspace_bytes_fn(
                         stream_type_k, params.type_v,
-                        hparams.n_embd_head_k(il), stream_head_dim_v,
+                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
                         hparams.n_head_kv(il), 256, &layer_conversion_bytes)) {
                     throw std::runtime_error("invalid block KV streaming page geometry");
                 }
