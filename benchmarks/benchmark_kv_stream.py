@@ -620,6 +620,25 @@ def parse_kv_stream_trace(log_path: Path) -> dict:
 
 
 
+def decode_shortfall_tolerance(extra_server_args: list[str]) -> int:
+    """Speculative decoding (--spec-chain N) verifies up to N+1 tokens per
+    step. The exact prompt/decode split in run_measurement() leaves no slack
+    past context_capacity, so the last verification chunk near that boundary
+    can be clipped short by a few tokens instead of landing exactly on
+    decode_tokens. decode_tps is the server's own measured rate (actual
+    predicted_n / predicted_ms), so it stays correct regardless - this
+    tolerance only avoids flagging that harmless shortfall as a failure.
+    """
+    if "--spec-chain" not in extra_server_args:
+        return 0
+    try:
+        return 1 + int(
+            extra_server_args[extra_server_args.index("--spec-chain") + 1]
+        )
+    except (ValueError, IndexError):
+        return 0
+
+
 def run_measurement(
     args: argparse.Namespace,
     context_capacity: int,
@@ -658,10 +677,12 @@ def run_measurement(
             args.request_timeout,
         )
         timings = response.get("timings") or {}
-        if timings.get("predicted_n") != args.decode_tokens:
+        predicted_n = timings.get("predicted_n")
+        spec_chain_tolerance = decode_shortfall_tolerance(args.extra_server_arg)
+        if predicted_n is None or predicted_n < args.decode_tokens - spec_chain_tolerance:
             raise RuntimeError(
-                f"incomplete decode: expected {args.decode_tokens}, "
-                f"received {timings.get('predicted_n')}"
+                f"incomplete decode: expected {args.decode_tokens} "
+                f"(tolerance {spec_chain_tolerance}), received {predicted_n}"
             )
         after = query_gpu_memory(args.nvidia_smi, args.gpu_index)
         measurement = {
