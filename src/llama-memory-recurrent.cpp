@@ -1378,6 +1378,19 @@ uint32_t llama_memory_recurrent_context::get_replay_len() const {
     return m;
 }
 
+void llama_memory_recurrent_context::consume_replay_len() const {
+    if (!mem->gdn_replay || is_full) {
+        return;
+    }
+    const llama_ubatch & ubatch = get_ubatch();
+    for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+        const llama_seq_id seq = ubatch.seq_id_unq[i];
+        if (seq >= 0 && (size_t) seq < mem->replay_len.size()) {
+            mem->replay_len[seq] = 0;
+        }
+    }
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
