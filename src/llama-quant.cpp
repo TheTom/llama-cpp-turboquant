@@ -332,6 +332,17 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
+    // do not quantize Qwen4-Exp's state-space gains, hyper-connection injection matrices or
+    // n-gram conv kernel. They are small and structural rather than arithmetic: the injection
+    // matrices decide how the token embedding enters each layer, and the gains set the decay of
+    // the recurrence. A 4-bit copy of them leaves a model that loads, runs at full speed and
+    // answers every prompt with the same text, because its input never reaches the residual.
+    quantize &= name.find("ssm_alpha.weight")      == std::string::npos;
+    quantize &= name.find("ssm_beta.weight")       == std::string::npos;
+    quantize &= name.find("hc_attn_inject.weight") == std::string::npos;
+    quantize &= name.find("hc_ffn_inject.weight")  == std::string::npos;
+    quantize &= name.find("ple_conv1d.weight")     == std::string::npos;
+
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
