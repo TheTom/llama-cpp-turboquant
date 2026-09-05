@@ -21,6 +21,16 @@ struct llama_kv_stream_config {
     bool single_sequence = false;
     bool flash_attention = false;
     bool kv_offload      = false;
+
+    // For an iSWA-shaped cache (llama_kv_cache_iswa: separate kv_base +
+    // kv_swa), --swa-full makes kv_swa full-context-length too, so both
+    // sub-caches would try to attach a streaming runtime to the same
+    // single-lease CUDA phase arena - the second one to construct always
+    // fails. Set this to (params.swa_full && hparams.is_swa_any()) so that
+    // failure surfaces here with a clear reason instead of the generic
+    // "failed to create CUDA block KV streaming runtime" from whichever
+    // sub-cache loses the race to bind the arena.
+    bool swa_full_conflict = false;
 };
 
 struct llama_kv_stream_config_result {

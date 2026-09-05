@@ -21,6 +21,10 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     if (!config.single_sequence) {
         return invalid("block KV streaming requires exactly one sequence (-np 1)");
     }
+    if (config.swa_full_conflict) {
+        return invalid("block KV streaming does not yet support --swa-full "
+                        "(would need two concurrent streaming targets sharing one arena)");
+    }
     if (!config.flash_attention) {
         return invalid("block KV streaming requires Flash Attention");
     }

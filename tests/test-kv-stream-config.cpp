@@ -59,6 +59,9 @@ int main() {
         config = base;
         config.arena_bytes = config.minimum_arena_bytes - 1;
         expect_invalid("arena below its minimum", config);
+        config = base;
+        config.swa_full_conflict = true;
+        expect_invalid("--swa-full on an iSWA-shaped cache", config);
     });
 
     t.test("pool is partitioned evenly across layers with one scratch page", [](testing & t) {
