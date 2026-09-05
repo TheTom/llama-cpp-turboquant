@@ -236,6 +236,22 @@ int main() {
         t.assert_true("overflow is rejected", !page_bytes_fn(
             GGML_TYPE_F32, GGML_TYPE_F32, UINT32_MAX, UINT32_MAX,
             UINT32_MAX, UINT32_MAX, &page_bytes));
+
+        // head_dim_v == 0 means "no separate V storage" (the MLA-shaped
+        // has_v == false case in llama-kv-cache.cpp) - the page must size
+        // off K alone, not silently reserve a V region too.
+        size_t k_only_page_bytes = 0;
+        t.assert_true("K-only geometry (head_dim_v=0) is valid", page_bytes_fn(
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 0, 4, 256, &k_only_page_bytes));
+        const size_t expected_k_only =
+            (256*4*ggml_row_size(GGML_TYPE_Q8_0, 256) + 127) & ~size_t(127);
+        t.assert_equal(expected_k_only, k_only_page_bytes);
+
+        size_t k_and_v_page_bytes = 0;
+        t.assert_true("same type with real V storage is valid", page_bytes_fn(
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 256, 4, 256, &k_and_v_page_bytes));
+        t.assert_true("K-only page omits the V region entirely",
+            k_only_page_bytes < k_and_v_page_bytes);
     });
 
     t.test("conversion workspace is bounded to one page for every exposed KV pair", [](testing & t) {
@@ -288,6 +304,18 @@ int main() {
                 }
             }
         }
+
+        // head_dim_v == 0 (MLA-shaped, no separate V storage) must halve the
+        // F16 conversion workspace too, not just the resident page. F32 has
+        // online_write=true but isn't direct_attention-eligible, so this is
+        // guaranteed to exercise the ATTENTION_F16 branch regardless of
+        // GGML_CUDA_FA_ALL_QUANTS (unlike e.g. Q2_K, which lacks
+        // online_write and would resolve to UNSUPPORTED instead).
+        size_t k_only_workspace = SIZE_MAX;
+        t.assert_true("K-only workspace geometry is valid", workspace_fn(
+            GGML_TYPE_F32, GGML_TYPE_F32, head_dim, 0, head_count, page_tokens,
+            &k_only_workspace));
+        t.assert_equal((f16_k_page + 127) & ~size_t(127), k_only_workspace);
     });
 
     t.test("mapped authoritative cache SET_ROWS matches CUDA quantization", [](testing & t) {

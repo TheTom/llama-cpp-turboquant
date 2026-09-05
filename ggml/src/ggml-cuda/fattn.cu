@@ -1199,45 +1199,59 @@ static inline uint32_t ggml_cuda_kv_stream_padded_head_dim(ggml_type type, uint3
     return ((head_dim + 127) / 128) * 128;
 }
 
+// head_dim_v == 0 means "this layer has no separate V storage" - the
+// MLA-shaped case (llama_kv_cache's has_v == false), where V is a
+// graph-time view/reconstruction over the K/KV-latent tensor rather than a
+// real cache tensor. Sizing a V region for it anyway would silently double
+// the streaming page size for every MLA (and MLA-derived DSA/DSV4) layer.
 bool ggml_cuda_kv_stream_page_bytes(
         ggml_type type_k, ggml_type type_v,
         uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
         uint32_t page_tokens, size_t * page_bytes) {
-    if (head_dim_k == 0 || head_dim_v == 0 || head_count == 0 || page_tokens == 0 || page_bytes == nullptr) {
+    if (head_dim_k == 0 || head_count == 0 || page_tokens == 0 || page_bytes == nullptr) {
         return false;
     }
+    const bool has_v = head_dim_v != 0;
 
     const auto capabilities_k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
-    const auto capabilities_v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
-    if (!capabilities_k.storage || !capabilities_v.storage) {
+    const auto capabilities_v = has_v ?
+        ggml_backend_cuda_kv_stream_get_type_capabilities(type_v) :
+        ggml_backend_cuda_kv_stream_type_capabilities{};
+    if (!capabilities_k.storage || (has_v && !capabilities_v.storage)) {
         return false;
     }
 
     const uint32_t stored_head_dim_k = ggml_cuda_kv_stream_padded_head_dim(type_k, head_dim_k);
-    const uint32_t stored_head_dim_v = ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
+    const uint32_t stored_head_dim_v = has_v ?
+        ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v) : 0;
 
     const uint32_t block_size_k = ggml_blck_size(type_k);
-    const uint32_t block_size_v = ggml_blck_size(type_v);
+    const uint32_t block_size_v = has_v ? ggml_blck_size(type_v) : 1;
     if (block_size_k == 0 || block_size_v == 0 ||
-            stored_head_dim_k % block_size_k != 0 || stored_head_dim_v % block_size_v != 0) {
+            stored_head_dim_k % block_size_k != 0 ||
+            (has_v && stored_head_dim_v % block_size_v != 0)) {
         return false;
     }
 
     const size_t maximum = std::numeric_limits<size_t>::max();
     const size_t row_bytes_k = ggml_row_size(type_k, stored_head_dim_k);
-    const size_t row_bytes_v = ggml_row_size(type_v, stored_head_dim_v);
-    if (row_bytes_k > maximum/head_count || row_bytes_v > maximum/head_count) {
+    const size_t row_bytes_v = has_v ? ggml_row_size(type_v, stored_head_dim_v) : 0;
+    if (row_bytes_k > maximum/head_count || (has_v && row_bytes_v > maximum/head_count)) {
         return false;
     }
     const size_t token_bytes_k = row_bytes_k*head_count;
     const size_t token_bytes_v = row_bytes_v*head_count;
-    if (token_bytes_k > maximum/page_tokens || token_bytes_v > maximum/page_tokens) {
+    if (token_bytes_k > maximum/page_tokens || (has_v && token_bytes_v > maximum/page_tokens)) {
         return false;
     }
     const size_t page_bytes_k = token_bytes_k*page_tokens;
     const size_t page_bytes_v = token_bytes_v*page_tokens;
     if (page_bytes_k > maximum - 127) {
         return false;
+    }
+    if (!has_v) {
+        *page_bytes = (page_bytes_k + 127) & ~size_t(127);
+        return true;
     }
     const size_t page_offset_v = (page_bytes_k + 127) & ~size_t(127);
     if (page_bytes_v > maximum - page_offset_v) {
@@ -1266,9 +1280,12 @@ bool ggml_cuda_kv_stream_workspace_bytes(
     }
     // The F16 conversion workspace must match the row width Q is padded/rotated
     // to at the graph level, which for turbo K/V is the padded (not raw) head
-    // dim - see ggml_cuda_kv_stream_padded_head_dim().
+    // dim - see ggml_cuda_kv_stream_padded_head_dim(). head_dim_v == 0 (the
+    // MLA-shaped, no-separate-V-storage case) propagates through unchanged -
+    // ggml_cuda_kv_stream_page_bytes() already treats it as "no V region".
     const uint32_t stored_head_dim_k = ggml_cuda_kv_stream_padded_head_dim(type_k, head_dim_k);
-    const uint32_t stored_head_dim_v = ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
+    const uint32_t stored_head_dim_v = head_dim_v == 0 ? 0 :
+        ggml_cuda_kv_stream_padded_head_dim(type_v, head_dim_v);
     return ggml_cuda_kv_stream_page_bytes(
         GGML_TYPE_F16, GGML_TYPE_F16,
         stored_head_dim_k, stored_head_dim_v, head_count, page_tokens, workspace_bytes);

@@ -488,15 +488,21 @@ llama_context::llama_context(
                 if (page_bytes_fn == nullptr || workspace_bytes_fn == nullptr) {
                     throw std::runtime_error("block KV streaming requires the CUDA backend");
                 }
+                // MLA layers have no separate V cache tensor (V is a
+                // graph-time view over the K/KV-latent tensor - see
+                // llama-kv-cache.cpp's has_v) - head_dim_v=0 tells the
+                // geometry functions to size the page off K alone.
+                const uint32_t stream_head_dim_v =
+                    hparams.is_mla() ? 0 : hparams.n_embd_head_v(il);
                 size_t layer_page_bytes = 0;
                 size_t layer_conversion_bytes = 0;
                 if (!page_bytes_fn(
                         stream_type_k, params.type_v,
-                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                        hparams.n_embd_head_k(il), stream_head_dim_v,
                         hparams.n_head_kv(il), 256, &layer_page_bytes) ||
                     !workspace_bytes_fn(
                         stream_type_k, params.type_v,
-                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                        hparams.n_embd_head_k(il), stream_head_dim_v,
                         hparams.n_head_kv(il), 256, &layer_conversion_bytes)) {
                     throw std::runtime_error("invalid block KV streaming page geometry");
                 }
