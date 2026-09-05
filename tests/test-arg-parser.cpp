@@ -425,6 +425,34 @@ static void test(void) {
     assert(params.cpuparams.n_threads == 1010);
 #endif // _WIN32
 
+    {
+        printf("test-arg-parser: test --kv-stream-arena-mib\n\n");
+        common_params kv_stream_params;
+        assert(kv_stream_params.kv_stream_arena_mib == 0);
+
+        argv = {"binary_name", "--kv-stream-arena-mib", "4096"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_stream_params, LLAMA_EXAMPLE_COMMON));
+        assert(kv_stream_params.kv_stream_arena_mib == 4096);
+
+        // legacy alias must set the same field
+        common_params kv_stream_alias_params;
+        argv = {"binary_name", "--kv-stream-stage-mib", "2048"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_stream_alias_params, LLAMA_EXAMPLE_COMMON));
+        assert(kv_stream_alias_params.kv_stream_arena_mib == 2048);
+
+        // negative values are rejected
+        argv = {"binary_name", "--kv-stream-arena-mib", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_stream_params, LLAMA_EXAMPLE_COMMON));
+        argv = {"binary_name", "--kv-stream-stage-mib", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_stream_params, LLAMA_EXAMPLE_COMMON));
+
+        // 0 explicitly disables it and is not rejected
+        common_params kv_stream_disabled_params;
+        argv = {"binary_name", "--kv-stream-arena-mib", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_stream_disabled_params, LLAMA_EXAMPLE_COMMON));
+        assert(kv_stream_disabled_params.kv_stream_arena_mib == 0);
+    }
+
     printf("test-arg-parser: test download functions\n\n");
     const char * GOOD_URL = "http://ggml.ai/";
     const char * BAD_URL  = "http://ggml.ai/404";
