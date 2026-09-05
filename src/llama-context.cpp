@@ -503,7 +503,18 @@ llama_context::llama_context(
             size_t conversion_bytes = 0;
             uint32_t layer_count = 0;
             for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-                if (!hparams.has_kv(il) || hparams.is_recr(il)) {
+                // For iSWA-shaped models (llama_kv_cache_iswa), SWA layers
+                // land in kv_swa, not kv_base - and kv_swa only gets a
+                // streaming runtime attached when swa_full makes it
+                // full-context-length too (see llama-kv-cache-iswa.cpp).
+                // Some models (e.g. Gemma-family) have genuinely different
+                // per-layer geometry between their SWA and full-attention
+                // layers (separate key_length/key_length_swa in the GGUF),
+                // so including SWA layers in this scan's uniform-geometry
+                // check would wrongly reject models whose actually-streamed
+                // layer set (kv_base's non-SWA layers) IS uniform.
+                if (!hparams.has_kv(il) || hparams.is_recr(il) ||
+                        (hparams.is_swa(il) && !params.swa_full)) {
                     continue;
                 }
                 auto * dev = model.dev_layer(il);
