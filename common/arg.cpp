@@ -2370,6 +2370,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--kv-stream-arena-mib", "--kv-stream-stage-mib"}, "N",
+        string_format("shared CUDA arena for block-streaming KV and phase compute buffers in MiB; 0 disables it (default: %u)", params.kv_stream_arena_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("KV stream arena size must be non-negative");
+            }
+            params.kv_stream_arena_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_STREAM_ARENA_MIB"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),
