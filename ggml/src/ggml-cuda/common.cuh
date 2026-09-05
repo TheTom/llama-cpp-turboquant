@@ -1453,6 +1453,11 @@ struct ggml_backend_cuda_context {
     // the same graph eval with identical layout. Stream ordering makes overwrite safe (all
     // consumers of the previous entry are already enqueued before the next quantize runs),
     // and the buffer only grows on shape changes, which force a CUDA-graph re-capture anyway.
+    // Retired (outgrown) device buffers, freed at teardown. Named at class scope: MSVC mangles
+    // a type nested in an unnamed struct as <unnamed-tag>, so two identical nested copies
+    // collide into one decorated name and the linker rejects the object (LNK1179).
+    struct retired_buf { char * ptr; size_t cap; int dev; };
+
     struct {
         char *              ptr  = nullptr;      // raw device memory (not pool), grow-only
         size_t              cap  = 0;            // usable bytes
@@ -1463,7 +1468,6 @@ struct ggml_backend_cuda_context {
         size_t              size = 0;            // quantized bytes
         int64_t             ne10_padded = 0;     // layout keys
         ggml_type           type = GGML_TYPE_COUNT;
-        struct retired_buf { char * ptr; size_t cap; int dev; };
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } q8_cache;
 
@@ -1478,7 +1482,6 @@ struct ggml_backend_cuda_context {
         const void *        data = nullptr;
         uint64_t            epoch = 0;
         size_t              size = 0;
-        struct retired_buf { char * ptr; size_t cap; int dev; };
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } tq_rot_cache;
 
