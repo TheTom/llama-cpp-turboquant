@@ -424,9 +424,16 @@ llama_context::llama_context(
         // DFLASH only needs the exclusion when its DSpark stages hold a
         // single MLA-style K per position (dsv4_hc_mult > 0); the plain
         // multi-head-K variant behaves like an ordinary unified cache.
+        // TurboQuant: SWA (iSWA) architectures are no longer blanket-excluded
+        // here - llama_kv_cache_iswa/llama_memory_hybrid_iswa now forward the
+        // streaming params to their base cache (see llama-kv-cache-iswa.cpp),
+        // and llama_context::kv_stream_switch_phase/process_ubatch resolve
+        // targets via llama_memory_i::get_kv_stream_targets() rather than a
+        // fixed set of dynamic_casts, so an un-wired memory type (e.g.
+        // llama_memory_hybrid_idx) fails closed with a clean error instead
+        // of the hard crash this exclusion used to prevent.
         const bool kv_stream_unified_kv_cache =
             !llm_arch_is_recurrent(model.arch) &&
-            !hparams.is_swa_any() &&
             model.arch != LLM_ARCH_MINIMAX_M3 &&
             model.arch != LLM_ARCH_GLM_DSA &&
             model.arch != LLM_ARCH_DEEPSEEK32 &&
