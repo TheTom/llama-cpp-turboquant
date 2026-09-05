@@ -1489,7 +1489,8 @@ struct ggml_backend_cuda_context {
     struct {
         int64_t elem_chain    = 0;   // elementwise chains launched (ggml_cuda_fuse_elem_chain)
         int64_t q8_cache_hits = 0;   // mmvq shared-quantize cache hits
-        int64_t fused_binary  = 0;   // tuned multi-ADD/MUL runs (ggml_cuda_op_fused_add/mul)
+        int64_t fused_add     = 0;   // tuned multi-ADD runs (ggml_cuda_op_fused_add)
+        int64_t fused_mul     = 0;   // tuned multi-MUL runs (ggml_cuda_op_fused_mul)
     } fusion_stats;
 
 #ifdef USE_CUDA_GRAPH

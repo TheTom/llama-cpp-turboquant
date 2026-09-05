@@ -968,8 +968,10 @@ struct console_printer : public printer {
 
         if (result.passed) {
             printf("\033[1;32mOK\033[0m\n");
-        } else {
+        } else if (result.error_message.empty()) {
             printf("\033[1;31mFAIL\033[0m\n");
+        } else {
+            printf("\033[1;31mFAIL\033[0m [%s]\n", result.error_message.c_str());
         }
     }
 
@@ -1511,11 +1513,19 @@ struct test_case {
             fused_nodes_to_verify.push_back(out);
         }
 
-        // optional guard that the fusion under test really fired on backend1
+        // optional guard that the fusion under test really fired on backend1.
+        // Skipped under the backend's global fusion kill switch, which is a normal thing to set
+        // while bisecting a numeric problem and would otherwise fail every guarded case.
+        static const bool fusion_off = [] {
+            const char * e = getenv("GGML_CUDA_DISABLE_FUSION");
+            return e != nullptr && atoi(e) != 0;
+        }();
+
         typedef int64_t (*fusion_count_t)(ggml_backend_t, const char *);
+        const char *   fusion        = fusion_off ? nullptr : required_fusion();
         fusion_count_t fusion_count  = nullptr;
         int64_t        fusion_before = -1;
-        if (const char * fusion = required_fusion()) {
+        if (fusion != nullptr) {
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1));
             if (reg != nullptr) {
                 fusion_count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
@@ -1529,14 +1539,38 @@ struct test_case {
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
 
-        bool fusion_ok = true;
-        if (fusion_count != nullptr && fusion_before >= 0) {
-            fusion_ok = fusion_count(backend1, required_fusion()) > fusion_before;
+        bool        fusion_ok = true;
+        std::string fusion_err;
+        if (fusion_count != nullptr) {
+            if (fusion_before < 0) {
+                // the backend has the counters but does not know this name: a typo would otherwise
+                // disable the check silently, which defeats the point of having it
+                fusion_ok  = false;
+                fusion_err = std::string("unknown fusion counter '") + fusion + "'";
+            } else if (fusion_count(backend1, fusion) <= fusion_before) {
+                fusion_ok  = false;
+                fusion_err = std::string("fusion '") + fusion + "' did not fire";
+            }
         }
 
-        // Create test result
+        // Create test result. Every reason is reported: a numeric failure must stay visible even
+        // when the fusion guard trips as well.
         bool        test_passed = ud.ok && cmp_ok && fusion_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : !fusion_ok ? "fusion did not fire" : "test failed");
+        std::string error_msg;
+        if (!test_passed) {
+            const auto add_reason = [&error_msg](const std::string & reason) {
+                error_msg += error_msg.empty() ? reason : ", " + reason;
+            };
+            if (!cmp_ok) {
+                add_reason("compare failed");
+            }
+            if (!ud.ok) {
+                add_reason("test failed");
+            }
+            if (!fusion_ok) {
+                add_reason(fusion_err);
+            }
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -6553,11 +6587,14 @@ struct test_mul_mat_shared_src1 : public test_case {
     test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k)
         : type(type), m(m), n(n), k(k) {}
 
-    // the shared-quantize cache lives on the mmvq path, which the CUDA backend takes for n <= 8;
-    // native TQ weights quantize their activation on their own path, so those cases are numeric-only
+    // The shared-quantize cache lives on the mmvq path, and ggml_cuda_should_use_mmvq picks that
+    // path from a per-architecture table: the lowest bound among the types tested here is ne11 <= 6
+    // (Q8_0 on CDNA1), so only n <= 4 is guaranteed to route to mmvq everywhere. Larger n stays
+    // numeric-only rather than reporting a missing fusion on a correct build. Native TQ weights
+    // quantize their activation on their own path, so those cases are numeric-only too.
     const char * required_fusion() override {
         const bool tq = type == GGML_TYPE_TQ4_1S || type == GGML_TYPE_TQ3_1S;
-        return n <= 8 && !tq ? "q8_cache_hits" : nullptr;
+        return n <= 4 && !tq ? "q8_cache_hits" : nullptr;
     }
 
     std::string vars() override {
@@ -6607,7 +6644,7 @@ struct test_elem_chain_fusion : public test_case {
         return VARS_TO_STR5(ne, with_gelu_softplus, self_mul, add_run, scale_bias);
     }
 
-    const char * required_fusion() override { return add_run ? "fused_binary" : "elem_chain"; }
+    const char * required_fusion() override { return add_run ? "fused_add" : "elem_chain"; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);

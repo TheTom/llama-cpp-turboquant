@@ -3905,10 +3905,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node.src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
             }
             fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
-            cuda_ctx->fusion_stats.fused_binary++;
             if (node->op == GGML_OP_ADD) {
+                cuda_ctx->fusion_stats.fused_add++;
                 ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
             } else {
+                cuda_ctx->fusion_stats.fused_mul++;
                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
             }
             return n_fuse - 1;
@@ -5908,8 +5909,11 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "q8_cache_hits") == 0) {
         return ctx->fusion_stats.q8_cache_hits;
     }
-    if (strcmp(name, "fused_binary") == 0) {
-        return ctx->fusion_stats.fused_binary;
+    if (strcmp(name, "fused_add") == 0) {
+        return ctx->fusion_stats.fused_add;
+    }
+    if (strcmp(name, "fused_mul") == 0) {
+        return ctx->fusion_stats.fused_mul;
     }
     return -1;
 }
