@@ -2,9 +2,15 @@
 #include "testing.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 int main() {
+    if (ggml_backend_cuda_get_device_count() == 0) {
+        printf("SKIP: no CUDA device available\n");
+        return 77; // ctest interprets 77 as SKIP_RETURN_CODE
+    }
+
     testing t;
 
     t.test("runtime exposes exact staging geometry", [](testing & t) {

@@ -272,6 +272,10 @@ if (GGML_CUDA)
         ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp)
     target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
     llama_build_and_test(test-kv-stream-cuda-buffer.cpp LABEL cuda)
+    # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
+    # on a GPU-less CI runner). ctest only treats that as a skip when
+    # SKIP_RETURN_CODE says so; without it the skip is recorded as a failure.
+    set_tests_properties(test-kv-stream-cuda-buffer PROPERTIES SKIP_RETURN_CODE 77)
     llama_build_and_test(test-kv-stream-cuda-attn.cpp LABEL cuda)
     llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
 endif()

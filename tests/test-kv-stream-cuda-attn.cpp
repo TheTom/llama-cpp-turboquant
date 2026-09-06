@@ -24,6 +24,26 @@ size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1)/alignment*alignment;
 }
 
+// GGML_CUDA_FA_ALL_QUANTS is a private compile definition of the ggml-cuda
+// target - it isn't propagated to this test executable, so a preprocessor
+// #ifdef here would reflect nothing about how the linked libggml-cuda was
+// actually built. Query it the same way ggml_backend_get_version_string's
+// caller would: through the backend's runtime feature list.
+bool backend_has_fa_all_quants(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto get_features_fn = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_get_features");
+    if (get_features_fn == nullptr) {
+        return false;
+    }
+    for (const ggml_backend_feature * f = get_features_fn(reg); f->name != nullptr; ++f) {
+        if (std::strcmp(f->name, "FA_ALL_QUANTS") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct attention_inputs {
     ggml_type type_k = GGML_TYPE_Q8_0;
     ggml_type type_v = GGML_TYPE_Q4_0;
@@ -471,6 +491,21 @@ int main() {
             return;
         }
 
+        if (!backend_has_fa_all_quants(backend.get())) {
+            // This cross product (F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 x itself)
+            // is upstream's "original direct_attention type set" - see
+            // fattn.cu's ggml_cuda_get_best_fattn_kernel, whose mixed-K/V-type
+            // allowlist for plain (non-streamed) attention only admits
+            // {turbo2/3/4, q8_0, f16, bf16} without this flag. A mismatched
+            // pair like (f16, q4_0) fails ggml_backend_supports_op for
+            // ordinary CUDA flash attention, before kv-streaming ever enters
+            // the picture, so this test cannot produce a reference result on
+            // a default build. Not something the kv-stream feature itself
+            // can fix or work around.
+            std::fprintf(stderr, "all native CUDA KV pairs: SKIP (requires GGML_CUDA_FA_ALL_QUANTS)\n");
+            return;
+        }
+
         for (const ggml_type type_k : native_types) {
             for (const ggml_type type_v : native_types) {
                 const attention_inputs inputs =
@@ -544,13 +579,24 @@ int main() {
             return;
         }
 
+        // Without GGML_CUDA_FA_ALL_QUANTS, direct_attention kernels aren't
+        // instantiated at all (see fattn.cu's
+        // ggml_backend_cuda_kv_stream_get_attention_mode), so even these
+        // natively-paired turbo types fall back to F16. Query it at runtime,
+        // not via #ifdef: that macro is a private compile definition of the
+        // ggml-cuda target and isn't propagated to this test executable, so
+        // it would reflect nothing about how the linked library was built.
+        const auto expected_mode = backend_has_fa_all_quants(backend.get())
+            ? GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT
+            : GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
+
         for (const ggml_type type_k : turbo_types) {
             for (const ggml_type type_v : companion_types) {
                 t.assert_equal(
-                    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT,
+                    expected_mode,
                     ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v));
                 t.assert_equal(
-                    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT,
+                    expected_mode,
                     ggml_backend_cuda_kv_stream_get_attention_mode(type_v, type_k));
 
                 for (const bool swap : { false, true }) {
@@ -572,6 +618,11 @@ int main() {
                     params.device      = 0;
                     params.stage_bytes = page_bytes;
                     params.stage_slots = 1;
+                    if (expected_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16) {
+                        const size_t f16_page_bytes =
+                            ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+                        params.conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+                    }
                     auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
                     if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
                         return;
