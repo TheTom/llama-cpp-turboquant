@@ -47,6 +47,8 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 | `TURBO_AUTO_ASYMMETRIC`     | `1`     | Auto-select asymmetric K/V types for large-GQA models |
 | `TURBO_SPARSE_V`            | `1`     | Sparse-V dequant skip in flash attention |
 | `GGML_TQ_NATIVE`            | unset    | `1` opts out of load-time TQ->q8_0 conversion, uses fused native TQ kernels (saves ~1.7x VRAM on decode-heavy workloads) |
+| `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
+| `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
 | `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
 
 ### Test gates (all must pass before touching quant/backend code)

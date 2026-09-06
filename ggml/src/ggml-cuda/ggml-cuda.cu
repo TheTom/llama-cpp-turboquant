@@ -3673,6 +3673,22 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
         }
         const int out_ch[1] = { i + len - 1 };
 
+        // A run of same-op ADDs or MULs over same-layout operands, chained through src0, is what
+        // the tuned multi-ADD/MUL kernels in ggml_cuda_try_fuse() take, and they are a little
+        // faster than the chain kernel for it (MI210, four ADDs over 4096x64 f32: 3.75-3.96 us
+        // per run tuned vs 4.0 us chain). Leave that pattern to them.
+        {
+            bool pure_run = (ops_ch[0] == GGML_OP_ADD || ops_ch[0] == GGML_OP_MUL);
+            for (int k = 0; k < len && pure_run; ++k) {
+                const ggml_tensor * nd = cgraph->nodes[i + k];
+                pure_run = nd->op == ops_ch[0] && !desc.bcast[k] && (k == 0 || desc.chain_is_lhs[k]) &&
+                           ggml_are_same_layout(nd->src[1], cgraph->nodes[i]->src[1]);
+            }
+            if (pure_run) {
+                return -1;
+            }
+        }
+
         // Aliasing. ggml_cuda_check_fusion_memory_ranges() is not used here on purpose: it
         // vetoes any overlap between the output and an input, and exact in-place aliasing is
         // the common case for this pattern (galloc hands residual adds their input's buffer).
@@ -3716,6 +3732,7 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
             ggml_can_fuse_subgraph(cgraph, i, len, ops_ch, out_ch, 1)) {
 
             desc.n_ops = len;
+            ctx.fusion_stats.elem_chain++;
             ggml_cuda_op_elem_chain(ctx, (const float *) head_src->data,
                                     (float *) out->data, ggml_nelements(out), desc);
             return len - 1;   // nodes consumed beyond this one
@@ -3825,7 +3842,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Elementwise chain ("midi-kernel"), see ggml_cuda_fuse_elem_chain().
+    // Elementwise chain ("midi-kernel"), see ggml_cuda_fuse_elem_chain(). It runs before the
+    // tuned fusions below (multi-ADD/MUL, unary+MUL, RELU+SQR) and covers a superset of their
+    // patterns; a pure same-layout ADD or MUL run is the one case it hands back to them, since
+    // their kernels are a little faster for it (numbers in ggml_cuda_fuse_elem_chain()).
     {
         const int n_fused = ggml_cuda_fuse_elem_chain(*cuda_ctx, cgraph, i);
         if (n_fused >= 0) {
@@ -3917,8 +3937,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
             if (node->op == GGML_OP_ADD) {
+                cuda_ctx->fusion_stats.fused_add++;
                 ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
             } else {
+                cuda_ctx->fusion_stats.fused_mul++;
                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
             }
             return n_fuse - 1;
@@ -5907,6 +5929,26 @@ static ggml_backend_dev_t ggml_backend_cuda_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name) {
+    if (!ggml_backend_is_cuda(backend) || name == nullptr) {
+        return -1;
+    }
+    const ggml_backend_cuda_context * ctx = (const ggml_backend_cuda_context *) backend->context;
+    if (strcmp(name, "elem_chain") == 0) {
+        return ctx->fusion_stats.elem_chain;
+    }
+    if (strcmp(name, "q8_cache_hits") == 0) {
+        return ctx->fusion_stats.q8_cache_hits;
+    }
+    if (strcmp(name, "fused_add") == 0) {
+        return ctx->fusion_stats.fused_add;
+    }
+    if (strcmp(name, "fused_mul") == 0) {
+        return ctx->fusion_stats.fused_mul;
+    }
+    return -1;
+}
+
 static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t reg) {
     static std::vector<ggml_backend_feature> features = []() {
         std::vector<ggml_backend_feature> features;
@@ -5983,6 +6025,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_fusion_count") == 0) {
+        return (void *)ggml_backend_cuda_fusion_count;
     }
     return nullptr;
 }
