@@ -2166,8 +2166,9 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
     if (kv_stream_runtime.runtime != nullptr) {
         GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn != nullptr);
-        GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn(
-            kv_stream_runtime.runtime, data, n_tokens));
+        const bool marked = kv_stream_runtime.mark_dirty_rows_fn(
+            kv_stream_runtime.runtime, data, n_tokens);
+        GGML_ASSERT(marked);
     }
 }
 
