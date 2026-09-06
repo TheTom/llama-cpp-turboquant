@@ -106,6 +106,8 @@ bool ggml_cuda_kv_stream_workspace_bytes(
     ggml_type type_k, ggml_type type_v,
     uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
     uint32_t page_tokens, size_t * workspace_bytes);
+bool ggml_cuda_kv_stream_transient_workspace_bytes(
+    uint32_t n_head_q, uint32_t head_dim_v, uint32_t n_ubatch, size_t * transient_bytes);
 
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes);
 

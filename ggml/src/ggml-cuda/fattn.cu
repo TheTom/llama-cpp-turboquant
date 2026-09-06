@@ -1296,6 +1296,64 @@ bool ggml_cuda_kv_stream_workspace_bytes(
         stored_head_dim_k, stored_head_dim_v, head_count, page_tokens, workspace_bytes);
 }
 
+// ggml_cuda_flash_attn_ext_streamed's chunked partial-attention reduction
+// (parts/meta/accumulator/accumulator_meta below) allocates its scratch
+// buffers from the device's general ctx.pool() - a separate CUDA memory
+// pool from the phase arena, not carved out of it. A caller that sizes the
+// arena to exactly fill remaining VRAM can construct successfully and still
+// hit a hard, unrecoverable abort the first time this pool needs to grow
+// mid-request (see docs/kv-stream.md's "Sizing the arena"). This returns
+// the worst case those four allocations can reach, so a caller can confirm
+// that much *additional* free VRAM survives reserving the arena, and refuse
+// construction up front instead.
+bool ggml_cuda_kv_stream_transient_workspace_bytes(
+        uint32_t n_head_q, uint32_t head_dim_v, uint32_t n_ubatch, size_t * transient_bytes) {
+    if (n_head_q == 0 || head_dim_v == 0 || n_ubatch == 0 || transient_bytes == nullptr) {
+        return false;
+    }
+
+    // parts/meta size off max(KV_STREAM_MAX_PARTS_PER_CHUNK*KV_STREAM_QUERY_WORKSPACE_TOKENS, n_ubatch)
+    // query-rows worth of per-head partial state - the first term bounds the
+    // non-MMA chunked-reduction path (partial_count <= 16, workspace_queries
+    // <= 256 regardless of n_ubatch), the second bounds the MMA-prefill path
+    // (partial_count == 1, workspace_queries == the real ubatch token count,
+    // unclamped). accumulator/accumulator_meta are always exactly one
+    // n_ubatch-worth of the real destination tensor.
+    const uint64_t max_parts_workspace_rows =
+        uint64_t(KV_STREAM_MAX_PARTS_PER_CHUNK)*uint64_t(KV_STREAM_QUERY_WORKSPACE_TOKENS);
+    const uint64_t worst_case_rows = std::max<uint64_t>(max_parts_workspace_rows, n_ubatch);
+
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    if (worst_case_rows > maximum/n_head_q) {
+        return false;
+    }
+    const uint64_t worst_case_row_heads = worst_case_rows*n_head_q;
+    if (worst_case_row_heads > maximum/head_dim_v || worst_case_row_heads > maximum/sizeof(float2)) {
+        return false;
+    }
+    const size_t parts_bytes = size_t(worst_case_row_heads)*head_dim_v*sizeof(float);
+    const size_t meta_bytes  = size_t(worst_case_row_heads)*sizeof(float2);
+
+    if (uint64_t(n_ubatch) > maximum/n_head_q) {
+        return false;
+    }
+    const uint64_t ubatch_row_heads = uint64_t(n_ubatch)*n_head_q;
+    if (ubatch_row_heads > maximum/head_dim_v || ubatch_row_heads > maximum/sizeof(float2)) {
+        return false;
+    }
+    const size_t accumulator_bytes      = size_t(ubatch_row_heads)*head_dim_v*sizeof(float);
+    const size_t accumulator_meta_bytes = size_t(ubatch_row_heads)*sizeof(float2);
+
+    if (parts_bytes > maximum - meta_bytes ||
+            parts_bytes + meta_bytes > maximum - accumulator_bytes ||
+            parts_bytes + meta_bytes + accumulator_bytes > maximum - accumulator_meta_bytes) {
+        return false;
+    }
+
+    *transient_bytes = parts_bytes + meta_bytes + accumulator_bytes + accumulator_meta_bytes;
+    return true;
+}
+
 bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t stage_bytes) {
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;

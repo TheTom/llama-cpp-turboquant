@@ -540,6 +540,8 @@ llama_context::llama_context(
             size_t page_bytes = 0;
             size_t conversion_bytes = 0;
             uint32_t layer_count = 0;
+            uint32_t stream_head_count_q = 0;
+            uint32_t stream_head_dim_v = 0;
             for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
                 // For iSWA-shaped models (llama_kv_cache_iswa), SWA layers
                 // land in kv_swa, not kv_base - and kv_swa only gets a
@@ -591,6 +593,8 @@ llama_context::llama_context(
                 }
                 page_bytes = layer_page_bytes;
                 conversion_bytes = layer_conversion_bytes;
+                stream_head_count_q = hparams.n_head(il);
+                stream_head_dim_v = hparams.n_embd_head_v(il);
             }
             if (stream_device == nullptr || page_bytes == 0 || layer_count == 0) {
                 throw std::runtime_error("block KV streaming found no attention layers");
@@ -609,6 +613,49 @@ llama_context::llama_context(
             if (kv_stream_minimum_stage_bytes >= kv_stream_arena_bytes) {
                 throw std::runtime_error(
                     "block KV streaming arena is too small for bootstrap KV and compute slices");
+            }
+
+            // The streamed attention kernel's chunked partial-attention
+            // reduction (fattn.cu's ggml_cuda_flash_attn_ext_streamed) draws
+            // its scratch buffers from the device's general CUDA memory
+            // pool, not from this arena - an arena that fits by itself can
+            // still leave too little free VRAM for that pool to grow into
+            // during actual inference, which aborts the whole process
+            // instead of failing cleanly (see docs/kv-stream.md's "Sizing
+            // the arena"). Confirm enough headroom survives reserving the
+            // arena for that pool's worst case before ever allocating it.
+            // This uses free VRAM as measured right now; other allocations
+            // later in context construction (e.g. the compute buffer) are
+            // not yet accounted for, so this catches the clearly-too-tight
+            // case, not every possible one - the empirical probing in
+            // benchmarks/benchmark_kv_stream.py remains the reliable way to
+            // size an arena for production.
+            {
+                using transient_workspace_fn_t = bool (*)(uint32_t, uint32_t, uint32_t, size_t *);
+                auto transient_workspace_fn = (transient_workspace_fn_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(stream_device),
+                    "ggml_backend_cuda_kv_stream_transient_workspace_bytes");
+                if (transient_workspace_fn == nullptr) {
+                    throw std::runtime_error("block KV streaming requires the CUDA backend");
+                }
+                size_t transient_workspace_bytes = 0;
+                if (!transient_workspace_fn(
+                        stream_head_count_q, stream_head_dim_v, cparams.n_ubatch,
+                        &transient_workspace_bytes)) {
+                    throw std::runtime_error("invalid block KV streaming transient workspace geometry");
+                }
+                size_t dev_free_bytes = 0;
+                size_t dev_total_bytes = 0;
+                ggml_backend_dev_memory(stream_device, &dev_free_bytes, &dev_total_bytes);
+                if (kv_stream_arena_bytes > dev_free_bytes ||
+                        transient_workspace_bytes > dev_free_bytes - kv_stream_arena_bytes) {
+                    throw std::runtime_error(
+                        "block KV streaming arena leaves insufficient free VRAM for the streamed "
+                        "attention kernel's transient workspace (needs roughly " +
+                        std::to_string((transient_workspace_bytes + 1024*1024 - 1)/(1024*1024)) +
+                        " MiB of headroom beyond the arena) - reduce --kv-stream-arena-mib or "
+                        "--ubatch-size, or free more device memory");
+                }
             }
 
             auto reg = ggml_backend_dev_backend_reg(stream_device);

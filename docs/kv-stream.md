@@ -109,17 +109,23 @@ not a flag flip. Not attempted in this branch.
 
 ## Sizing the arena
 
-Two categories of failure exist near the VRAM boundary, and only one of them
-is safe:
+Two categories of failure exist near the VRAM boundary:
 
 - **Arena itself too large to allocate at context creation** - a clean,
   caught failure. The server logs an error and exits; nothing is corrupted.
-- **Arena large enough to construct, but too tight for a transient kernel
-  allocation during actual inference** (`ggml_cuda_pool_vmm::alloc()`
-  failing mid-attention-kernel) - a **hard process abort** (`GGML_ASSERT` /
-  `SIGABRT`), not recoverable in-process. This can take down an
-  already-running, already-serving server on its first request that crosses
-  the margin, not just fail to start.
+- **Arena large enough to construct, but too tight for the streamed
+  attention kernel's transient scratch workspace** (`fattn.cu`'s
+  `ggml_cuda_flash_attn_ext_streamed` allocates four small buffers from the
+  device's general CUDA memory pool - not from the arena itself - for its
+  chunked partial-attention reduction). Construction now computes that
+  workspace's worst case from the model's head count/dim and `--ubatch-size`
+  and confirms that much free VRAM survives reserving the arena, refusing
+  construction with a clear error if not - the same clean, caught failure as
+  an oversized arena, not the hard, unrecoverable `GGML_ASSERT`/`SIGABRT`
+  this used to risk mid-request. This check uses free VRAM as measured at
+  that point in context construction; other allocations later in
+  construction (e.g. the compute buffer) aren't yet accounted for, so it
+  catches the clearly-too-tight case, not necessarily every possible one.
 
 Use `benchmarks/benchmark_kv_stream.py` (see `benchmarks/README.md`) to find
 a safe arena size empirically for your model/GPU/context combination rather

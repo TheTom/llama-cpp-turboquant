@@ -7244,6 +7244,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
                 type_k, type_v, head_dim_k, head_dim_v, head_count, page_tokens, workspace_bytes);
         };
     }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_transient_workspace_bytes") == 0) {
+        return (void *) +[](uint32_t n_head_q, uint32_t head_dim_v, uint32_t n_ubatch,
+                size_t * transient_bytes) {
+            return ggml_cuda_kv_stream_transient_workspace_bytes(
+                n_head_q, head_dim_v, n_ubatch, transient_bytes);
+        };
+    }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_runtime_new_for_device") == 0) {
         return (void *) +[](ggml_backend_dev_t dev, size_t pool_bytes, size_t page_bytes,
                 size_t conversion_bytes,
