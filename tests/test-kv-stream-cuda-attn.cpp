@@ -136,6 +136,57 @@ attention_inputs make_f16_reference(const attention_inputs & inputs, int64_t n_k
     return result;
 }
 
+// Mirrors ggml_cuda_get_best_fattn_kernel's mixed-K/V-type allowlist for
+// plain (non-streamed) attention: without GGML_CUDA_FA_ALL_QUANTS, ordinary
+// CUDA flash attention refuses a mismatched pair unless both sides are in
+// {turbo2/3/4, q8_0, f16, bf16}. Most of this file's mechanics tests default
+// to (q8_0, q4_0) - a real KV pair for exercising the streaming/paging code,
+// but not one this allowlist admits - purely to compute a *reference* value
+// via the ordinary (non-streamed) backend; the actual streamed computation
+// under test isn't gated by this restriction at all (kv-stream attention
+// dispatch only cares whether ggml_backend_cuda_kv_stream_get_attention_mode
+// is UNSUPPORTED, which q8_0/q4_0 individually never are). So when the
+// direct reference would be refused, fall back to an F16-domain reference
+// instead - already the established pattern for the bounded-fallback tests
+// below - rather than changing what the streamed side is tested against.
+bool backend_supports_plain_kv_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v) {
+    if (type_k == type_v) {
+        return true;
+    }
+    if (backend_has_fa_all_quants(backend)) {
+        return true;
+    }
+    const auto is_kv_compat = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+            t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+    };
+    return is_kv_compat(type_k) && is_kv_compat(type_v);
+}
+
+// Q8_0/Q4_0 (this file's default KV pair for exercising streaming mechanics)
+// resolves to ATTENTION_DIRECT under GGML_CUDA_FA_ALL_QUANTS (no conversion
+// workspace needed) but ATTENTION_F16 without it - which needs one, or
+// ggml_cuda_flash_attn_ext_streamed hits GGML_ASSERT(transfer_ring->
+// conversion_data != nullptr). Compute it from the real dispatch decision
+// (not a build-flag guess) so every runtime params{} block below stays
+// correct regardless of how libggml-cuda was built.
+size_t kv_stream_conversion_bytes(ggml_type type_k, ggml_type type_v) {
+    if (ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v) !=
+            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16) {
+        return 0;
+    }
+    const size_t f16_k_page_bytes = ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+    const size_t f16_v_page_bytes = ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+    return align_up(f16_k_page_bytes, 128) + f16_v_page_bytes;
+}
+
+attention_inputs reference_inputs(ggml_backend_t backend, const attention_inputs & inputs, int64_t n_kv) {
+    if (backend_supports_plain_kv_pair(backend, inputs.type_k, inputs.type_v)) {
+        return inputs;
+    }
+    return make_f16_reference(inputs, n_kv);
+}
+
 std::vector<float> run_attention(
         ggml_backend_t backend,
         const attention_inputs & inputs,
@@ -289,7 +340,9 @@ std::vector<float> run_attention_layers(
         int64_t update_rows = 1,
         ggml_type index_type = GGML_TYPE_I32,
         ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr,
-        uint32_t layout_after_first = 0) {
+        uint32_t layout_after_first = 0,
+        ggml_type type_k = GGML_TYPE_Q8_0,
+        ggml_type type_v = GGML_TYPE_Q4_0) {
     constexpr size_t N_TENSORS = 256;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
         ggml_graph_overhead_custom(N_TENSORS, false);
@@ -325,19 +378,19 @@ std::vector<float> run_attention_layers(
         current.mask = ggml_new_tensor_4d(
             compute_ctx.get(), GGML_TYPE_F16, n_kv, n_batch, 1, 1);
         current.k_storage = ggml_new_tensor_2d(
-            kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, n_kv);
+            kv_ctx.get(), type_k, HEAD_DIM*N_KV_HEAD, n_kv);
         current.v_storage = ggml_new_tensor_2d(
-            kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, n_kv);
+            kv_ctx.get(), type_v, HEAD_DIM*N_KV_HEAD, n_kv);
         ggml_tensor * k_cache = ggml_view_4d(
             kv_ctx.get(), current.k_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
-            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM),
-            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD),
-            ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+            ggml_row_size(type_k, HEAD_DIM),
+            ggml_row_size(type_k, HEAD_DIM*N_KV_HEAD),
+            ggml_row_size(type_k, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
         ggml_tensor * v_cache = ggml_view_4d(
             kv_ctx.get(), current.v_storage, HEAD_DIM, N_KV_HEAD, n_kv, 1,
-            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM),
-            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD),
-            ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+            ggml_row_size(type_v, HEAD_DIM),
+            ggml_row_size(type_v, HEAD_DIM*N_KV_HEAD),
+            ggml_row_size(type_v, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
         ggml_tensor * k = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
         ggml_tensor * v = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
 
@@ -421,6 +474,35 @@ std::vector<float> run_attention_layers(
             ggml_nbytes(current.out));
     }
     return result;
+}
+
+std::vector<attention_inputs> reference_layers(
+        ggml_backend_t backend, const std::vector<attention_inputs> & layers, int64_t n_kv) {
+    std::vector<attention_inputs> result;
+    result.reserve(layers.size());
+    for (const auto & layer : layers) {
+        result.push_back(reference_inputs(backend, layer, n_kv));
+    }
+    return result;
+}
+
+// run_attention_layers hardcodes q8_0/q4_0 storage (its type_k/type_v
+// defaults) for every caller - see reference_inputs above for why that pair
+// needs an F16-domain reference without GGML_CUDA_FA_ALL_QUANTS.
+std::vector<float> run_attention_layers_reference(
+        ggml_backend_t backend, const std::vector<attention_inputs> & layers,
+        int64_t n_kv, int64_t n_batch, int repeats = 1, int64_t update_rows = 1,
+        ggml_type index_type = GGML_TYPE_I32) {
+    if (backend_supports_plain_kv_pair(backend, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)) {
+        return run_attention_layers(
+            backend, layers, ggml_backend_get_default_buffer_type(backend),
+            n_kv, n_batch, repeats, update_rows, index_type);
+    }
+    return run_attention_layers(
+        backend, reference_layers(backend, layers, n_kv),
+        ggml_backend_get_default_buffer_type(backend),
+        n_kv, n_batch, repeats, update_rows, index_type,
+        nullptr, 0, GGML_TYPE_F16, GGML_TYPE_F16);
 }
 
 } // namespace
@@ -521,6 +603,7 @@ int main() {
                 const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
                 ggml_backend_cuda_kv_stream_params params{};
                 params.device      = 0;
+                params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
                 params.stage_bytes = page_bytes;
                 params.stage_slots = 1;
                 auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -616,6 +699,7 @@ int main() {
                     const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
                     ggml_backend_cuda_kv_stream_params params{};
                     params.device      = 0;
+                    params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
                     params.stage_bytes = page_bytes;
                     params.stage_slots = 1;
                     if (expected_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16) {
@@ -713,6 +797,7 @@ int main() {
 
                 ggml_backend_cuda_kv_stream_params params{};
                 params.device           = 0;
+                params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
                 params.stage_bytes      = page_bytes;
                 params.stage_slots      = 1;
                 params.conversion_bytes = conversion_bytes;
@@ -779,6 +864,7 @@ int main() {
 
         ggml_backend_cuda_kv_stream_params params{};
         params.device           = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes      = page_bytes;
         params.stage_slots      = 2;
         params.conversion_bytes = conversion_bytes;
@@ -818,21 +904,27 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         // Exercise the final causal block. With query_start == 0, every block
         // after the first is masked and corrupted streamed pages are invisible.
         const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 256);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch, 2, 256, true);
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch, 2, 256, true);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 2;
-        params.pool_bytes           = 3*page_bytes;
+        params.pool_bytes           = 3*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -881,16 +973,22 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device      = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes = page_bytes;
         params.stage_slots = 1;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -915,19 +1013,25 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch, 340);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 1;
-        params.pool_bytes           = 3*page_bytes;
+        params.pool_bytes           = 3*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -952,19 +1056,25 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch, 340);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 2;
-        params.pool_bytes           = 3*page_bytes;
+        params.pool_bytes           = 3*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -997,6 +1107,10 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -1005,14 +1119,16 @@ int main() {
         for (const int64_t n_batch : query_counts) {
             const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - n_batch);
             const std::vector<float> expected = run_attention(
-                backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+                ggml_backend_get_default_buffer_type(backend.get()),
                 n_kv, n_batch, 1, n_batch);
 
             ggml_backend_cuda_kv_stream_params params{};
             params.device               = 0;
+            params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
             params.stage_bytes          = page_bytes;
             params.stage_slots          = 2;
-            params.pool_bytes           = 3*page_bytes;
+            params.pool_bytes           = 3*page_bytes + params.conversion_bytes;
             params.resident_layer_count = 1;
             params.page_tokens          = 256;
             auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1050,6 +1166,10 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -1057,9 +1177,10 @@ int main() {
 
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 4;
-        params.pool_bytes           = 6*page_bytes;
+        params.pool_bytes           = 6*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1106,10 +1227,15 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()),
             n_kv, n_batch, 2, 1, true, GGML_TYPE_I32, true);
 
         const size_t k_token_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD;
@@ -1119,9 +1245,10 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 1;
-        params.pool_bytes           = 3*page_bytes;
+        params.pool_bytes           = 3*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1151,10 +1278,15 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()),
             n_kv, n_batch, 5, 1, true, GGML_TYPE_I64, false, nullptr, true);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -1162,9 +1294,10 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 1;
-        params.pool_bytes           = 3*page_bytes;
+        params.pool_bytes           = 3*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1296,7 +1429,8 @@ int main() {
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()),
             n_kv, n_batch, 5, 1, true, GGML_TYPE_I64, false, nullptr, true, true, 1);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -1304,9 +1438,10 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 1;
-        params.pool_bytes           = 3*page_bytes;
+        params.pool_bytes           = 3*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1332,10 +1467,15 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()),
             n_kv, n_batch, 2);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -1343,9 +1483,10 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 4;
-        params.pool_bytes           = 5*page_bytes;
+        params.pool_bytes           = 5*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1379,10 +1520,15 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch);
         const std::vector<float> expected = run_attention(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            backend.get(), reference_inputs(backend.get(), inputs, n_kv),
+            ggml_backend_get_default_buffer_type(backend.get()),
             n_kv, n_batch);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
@@ -1390,9 +1536,10 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 40;
-        params.pool_bytes           = 41*page_bytes;
+        params.pool_bytes           = 41*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 1;
         params.page_tokens          = 256;
         params.decode_span_pages    = 32;
@@ -1433,6 +1580,10 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         std::vector<attention_inputs> inputs(16, make_inputs(n_kv, n_batch, n_kv - 256));
         for (size_t layer = 1; layer < inputs.size(); ++layer) {
@@ -1440,18 +1591,18 @@ int main() {
                 inputs[layer].q[i] += 0.025f*layer*std::sin(float(i)*0.015625f);
             }
         }
-        const std::vector<float> expected = run_attention_layers(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
-            n_kv, n_batch, 1, 2, GGML_TYPE_I64);
+        const std::vector<float> expected = run_attention_layers_reference(
+            backend.get(), inputs, n_kv, n_batch, 1, 2, GGML_TYPE_I64);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 8;
-        params.pool_bytes           = 24*page_bytes;
+        params.pool_bytes           = 24*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 16;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1490,6 +1641,10 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         std::vector<attention_inputs> inputs{
             make_inputs(n_kv, n_batch),
@@ -1501,17 +1656,18 @@ int main() {
                 inputs[layer].q[i] += 0.025f*layer*std::sin(float(i)*0.015625f);
             }
         }
-        const std::vector<float> expected = run_attention_layers(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+        const std::vector<float> expected = run_attention_layers_reference(
+            backend.get(), inputs, n_kv, n_batch);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 2;
-        params.pool_bytes           = 5*page_bytes;
+        params.pool_bytes           = 5*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 3;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1585,9 +1741,10 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 1;
-        params.pool_bytes           = 5*page_bytes;
+        params.pool_bytes           = 5*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 4;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1615,9 +1772,10 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 8;
-        params.pool_bytes           = 12*page_bytes;
+        params.pool_bytes           = 12*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 4;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1651,17 +1809,18 @@ int main() {
             make_inputs(n_kv, n_batch, n_kv - 1),
             make_inputs(n_kv, n_batch, n_kv - 1),
         };
-        const std::vector<float> expected = run_attention_layers(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+        const std::vector<float> expected = run_attention_layers_reference(
+            backend.get(), inputs, n_kv, n_batch);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 8;
-        params.pool_bytes           = 12*page_bytes;
+        params.pool_bytes           = 12*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 4;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -1705,23 +1864,28 @@ int main() {
         if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
             return;
         }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
 
         std::vector<attention_inputs> inputs{
             make_inputs(n_kv, n_batch, n_kv - 1),
             make_inputs(n_kv, n_batch, n_kv - 1),
             make_inputs(n_kv, n_batch, n_kv - 1),
         };
-        const std::vector<float> expected = run_attention_layers(
-            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+        const std::vector<float> expected = run_attention_layers_reference(
+            backend.get(), inputs, n_kv, n_batch);
 
         const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         ggml_backend_cuda_kv_stream_params params{};
         params.device               = 0;
+        params.conversion_bytes = kv_stream_conversion_bytes(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
         params.stage_bytes          = page_bytes;
         params.stage_slots          = 3;
-        params.pool_bytes           = 6*page_bytes;
+        params.pool_bytes           = 6*page_bytes + params.conversion_bytes;
         params.resident_layer_count = 3;
         params.page_tokens          = 256;
         auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
