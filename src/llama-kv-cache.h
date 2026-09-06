@@ -25,6 +25,21 @@ ggml_type llama_kv_cache_resolve_stream_type_k(
         const llama_model & model, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v);
 
+// Layer-adaptive per-layer KV precision override (TURBO_LAYER_ADAPTIVE env
+// var - see llama-kv-cache.cpp for the mode legend). Exposed, like the
+// resolver above, so llama-context.cpp's block KV streaming pre-scan can
+// detect ahead of time whether a model will actually get non-uniform
+// per-layer KV types: the streamed page pool has one page size and one
+// buffer type for the whole arena, so mixed q8_0/turbo2/turbo4 layers would
+// otherwise pack differently-shaped rows into pages sized for a layer that
+// isn't theirs.
+int llama_kv_cache_turbo_layer_adaptive_mode(ggml_type type_v, uint32_t n_layer);
+
+ggml_type llama_kv_cache_turbo_layer_adaptive_type_k(
+        int mode, ggml_type type_k, ggml_type type_v, uint32_t il, uint32_t n_layer);
+ggml_type llama_kv_cache_turbo_layer_adaptive_type_v(
+        int mode, ggml_type type_k, ggml_type type_v, uint32_t il, uint32_t n_layer);
+
 //
 // llama_kv_cache
 //

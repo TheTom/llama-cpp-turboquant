@@ -507,6 +507,35 @@ llama_context::llama_context(
             const ggml_type stream_type_k =
                 llama_kv_cache_resolve_stream_type_k(model, hparams, params.type_k, params.type_v);
 
+            // TURBO_LAYER_ADAPTIVE (see llama-kv-cache.cpp) can give individual
+            // layers a different K/V precision than the rest of the cache -
+            // including auto-enabling itself with no env var at all whenever
+            // type_v is turbo2 on an >=8-layer model. The streamed page pool
+            // has one page size and one buffer type for the whole arena, so a
+            // model that would actually get non-uniform per-layer types must
+            // be refused here, before ever touching the CUDA runtime, rather
+            // than silently packing wrongly-shaped rows into shared pages.
+            const int kv_stream_adaptive_mode =
+                llama_kv_cache_turbo_layer_adaptive_mode(params.type_v, hparams.n_layer());
+            if (kv_stream_adaptive_mode != 0) {
+                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                    if (!hparams.has_kv(il) || hparams.is_recr(il) ||
+                            (hparams.is_swa(il) && !params.swa_full)) {
+                        continue;
+                    }
+                    const ggml_type layer_type_k = llama_kv_cache_turbo_layer_adaptive_type_k(
+                            kv_stream_adaptive_mode, stream_type_k, params.type_v, il, hparams.n_layer());
+                    const ggml_type layer_type_v = llama_kv_cache_turbo_layer_adaptive_type_v(
+                            kv_stream_adaptive_mode, stream_type_k, params.type_v, il, hparams.n_layer());
+                    if (layer_type_k != stream_type_k || layer_type_v != params.type_v) {
+                        throw std::runtime_error(
+                            "block KV streaming does not support per-layer mixed KV precision "
+                            "(TURBO_LAYER_ADAPTIVE=" + std::to_string(kv_stream_adaptive_mode) +
+                            "); the streamed page pool assumes uniform per-layer geometry");
+                    }
+                }
+            }
+
             ggml_backend_dev_t stream_device = nullptr;
             size_t page_bytes = 0;
             size_t conversion_bytes = 0;

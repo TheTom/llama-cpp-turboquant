@@ -125,6 +125,56 @@ ggml_type llama_kv_cache_resolve_stream_type_k(
     return type_k;
 }
 
+int llama_kv_cache_turbo_layer_adaptive_mode(ggml_type type_v, uint32_t n_layer) {
+    const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+    if (env) {
+        return atoi(env);
+    }
+    if (type_v == GGML_TYPE_TURBO2_0 && n_layer >= 8) {
+        return 7;
+    }
+    return 0;
+}
+
+ggml_type llama_kv_cache_turbo_layer_adaptive_type_k(
+        int mode, ggml_type type_k, ggml_type /* type_v */, uint32_t il, uint32_t n_layer) {
+    const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+    if (is_turbo && n_layer >= 8) {
+        if (mode == 1 && (il < 4 || il >= n_layer - 4)) {
+            return GGML_TYPE_Q8_0;
+        }
+        if (mode == 2 && il >= n_layer - 8) {
+            return GGML_TYPE_Q8_0;
+        }
+    }
+    return type_k;
+}
+
+ggml_type llama_kv_cache_turbo_layer_adaptive_type_v(
+        int mode, ggml_type type_k, ggml_type type_v, uint32_t il, uint32_t n_layer) {
+    if (n_layer < 8) {
+        return type_v;
+    }
+    const bool is_turbo   = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+    const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+    if (mode == 1 && is_turbo && (il < 4 || il >= n_layer - 4)) {
+        return GGML_TYPE_Q8_0;
+    }
+    if (mode == 2 && is_turbo && il >= n_layer - 8) {
+        return GGML_TYPE_Q8_0;
+    }
+    if (mode == 5 && v_is_turbo) {
+        return (il < 2 || il >= n_layer - 2) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
+    }
+    if (mode == 6 && v_is_turbo) {
+        return (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
+    }
+    if (mode == 7 && v_is_turbo) {
+        return (il < 2 || il >= n_layer - 2) ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
+    }
+    return type_v;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -270,22 +320,14 @@ llama_kv_cache::llama_kv_cache(
     // a process that constructs caches for more than one type_v in turn (e.g.
     // llama-bench sweeping --cache-type-v) must not have the first
     // construction's mode silently pin the strategy for every later one.
-    const int kv_adaptive_mode = [&]() {
-        const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-        if (env) {
-            int mode = atoi(env);
-            if (mode > 0) {
-                LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-            }
-            return mode;
-        }
-        // Auto-enable Boundary V (mode 7) when V is turbo2
-        if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
+    const int kv_adaptive_mode = llama_kv_cache_turbo_layer_adaptive_mode(type_v, hparams.n_layer());
+    if (kv_adaptive_mode > 0) {
+        if (getenv("TURBO_LAYER_ADAPTIVE")) {
+            LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", kv_adaptive_mode);
+        } else {
             LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-            return 7;
         }
-        return 0;
-    }();
+    }
 
     ggml_backend_dev_t kv_stream_dev = nullptr;
     ggml_backend_buffer_type_t kv_stream_buft = nullptr;
@@ -499,41 +541,17 @@ llama_kv_cache::llama_kv_cache(
 
         // Layer-adaptive: use higher precision for quality-sensitive layers.
         // See kv_adaptive_mode above for the mode legend and env var.
-        ggml_type layer_type_k = type_k;
-        ggml_type layer_type_v = type_v;
-        {
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+        const ggml_type layer_type_k = llama_kv_cache_turbo_layer_adaptive_type_k(
+                kv_adaptive_mode, type_k, type_v, il, hparams.n_layer());
+        const ggml_type layer_type_v = llama_kv_cache_turbo_layer_adaptive_type_v(
+                kv_adaptive_mode, type_k, type_v, il, hparams.n_layer());
+        if (il == 0) {
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
-            const uint32_t n_layer = hparams.n_layer();
-            if (kv_adaptive_mode == 1 && is_turbo && n_layer >= 8) {
-                if (il < 4 || il >= n_layer - 4) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                    layer_type_v = GGML_TYPE_Q8_0;
-                }
-            } else if (kv_adaptive_mode == 2 && is_turbo && n_layer >= 8) {
-                if (il >= n_layer - 8) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                    layer_type_v = GGML_TYPE_Q8_0;
-                }
-            } else if (kv_adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
-                // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2
-                const bool is_boundary = (il < 2 || il >= n_layer - 2);
-                layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
-                if (il == 0) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
-                }
-            } else if (kv_adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
-                // V-only: last 8 V=turbo4, rest V=turbo2
-                layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
-                if (il == 0) {
-                    LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
-                }
-            } else if (kv_adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
-                // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
-                const bool is_boundary = (il < 2 || il >= n_layer - 2);
-                layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
-                if (il == 0) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n");
+            if (v_is_turbo && hparams.n_layer() >= 8) {
+                switch (kv_adaptive_mode) {
+                    case 5: LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n"); break;
+                    case 6: LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n"); break;
+                    case 7: LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n"); break;
                 }
             }
         }
