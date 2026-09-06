@@ -101,6 +101,32 @@ over PCIe, but pays that transfer on every single decode step with none of
 streaming's page-residency/prefetch benefit. Correct, just slow - budget
 for it rather than assume streaming accelerates every model uniformly.
 
+## Numerical exactness
+
+Streamed output is close to non-streamed output, not bit-identical, and by
+design:
+
+- The chunked reduction combines each streamed block's partial attention
+  result via a sequential online-softmax rescale as blocks arrive, rather
+  than the single combined pass ordinary (non-streamed) Flash Attention
+  uses (`flash_attn_combine_results`). Floating-point addition isn't
+  associative, so summing the same terms in a different order gives a
+  slightly different result - mean KL-divergence around 0.000000 and
+  99%+ same-top-token in every correctness check run for this PR (see the
+  PR description), not exact equality.
+- `ggml_cuda_kv_stream_span_tuner` (`kv-stream-span-tuner.h`) picks between
+  the ordinary coalesced streamed kernel and a bounded-span pipeline by
+  comparing measured wall-clock time across trial runs, once per resident/
+  ring layout. Which one wins depends on transient timing noise (system
+  load, thermal state, etc.) during that trial window, so the same model/
+  context/hardware can select a different kernel variant - and therefore a
+  slightly different numerical result within the tolerance above - from one
+  run to the next.
+
+Both are intentional performance trade-offs, not bugs, but they mean two
+runs of the same request are not guaranteed to produce byte-identical
+logits even with all sampling held constant.
+
 ## Why single-sequence only
 
 This is not a simple validation gate that could be relaxed by testing more -
