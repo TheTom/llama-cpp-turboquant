@@ -768,6 +768,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
+    // Diagnostic A/B for HIP flash-attention prefill regressions. This is intentionally
+    // opt-in so normal dispatch is unchanged. The MMA gate is limited to the symmetric
+    // head sizes with compiled instances.
+    if (const char * forced_kernel = getenv("GGML_HIP_FA_KERNEL")) {
+        if (strcmp(forced_kernel, "tile") == 0) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+
+        const bool mma_shape = V->ne[0] == Q->ne[0] &&
+            (Q->ne[0] == 64 || Q->ne[0] == 80 || Q->ne[0] == 96 ||
+             Q->ne[0] == 112 || Q->ne[0] == 128 || Q->ne[0] == 256);
+        if (strcmp(forced_kernel, "mma") == 0 && mma_shape) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+    }
+
     // HIP/ROCm: the TILE/MMA/WMMA FA paths allocate large f16 temp buffers for
     // quantized KV types (K_f16, V_f16 in launch_fattn). For SMALL batches (decode)
     // the VEC kernel is preferred: it does inline dequant with zero temp buffer
