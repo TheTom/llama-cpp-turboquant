@@ -1746,6 +1746,14 @@ struct ggml_backend_cuda_kv_stream_runtime {
     ggml_backend_buffer_type buffer_type{};
 };
 
+// Process-wide count of live KV streaming runtimes. Lets
+// ggml_cuda_graph_update_required skip its per-node kv_stream_generation
+// scan entirely for the common case (no caller has ever enabled streaming),
+// instead of paying that O(n_nodes * GGML_MAX_SRC) cost on every graph
+// compute - including every decode step - regardless of whether streaming
+// is in use at all.
+static std::atomic<uint32_t> g_kv_stream_runtime_count{0};
+
 struct ggml_backend_cuda_kv_stream_buffer_context {
     ggml_backend_cuda_kv_stream_runtime_t runtime = nullptr;
     void * host_data = nullptr;
@@ -1766,6 +1774,7 @@ static void ggml_backend_cuda_kv_stream_runtime_release(
         CUDA_CHECK(cudaFree(runtime->stage_data));
     }
     delete runtime;
+    g_kv_stream_runtime_count.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 static const char * ggml_backend_cuda_kv_stream_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -1991,6 +2000,7 @@ static ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), params.device),
         /* .context = */ runtime,
     };
+    g_kv_stream_runtime_count.fetch_add(1, std::memory_order_acq_rel);
     return runtime;
 }
 
@@ -4064,21 +4074,31 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // A live tensor can only reference a KV streaming runtime by holding a
+    // reference to its buffer, which in turn holds a reference to the
+    // runtime (see ggml_backend_cuda_kv_stream_buffer_free) - so no live
+    // tensor anywhere can reference a runtime once the global live count
+    // drops to zero. Skip this O(n_nodes * GGML_MAX_SRC) scan entirely for
+    // the common case where no caller has ever enabled streaming, rather
+    // than paying it on every graph compute (including every decode step)
+    // regardless of whether streaming is in use at all.
     uint64_t kv_stream_generation = 0;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i])) {
-            kv_stream_generation = std::max(kv_stream_generation, runtime->generation);
-        }
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i]->src[j])) {
+    uint64_t previous_kv_stream_generation = 0;
+    if (g_kv_stream_runtime_count.load(std::memory_order_acquire) != 0) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i])) {
                 kv_stream_generation = std::max(kv_stream_generation, runtime->generation);
             }
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i]->src[j])) {
+                    kv_stream_generation = std::max(kv_stream_generation, runtime->generation);
+                }
+            }
         }
-    }
-    uint64_t previous_kv_stream_generation = 0;
-    for (const auto & prop : graph->node_props) {
-        previous_kv_stream_generation = std::max(
-            previous_kv_stream_generation, prop.kv_stream_generation);
+        for (const auto & prop : graph->node_props) {
+            previous_kv_stream_generation = std::max(
+                previous_kv_stream_generation, prop.kv_stream_generation);
+        }
     }
 
     if (cgraph->uid != 0 &&
