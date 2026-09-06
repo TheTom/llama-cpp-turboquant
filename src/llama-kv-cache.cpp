@@ -3368,7 +3368,7 @@ std::vector<llama_kv_stream_active_target> llama_kv_cache_context::get_kv_stream
     if (kv->get_kv_stream_targets().empty()) {
         return {};
     }
-    return { { kv, n_kv } };
+    return { { kv, (uint32_t) n_kv } };
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
