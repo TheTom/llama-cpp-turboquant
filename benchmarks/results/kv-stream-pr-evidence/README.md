@@ -3,8 +3,6 @@
 Backing data for this PR's description. Referenced from the PR body as
 `results.csv` under each benchmark's own name.
 
-- `images/` - the five benchmark charts embedded in the PR description, at
-  full resolution.
 - `qwen3.8-27b-throughput/` - `benchmark_kv_stream.py`, Qwen3.8-27B-AD, 8K->262K, no MTP.
 - `qwen3.8-27b-mtp-throughput/` - same, with `--spec-type draft-mtp --spec-chain 8`, 8K->106K.
 - `gemma4-it-throughput/` - same, Gemma-4-26B-A4B-It, 8K->131K.
