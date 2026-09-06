@@ -890,7 +890,13 @@ static __global__ void kv_stream_normalize_chunk_results(
     }
     ggml_cuda_pdl_sync();
 
-    dst[row*D + tid] = accumulator[row*D + tid]/accumulator_meta[row].y;
+    // A row whose mask is entirely -inf (e.g. a padding row filled in just to
+    // round the grid out to a uniform block/row count, never written back to
+    // the real output) has a zero softmax normalizer here. Guard the divide
+    // so that stays a harmless zero rather than a silent NaN/Inf that could
+    // propagate if such a row's output were ever read by mistake.
+    const float denom = accumulator_meta[row].y;
+    dst[row*D + tid] = denom > 0.0f ? accumulator[row*D + tid]/denom : 0.0f;
 }
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
