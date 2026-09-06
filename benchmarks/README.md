@@ -96,3 +96,41 @@ driver spellings remain accepted as compatibility aliases.
 
 Do not run another GPU workload during the sweep. Its allocations would change
 the automatically selected arena and invalidate comparisons between points.
+
+## Memory footprint sweep (VRAM/RAM, streaming vs no streaming)
+
+`benchmark_kv_memory.py` tracks GPU VRAM and host RAM usage against context
+length instead of throughput. It doesn't run a prefill/decode pass - the
+KV/compute buffers are sized when the context is constructed, not grown
+lazily during inference - so each point only needs to start the server, read
+memory, and stop it, making it cheap enough to sweep wide ranges and to run
+a same-context no-streaming baseline alongside the streaming measurement at
+every point, including past the point where the baseline runs out of VRAM.
+
+```bash
+python3 benchmarks/benchmark_kv_memory.py \
+  --model /path/to/model.gguf \
+  --min-context 65536 --max-context 393216 --context-step 65536 \
+  --arena-mib 8192 \
+  --output-dir benchmarks/results/my-memory-sweep
+```
+
+For contexts beyond the model's training context, pass rope scaling through
+like any other server flag:
+
+```bash
+  --extra-server-arg=--rope-scaling --extra-server-arg=yarn \
+  --extra-server-arg=--rope-scale --extra-server-arg=4 \
+  --extra-server-arg=--yarn-orig-ctx --extra-server-arg=262144
+```
+
+Output is `kv-memory-sweep.png`/`.svg`: GPU VRAM and host process RSS, each
+with a streaming line and a no-streaming line. When the no-streaming leg
+fails (CUDA OOM or a hard abort near the VRAM ceiling - see
+[docs/kv-stream.md](../docs/kv-stream.md)), that failure is recorded in
+`results.csv`/`results.jsonl`, the no-streaming line stops there, and the
+plot marks it with a labeled vertical line rather than silently omitting
+the point. Once the no-streaming leg fails, larger contexts only run the
+streaming leg (a monotonically larger context won't un-fail it). Pass
+`--no-baseline` to skip the no-streaming leg entirely and only sweep
+streaming.
