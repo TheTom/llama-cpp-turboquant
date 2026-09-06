@@ -30,7 +30,10 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                     size_t kv_stream_stage_bytes,
+                     void * kv_stream_phase_arena,
+                     size_t kv_stream_maximum_pool_bytes) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -50,7 +53,11 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        kv_stream_stage_bytes,
+        kv_stream_phase_arena,
+        kv_stream_maximum_pool_bytes
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -189,6 +196,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+std::vector<llama_kv_stream_target> llama_memory_hybrid::get_kv_stream_targets() const {
+    return mem_attn->get_kv_stream_targets();
+}
+
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);
@@ -286,6 +297,10 @@ ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
 
 ggml_tensor * llama_memory_hybrid_context::get_turbo_innerq_scale_inv() const {
     return ctx_attn ? ctx_attn->get_turbo_innerq_scale_inv() : nullptr;
+}
+
+std::vector<llama_kv_stream_active_target> llama_memory_hybrid_context::get_kv_stream_active_targets() const {
+    return ctx_attn ? ctx_attn->get_kv_stream_active_targets() : std::vector<llama_kv_stream_active_target>{};
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {

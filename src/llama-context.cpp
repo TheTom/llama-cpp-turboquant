@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-stream-config.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
@@ -133,6 +134,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.mtp_chain               = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.kv_stream_arena_mib     = params.kv_stream_arena_mib;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -411,12 +413,314 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        const uint64_t kv_stream_arena_bytes = uint64_t(cparams.kv_stream_arena_mib)*1024ULL*1024ULL;
+        uint64_t kv_stream_stage_bytes = kv_stream_arena_bytes;
+        uint64_t kv_stream_minimum_stage_bytes = 0;
+
+        // TurboQuant: this fork's MLA/indexer caches (DSA/DSV4/MSA) and the
+        // recurrent memory implementation compress or index the KV store in
+        // ways block KV streaming's uniform-page-size pool does not model -
+        // same exclusion set as this fork's now-removed PR #326 attempt.
+        // DFLASH only needs the exclusion when its DSpark stages hold a
+        // single MLA-style K per position (dsv4_hc_mult > 0); the plain
+        // multi-head-K variant behaves like an ordinary unified cache.
+        // TurboQuant: SWA (iSWA) architectures are no longer blanket-excluded
+        // here - llama_kv_cache_iswa/llama_memory_hybrid_iswa now forward the
+        // streaming params to their base cache (see llama-kv-cache-iswa.cpp),
+        // and llama_context::kv_stream_switch_phase/process_ubatch resolve
+        // targets via llama_memory_i::get_kv_stream_targets() rather than a
+        // fixed set of dynamic_casts, so an un-wired memory type (e.g.
+        // llama_memory_hybrid_idx) fails closed with a clean error instead
+        // of the hard crash this exclusion used to prevent.
+        //
+        // LLM_ARCH_DEEPSEEK4 (llama_kv_cache_dsv4) stays excluded, along with
+        // DEEPSEEK32/GLM_DSA (llama_kv_cache_dsa) and MINIMAX_M3
+        // (llama_kv_cache_msa). kv_csa has streaming plumbing wired up (see
+        // llama-kv-cache-dsv4.cpp), but real-model KL-divergence testing
+        // against a real DeepSeek-V4 model found a genuine, large, and
+        // arena-size-independent correctness regression (mean KLD 0.07, max
+        // 4.3, vs ~0.000000 for every other architecture validated this
+        // way) when streaming is enabled. The initial hypothesis - that the
+        // shared page-geometry function in fattn.cu mis-sizes the V region
+        // for kv_csa's K-only shape, since DSV4's compressed-cache attention
+        // (models/deepseek4.cpp, build_attn_mha with k_all passed as both K
+        // and V) always needs a real V-shaped region even though the
+        // persistent cache doesn't store V - was tested and RULED OUT: the
+        // KLD was bit-identical whether or not that geometry path reserved a
+        // V region at all. The actual root cause is still unidentified;
+        // likely candidates are DSV4's online-compression bookkeeping
+        // (state_pos/state_persist_*/state_snapshot_* row addressing in
+        // llama_kv_cache_dsv4_context::comp_plan) not surviving the
+        // resident-cache/ring-buffer model correctly, but this needs
+        // dedicated investigation into that machinery before re-enabling.
+        // The same K-only cache shape is used by DSA's kv_mla and by plain
+        // MLA, so - although neither has been empirically tested against a
+        // real model - both should be treated as similarly unverified until
+        // this is root-caused, not assumed safe by extension of Phase 4's
+        // (inspection-only, never-tested) conclusion that MLA "just works"
+        // via the generalized single-cache path.
+        const bool kv_stream_unified_kv_cache =
+            !llm_arch_is_recurrent(model.arch) &&
+            model.arch != LLM_ARCH_MINIMAX_M3 &&
+            model.arch != LLM_ARCH_GLM_DSA &&
+            model.arch != LLM_ARCH_DEEPSEEK32 &&
+            model.arch != LLM_ARCH_DEEPSEEK4 &&
+            (model.arch != LLM_ARCH_DFLASH || hparams.dsv4_hc_mult == 0);
+
+        const llama_kv_stream_config stream_config = {
+            /*.arena_bytes         =*/ kv_stream_arena_bytes,
+            /*.minimum_arena_bytes =*/ kv_stream_arena_bytes == 0 ? uint64_t(0) : uint64_t(1),
+            /*.unified_kv_cache    =*/ kv_stream_unified_kv_cache,
+            /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
+            /*.single_sequence     =*/ cparams.n_seq_max == 1,
+            /*.flash_attention     =*/ cparams.flash_attn,
+            /*.kv_offload          =*/ cparams.offload_kqv,
+            /*.swa_full_conflict   =*/ params.swa_full && hparams.is_swa_any(),
+        };
+        const auto stream_validation = llama_kv_stream_config_validate(stream_config);
+        if (!stream_validation.valid) {
+            throw std::runtime_error(stream_validation.error);
+        }
+        // TurboQuant: a no_alloc context (e.g. common_get_device_memory_data's
+        // no_alloc=true measurement pass, used to size the parent model for
+        // MTP) never actually allocates backend buffers, so llama_kv_cache's
+        // own streaming-attach loop skips it (see the matching !hparams.no_alloc
+        // guard in llama-kv-cache.cpp). Building the phase arena here anyway
+        // would leave it with no cache ever attached, and kv_stream_switch_phase
+        // would then fail closed with a confusing "requires a memory type with
+        // a streamable KV cache" error on every no_alloc measurement pass.
+        if (stream_validation.enabled && !hparams.no_alloc) {
+            using page_bytes_fn_t = bool (*)(
+                ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
+            using arena_new_fn_t = void * (*)(ggml_backend_dev_t, size_t);
+            using arena_free_fn_t = void (*)(void *);
+            using arena_set_compute_fn_t = bool (*)(void *, size_t, size_t);
+            using arena_buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
+            using graph_reset_fn_t = bool (*)(ggml_backend_t);
+
+            // llama_kv_cache's constructor may itself upgrade K away from the
+            // requested type (turbo auto-asymmetric on high-GQA-ratio models -
+            // see llama-kv-cache.cpp). Size this bootstrap pre-scan off the
+            // same effective type it will actually construct with, or the
+            // streaming runtime's internal page-count arithmetic can end up
+            // inconsistent with what gets allocated.
+            const ggml_type stream_type_k =
+                llama_kv_cache_resolve_stream_type_k(model, hparams, params.type_k, params.type_v);
+
+            // TURBO_LAYER_ADAPTIVE (see llama-kv-cache.cpp) can give individual
+            // layers a different K/V precision than the rest of the cache -
+            // including auto-enabling itself with no env var at all whenever
+            // type_v is turbo2 on an >=8-layer model. The streamed page pool
+            // has one page size and one buffer type for the whole arena, so a
+            // model that would actually get non-uniform per-layer types must
+            // be refused here, before ever touching the CUDA runtime, rather
+            // than silently packing wrongly-shaped rows into shared pages.
+            const int kv_stream_adaptive_mode =
+                llama_kv_cache_turbo_layer_adaptive_mode(params.type_v, hparams.n_layer());
+            if (kv_stream_adaptive_mode != 0) {
+                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                    if (!hparams.has_kv(il) || hparams.is_recr(il) ||
+                            (hparams.is_swa(il) && !params.swa_full)) {
+                        continue;
+                    }
+                    const ggml_type layer_type_k = llama_kv_cache_turbo_layer_adaptive_type_k(
+                            kv_stream_adaptive_mode, stream_type_k, params.type_v, il, hparams.n_layer());
+                    const ggml_type layer_type_v = llama_kv_cache_turbo_layer_adaptive_type_v(
+                            kv_stream_adaptive_mode, stream_type_k, params.type_v, il, hparams.n_layer());
+                    if (layer_type_k != stream_type_k || layer_type_v != params.type_v) {
+                        throw std::runtime_error(
+                            "block KV streaming does not support per-layer mixed KV precision "
+                            "(TURBO_LAYER_ADAPTIVE=" + std::to_string(kv_stream_adaptive_mode) +
+                            "); the streamed page pool assumes uniform per-layer geometry");
+                    }
+                }
+            }
+
+            ggml_backend_dev_t stream_device = nullptr;
+            size_t page_bytes = 0;
+            size_t conversion_bytes = 0;
+            uint32_t layer_count = 0;
+            uint32_t stream_head_count_q = 0;
+            uint32_t stream_head_dim_v = 0;
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                // For iSWA-shaped models (llama_kv_cache_iswa), SWA layers
+                // land in kv_swa, not kv_base - and kv_swa only gets a
+                // streaming runtime attached when swa_full makes it
+                // full-context-length too (see llama-kv-cache-iswa.cpp).
+                // Some models (e.g. Gemma-family) have genuinely different
+                // per-layer geometry between their SWA and full-attention
+                // layers (separate key_length/key_length_swa in the GGUF),
+                // so including SWA layers in this scan's uniform-geometry
+                // check would wrongly reject models whose actually-streamed
+                // layer set (kv_base's non-SWA layers) IS uniform.
+                if (!hparams.has_kv(il) || hparams.is_recr(il) ||
+                        (hparams.is_swa(il) && !params.swa_full)) {
+                    continue;
+                }
+                auto * dev = model.dev_layer(il);
+                if (stream_device != nullptr && stream_device != dev) {
+                    throw std::runtime_error(
+                        "block KV streaming requires every attention layer on one CUDA device");
+                }
+                stream_device = dev;
+                ++layer_count;
+
+                auto reg = ggml_backend_dev_backend_reg(dev);
+                auto page_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_kv_stream_page_bytes");
+                auto workspace_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
+                if (page_bytes_fn == nullptr || workspace_bytes_fn == nullptr) {
+                    throw std::runtime_error("block KV streaming requires the CUDA backend");
+                }
+                size_t layer_page_bytes = 0;
+                size_t layer_conversion_bytes = 0;
+                if (!page_bytes_fn(
+                        stream_type_k, params.type_v,
+                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                        hparams.n_head_kv(il), 256, &layer_page_bytes) ||
+                    !workspace_bytes_fn(
+                        stream_type_k, params.type_v,
+                        hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                        hparams.n_head_kv(il), 256, &layer_conversion_bytes)) {
+                    throw std::runtime_error("invalid block KV streaming page geometry");
+                }
+                if ((page_bytes != 0 && page_bytes != layer_page_bytes) ||
+                        (conversion_bytes != 0 &&
+                         conversion_bytes != layer_conversion_bytes)) {
+                    throw std::runtime_error(
+                        "block KV streaming requires uniform attention-layer geometry");
+                }
+                page_bytes = layer_page_bytes;
+                conversion_bytes = layer_conversion_bytes;
+                stream_head_count_q = hparams.n_head(il);
+                stream_head_dim_v = hparams.n_embd_head_v(il);
+            }
+            if (stream_device == nullptr || page_bytes == 0 || layer_count == 0) {
+                throw std::runtime_error("block KV streaming found no attention layers");
+            }
+
+            const uint64_t bootstrap_pages =
+                uint64_t(layer_count) + kv_stream_phase_arena.minimum_ring_slots;
+            if (bootstrap_pages > std::numeric_limits<uint64_t>::max()/page_bytes ||
+                    conversion_bytes > std::numeric_limits<uint64_t>::max() -
+                        bootstrap_pages*page_bytes) {
+                throw std::runtime_error("block KV streaming bootstrap size overflow");
+            }
+            const uint64_t bootstrap_raw =
+                conversion_bytes + bootstrap_pages*page_bytes;
+            kv_stream_minimum_stage_bytes = (bootstrap_raw + 127ULL) & ~127ULL;
+            if (kv_stream_minimum_stage_bytes >= kv_stream_arena_bytes) {
+                throw std::runtime_error(
+                    "block KV streaming arena is too small for bootstrap KV and compute slices");
+            }
+
+            // The streamed attention kernel's chunked partial-attention
+            // reduction (fattn.cu's ggml_cuda_flash_attn_ext_streamed) draws
+            // its scratch buffers from the device's general CUDA memory
+            // pool, not from this arena - an arena that fits by itself can
+            // still leave too little free VRAM for that pool to grow into
+            // during actual inference, which aborts the whole process
+            // instead of failing cleanly (see docs/kv-stream.md's "Sizing
+            // the arena"). Confirm enough headroom survives reserving the
+            // arena for that pool's worst case before ever allocating it.
+            // This uses free VRAM as measured right now; other allocations
+            // later in context construction (e.g. the compute buffer) are
+            // not yet accounted for, so this catches the clearly-too-tight
+            // case, not every possible one - the empirical probing in
+            // benchmarks/benchmark_kv_stream.py remains the reliable way to
+            // size an arena for production.
+            {
+                using transient_workspace_fn_t = bool (*)(uint32_t, uint32_t, uint32_t, size_t *);
+                auto transient_workspace_fn = (transient_workspace_fn_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(stream_device),
+                    "ggml_backend_cuda_kv_stream_transient_workspace_bytes");
+                if (transient_workspace_fn == nullptr) {
+                    throw std::runtime_error("block KV streaming requires the CUDA backend");
+                }
+                size_t transient_workspace_bytes = 0;
+                if (!transient_workspace_fn(
+                        stream_head_count_q, stream_head_dim_v, cparams.n_ubatch,
+                        &transient_workspace_bytes)) {
+                    throw std::runtime_error("invalid block KV streaming transient workspace geometry");
+                }
+                size_t dev_free_bytes = 0;
+                size_t dev_total_bytes = 0;
+                ggml_backend_dev_memory(stream_device, &dev_free_bytes, &dev_total_bytes);
+                if (kv_stream_arena_bytes > dev_free_bytes ||
+                        transient_workspace_bytes > dev_free_bytes - kv_stream_arena_bytes) {
+                    throw std::runtime_error(
+                        "block KV streaming arena leaves insufficient free VRAM for the streamed "
+                        "attention kernel's transient workspace (needs roughly " +
+                        std::to_string((transient_workspace_bytes + 1024*1024 - 1)/(1024*1024)) +
+                        " MiB of headroom beyond the arena) - reduce --kv-stream-arena-mib or "
+                        "--ubatch-size, or free more device memory");
+                }
+            }
+
+            auto reg = ggml_backend_dev_backend_reg(stream_device);
+            auto arena_new_fn = (arena_new_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_phase_arena_new_for_device");
+            auto arena_free_fn = (arena_free_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_phase_arena_free");
+            auto arena_set_compute_fn = (arena_set_compute_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_phase_arena_set_compute");
+            auto arena_buffer_type_fn = (arena_buffer_type_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_phase_arena_buffer_type");
+            auto graph_reset_fn = (graph_reset_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_graph_reset");
+            if (arena_new_fn == nullptr || arena_free_fn == nullptr ||
+                    arena_set_compute_fn == nullptr || arena_buffer_type_fn == nullptr ||
+                    graph_reset_fn == nullptr) {
+                throw std::runtime_error("block KV streaming phase arena is unavailable");
+            }
+
+            kv_stream_phase_arena.arena = arena_new_fn(
+                stream_device, kv_stream_arena_bytes);
+            kv_stream_phase_arena.free_fn = arena_free_fn;
+            kv_stream_phase_arena.set_compute_fn = arena_set_compute_fn;
+            kv_stream_phase_arena.buffer_type_fn = arena_buffer_type_fn;
+            kv_stream_phase_arena.graph_reset_fn = graph_reset_fn;
+            kv_stream_phase_arena.device = stream_device;
+            kv_stream_phase_arena.arena_bytes = kv_stream_arena_bytes;
+            kv_stream_phase_arena.page_bytes = page_bytes;
+            kv_stream_phase_arena.conversion_bytes = conversion_bytes;
+            kv_stream_phase_arena.layer_count = layer_count;
+            kv_stream_phase_arena.current_kv_bytes = kv_stream_minimum_stage_bytes;
+            kv_stream_phase_arena.current_compute_offset =
+                kv_stream_minimum_stage_bytes;
+            kv_stream_phase_arena.current_compute_bytes =
+                kv_stream_arena_bytes - kv_stream_minimum_stage_bytes;
+            kv_stream_phase_arena.current_ring_slots =
+                kv_stream_phase_arena.minimum_ring_slots;
+            if (kv_stream_phase_arena.arena == nullptr ||
+                    !arena_set_compute_fn(
+                        kv_stream_phase_arena.arena,
+                        kv_stream_minimum_stage_bytes,
+                        kv_stream_arena_bytes - kv_stream_minimum_stage_bytes)) {
+                throw std::runtime_error("failed to create CUDA block KV streaming phase arena");
+            }
+            kv_stream_phase_arena.buffer_type =
+                arena_buffer_type_fn(kv_stream_phase_arena.arena);
+            if (kv_stream_phase_arena.buffer_type == nullptr) {
+                throw std::runtime_error("failed to obtain phase arena CUDA buffer type");
+            }
+            kv_stream_stage_bytes = kv_stream_minimum_stage_bytes;
+            LLAMA_LOG_INFO(
+                "%s: experimental block KV streaming enabled, arena = %.2f MiB, bootstrap KV = %.2f MiB\n",
+                __func__, kv_stream_arena_bytes/1024.0/1024.0,
+                kv_stream_stage_bytes/1024.0/1024.0);
+        }
+
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k                =*/ params.type_k,
+            /*.type_v                =*/ params.type_v,
+            /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
+            /*.kv_stream_phase_arena =*/ kv_stream_phase_arena.arena,
+            /*.kv_stream_maximum_pool_bytes =*/ kv_stream_arena_bytes,
+            /*.swa_full              =*/ params.swa_full,
+            /*.ctx_type              =*/ cparams.ctx_type,
+            /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -698,6 +1002,157 @@ static bool llama_model_has_cacheable_moe_weights(
     return false;
 }
 
+bool llama_context::kv_stream_switch_phase(
+        bool decode, uint32_t active_tokens) {
+    auto & arena = kv_stream_phase_arena;
+    if (!arena.configured) {
+        return true;
+    }
+    if (sched && arena.decode == decode) {
+        return true;
+    }
+    if (arena.backend_index >= backend_ptrs.size()) {
+        LLAMA_LOG_ERROR("%s: invalid phase-arena backend index\n", __func__);
+        return false;
+    }
+
+    // TurboQuant: memory->get_kv_stream_targets() reports which sub-cache(s)
+    // of this memory object (a plain llama_kv_cache, llama_memory_hybrid's
+    // attention sub-cache, or - once wired up - one of iSWA/DSA/MSA/DSV4's
+    // sub-caches) have a streaming runtime attached. Only one target is
+    // ever produced today; a second concurrent target needs the CUDA phase
+    // arena's single-lease design generalized first (not yet done - see the
+    // multi-cache streaming plan), so more than one here is a hard error
+    // rather than silently only switching the first.
+    const auto stream_targets = memory->get_kv_stream_targets();
+    if (stream_targets.empty()) {
+        LLAMA_LOG_ERROR("%s: phase arena requires a memory type with a streamable KV cache\n", __func__);
+        return false;
+    }
+    if (stream_targets.size() > 1) {
+        LLAMA_LOG_ERROR("%s: phase arena does not yet support more than one concurrent streaming target\n", __func__);
+        return false;
+    }
+    llama_kv_cache * kv = stream_targets[0].cache;
+    if (kv == nullptr) {
+        LLAMA_LOG_ERROR("%s: phase arena requires a memory type with a streamable KV cache\n", __func__);
+        return false;
+    }
+    const auto & target = decode ? arena.token_generation : arena.prefill;
+
+    synchronize();
+    if (sched && !arena.graph_reset_fn(backend_ptrs[arena.backend_index])) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to invalidate CUDA graphs before arena repartition\n",
+            __func__);
+        return false;
+    }
+
+    // Releasing the scheduler returns the only borrowed compute lease.
+    sched.reset();
+    gf_res_prev->reset();
+
+    const size_t old_kv_bytes = arena.current_kv_bytes;
+    const size_t old_compute_offset = arena.current_compute_offset;
+    const size_t old_compute_bytes = arena.current_compute_bytes;
+    const uint32_t old_ring_slots = arena.current_ring_slots;
+
+    auto resize_kv = [&](size_t bytes, uint32_t ring_slots) {
+        return kv->kv_stream_resize_pool(
+            bytes, active_tokens, ring_slots);
+    };
+    auto restore_compute = [&] {
+        return arena.set_compute_fn(
+            arena.arena, old_compute_offset, old_compute_bytes);
+    };
+
+    if (target.kv_bytes > old_kv_bytes) {
+        // Moving compute upward frees the bytes before KV claims them.
+        if (!arena.set_compute_fn(
+                arena.arena, target.compute_offset, target.compute_bytes)) {
+            LLAMA_LOG_ERROR("%s: failed to move arena compute slice upward\n",
+                __func__);
+            return false;
+        }
+        if (!resize_kv(target.kv_bytes, target.ring_slots)) {
+            (void) restore_compute();
+            LLAMA_LOG_ERROR("%s: failed to grow arena KV slice\n", __func__);
+            return false;
+        }
+    } else if (target.kv_bytes < old_kv_bytes) {
+        // KV releases the bytes before compute expands downward.
+        if (!resize_kv(target.kv_bytes, target.ring_slots)) {
+            LLAMA_LOG_ERROR("%s: failed to shrink arena KV slice\n", __func__);
+            return false;
+        }
+        if (!arena.set_compute_fn(
+                arena.arena, target.compute_offset, target.compute_bytes)) {
+            (void) resize_kv(old_kv_bytes, old_ring_slots);
+            LLAMA_LOG_ERROR("%s: failed to move arena compute slice downward\n",
+                __func__);
+            return false;
+        }
+    } else {
+        if (!arena.set_compute_fn(
+                arena.arena, target.compute_offset, target.compute_bytes)) {
+            LLAMA_LOG_ERROR("%s: failed to update arena compute slice\n",
+                __func__);
+            return false;
+        }
+        if (!resize_kv(target.kv_bytes, target.ring_slots)) {
+            (void) restore_compute();
+            LLAMA_LOG_ERROR("%s: failed to update arena KV layout\n",
+                __func__);
+            return false;
+        }
+    }
+
+    arena.current_kv_bytes = target.kv_bytes;
+    arena.current_compute_offset = target.compute_offset;
+    arena.current_compute_bytes = target.compute_bytes;
+    arena.current_ring_slots = target.ring_slots;
+
+    sched.reset(ggml_backend_sched_new(
+        backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+        arena.max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (!sched) {
+        LLAMA_LOG_ERROR("%s: failed to recreate scheduler\n", __func__);
+        return false;
+    }
+
+    auto reserve_mctx = memory->init_full();
+    if (!reserve_mctx) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to initialize full memory for phase reserve\n",
+            __func__);
+        return false;
+    }
+
+    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_tokens = decode ?
+        n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs = decode ?
+        n_seqs : std::min(n_tokens, cparams.n_outputs_max);
+    auto * gf = graph_reserve(
+        n_tokens, n_seqs, n_outputs, reserve_mctx.get());
+    if (gf == nullptr) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to reserve %s compute graph in phase arena\n",
+            __func__, decode ? "decode" : "prefill");
+        return false;
+    }
+
+    backend_buf_exp_size = target.backend_sizes;
+    arena.decode = decode;
+    LLAMA_LOG_INFO(
+        "%s: activated %s phase: KV %.2f MiB, compute %.2f MiB, active tokens %u\n",
+        __func__, decode ? "decode" : "prefill",
+        target.kv_bytes/1024.0/1024.0,
+        target.compute_bytes/1024.0/1024.0,
+        active_tokens);
+    return true;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -708,6 +1163,15 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    if (kv_stream_phase_arena.configured && sched &&
+            kv_stream_phase_arena.backend_index < backend_ptrs.size()) {
+        if (!kv_stream_phase_arena.graph_reset_fn(
+                backend_ptrs[kv_stream_phase_arena.backend_index])) {
+            throw std::runtime_error(
+                "failed to reset CUDA graphs before measuring phase arena");
+        }
+        sched.reset();
+    }
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -810,6 +1274,138 @@ void llama_context::sched_reserve() {
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    if (kv_stream_phase_arena.arena != nullptr) {
+        size_t backend_index = SIZE_MAX;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (ggml_backend_get_device(backend_ptrs[i]) ==
+                    kv_stream_phase_arena.device) {
+                backend_index = i;
+                break;
+            }
+        }
+        if (backend_index == SIZE_MAX) {
+            throw std::runtime_error(
+                "failed to match phase arena to its CUDA scheduler backend");
+        }
+
+        const uint32_t n_outputs_pp =
+            std::min(n_tokens, cparams.n_outputs_max);
+        std::vector<size_t> sizes_pp(backend_ptrs.size(), 0);
+        std::vector<size_t> sizes_tg(backend_ptrs.size(), 0);
+
+        auto * gf_pp = graph_reserve(
+            n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes_pp.data());
+        if (gf_pp == nullptr) {
+            throw std::runtime_error("failed to measure compute pp buffers");
+        }
+        const int n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+        const int n_nodes_pp = ggml_graph_n_nodes(gf_pp);
+
+        auto * gf_tg = graph_reserve(
+            n_seqs, n_seqs, n_seqs, mctx.get(), true, sizes_tg.data());
+        if (gf_tg == nullptr) {
+            throw std::runtime_error("failed to measure compute tg buffers");
+        }
+        const int n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
+        const int n_nodes_tg = ggml_graph_n_nodes(gf_tg);
+
+        const uint64_t compute_alignment =
+            ggml_backend_buft_get_alignment(backend_buft[backend_index]);
+        const auto plan_pp = llama_kv_stream_phase_plan_make({
+            /*.arena_bytes        =*/ kv_stream_phase_arena.arena_bytes,
+            /*.compute_bytes      =*/ sizes_pp[backend_index],
+            /*.compute_alignment  =*/ compute_alignment,
+            /*.page_bytes         =*/ kv_stream_phase_arena.page_bytes,
+            /*.conversion_bytes   =*/ kv_stream_phase_arena.conversion_bytes,
+            /*.layer_count        =*/ kv_stream_phase_arena.layer_count,
+            /*.minimum_ring_pages =*/ kv_stream_phase_arena.minimum_ring_slots,
+        });
+        const auto plan_tg = llama_kv_stream_phase_plan_make({
+            /*.arena_bytes        =*/ kv_stream_phase_arena.arena_bytes,
+            /*.compute_bytes      =*/ sizes_tg[backend_index],
+            /*.compute_alignment  =*/ compute_alignment,
+            /*.page_bytes         =*/ kv_stream_phase_arena.page_bytes,
+            /*.conversion_bytes   =*/ kv_stream_phase_arena.conversion_bytes,
+            /*.layer_count        =*/ kv_stream_phase_arena.layer_count,
+            /*.minimum_ring_pages =*/ kv_stream_phase_arena.minimum_ring_slots,
+        });
+        if (!plan_pp.valid) {
+            throw std::runtime_error(
+                std::string("prefill phase does not fit shared CUDA arena: ") +
+                plan_pp.error);
+        }
+        if (!plan_tg.valid) {
+            throw std::runtime_error(
+                std::string("token-generation phase does not fit shared CUDA arena: ") +
+                plan_tg.error);
+        }
+
+        auto make_layout = [](const llama_kv_stream_phase_plan & plan,
+                              std::vector<size_t> sizes) {
+            kv_stream_phase_arena_owner::layout result;
+            result.kv_bytes = plan.kv_bytes;
+            result.compute_offset = plan.compute_offset;
+            result.compute_bytes = plan.compute_bytes;
+            result.ring_slots = plan.ring_pages;
+            result.resident_pages_per_layer =
+                plan.resident_pages_per_layer;
+            result.backend_sizes = std::move(sizes);
+            return result;
+        };
+
+        kv_stream_phase_arena.prefill =
+            make_layout(plan_pp, std::move(sizes_pp));
+        kv_stream_phase_arena.token_generation =
+            make_layout(plan_tg, std::move(sizes_tg));
+        kv_stream_phase_arena.backend_index = backend_index;
+        kv_stream_phase_arena.max_nodes = max_nodes;
+        kv_stream_phase_arena.configured = true;
+
+        sched.reset();
+        backend_buft[backend_index] = kv_stream_phase_arena.buffer_type;
+        if (!kv_stream_switch_phase(false, 0)) {
+            throw std::runtime_error(
+                "failed to activate shared CUDA arena prefill phase");
+        }
+
+        LLAMA_LOG_INFO(
+            "%s: phase arena prefill: KV %.2f MiB, compute %.2f MiB, resident %u pages/layer, ring %u pages\n",
+            __func__,
+            kv_stream_phase_arena.prefill.kv_bytes/1024.0/1024.0,
+            kv_stream_phase_arena.prefill.compute_bytes/1024.0/1024.0,
+            kv_stream_phase_arena.prefill.resident_pages_per_layer,
+            kv_stream_phase_arena.prefill.ring_slots);
+        LLAMA_LOG_INFO(
+            "%s: phase arena decode:  KV %.2f MiB, compute %.2f MiB, resident %u pages/layer, ring %u pages\n",
+            __func__,
+            kv_stream_phase_arena.token_generation.kv_bytes/1024.0/1024.0,
+            kv_stream_phase_arena.token_generation.compute_bytes/1024.0/1024.0,
+            kv_stream_phase_arena.token_generation.resident_pages_per_layer,
+            kv_stream_phase_arena.token_generation.ring_slots);
+
+        if (n_nodes_pp == n_nodes_tg) {
+            LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
+        } else {
+            LLAMA_LOG_INFO(
+                "%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n",
+                __func__, n_nodes_pp, n_tokens, n_nodes_tg);
+        }
+        if (n_splits_pp == n_splits_tg) {
+            LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
+        } else {
+            LLAMA_LOG_INFO(
+                "%s: graph splits = %d (with bs=%d), %d (with bs=1)\n",
+                __func__, n_splits_pp, n_tokens, n_splits_tg);
+        }
+
+        const int64_t t_end_us = ggml_time_us();
+        LLAMA_LOG_INFO(
+            "%s: reserve took %.2f ms, sched copies = %d\n",
+            __func__, (t_end_us - t_start_us)/1000.0,
+            ggml_backend_sched_get_n_copies(sched.get()));
+        return;
     }
 
     // reserve worst-case graph
@@ -1416,6 +2012,17 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
     cparams.n_threads_batch = n_threads_batch;
 }
 
+void llama_context::set_decode_phase(enum llama_decode_phase phase) {
+    switch (phase) {
+        case LLAMA_DECODE_PHASE_AUTOMATIC:
+        case LLAMA_DECODE_PHASE_PROMPT:
+        case LLAMA_DECODE_PHASE_GENERATION:
+            decode_phase = phase;
+            return;
+    }
+    decode_phase = LLAMA_DECODE_PHASE_AUTOMATIC;
+}
+
 void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
@@ -1614,6 +2221,51 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // Consume feedback from the previous completed decode before building the
+    // next graph. Repartition itself synchronizes only when hysteresis selects
+    // a new boundary, so steady-state token generation stays asynchronous.
+    //
+    // TurboQuant: this used to be gated on dynamic_cast<llama_memory_hybrid*>
+    // with no fallback, so for a PLAIN (non-hybrid) llama_kv_cache - what
+    // every model validated on this fork so far actually uses - the phase
+    // never switched past its initial construction-time prefill layout, and
+    // kv_stream_adapt() never ran at all. mctx->get_kv_stream_active_targets()
+    // covers both cases (and, once wired up, iSWA/DSA/MSA/DSV4's sub-caches)
+    // uniformly.
+    if (mctx != nullptr) {
+        for (const auto & active_target : mctx->get_kv_stream_active_targets()) {
+            if (active_target.cache == nullptr) {
+                continue;
+            }
+            llama_kv_stream_phase phase =
+                LLAMA_KV_STREAM_PHASE_AUTOMATIC;
+            if (decode_phase == LLAMA_DECODE_PHASE_PROMPT) {
+                phase = LLAMA_KV_STREAM_PHASE_PROMPT;
+            } else if (decode_phase == LLAMA_DECODE_PHASE_GENERATION) {
+                phase = LLAMA_KV_STREAM_PHASE_GENERATION;
+            }
+            const bool generation =
+                llama_kv_stream_phase_is_generation(
+                    phase, ubatch.n_tokens);
+            if (kv_stream_phase_arena.configured && generation &&
+                    ubatch.n_tokens != cparams.n_seq_max) {
+                LLAMA_LOG_ERROR(
+                    "%s: phase arena currently supports TG1 without speculative batches\n",
+                    __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (!kv_stream_switch_phase(generation, active_target.n_kv)) {
+                LLAMA_LOG_ERROR(
+                    "%s: failed to switch shared CUDA arena phase\n",
+                    __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            (void) active_target.cache->kv_stream_adapt(active_target.n_kv, ubatch.n_tokens);
+        }
     }
 
     auto * res = gf_res_prev.get();
@@ -3816,6 +4468,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_stream_arena_mib         =*/ 0,
     };
 
     return result;
@@ -3997,6 +4650,11 @@ void llama_detach_threadpool(llama_context * ctx) {
 
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
+}
+
+void llama_set_decode_phase(
+        llama_context * ctx, enum llama_decode_phase phase) {
+    ctx->set_decode_phase(phase);
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

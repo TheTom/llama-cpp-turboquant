@@ -101,7 +101,10 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                          size_t kv_stream_stage_bytes = 0,
+                          void * kv_stream_phase_arena = nullptr,
+                          size_t kv_stream_maximum_pool_bytes = 0);
 
     ~llama_kv_cache_dsv4() = default;
 
