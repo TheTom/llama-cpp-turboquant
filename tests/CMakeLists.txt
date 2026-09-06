@@ -264,8 +264,7 @@ llama_build_and_test(test-kv-stream-plan.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-
 target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-stream-config.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp)
 target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build_and_test(test-kv-stream-softmax.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-softmax.cpp)
-target_include_directories(test-kv-stream-softmax PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp)
 if (GGML_CUDA)
     llama_build_and_test(
         test-kv-stream-bench-config.cpp

@@ -1,5 +1,10 @@
 #pragma once
 
+// A CPU model of the CUDA FlashAttention fixup kernel's block-merge math
+// (see fattn.cu's kv_stream_normalize_chunk_results and friends), used only
+// to validate that math in isolation. No production code calls this - it
+// lives under tests/, not src/, so it isn't compiled into libllama.
+
 #include <string>
 #include <vector>
 
