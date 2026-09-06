@@ -21,12 +21,6 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT_STEP = 8192
-UVM_ENV_NAMES = (
-    "GGML_CUDA_ENABLE_UNIFIED_MEMORY",
-    "GGML_CUDA_PREFER_MODEL_WEIGHTS",
-    "GGML_CUDA_PREFER_KV_HOST",
-    "GGML_CUDA_KV_ACCESSED_BY_GPU",
-)
 
 KV_STREAM_TRACE_RE = re.compile(
     r"kv_stream_adapt: active (\d+), resident (\d+), ring (\d+), "
@@ -247,8 +241,6 @@ def clean_server_env(
     trace_kv_stream: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
-    for name in UVM_ENV_NAMES:
-        env.pop(name, None)
     env.pop("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS", None)
     env.pop("LLAMA_KV_STREAM_TRACE", None)
     if trace_kv_stream:

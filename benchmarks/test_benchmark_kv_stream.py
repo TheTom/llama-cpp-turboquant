@@ -87,15 +87,11 @@ class BenchmarkKvStreamTest(unittest.TestCase):
 
     def test_clean_server_env_removes_memory_policy_overrides(self) -> None:
         inherited = {
-            "GGML_CUDA_ENABLE_UNIFIED_MEMORY": "1",
-            "GGML_CUDA_PREFER_MODEL_WEIGHTS": "1",
             "GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS": "8",
             "KEEP_ME": "yes",
         }
         with mock.patch.dict(os.environ, inherited, clear=True):
             env = BENCHMARK.clean_server_env("2")
-        self.assertNotIn("GGML_CUDA_ENABLE_UNIFIED_MEMORY", env)
-        self.assertNotIn("GGML_CUDA_PREFER_MODEL_WEIGHTS", env)
         self.assertNotIn("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS", env)
         self.assertEqual(env["KEEP_ME"], "yes")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "2")
