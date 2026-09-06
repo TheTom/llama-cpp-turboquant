@@ -3570,7 +3570,18 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
     if (i + 1 >= cgraph->n_nodes) {
         return -1;
     }
-    static bool disable_chain = getenv("GGML_CUDA_FUSE_CHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_CHAIN")) == 0;
+    static const int chain_mode = [] {
+        const char * value = getenv("GGML_CUDA_FUSE_CHAIN");
+        if (value != nullptr) {
+            return std::atoi(value) != 0 ? 1 : 0;
+        }
+        return -1;
+    }();
+#if defined(GGML_USE_HIP)
+    const bool disable_chain = chain_mode == 0 || (chain_mode < 0 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc));
+#else
+    const bool disable_chain = chain_mode == 0;
+#endif
 
     auto chain_code = [](const ggml_tensor * t, int & code, float & p0, float & p1) -> bool {
         switch (t->op) {
