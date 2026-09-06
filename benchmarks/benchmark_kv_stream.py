@@ -797,7 +797,11 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
     if not rows:
         return
     contexts = sorted(rows)
-    x = [context / 1024 for context in contexts]
+    # Decimal K (1,000), not binary Ki (1,024) - 700000 tokens must read as
+    # an unambiguous "700" on the axis, not a confusing 683.6. The footnote
+    # spells this out so a reader never mistakes the axis for raw token
+    # counts or for Ki-scaled values.
+    x = [context / 1000.0 for context in contexts]
 
     fig, (decode_ax, arena_ax) = plt.subplots(
         2,
@@ -837,7 +841,7 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
     decode_ax.set_title("Adaptive KV streaming context sweep")
     decode_ax.set_ylabel("Decode speed (tokens/s)")
     prefill_ax.set_ylabel("Prefill speed (tokens/s)")
-    arena_ax.set_xlabel("Configured context capacity (Ki tokens)")
+    arena_ax.set_xlabel("Configured context capacity (K tokens)")
     arena_ax.set_ylabel("Arena (MiB)")
     decode_ax.set_ylim(bottom=0)
     prefill_ax.set_ylim(bottom=0)
@@ -848,6 +852,11 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
     handles_b, labels_b = prefill_ax.get_legend_handles_labels()
     decode_ax.legend(handles_a + handles_b, labels_a + labels_b, loc="best")
     arena_ax.legend(loc="best")
+    fig.text(
+        0.01, 0.005,
+        "Note: K = 1,000 tokens (decimal), not 1,024 - e.g. 700 on this axis is 700,000 tokens.",
+        fontsize=8, color="#555555", ha="left",
+    )
 
     png_path = output_dir / "kv-stream-sweep.png"
     fig.savefig(png_path, dpi=180)
