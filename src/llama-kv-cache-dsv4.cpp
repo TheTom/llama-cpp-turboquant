@@ -1553,10 +1553,6 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
-std::vector<llama_kv_stream_target> llama_kv_cache_dsv4::get_kv_stream_targets() const {
-    return kv_csa->get_kv_stream_targets();
-}
-
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
@@ -2100,13 +2096,6 @@ const llama_ubatch & llama_kv_cache_dsv4_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
-}
-
-std::vector<llama_kv_stream_active_target> llama_kv_cache_dsv4_context::get_kv_stream_active_targets() const {
-    if (status != LLAMA_MEMORY_STATUS_SUCCESS || !ctx_csa_mem) {
-        return {};
-    }
-    return ctx_csa_mem->get_kv_stream_active_targets();
 }
 
 const llama_kv_cache_dsv4_raw_context * llama_kv_cache_dsv4_context::get_raw() const {
