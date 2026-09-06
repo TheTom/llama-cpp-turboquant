@@ -56,6 +56,37 @@ the arena only supports one lease today. This combination is explicitly
 rejected at startup with a clear error rather than allowed to fail deep
 inside cache construction.
 
+## Attention dispatch: direct vs F16 fallback
+
+Streamed attention picks between two CUDA code paths per (K type, V type)
+pair, independent of everything else in this document:
+
+- **`direct_attention`** - the same native turbo2/3/4 kernel (and the
+  classic F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 kernels) ordinary non-streamed
+  Flash Attention already uses, adapted to read resident/streamed pages
+  directly. No extra workspace, no precision loss beyond the KV type's own
+  quantization.
+- **F16 fallback** - dequantizes each streamed page to F16 into a
+  conversion workspace, then runs ordinary F16 attention on it. Works for
+  any KV type this cache supports streaming for at all, but costs a
+  dequant pass and workspace bandwidth per page.
+
+`direct_attention` for the streamed path requires the ggml-cuda backend to
+be built with `GGML_CUDA_FA_ALL_QUANTS` (off by default - it substantially
+increases build time and the CUDA library size, since it instantiates
+Flash Attention across the full K/V type cross product). **Without it,
+every streamed KV type pair falls back to F16**, regardless of arena size
+or model. Ordinary (non-streamed) attention is unaffected either way - the
+turbo-native kernel it uses is unconditionally compiled in.
+
+Measured impact (Qwen3.8-27B-AD, `-ctk q8_0 -ctv turbo4`, 8K context,
+single RTX 5090-class GPU): streamed prefill is ~2840 t/s with
+`GGML_CUDA_FA_ALL_QUANTS=ON`, ~1200 t/s on a default build. Every
+benchmark number in the PR description and `benchmarks/results/` was
+measured with the flag on; a default build should expect materially lower
+streamed prefill throughput at the same context and arena size, though
+still functionally correct.
+
 ## Why single-sequence only
 
 This is not a simple validation gate that could be relaxed by testing more -
