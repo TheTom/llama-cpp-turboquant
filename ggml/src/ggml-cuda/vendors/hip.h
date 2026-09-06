@@ -114,6 +114,7 @@
 #define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostAllocWriteCombined hipHostMallocWriteCombined
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaHostGetFlags hipHostGetFlags
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc

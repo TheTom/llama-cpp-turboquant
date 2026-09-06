@@ -824,6 +824,14 @@ static bool ggml_backend_cuda_buffer_set_preferred_device(ggml_backend_buffer_t 
         return false;
     }
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // cudaMemAdvise's location-struct form (CUDA 12+) has no HIP/MUSA
+    // equivalent - this is an optional UVM placement hint behind an
+    // opt-in env var, so skip it cleanly rather than guess at each
+    // platform's older/different cudaMemAdvise signature.
+    (void) buffer;
+    return false;
+#else
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
     cudaMemLocation location = {};
     location.type = cudaMemLocationTypeDevice;
@@ -846,6 +854,7 @@ static bool ggml_backend_cuda_buffer_set_preferred_device(ggml_backend_buffer_t 
     GGML_LOG_INFO("set GPU-preferred placement for %.2f MiB model-weight buffer on device %d\n",
         ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, ctx->device);
     return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 static bool ggml_backend_cuda_buffer_set_preferred_host(ggml_backend_buffer_t buffer) {
@@ -853,6 +862,11 @@ static bool ggml_backend_cuda_buffer_set_preferred_host(ggml_backend_buffer_t bu
         return false;
     }
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // See ggml_backend_cuda_buffer_set_preferred_device() above.
+    (void) buffer;
+    return false;
+#else
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
     cudaMemLocation location = {};
     location.type = cudaMemLocationTypeHost;
@@ -896,6 +910,7 @@ static bool ggml_backend_cuda_buffer_set_preferred_host(ggml_backend_buffer_t bu
     GGML_LOG_INFO("set host-preferred placement for %.2f MiB KV buffer on device %d\n",
         ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, ctx->device);
     return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
