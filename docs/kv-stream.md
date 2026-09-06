@@ -87,6 +87,20 @@ measured with the flag on; a default build should expect materially lower
 streamed prefill throughput at the same context and arena size, though
 still functionally correct.
 
+**Head dim must be 256 for either path to activate at all.** Both
+`direct_attention` and F16 fallback require `Q->ne[0] == V->ne[0] == 256`
+(`ggml_cuda_flash_attn_ext_streamed_supported` in `fattn.cu`) - this isn't
+architecture-gated the way MLA/DSA/DSV4/MSA are, so a head-dim-128 model
+(common outside this fork's own turbo/Qwen3.8 testing) still passes every
+other requirement above, still gets its KV cache pinned into the streaming
+buffer, and still streams pages - it just never gets a streaming-accelerated
+attention kernel for it. Every `GGML_OP_FLASH_ATTN_EXT` op for that model
+falls through to ordinary (non-streamed) Flash Attention instead, which
+still produces correct output by reading K/V from the pinned host buffer
+over PCIe, but pays that transfer on every single decode step with none of
+streaming's page-residency/prefetch benefit. Correct, just slow - budget
+for it rather than assume streaming accelerates every model uniformly.
+
 ## Why single-sequence only
 
 This is not a simple validation gate that could be relaxed by testing more -
