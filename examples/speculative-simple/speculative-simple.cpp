@@ -75,6 +75,24 @@ int main(int argc, char ** argv) {
         }
 
         auto cparams = common_context_params_to_llama(params_dft);
+
+        // An MTP head only has the MTP graph; building it as an ordinary decoder walks the trunk
+        // tensors it does not carry. The server does the same at server-context.cpp. Both MTP
+        // types need this: the adaptive one only varies draft depth at runtime, so matching just
+        // COMMON_SPECULATIVE_TYPE_DRAFT_MTP left draft-mtp-adaptive loading the head as an
+        // ordinary decoder, failing, and crashing later on the null context.
+        const auto & spec_types = params.speculative.types;
+        const bool spec_mtp =
+            std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP)          != spec_types.end() ||
+            std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != spec_types.end();
+        if (spec_mtp) {
+            cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams.n_rs_seq = 0;
+            // an MTP head has no trunk and borrows the embeddings and lm head from the model it
+            // drafts for, so its context has to know which context that is
+            cparams.ctx_other = ctx_tgt;
+        }
+
         ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
@@ -224,13 +242,21 @@ int main(int argc, char ** argv) {
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-            llama_decode(ctx_tgt, batch_tgt);
+            const int32_t rc = llama_decode(ctx_tgt, batch_tgt);
+            if (rc != 0) {
+                LOG_ERR("%s: target decode failed, ret = %d\n", __func__, rc);
+                return 1;
+            }
         }
 
-        // evaluate the same batch with the draft model
-        {
-            // TODO: extend to support MTP, Eagle, etc. See server code for reference
-            llama_decode(ctx_dft.get(), batch_tgt);
+        // Hand the target's batch to the speculative layer and let it advance the draft in
+        // whatever way its kind requires. A standalone draft model replays the tokens, which is
+        // what this example used to do by hand; an MTP head instead needs the target's hidden
+        // states, and this call is the only thing that captures them. Doing it by hand left the
+        // head drafting from an empty state, which reads as fluent text that ignores the target.
+        if (!common_speculative_process(spec, batch_tgt)) {
+            LOG_ERR("%s: failed to advance the draft with the target's batch\n", __func__);
+            return 1;
         }
 
         // only save the sampler sampler state if we use checkpoints
