@@ -699,6 +699,23 @@ static void launch_tq3_1s_wmma(
 //   grid.z = token/sample (ne2)            one dot product per (row, expert_slot, sample)
 // ============================================================================
 
+// Fills a per-expert address table. Every entry is base + i*nb_expert here, which reproduces the
+// contiguous layout exactly; the point is that an entry can instead be made to point at a VRAM
+// cache slot or at mapped host memory for an expert that is not resident, with the kernels none
+// the wiser. Built on the device so nothing is read back to the host, which would be illegal
+// inside a graph capture.
+static __global__ void tq_build_expert_table(
+        const char *  __restrict__ base,
+        const int64_t nb_expert,
+        const int     n_expert,
+        const void ** __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_expert) {
+        out[i] = base + (int64_t) i * nb_expert;
+    }
+}
+
+template <bool USE_TABLE>
 static __global__ void mul_mat_tq3_1s_moe(
         const void    * __restrict__ vx,       // all experts, base pointer
         const float   * __restrict__ vy_rot,   // pre-rotated activations
@@ -733,7 +750,8 @@ static __global__ void mul_mat_tq3_1s_moe(
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
     const block_tq3_1s * x_row =
-        (const block_tq3_1s *) ((const char *) vx + (int64_t) expert * nb_expert)
+        (const block_tq3_1s *) (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
+                             : (const char *) vx + (int64_t) expert * nb_expert)
         + (int64_t) row * blocks_per_row;
     const float * act = vy_rot + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
@@ -759,6 +777,7 @@ static __global__ void mul_mat_tq3_1s_moe(
     }
 }
 
+template <bool USE_TABLE>
 static __global__ void mul_mat_tq4_1s_scalar_moe(
         const void    * __restrict__ vx,
         const float   * __restrict__ vy_rot,
@@ -791,7 +810,8 @@ static __global__ void mul_mat_tq4_1s_scalar_moe(
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ4_1S;
     const block_tq4_1s * x_row =
-        (const block_tq4_1s *) ((const char *) vx + (int64_t) expert * nb_expert)
+        (const block_tq4_1s *) (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
+                             : (const char *) vx + (int64_t) expert * nb_expert)
         + (int64_t) row * blocks_per_row;
     const float * act = vy_rot + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
@@ -816,7 +836,7 @@ static __global__ void mul_mat_tq4_1s_scalar_moe(
 // NVIDIA TQ4_1S dp4a MoE variant: same device-side ids routing as the scalar kernels above, but
 // the int8 dp4a inner loop of mul_mat_tq4_1s_dp4a_multi (warp-strided over blocks, q8_1 activations,
 // packed-centroid LUT). One dot product per (row, expert_slot, sample) output element.
-template <int LPR>   // lanes cooperating on one output row (must divide WARP_SIZE)
+template <int LPR, bool USE_TABLE>   // LPR: lanes cooperating on one output row (must divide WARP_SIZE)
 static __global__ void mul_mat_tq4_1s_dp4a_moe(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,      // pre-rotated activations (q8_1)
@@ -851,7 +871,8 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
     const int lane = lane_in_row;
     const int blocks_per_row = ncols_x / QK_TQ4_1S;
     const block_tq4_1s * x_row =
-        (const block_tq4_1s *) ((const char *) vx + (int64_t) expert * nb_expert)
+        (const block_tq4_1s *) (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
+                             : (const char *) vx + (int64_t) expert * nb_expert)
         + (int64_t) row * blocks_per_row;
     const block_q8_1 * a_base = vy_q8 + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
@@ -1000,6 +1021,21 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
     const int64_t stride_channel_dst = dst->nb[1] / ggml_type_size(dst->type);
     const int64_t stride_sample_dst  = dst->nb[2] / ggml_type_size(dst->type);
 
+    // Optional per-expert address table. Filled here to reproduce the contiguous layout exactly,
+    // so behaviour is unchanged; the point is that an entry can later be pointed at a VRAM cache
+    // slot or at mapped host memory for an expert that is not resident, without the kernels
+    // needing to know. Opt-in while this is being brought up.
+    static const bool tq_use_expert_table = getenv("GGML_MOE_EXPERT_TABLE") != nullptr;
+    const int n_expert_all = (int) ne02;
+    ggml_cuda_pool_alloc<const void *> expert_tab_buf(ctx.pool(id));
+    const void ** expert_tab = nullptr;
+    if (tq_use_expert_table) {
+        expert_tab = expert_tab_buf.alloc(n_expert_all);
+        const int nthr = 64;
+        tq_build_expert_table<<<(n_expert_all + nthr - 1) / nthr, nthr, 0, stream>>>(
+                (const char *) src0->data, nb_expert, n_expert_all, expert_tab);
+    }
+
     const int n_act_elements = ncols_x * nchannels_y * n_tokens;
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS, n_expert_used, n_tokens);
@@ -1039,10 +1075,19 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         const dim3 grid_l((unsigned) ((nrows_x + rows_per_wg - 1) / rows_per_wg),
                           (unsigned) n_expert_used, (unsigned) n_tokens);
 
-        #define TQ_LAUNCH_MOE(L) mul_mat_tq4_1s_dp4a_moe<L><<<grid_l, block, 0, stream>>>( \
-            src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x, \
-            nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y, \
-            stride_channel_dst, stride_sample_dst)
+        #define TQ_LAUNCH_MOE(L) do {                                                                  \
+            if (expert_tab) {                                                                   \
+                mul_mat_tq4_1s_dp4a_moe<L, true><<<grid_l, block, 0, stream>>>(                  \
+                    (const void *) expert_tab, q8_act, dst_d, ids_d, ncols_x, nrows_x,                 \
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,                  \
+                    stride_channel_dst, stride_sample_dst);  \
+            } else {                                                                            \
+                mul_mat_tq4_1s_dp4a_moe<L, false><<<grid_l, block, 0, stream>>>(                 \
+                    src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x,                       \
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,                  \
+                    stride_channel_dst, stride_sample_dst);  \
+            }                                                                                   \
+        } while (0)
 
         switch (lpr) {
             case 32: TQ_LAUNCH_MOE(32); break;
@@ -1066,15 +1111,29 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         const int64_t stride_channel_y = ncols_x;                                // float elems to next y-channel
         const int64_t stride_sample_y  = (int64_t) nchannels_y * ncols_x;        // float elems to next token
         if (src0->type == GGML_TYPE_TQ3_1S) {
-            mul_mat_tq3_1s_moe<<<grid, block, 0, stream>>>(
-                src0->data, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
-                nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
-                stride_channel_dst, stride_sample_dst);
+            if (expert_tab) {
+                mul_mat_tq3_1s_moe<true><<<grid, block, 0, stream>>>(
+                    (const void *) expert_tab, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            } else {
+                mul_mat_tq3_1s_moe<false><<<grid, block, 0, stream>>>(
+                    src0->data, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            }
         } else {
-            mul_mat_tq4_1s_scalar_moe<<<grid, block, 0, stream>>>(
-                src0->data, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
-                nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
-                stride_channel_dst, stride_sample_dst);
+            if (expert_tab) {
+                mul_mat_tq4_1s_scalar_moe<true><<<grid, block, 0, stream>>>(
+                    (const void *) expert_tab, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            } else {
+                mul_mat_tq4_1s_scalar_moe<false><<<grid, block, 0, stream>>>(
+                    src0->data, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            }
         }
     }
     CUDA_CHECK(cudaGetLastError());
