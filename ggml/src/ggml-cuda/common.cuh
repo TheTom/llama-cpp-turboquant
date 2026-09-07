@@ -1485,6 +1485,24 @@ struct ggml_backend_cuda_context {
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } tq_rot_cache;
 
+    // Per-expert address tables for the MoE weight indirection (see tq_build_expert_table). One
+    // entry per expert tensor, built on first use and kept for the life of the context: a captured
+    // graph replays kernels that read this exact address, so it cannot be pool memory and cannot be
+    // freed early. Same discipline as the caches above.
+    struct moe_expert_table {
+        const void *  base      = nullptr;   // src0->data the table was built from
+        int64_t       nb_expert = 0;
+        int           n_expert  = 0;
+        int           dev       = -1;
+        const void ** ptr       = nullptr;   // device array of n_expert addresses
+    };
+    std::vector<moe_expert_table> moe_tables;
+    std::vector<retired_buf>      moe_tables_retired;
+
+    // The cached table for this expert tensor, built on first use. Stable across calls so a
+    // captured graph can keep referencing it.
+    const void ** moe_expert_table_get(const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream);
+
     uint64_t graph_epoch = 1;
 
     // Fusion hit counters. Read through ggml_backend_cuda_fusion_count(); test-backend-ops uses

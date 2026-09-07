@@ -715,6 +715,38 @@ static __global__ void tq_build_expert_table(
     }
 }
 
+const void ** ggml_backend_cuda_context::moe_expert_table_get(
+        const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream) {
+    const int n_expert = (int) src0->ne[2];
+    const int dev      = device;
+
+    for (auto & t : moe_tables) {
+        if (t.dev == dev && t.base == src0->data && t.nb_expert == nb_expert && t.n_expert == n_expert) {
+            return t.ptr;
+        }
+        // same weights at a new address or size: retire the old buffer rather than free it, since
+        // a captured graph may still reference it
+        if (t.dev == dev && t.base != nullptr && t.base == src0->data) {
+            moe_tables_retired.push_back({ (char *) t.ptr, (size_t) t.n_expert * sizeof(const void *), t.dev });
+            t.base = nullptr;
+        }
+    }
+
+    moe_expert_table e;
+    e.base      = src0->data;
+    e.nb_expert = nb_expert;
+    e.n_expert  = n_expert;
+    e.dev       = dev;
+    CUDA_CHECK(ggml_cuda_device_malloc((void **) &e.ptr, (size_t) n_expert * sizeof(const void *), dev));
+
+    const int nthr = 64;
+    tq_build_expert_table<<<(n_expert + nthr - 1) / nthr, nthr, 0, stream>>>(
+            (const char *) src0->data, nb_expert, n_expert, e.ptr);
+
+    moe_tables.push_back(e);
+    return e.ptr;
+}
+
 template <bool USE_TABLE>
 static __global__ void mul_mat_tq3_1s_moe(
         const void    * __restrict__ vx,       // all experts, base pointer
@@ -1027,14 +1059,9 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
     // needing to know. Opt-in while this is being brought up.
     static const bool tq_use_expert_table = getenv("GGML_MOE_EXPERT_TABLE") != nullptr;
     const int n_expert_all = (int) ne02;
-    ggml_cuda_pool_alloc<const void *> expert_tab_buf(ctx.pool(id));
-    const void ** expert_tab = nullptr;
-    if (tq_use_expert_table) {
-        expert_tab = expert_tab_buf.alloc(n_expert_all);
-        const int nthr = 64;
-        tq_build_expert_table<<<(n_expert_all + nthr - 1) / nthr, nthr, 0, stream>>>(
-                (const char *) src0->data, nb_expert, n_expert_all, expert_tab);
-    }
+    const void ** expert_tab = tq_use_expert_table
+            ? ctx.moe_expert_table_get(src0, nb_expert, stream)
+            : nullptr;
 
     const int n_act_elements = ncols_x * nchannels_y * n_tokens;
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);

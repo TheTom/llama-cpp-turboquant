@@ -755,6 +755,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (const auto & r : tq_rot_cache.retired) {
         free_buf(r.ptr, r.dev);
     }
+    for (const auto & t : moe_tables) {
+        free_buf((char *) t.ptr, t.dev);
+    }
+    for (const auto & r : moe_tables_retired) {
+        free_buf(r.ptr, r.dev);
+    }
 
     q8_cache.ptr = nullptr;
     q8_cache.retired.clear();
