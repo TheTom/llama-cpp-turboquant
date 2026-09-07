@@ -123,6 +123,278 @@ __device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, int &c0, int
 // (the WHT butterfly itself was always computed in float registers; only
 // the final store truncated to half) removes this without touching the
 // weight-side quantization or the WHT math itself.
+// Fills a per-expert address table. Every entry is base + i*stride here, which reproduces the
+// contiguous layout exactly; the point is that an entry can instead be made to point at a VRAM
+// cache slot or at mapped host memory for an expert that is not resident, with the kernels none
+// the wiser. Built on the device so nothing is read back to the host, which would be illegal
+// inside a CUDA graph capture.
+static __global__ void tq_build_expert_table(
+        const char *  __restrict__ base,
+        const int64_t nb_expert,
+        const int     n_expert,
+        const void ** __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_expert) {
+        out[i] = base + (int64_t) i * nb_expert;
+    }
+}
+
+// Copy the experts this call routes to into VRAM slots and point the address table at the copies,
+// so the matmul only ever reads VRAM. This is what makes leaving the expert stack in host memory
+// affordable: measured on gfx90a, a coalesced copy reaches 27.6 GB/s against the 28.6 GB/s of a
+// bulk transfer, while the matmul dereferencing the same host memory in place manages only about
+// 2.7 GB/s. It has to be a kernel rather than a host-issued copy because a captured graph fixes
+// its addresses at capture time and the routing is not known until the graph runs; this reads the
+// routing itself. Decode only for now, and no reuse between calls: every routed expert is copied
+// on every call, which is the worst case the residency policy will improve on.
+static __global__ void tq_page_in_experts(
+        const char    * __restrict__ base,
+        const int64_t                nb_expert,
+        const int32_t * __restrict__ ids,
+        char          * __restrict__ slab,
+        const void   ** __restrict__ table,
+        const int64_t                n_vec) {
+    const int slot   = blockIdx.y;
+    const int expert = ids[slot];
+
+    const uint4 * __restrict__ src = (const uint4 *) (base + (int64_t) expert * nb_expert);
+    uint4       * __restrict__ dst = (uint4       *) (slab + (int64_t) slot   * nb_expert);
+
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n_vec;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+
+    // safe to publish from any block: the matmul is a separate launch and cannot start until this
+    // kernel has fully retired
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        table[expert] = dst;
+    }
+}
+
+// Direct-mapped residency: expert e lives in slot e % n_slots, so deciding whether it is resident
+// is one comparison rather than a search. The first attempt used a true LRU with a scan over the
+// slots, which measured slower than not caching at all: a single thread walking device memory with
+// full latency, run before every offloaded expert matmul, cost more than the transfers it saved.
+//
+// Two routed experts can collide on a slot. The loser is not a problem: the address table can point
+// an expert at host memory just as well as at a slot, so a collision simply degrades that one
+// expert to being read in place, which is exactly what it would have cost with no cache at all.
+//
+// claim[] is reset each call and resolves collisions by lowest routed index, so the outcome does
+// not depend on thread scheduling.
+static __global__ void tq_cache_probe(
+        const int32_t * __restrict__ ids,
+        const int                    n_routed,
+        const int                    n_slots,
+        const int32_t * __restrict__ slot_expert,
+        int32_t       * __restrict__ claim,
+        int32_t       * __restrict__ hit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_routed) {
+        return;
+    }
+    const int e    = ids[i];
+    const int slot = e % n_slots;
+
+    if (slot_expert[slot] == e) {
+        hit[i] = 1;
+        // Reserve the slot. Without this, another routed expert mapping to the same slot could
+        // claim it and overwrite the contents in this very call, while this expert's table entry
+        // still points there - so it would silently read the other expert's weights. The output
+        // stays fluent, which is why only a byte-for-byte comparison catches it.
+        atomicMin(&claim[slot], -1);
+    } else {
+        hit[i] = 0;
+        atomicMin(&claim[slot], i);       // lowest routed index wins a free-to-take slot
+    }
+}
+
+// Award the claimed slots and build the miss list. One thread per routed expert, no search.
+static __global__ void tq_cache_award(
+        const int32_t * __restrict__ ids,
+        const int                    n_routed,
+        const int                    n_slots,
+        const int32_t * __restrict__ claim,
+        const int32_t * __restrict__ hit,
+        int32_t       * __restrict__ slot_expert,
+        int32_t       * __restrict__ miss_expert,
+        int32_t       * __restrict__ miss_slot,
+        int32_t       * __restrict__ n_miss,
+        int32_t       * __restrict__ won) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_routed) {
+        return;
+    }
+    if (hit[i]) {
+        won[i] = 1;
+        return;
+    }
+    const int e    = ids[i];
+    const int slot = e % n_slots;
+
+    // claim[slot] == -1 means a hit reserved it, so no miss may take it this call
+    if (claim[slot] == i) {
+        slot_expert[slot] = e;
+        const int k = atomicAdd(n_miss, 1);
+        miss_expert[k] = e;
+        miss_slot[k]   = slot;
+        won[i] = 1;                       // will be resident once the copy runs
+    } else {
+        won[i] = 0;                       // reserved or lost the collision: read this one in place
+    }
+}
+
+// Copy only the experts the plan marked as missing.
+static __global__ void tq_page_in_misses(
+        const char    * __restrict__ base,
+        const int64_t                nb_expert,
+        const int32_t * __restrict__ miss_expert,
+        const int32_t * __restrict__ miss_slot,
+        const int32_t * __restrict__ n_miss,
+        char          * __restrict__ slab,
+        const int64_t                n_vec) {
+    if (blockIdx.y >= (unsigned) *n_miss) {
+        return;
+    }
+    const int expert = miss_expert[blockIdx.y];
+    const int slot   = miss_slot[blockIdx.y];
+
+    const uint4 * __restrict__ src = (const uint4 *) (base + (int64_t) expert * nb_expert);
+    uint4       * __restrict__ dst = (uint4       *) (slab + (int64_t) slot   * nb_expert);
+
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n_vec;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// Point the table at the slots for everything this call routes to, hits included.
+static __global__ void tq_table_point(
+        const int32_t * __restrict__ ids,
+        const int                    n_routed,
+        const int                    n_slots,
+        const int32_t * __restrict__ won,
+        const char    * __restrict__ base,
+        char          * __restrict__ slab,
+        const int64_t                nb_expert,
+        const void   ** __restrict__ table) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_routed) {
+        return;
+    }
+    const int e = ids[i];
+    // a slot if this expert is or is about to be resident, otherwise its home address
+    table[e] = won[i] ? (const void *) (slab + (int64_t) (e % n_slots) * nb_expert)
+                      : (const void *) (base + (int64_t) e * nb_expert);
+}
+
+ggml_backend_cuda_context::moe_expert_slab * ggml_backend_cuda_context::moe_expert_slab_get(
+        const ggml_tensor * src0, int64_t nb_expert, int n_expert, int n_routed, cudaStream_t stream) {
+    const int dev = device;
+
+    static const int n_slots = [] {
+        const char * env = getenv("GGML_MOE_PAGE_SLOTS");
+        const int    v   = env ? atoi(env) : 64;
+        return v > 0 ? v : 64;
+    }();
+
+    for (auto & s : moe_slabs) {
+        if (s.dev == dev && s.base == src0->data && s.nb_expert == nb_expert) {
+            return s.slab ? &s : nullptr;   // remembered as not worth paging
+        }
+    }
+
+    // Paging only makes sense for a tensor that is not already in VRAM. Reading a resident expert
+    // costs nothing, so copying it into a slot would spend VRAM and bandwidth to no purpose, and
+    // doing it for every expert tensor rather than the offloaded ones overflowed the card.
+    {
+#if defined(GGML_USE_HIP)
+        hipPointerAttribute_t attr = {};
+        const hipError_t err = hipPointerGetAttributes(&attr, src0->data);
+        const bool in_host = err == hipSuccess &&
+                             (attr.type == hipMemoryTypeHost || attr.type == hipMemoryTypeUnregistered);
+        (void) hipGetLastError();
+#else
+        cudaPointerAttributes attr = {};
+        const cudaError_t err = cudaPointerGetAttributes(&attr, src0->data);
+        const bool in_host = err == cudaSuccess &&
+                             (attr.type == cudaMemoryTypeHost || attr.type == cudaMemoryTypeUnregistered);
+        (void) cudaGetLastError();
+#endif
+        if (!in_host) {
+            moe_expert_slab skip;   // remember, so the query happens once per tensor
+            skip.base      = src0->data;
+            skip.nb_expert = nb_expert;
+            skip.dev       = dev;
+            skip.slab      = nullptr;
+            moe_slabs.push_back(skip);
+            return nullptr;
+        }
+    }
+
+    moe_expert_slab e;
+    e.base      = src0->data;
+    e.nb_expert = nb_expert;
+    e.n_slots   = n_slots < n_expert ? n_slots : n_expert;
+    e.n_expert  = n_expert;
+    e.n_routed  = n_routed;
+    e.dev       = dev;
+
+    auto alloc = [&](void ** p, size_t bytes) {
+        return ggml_cuda_device_malloc(p, bytes, dev) == cudaSuccess;
+    };
+    if (!alloc(&e.slab, (size_t) e.n_slots * nb_expert) ||
+        !alloc((void **) &e.slot_expert, (size_t) e.n_slots * sizeof(int32_t)) ||
+        !alloc((void **) &e.claim,       (size_t) e.n_slots * sizeof(int32_t)) ||
+        !alloc((void **) &e.hit,         (size_t) n_routed * sizeof(int32_t)) ||
+        !alloc((void **) &e.won,         (size_t) n_routed * sizeof(int32_t)) ||
+        !alloc((void **) &e.miss_expert, (size_t) n_routed * sizeof(int32_t)) ||
+        !alloc((void **) &e.miss_slot,   (size_t) n_routed * sizeof(int32_t)) ||
+        !alloc((void **) &e.n_miss,      sizeof(int32_t))) {
+        return nullptr;   // caller falls back to reading the experts where they live
+    }
+
+    // empty cache: every slot holds nothing
+    CUDA_CHECK(cudaMemsetAsync(e.slot_expert, 0xff, (size_t) e.n_slots * sizeof(int32_t), stream));
+
+    moe_slabs.push_back(e);
+    return &moe_slabs.back();
+}
+
+const void ** ggml_backend_cuda_context::moe_expert_table_get(
+        const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream) {
+    const int n_expert = (int) src0->ne[2];
+    const int dev      = device;
+
+    for (auto & t : moe_tables) {
+        if (t.dev == dev && t.base == src0->data && t.nb_expert == nb_expert && t.n_expert == n_expert) {
+            return t.ptr;
+        }
+        // same tensor, moved or resized: retire the old buffer rather than free it, since a
+        // captured graph may still reference the address
+        if (t.dev == dev && t.base != nullptr && t.base == src0->data) {
+            moe_tables_retired.push_back({ (char *) t.ptr,
+                    (size_t) t.n_expert * sizeof(const void *), t.dev });
+            t.base = nullptr;
+        }
+    }
+
+    moe_expert_table e;
+    e.base = src0->data;
+    e.nb_expert = nb_expert;
+    e.n_expert = n_expert;
+    e.dev = dev;
+    CUDA_CHECK(ggml_cuda_device_malloc((void **) &e.ptr, (size_t) n_expert * sizeof(const void *), dev));
+
+    const int threads = 64;
+    tq_build_expert_table<<<(n_expert + threads - 1) / threads, threads, 0, stream>>>(
+        (const char *) src0->data, nb_expert, n_expert, e.ptr);
+
+    moe_tables.push_back(e);
+    return e.ptr;
+}
+
 static __global__ void tq_prerotate_activation(
         const float * __restrict__ src,
         float       * __restrict__ dst,
@@ -704,49 +976,6 @@ static void launch_tq3_1s_wmma(
 // cache slot or at mapped host memory for an expert that is not resident, with the kernels none
 // the wiser. Built on the device so nothing is read back to the host, which would be illegal
 // inside a graph capture.
-static __global__ void tq_build_expert_table(
-        const char *  __restrict__ base,
-        const int64_t nb_expert,
-        const int     n_expert,
-        const void ** __restrict__ out) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n_expert) {
-        out[i] = base + (int64_t) i * nb_expert;
-    }
-}
-
-const void ** ggml_backend_cuda_context::moe_expert_table_get(
-        const ggml_tensor * src0, int64_t nb_expert, cudaStream_t stream) {
-    const int n_expert = (int) src0->ne[2];
-    const int dev      = device;
-
-    for (auto & t : moe_tables) {
-        if (t.dev == dev && t.base == src0->data && t.nb_expert == nb_expert && t.n_expert == n_expert) {
-            return t.ptr;
-        }
-        // same weights at a new address or size: retire the old buffer rather than free it, since
-        // a captured graph may still reference it
-        if (t.dev == dev && t.base != nullptr && t.base == src0->data) {
-            moe_tables_retired.push_back({ (char *) t.ptr, (size_t) t.n_expert * sizeof(const void *), t.dev });
-            t.base = nullptr;
-        }
-    }
-
-    moe_expert_table e;
-    e.base      = src0->data;
-    e.nb_expert = nb_expert;
-    e.n_expert  = n_expert;
-    e.dev       = dev;
-    CUDA_CHECK(ggml_cuda_device_malloc((void **) &e.ptr, (size_t) n_expert * sizeof(const void *), dev));
-
-    const int nthr = 64;
-    tq_build_expert_table<<<(n_expert + nthr - 1) / nthr, nthr, 0, stream>>>(
-            (const char *) src0->data, nb_expert, n_expert, e.ptr);
-
-    moe_tables.push_back(e);
-    return e.ptr;
-}
-
 template <bool USE_TABLE>
 static __global__ void mul_mat_tq3_1s_moe(
         const void    * __restrict__ vx,       // all experts, base pointer
@@ -1062,6 +1291,40 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
     const void ** expert_tab = tq_use_expert_table
             ? ctx.moe_expert_table_get(src0, nb_expert, stream)
             : nullptr;
+
+    // Expert paging, off unless asked for. Requires the address table, since paging works by
+    // repointing table entries at the slots rather than by moving the tensor.
+    static const bool page_in_on = getenv("GGML_MOE_PAGE_IN") != nullptr;
+    if (page_in_on && expert_tab && n_tokens == 1 && nb_expert % (int64_t) sizeof(uint4) == 0) {
+        const int n_expert_total = (int) src0->ne[2];
+        auto * cache = ctx.moe_expert_slab_get(src0, nb_expert, n_expert_total, n_expert_used, stream);
+        if (cache) {
+            const int nthr = 64;
+            const int nblk = (n_expert_used + nthr - 1) / nthr;
+            CUDA_CHECK(cudaMemsetAsync(cache->claim, 0x7f, (size_t) cache->n_slots * sizeof(int32_t), stream));
+            CUDA_CHECK(cudaMemsetAsync(cache->n_miss, 0, sizeof(int32_t), stream));
+            tq_cache_probe<<<nblk, nthr, 0, stream>>>(
+                ids_d, n_expert_used, cache->n_slots, cache->slot_expert, cache->claim, cache->hit);
+            tq_cache_award<<<nblk, nthr, 0, stream>>>(
+                ids_d, n_expert_used, cache->n_slots, cache->claim, cache->hit,
+                cache->slot_expert, cache->miss_expert, cache->miss_slot, cache->n_miss, cache->won);
+
+            const int64_t n_vec  = nb_expert / (int64_t) sizeof(uint4);
+            const int     thr    = 256;
+            int64_t       blocks = (n_vec + thr - 1) / thr;
+            if (blocks > 64) {
+                blocks = 64;
+            }
+            tq_page_in_misses<<<dim3((unsigned) blocks, (unsigned) n_expert_used), thr, 0, stream>>>(
+                (const char *) src0->data, nb_expert,
+                cache->miss_expert, cache->miss_slot, cache->n_miss,
+                (char *) cache->slab, n_vec);
+
+            tq_table_point<<<nblk, nthr, 0, stream>>>(
+                ids_d, n_expert_used, cache->n_slots, cache->won,
+                (const char *) src0->data, (char *) cache->slab, nb_expert, expert_tab);
+        }
+    }
 
     const int n_act_elements = ncols_x * nchannels_y * n_tokens;
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
