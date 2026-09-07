@@ -2,6 +2,8 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+
+#include <cstdlib>
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -783,6 +785,15 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// Widest src0_ne[1] for which the vector kernel still beats a GEMM above three columns on AMD
+// MFMA hardware. A GEMM whose output is a few columns wide is nearly all setup, which is ruinous
+// for narrow weights and fine for wide ones. Env-tunable while the crossover is being measured;
+// 0 restores the upstream behaviour of stopping at three columns whatever the width.
+static int64_t ggml_cuda_mmvf_narrow_max() {
+    static const int64_t v = getenv("GGML_MMVF_NARROW_MAX") ? atoll(getenv("GGML_MMVF_NARROW_MAX")) : 4096;
+    return v;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -812,6 +823,14 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
+                    // The MFMA GEMM only earns its setup on wide weights. qwen4exp puts narrow F32
+                    // matmuls on the hot path - the MoE router at [2560, 512], the hyper-connection
+                    // injects at [10240, 4], the SSM gates - and dropping those onto a GEMM at four
+                    // columns costs about 31 ms per decode step, against roughly 4 ms per added row
+                    // either side of the boundary. Keep the vector kernel for narrow weights.
+                    if (src0_ne[1] <= ggml_cuda_mmvf_narrow_max()) {
+                        return ne11 <= 8;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
@@ -858,6 +877,14 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (bf16_mma_hardware_available(cc)) {
+                    // Same narrow-weight case as F32 above, and worse here: on CDNA2 mmf refuses
+                    // BF16 outright, so above this limit there is no vector path left and the op
+                    // lands on a cuBLAS GEMM with a bf16 conversion on each side. qwen4exp keeps
+                    // its structural tensors in BF16 - the hyper-connection injects at [10240, 4],
+                    // the SSM gates at [2560, 48] - and they are on every token's path.
+                    if (src0_ne[1] <= ggml_cuda_mmvf_narrow_max()) {
+                        return ne11 <= 8;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
