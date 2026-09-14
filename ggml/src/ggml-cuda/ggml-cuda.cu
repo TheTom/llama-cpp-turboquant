@@ -1588,7 +1588,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
 
-        if (ggml_is_contiguously_allocated(src0)) {
+        // NOTE: view tensors can have nb[] inherited from the parent,
+        //       making ggml_is_contiguously_allocated return a false positive.
+        //       Always use the non-contiguous path for views to ensure
+        //       correct stride recomputation (s01 = ne00 after conversion).
+        if (ggml_is_contiguously_allocated(src0) && !src0->view_src) {
             const auto convert_func = traits::convert(src0->type);
             GGML_ASSERT(convert_func != nullptr);
             convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
@@ -1613,7 +1617,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
-        if (ggml_is_contiguously_allocated(src1)) {
+        if (ggml_is_contiguously_allocated(src1) && !src1->view_src) {
             const auto convert_func = traits::convert(src1->type);
             GGML_ASSERT(convert_func != nullptr);
             convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
@@ -1675,6 +1679,28 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // broadcast factors
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
+
+    // Guard: verify lda >= k before any GEMM call to catch invalid
+    // strides from view tensors with stale nb[] before cuBLAS
+    // returns CUBLAS_STATUS_INVALID_VALUE.
+    if (s01 < ne10) {
+        GGML_LOG_ERROR("%s: lda=%ld < k=%ld for src0 tensor '%s' (type=%s, view_src=%p, nb01=%zu, ne00=%ld, ne01=%ld)\n",
+                __func__, (long)s01, (long)ne10,
+                src0->name[0] ? src0->name : "(unnamed)",
+                ggml_type_name(src0->type),
+                (void*)src0->view_src,
+                src0->nb[1], (long)ne00, (long)ne01);
+        GGML_ABORT("cublas would get INVALID_VALUE from invalid lda (s01 < ne10)");
+    }
+    if (s11 < ne10) {
+        GGML_LOG_ERROR("%s: ldb=%ld < k=%ld for src1 tensor '%s' (type=%s, view_src=%p, nb11=%zu, ne10=%ld, ne11=%ld)\n",
+                __func__, (long)s11, (long)ne10,
+                src1->name[0] ? src1->name : "(unnamed)",
+                ggml_type_name(src1->type),
+                (void*)src1->view_src,
+                src1->nb[1], (long)ne10, (long)ne11);
+        GGML_ABORT("cublas would get INVALID_VALUE from invalid ldb (s11 < ne10)");
+    }
 
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
