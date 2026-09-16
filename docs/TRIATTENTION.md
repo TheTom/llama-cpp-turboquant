@@ -10,7 +10,10 @@ long-context inference. It is based on the paper
 
 When combined with TurboQuant's 2-4 bit KV compression, TriAttention provides
 **~40× effective KV memory reduction** (compression × eviction) while
-maintaining quality.
+maintaining quality. This reduces the number of *active* KV entries used for
+attention, not the physical KV buffer allocation: the buffer implied by `-c`
+is still allocated up front, so TriAttention does not currently let you run a
+context length whose buffer would not otherwise fit in VRAM.
 
 ## How it works
 
