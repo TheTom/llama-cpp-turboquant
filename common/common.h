@@ -761,6 +761,21 @@ struct common_params {
     // return false from callback to abort model loading or true to continue
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
+
+    // TriAttention KV cache eviction (arXiv 2604.04921)
+    std::string triattention_stats;
+    int32_t     triattention_budget          = 2048;
+    int32_t     triattention_window          = 128;
+    int32_t     triattention_offset_max      = 65536;
+    int32_t     triattention_mode            = 0;
+    int32_t     triattention_trigger         = 0;
+    int32_t     triattention_agg             = 0;
+    int32_t     triattention_seed            = 0;
+    bool        triattention_normalize       = false;
+    bool        triattention_protect_prefill = true;
+    bool        triattention_disable_mlr     = false;
+    bool        triattention_disable_trig    = false;
+    bool        triattention_log             = false;
     bool no_alloc = false; // Don't allocate model buffers
 
     // TTS params

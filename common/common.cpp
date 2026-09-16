@@ -1370,6 +1370,28 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // Initialize TriAttention KV cache eviction if calibration stats provided
+    if (!params.triattention_stats.empty()) {
+        int32_t rc = llama_triattention_init(lctx,
+            params.triattention_stats.c_str(),
+            params.triattention_budget,
+            params.triattention_window,
+            params.triattention_offset_max,
+            params.triattention_mode,
+            params.triattention_trigger,
+            params.triattention_agg,
+            params.triattention_seed,
+            params.triattention_normalize,
+            params.triattention_protect_prefill,
+            params.triattention_disable_mlr,
+            params.triattention_disable_trig,
+            params.triattention_log);
+        if (rc != 0) {
+            LOG_WRN("%s: TriAttention initialization failed (stats=%s) — continuing without eviction\n",
+                    __func__, params.triattention_stats.c_str());
+        }
+    }
+
     pimpl->context.reset(lctx);
 }
 
