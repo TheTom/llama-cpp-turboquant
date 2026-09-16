@@ -17,7 +17,9 @@
 #include "llama-hparams.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"   // GPU scoring: triattention_gpu_init, _score_head, etc.
+#endif
 
 // Block types and dequant declarations are in ggml-common.h (ggml/src/)
 // which is not on the include path for src/. We declare the dequant
@@ -934,6 +936,7 @@ void triattention_free(triattention_state * state) {
     delete[] state->keep_indices;
 
     // Free GPU scoring resources if initialized
+#ifdef GGML_USE_CUDA
     if (state->d_scores) {
         triattention_gpu_free_dev(state->d_scores);
         state->d_scores = nullptr;
@@ -942,6 +945,7 @@ void triattention_free(triattention_state * state) {
         triattention_gpu_free((triattention_gpu_state *)state->d_gpu_state);
         state->d_gpu_state = nullptr;
     }
+#endif
 
     delete state;
 }
@@ -1088,6 +1092,11 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
     if (state->gpu_init_tried) return;
     state->gpu_init_tried = true;
 
+#ifndef GGML_USE_CUDA
+    (void)k_type;
+    fprintf(stderr, "[TriAttention] built without CUDA support, using CPU scoring\n");
+    return;
+#else
     const triattention_calibration * cal = state->cal;
     const triattention_config & cfg = state->cfg;
 
@@ -1139,6 +1148,7 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
 
     fprintf(stderr, "[TriAttention] GPU scoring enabled (k_type=%d, heads=%u)\n",
             (int)k_type, cal->n_sampled);
+#endif // GGML_USE_CUDA
 }
 
 int32_t triattention_prune(
@@ -1374,6 +1384,7 @@ int32_t triattention_prune_impl(
     }
 
     if (state->use_gpu) {
+#ifdef GGML_USE_CUDA
         // ---- GPU path ----
         // Upload the n_decode candidate cell indices + positions to device.
         // Kernels are enqueued into the default stream (nullptr), ordered after the upload.
@@ -1444,6 +1455,7 @@ int32_t triattention_prune_impl(
         triattention_gpu_free_dev(d_scores_all);
         triattention_gpu_free_dev(d_cell_indices);
         triattention_gpu_free_dev(d_positions);
+#endif // GGML_USE_CUDA
 
     } else {
         // ---- CPU fallback path ----
