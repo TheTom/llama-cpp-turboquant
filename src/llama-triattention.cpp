@@ -104,6 +104,183 @@ static void matvec_128(const float * mat, const float * vec, float * out) {
 
 // Load .triattention calibration file
 // Returns nullptr on any error, with diagnostic printed to stderr
+static triattention_calibration * triattention_load_calibration_v2(FILE * f, const char * path) {
+    // The stream is positioned immediately after magic+version (byte 8).
+    uint32_t num_layers     = 0;
+    uint32_t num_heads      = 0;
+    uint32_t num_kv_heads   = 0;
+    uint32_t rotary_dim     = 0;
+    uint32_t freq_count     = 0;
+    float    rope_theta_f   = 0.0f;
+    float    attn_scale     = 1.0f;
+
+    bool ok = true;
+    ok = ok && fread(&num_layers,   sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&num_heads,    sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&num_kv_heads, sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&rotary_dim,   sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&freq_count,   sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&rope_theta_f, sizeof(float),    1, f) == 1;
+    ok = ok && fread(&attn_scale,   sizeof(float),    1, f) == 1;
+
+    if (!ok) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated TRIA v2 header in %s\n", path);
+        return nullptr;
+    }
+
+    if (num_layers == 0 || num_heads == 0 || num_kv_heads == 0 ||
+        num_heads % num_kv_heads != 0) {
+        fprintf(stderr,
+                "[TriAttention] ERROR: invalid TRIA v2 dimensions "
+                "(layers=%u, heads=%u, kv_heads=%u) in %s\n",
+                num_layers, num_heads, num_kv_heads, path);
+        return nullptr;
+    }
+
+    if (rotary_dim == 0 || freq_count == 0 || rotary_dim != 2 * freq_count) {
+        fprintf(stderr,
+                "[TriAttention] ERROR: invalid TRIA v2 rotary dimensions "
+                "(rotary_dim=%u, freq_count=%u) in %s\n",
+                rotary_dim, freq_count, path);
+        return nullptr;
+    }
+
+    // v2 header is always exactly 64 bytes. Ignore reserved metadata.
+    if (fseek(f, 64, SEEK_SET) != 0) {
+        fprintf(stderr, "[TriAttention] ERROR: cannot seek TRIA v2 header in %s\n", path);
+        return nullptr;
+    }
+
+    // v2 layer-budget scales are useful to domvox's per-layer selector, but the
+    // current atomic runtime uses one global budget. Read/validate the block so
+    // the following stats remain aligned, then intentionally ignore it.
+    std::vector<float> layer_scales(num_layers);
+    if (fread(layer_scales.data(), sizeof(float), num_layers, f) != num_layers) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated TRIA v2 layer scales in %s\n", path);
+        return nullptr;
+    }
+
+    struct tria_v2_head_tmp {
+        uint32_t layer;
+        uint32_t head;
+        std::vector<float> q_mean_real;
+        std::vector<float> q_mean_imag;
+        std::vector<float> q_abs_mean;
+    };
+
+    std::vector<tria_v2_head_tmp> active;
+    active.reserve((size_t)num_layers * num_heads);
+
+    std::vector<float> mrl(freq_count);
+
+    for (uint32_t li = 0; li < num_layers; ++li) {
+        for (uint32_t hi = 0; hi < num_heads; ++hi) {
+            tria_v2_head_tmp tmp;
+            tmp.layer = li;
+            tmp.head  = hi;
+            tmp.q_mean_real.resize(freq_count);
+            tmp.q_mean_imag.resize(freq_count);
+            tmp.q_abs_mean.resize(freq_count);
+
+            ok = true;
+            ok = ok && fread(tmp.q_mean_real.data(), sizeof(float), freq_count, f) == freq_count;
+            ok = ok && fread(tmp.q_mean_imag.data(), sizeof(float), freq_count, f) == freq_count;
+            ok = ok && fread(tmp.q_abs_mean.data(),  sizeof(float), freq_count, f) == freq_count;
+            ok = ok && fread(mrl.data(),             sizeof(float), freq_count, f) == freq_count;
+
+            if (!ok) {
+                fprintf(stderr,
+                        "[TriAttention] ERROR: truncated TRIA v2 stats "
+                        "at layer=%u head=%u in %s\n",
+                        li, hi, path);
+                return nullptr;
+            }
+
+            // domvox zero-fills layers without full attention. Do not turn those
+            // into sampled heads: zero heads can distort atomic's max aggregation
+            // and waste a large score buffer.
+            bool nonzero = false;
+            for (uint32_t fi = 0; fi < freq_count; ++fi) {
+                if (fabsf(tmp.q_abs_mean[fi])  > 1e-20f ||
+                    fabsf(tmp.q_mean_real[fi]) > 1e-20f ||
+                    fabsf(tmp.q_mean_imag[fi]) > 1e-20f) {
+                    nonzero = true;
+                    break;
+                }
+            }
+
+            if (nonzero) {
+                active.push_back(tmp);
+            }
+        }
+    }
+
+    if (active.empty()) {
+        fprintf(stderr, "[TriAttention] ERROR: TRIA v2 contains no active attention heads: %s\n", path);
+        return nullptr;
+    }
+
+    auto * cal = new triattention_calibration();
+    memset(cal, 0, sizeof(triattention_calibration));
+
+    // In domvox files this field is intentionally the RoPE/scoring dimension.
+    // For Qwen3.8: rotary_dim=64 while the model's full KV head width is 256.
+    cal->head_dim        = rotary_dim;
+    cal->num_layers      = num_layers;
+    cal->num_attn_heads  = num_heads;
+    cal->num_kv_heads    = num_kv_heads;
+    cal->num_kv_groups   = num_heads / num_kv_heads;
+    cal->rope_theta      = (double)rope_theta_f;
+    cal->rope_style      = 0; // domvox _to_complex uses half layout [real | imag]
+    cal->freq_count      = freq_count;
+    cal->n_sampled       = (uint32_t)active.size();
+
+    snprintf(cal->model_name, sizeof(cal->model_name), "domvox-TRIA-v2");
+
+    cal->sampled_layer = new uint32_t[cal->n_sampled];
+    cal->sampled_head  = new uint32_t[cal->n_sampled];
+    cal->head_stats    = new triattention_head_stats[cal->n_sampled];
+
+    for (uint32_t i = 0; i < cal->n_sampled; ++i) {
+        cal->sampled_layer[i] = active[i].layer;
+        cal->sampled_head[i]  = active[i].head;
+
+        auto & hs = cal->head_stats[i];
+        hs.q_mean_real  = new float[freq_count];
+        hs.q_mean_imag  = new float[freq_count];
+        hs.q_abs_mean   = new float[freq_count];
+        hs.q_mean_abs   = nullptr;
+        hs.extra_weight = nullptr;
+
+        memcpy(hs.q_mean_real, active[i].q_mean_real.data(), freq_count * sizeof(float));
+        memcpy(hs.q_mean_imag, active[i].q_mean_imag.data(), freq_count * sizeof(float));
+        memcpy(hs.q_abs_mean,  active[i].q_abs_mean.data(),  freq_count * sizeof(float));
+    }
+
+    float min_scale = layer_scales[0];
+    float max_scale = layer_scales[0];
+    for (float s : layer_scales) {
+        min_scale = fminf(min_scale, s);
+        max_scale = fmaxf(max_scale, s);
+    }
+
+    if (fabsf(attn_scale - 1.0f) > 1e-4f) {
+        fprintf(stderr,
+                "[TriAttention] WARNING: TRIA v2 attn_scale=%.6f is not consumed "
+                "by this atomic runtime\n",
+                attn_scale);
+    }
+
+    fprintf(stderr,
+            "[TriAttention] Loaded domvox TRIA v2: layers=%u, attn_heads=%u, "
+            "kv_heads=%u, rotary_dim=%u, freq_count=%u, sampled=%u, "
+            "rope_theta=%.1f, layer_scale=[%.3f, %.3f]\n",
+            cal->num_layers, cal->num_attn_heads, cal->num_kv_heads,
+            cal->head_dim, cal->freq_count, cal->n_sampled,
+            cal->rope_theta, min_scale, max_scale);
+
+    return cal;
+}
 static triattention_calibration * triattention_load_calibration(const char * path) {
     FILE * f = fopen(path, "rb");
     if (!f) {
@@ -121,10 +298,22 @@ static triattention_calibration * triattention_load_calibration(const char * pat
     }
 
     // Read and validate version
-    uint32_t version;
-    if (fread(&version, sizeof(uint32_t), 1, f) != 1 || version != TRIATTENTION_VERSION) {
-        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected %u)\n",
-                version, path, TRIATTENTION_VERSION);
+    uint32_t version = 0;
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated version field in %s\n", path);
+        fclose(f);
+        return nullptr;
+    }
+
+    if (version == 2u) {
+        triattention_calibration * cal = triattention_load_calibration_v2(f, path);
+        fclose(f);
+        return cal;
+    }
+
+    if (version != TRIATTENTION_VERSION) {
+        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected 1 or 2)\n",
+                version, path);
         fclose(f);
         return nullptr;
     }
@@ -641,12 +830,24 @@ triattention_state * triattention_init(
         return nullptr;
     }
 
-    // Validate model compatibility
-    if (cal->head_dim != head_dim) {
-        fprintf(stderr, "[TriAttention] ERROR: head_dim mismatch (calibration=%u, model=%u)\n",
-                cal->head_dim, head_dim);
+    // Validate model compatibility.
+    // cal->head_dim is the RoPE/scoring width. It may be smaller than the
+    // model's full KV head width on partial-RoPE architectures such as Qwen3.8.
+    if (cal->head_dim == 0 || cal->head_dim > head_dim ||
+        cal->freq_count * 2 != cal->head_dim) {
+        fprintf(stderr,
+                "[TriAttention] ERROR: incompatible dimensions "
+                "(calibration rotary_dim=%u, freq_count=%u, model_head_dim=%u)\n",
+                cal->head_dim, cal->freq_count, head_dim);
         triattention_free_calibration(cal);
         return nullptr;
+    }
+
+    if (cal->head_dim != head_dim) {
+        fprintf(stderr,
+                "[TriAttention] Partial RoPE enabled: model_head_dim=%u, "
+                "rotary_dim=%u, freq_count=%u\n",
+                head_dim, cal->head_dim, cal->freq_count);
     }
     if (cal->num_kv_heads != n_kv_heads) {
         fprintf(stderr, "[TriAttention] ERROR: n_kv_heads mismatch (calibration=%u, model=%u)\n",
@@ -667,6 +868,7 @@ triattention_state * triattention_init(
     state->cal  = cal;
     state->cfg  = *cfg;
     state->kv_size = kv_size;
+    state->model_head_dim = head_dim;
     state->absolute_position = 0;
     state->prefix_length     = 0;
 
@@ -674,7 +876,7 @@ triattention_state * triattention_init(
 
     // Build precomputed arrays
     state->omega = new float[fc];
-    triattention_build_omega(state->omega, fc, head_dim, rope_theta);
+    triattention_build_omega(state->omega, fc, cal->head_dim, cal->rope_theta);
 
     state->freq_scale_sq = new float[fc];
     triattention_build_freq_scale_sq(state->freq_scale_sq, state->omega, fc);
@@ -890,7 +1092,7 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
     const triattention_config & cfg = state->cfg;
 
     triattention_gpu_config gcfg = {};
-    gcfg.head_dim     = cal->head_dim;
+    gcfg.head_dim     = state->model_head_dim;
     gcfg.freq_count   = cal->freq_count;
     gcfg.n_kv_heads   = cal->num_kv_heads;
     gcfg.n_sampled    = cal->n_sampled;
@@ -898,6 +1100,14 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
     gcfg.k_type       = k_type;
     gcfg.need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0);
     gcfg.disable_trig = cfg.disable_trig;
+
+    if (gcfg.need_wht_inv && state->model_head_dim != 128) {
+        fprintf(stderr,
+                "[TriAttention] GPU WHT scoring currently supports model_head_dim=128 only "
+                "(got %u); using CPU scoring for this K cache type\n",
+                state->model_head_dim);
+        return;
+    }
 
     std::vector<triattention_gpu_head_calib> gcalibs(cal->n_sampled);
     for (uint32_t h = 0; h < cal->n_sampled; h++) {
@@ -942,7 +1152,7 @@ int32_t triattention_prune(
     const auto & cfg = state->cfg;
     const auto * cal = state->cal;
     const uint32_t fc = cal->freq_count;
-    const uint32_t hd = cal->head_dim;
+    const uint32_t hd = state->model_head_dim;
     // Padded head dim for turbo types (always 128-aligned)
     const uint32_t padded_hd = ((hd + 127) / 128) * 128;
 
@@ -1088,7 +1298,7 @@ int32_t triattention_prune_impl(
     const auto & cfg = state->cfg;
     const auto * cal = state->cal;
     const uint32_t fc = cal->freq_count;
-    const uint32_t hd = cal->head_dim;
+    const uint32_t hd = state->model_head_dim;
     const uint32_t padded_hd = ((hd + 127) / 128) * 128;
     const uint32_t budget = cfg.budget;
 

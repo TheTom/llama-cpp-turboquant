@@ -108,6 +108,8 @@ struct triattention_head_stats {
 
 // Model calibration data loaded from .triattention file
 struct triattention_calibration {
+    // Calibration/scoring dimension. For partial-RoPE models this is the
+    // rotary dimension (e.g. 64 for Qwen3.8), not the full KV head dimension.
     uint32_t head_dim;
     uint32_t num_layers;
     uint32_t num_attn_heads;      // total attention heads
@@ -154,6 +156,9 @@ struct triattention_state {
     int64_t  absolute_position;   // Monotonically increasing token counter
     int64_t  prefix_length;       // Prompt length (protected if protect_prefill)
     uint32_t kv_size;             // Total KV cache capacity (from cache init)
+    // Full model KV head width used for cache addressing/dequantization.
+    // May be larger than cal->head_dim on partial-RoPE models.
+    uint32_t model_head_dim;
 
     // Precomputed arrays (allocated once at init)
     float *   omega;              // [freq_count]  RoPE frequencies: theta^(-2f/d)
