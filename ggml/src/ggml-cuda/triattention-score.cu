@@ -30,6 +30,10 @@ struct triattention_gpu_state {
     float * d_q_mean_abs;      // [n_sampled * freq_count]
     float * d_extra_weight;    // [n_sampled * freq_count]
 
+    // Non-rotary "content" tail stats (null when cfg.content_dim == 0)
+    float * d_content_q_mean;       // [n_sampled * content_dim]
+    float * d_content_extra_weight; // [n_sampled * content_dim]
+
     // Device arrays: precomputed
     float * d_omega;           // [freq_count]
     float * d_freq_scale_sq;   // [freq_count]
@@ -150,6 +154,53 @@ static __device__ void dequant_head_to_smem(
 }
 
 // ============================================================================
+// Device helper: dequantize a single arbitrary element of a K row.
+// Used for the non-rotary "content" tail, which (unlike the rotary pairs
+// dequant_head_to_smem handles) has no fixed pairing structure. Not
+// applicable to turbo2/turbo3 (WHT-rotated types): the caller only invokes
+// this when NEED_WHT_INV is false, since content_dim is always 0 whenever
+// need_wht_inv is true and this kernel runs (see triattention_init_gpu's
+// model_head_dim==128 guard -- partial-RoPE turbo models never reach here).
+// ============================================================================
+
+template <enum ggml_type K_TYPE>
+static __device__ float dequant_one_element(const void * k_row_ptr, int idx) {
+    if constexpr (K_TYPE == GGML_TYPE_F32) {
+        return ((const float *)k_row_ptr)[idx];
+    } else if constexpr (K_TYPE == GGML_TYPE_F16) {
+        return __half2float(((const half *)k_row_ptr)[idx]);
+    } else if constexpr (K_TYPE == GGML_TYPE_Q8_0) {
+        const int blk = idx / QK8_0;
+        const int off = idx % QK8_0;
+        const block_q8_0 * x = (const block_q8_0 *)k_row_ptr;
+        return (float)x[blk].qs[off] * __half2float(x[blk].d);
+    } else if constexpr (K_TYPE == GGML_TYPE_TURBO4_0) {
+        const block_turbo4_0 * x = (const block_turbo4_0 *)k_row_ptr;
+        const int blk = idx / QK_TURBO4;
+        const int off = idx % QK_TURBO4;
+        const float norm = __half2float(x[blk].norm);
+        return turbo4_dequant_element(&x[blk], off, norm);
+    } else {
+        // turbo2/turbo3: not reached for content dims (see comment above).
+        return 0.0f;
+    }
+}
+
+template <enum ggml_type K_TYPE>
+static __device__ void dequant_content_to_smem(
+    float * smem,
+    const void * k_row_ptr,
+    int tid,
+    int freq_count,
+    int rotary_dim,
+    int content_dim)
+{
+    for (int c = tid; c < content_dim; c += freq_count) {
+        smem[rotary_dim + c] = dequant_one_element<K_TYPE>(k_row_ptr, rotary_dim + c);
+    }
+}
+
+// ============================================================================
 // Main scoring kernel
 //
 // One block per cell (position). freq_count threads per block.
@@ -185,7 +236,10 @@ static __global__ void triattention_score_kernel(
     const float  * __restrict__ q_mean_abs,      // [freq_count]
     const float  * __restrict__ extra_weight,    // [freq_count]
     const uint32_t              freq_count,
-    const int                   agg_mode)        // 0=mean, 1=max
+    const int                   agg_mode,        // 0=mean, 1=max
+    const float  * __restrict__ content_q_mean,      // [content_dim] for this head, or null
+    const float  * __restrict__ content_extra_weight, // [content_dim], or null
+    const uint32_t              content_dim)
 {
     const int cell_idx_local = blockIdx.x;  // which cell we're scoring
     const int f = threadIdx.x;              // frequency index [0, freq_count)
@@ -205,6 +259,18 @@ static __global__ void triattention_score_kernel(
     const char * k_row_ptr = (const char *)k_data + (size_t)cell_global * row_bytes + head_offset_bytes;
 
     dequant_head_to_smem<K_TYPE>(k_smem, k_row_ptr, f, padded_hd);
+
+    // ---- Step 1b: Dequant non-rotary "content" tail, if any ----
+    // Never rotated by RoPE or WHT, so no inversion needed -- just dequant
+    // and leave as-is. content_dim is always 0 whenever NEED_WHT_INV is true
+    // and this kernel runs (see triattention_init_gpu's model_head_dim==128
+    // guard), so this never has to interact with the WHT path.
+    if constexpr (!NEED_WHT_INV) {
+        if (content_dim > 0) {
+            const uint32_t rotary_dim = 2 * freq_count;
+            dequant_content_to_smem<K_TYPE>(k_smem, k_row_ptr, f, (int)freq_count, (int)rotary_dim, (int)content_dim);
+        }
+    }
     __syncthreads();
 
     // ---- Step 2: Inverse WHT rotation (turbo2/turbo3 only) ----
@@ -300,6 +366,25 @@ static __global__ void triattention_score_kernel(
         total_score = extra_weight[f] * freq_scale_sq[f] * k_mag;
     }
 
+    // ---- Step 4b: Non-rotary "content" term (position-independent) ----
+    // Each thread covers the same striped subset of content dims it
+    // dequantized in Step 1b; the block reduction below sums every thread's
+    // total_score, so this correctly folds into the final combined score
+    // without needing a separate reduction pass.
+    if constexpr (!NEED_WHT_INV) {
+        if (content_dim > 0) {
+            const uint32_t rotary_dim = 2 * freq_count;
+            float content_partial = 0.0f;
+            for (uint32_t c = f; c < content_dim; c += freq_count) {
+                float kv = k_smem[rotary_dim + c];
+                content_partial += content_q_mean[c] * kv + content_extra_weight[c] * fabsf(kv);
+            }
+            // Rescale to match the rotary term's aggregate magnitude -- see
+            // the matching comment in triattention_score_keys (CPU path).
+            total_score += content_partial * ((float)freq_count / (float)content_dim);
+        }
+    }
+
     // ---- Step 5: Block reduction  ----
     score_smem[f] = total_score;
     __syncthreads();
@@ -340,12 +425,15 @@ static void launch_score_kernel(
     const auto & cfg = state->cfg;
     const uint32_t fc = cfg.freq_count;
     const uint32_t hd = cfg.head_dim;
+    const uint32_t cd = cfg.content_dim;
 
     // Calibration pointers for this head
     const float * qmr = state->d_q_mean_real  + (size_t)head_calib_idx * fc;
     const float * qmi = state->d_q_mean_imag  + (size_t)head_calib_idx * fc;
     const float * qma = state->d_q_mean_abs   + (size_t)head_calib_idx * fc;
     const float * ew  = state->d_extra_weight  + (size_t)head_calib_idx * fc;
+    const float * cqm = cd > 0 ? state->d_content_q_mean       + (size_t)head_calib_idx * cd : nullptr;
+    const float * cew = cd > 0 ? state->d_content_extra_weight + (size_t)head_calib_idx * cd : nullptr;
 
     const dim3 grid(n_cells, 1, 1);
     const dim3 block(fc, 1, 1);
@@ -359,7 +447,7 @@ static void launch_score_kernel(
             scores_out, k_data, n_embd_k_gqa, row_bytes, head_off, hd, \
             cell_indices, positions, n_cells, round_start, \
             state->d_omega, state->d_freq_scale_sq, state->d_offsets, cfg.n_offsets, \
-            qmr, qmi, qma, ew, fc, agg_mode)
+            qmr, qmi, qma, ew, fc, agg_mode, cqm, cew, cd)
 
     if (cfg.disable_trig) {
         switch (cfg.k_type) {
@@ -431,6 +519,30 @@ triattention_gpu_state * triattention_gpu_init(
         CUDA_CHECK(cudaMemcpyAsync(
             (char *)state->d_extra_weight + off, head_calibs[h].extra_weight,
             fc * sizeof(float), cudaMemcpyHostToDevice, stream));
+    }
+
+    // Non-rotary "content" tail stats (null when content_dim == 0)
+    state->d_content_q_mean       = nullptr;
+    state->d_content_extra_weight = nullptr;
+    const uint32_t cd = config->content_dim;
+    if (cd > 0) {
+        const size_t content_bytes = (size_t)ns * cd * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&state->d_content_q_mean,       content_bytes));
+        CUDA_CHECK(cudaMalloc(&state->d_content_extra_weight, content_bytes));
+        for (uint32_t h = 0; h < ns; h++) {
+            const size_t off = (size_t)h * cd * sizeof(float);
+            if (head_calibs[h].content_q_mean && head_calibs[h].content_extra_weight) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    (char *)state->d_content_q_mean + off, head_calibs[h].content_q_mean,
+                    cd * sizeof(float), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    (char *)state->d_content_extra_weight + off, head_calibs[h].content_extra_weight,
+                    cd * sizeof(float), cudaMemcpyHostToDevice, stream));
+            } else {
+                CUDA_CHECK(cudaMemsetAsync((char *)state->d_content_q_mean + off, 0, cd * sizeof(float), stream));
+                CUDA_CHECK(cudaMemsetAsync((char *)state->d_content_extra_weight + off, 0, cd * sizeof(float), stream));
+            }
+        }
     }
 
     // Upload omega, freq_scale_sq, offsets
@@ -534,6 +646,8 @@ void triattention_gpu_free(triattention_gpu_state * state) {
     cudaFree(state->d_q_mean_imag);
     cudaFree(state->d_q_mean_abs);
     cudaFree(state->d_extra_weight);
+    cudaFree(state->d_content_q_mean);
+    cudaFree(state->d_content_extra_weight);
     cudaFree(state->d_omega);
     cudaFree(state->d_freq_scale_sq);
     cudaFree(state->d_offsets);

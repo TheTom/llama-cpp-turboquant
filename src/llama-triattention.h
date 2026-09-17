@@ -25,10 +25,11 @@ struct llama_hparams;
 // Binary calibration file format (.triattention)
 // ============================================================================
 //
-// Header:
+// Header (versions 1 and 3 -- version 2 is a distinct third-party format,
+// see triattention_load_calibration_v2 in the .cpp):
 //   magic          uint32  0x54524941 ("TRIA")
-//   version        uint32  1
-//   head_dim       uint32  e.g. 128
+//   version        uint32  1 or 3
+//   head_dim       uint32  e.g. 128 (rotary/scoring dim; may be < model head width)
 //   num_layers     uint32  e.g. 36
 //   num_attn_heads uint32  e.g. 36  (total attention heads, not KV heads)
 //   num_kv_heads   uint32  e.g. 4   (grouped query attention KV heads)
@@ -38,6 +39,7 @@ struct llama_hparams;
 //   freq_count     uint32  head_dim / 2
 //   name_len       uint32  length of model name string (including null)
 //   name           char[name_len]  UTF-8 null-terminated model name
+//   content_dim    uint32  version 3 only: non-rotary tail width (model_head_dim - head_dim)
 //
 // Per sampled head (repeated n_sampled times):
 //   layer_idx      uint32
@@ -46,9 +48,28 @@ struct llama_hparams;
 //   q_mean_imag    float32[freq_count]  Im(E[q_f])
 //   q_abs_mean     float32[freq_count]  E[||q_f||]
 //   r_f            float32[freq_count]  ||E[q_f]|| / E[||q_f||] (validation)
+//   -- version 3 only, when content_dim > 0 --
+//   content_q_mean     float32[content_dim]  E[q_d] for non-rotary dims (real, unrotated)
+//   content_q_abs_mean float32[content_dim]  E[|q_d|]
+//
+// Partial-RoPE architectures (e.g. Qwen3.8) split the KV head into a rotary
+// sub-range [0, head_dim) that RoPE rotates, and a non-rotary "content" tail
+// [head_dim, model_head_dim) that RoPE never touches. Versions 1 and 2 only
+// score the rotary sub-range, which leaves TriAttention blind to whatever
+// semantic content lives in the tail -- verified to cause real needle-in-
+// haystack retrieval failures on Qwen3.8 (see PR #368 discussion). Version 3
+// adds a position-independent content term computed the same way as the
+// existing norm-excess (MLR) term, just without the RoPE phase/frequency
+// structure since those dims never rotate.
 
-#define TRIATTENTION_MAGIC   0x54524941u  // "TRIA" in little-endian
-#define TRIATTENTION_VERSION 1u
+#define TRIATTENTION_MAGIC     0x54524941u  // "TRIA" in little-endian
+#define TRIATTENTION_VERSION   1u
+// Version 2 is a separate, externally-produced format ("domvox TRIA v2",
+// see triattention_load_calibration_v2 in llama-triattention.cpp) with its
+// own distinct header/record layout -- not a superset of version 1.
+// Version 3 extends version 1's layout (same base header/records) with a
+// trailing per-head content-dim block; see comment above.
+#define TRIATTENTION_VERSION_CONTENT 3u
 
 // ============================================================================
 // Enums
@@ -104,6 +125,13 @@ struct triattention_head_stats {
     // Precomputed at init time from the above:
     float * q_mean_abs;     // [freq_count]  ||E[q_f]|| = sqrt(re^2 + im^2)
     float * extra_weight;   // [freq_count]  E[||q_f||] - ||E[q_f]|| (norm excess, MLR-weighted)
+
+    // v2 only (null when content_dim == 0): non-rotary "content" tail stats.
+    // These dims are never RoPE-rotated, so there's no phase/frequency
+    // structure -- just a real per-dim mean and an MLR-style norm excess.
+    float * content_q_mean;      // [content_dim]  E[q_d]
+    float * content_q_abs_mean;  // [content_dim]  E[|q_d|]
+    float * content_extra_weight; // [content_dim] precomputed: E[|q_d|] - |E[q_d]|
 };
 
 // Model calibration data loaded from .triattention file
@@ -119,6 +147,7 @@ struct triattention_calibration {
     uint32_t rope_style;          // 0 = half, 1 = interleaved
     uint32_t freq_count;          // = head_dim / 2
     uint32_t n_sampled;           // number of (layer, head) pairs
+    uint32_t content_dim;         // v2: non-rotary tail width (0 for v1 files)
 
     // Per sampled head arrays — length n_sampled
     uint32_t * sampled_layer;     // [n_sampled]  layer index

@@ -50,6 +50,10 @@ struct triattention_gpu_head_calib {
     const float * q_mean_imag;
     const float * q_mean_abs;
     const float * extra_weight;
+    // Non-rotary "content" tail stats (partial-RoPE models). May be null
+    // when content_dim == 0 (no partial RoPE, or a v1/v2 calibration file).
+    const float * content_q_mean;
+    const float * content_extra_weight;
 };
 
 struct triattention_gpu_config {
@@ -58,6 +62,7 @@ struct triattention_gpu_config {
     uint32_t n_kv_heads;
     uint32_t n_sampled;
     uint32_t n_offsets;
+    uint32_t content_dim;   // non-rotary tail width; 0 if none
     enum ggml_type k_type;
     bool need_wht_inv;
     bool disable_trig;

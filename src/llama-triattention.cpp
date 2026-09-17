@@ -253,6 +253,9 @@ static triattention_calibration * triattention_load_calibration_v2(FILE * f, con
         hs.q_abs_mean   = new float[freq_count];
         hs.q_mean_abs   = nullptr;
         hs.extra_weight = nullptr;
+        hs.content_q_mean      = nullptr;
+        hs.content_q_abs_mean  = nullptr;
+        hs.content_extra_weight = nullptr;
 
         memcpy(hs.q_mean_real, active[i].q_mean_real.data(), freq_count * sizeof(float));
         memcpy(hs.q_mean_imag, active[i].q_mean_imag.data(), freq_count * sizeof(float));
@@ -313,8 +316,8 @@ static triattention_calibration * triattention_load_calibration(const char * pat
         return cal;
     }
 
-    if (version != TRIATTENTION_VERSION) {
-        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected 1 or 2)\n",
+    if (version != TRIATTENTION_VERSION && version != TRIATTENTION_VERSION_CONTENT) {
+        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected 1, 2, or 3)\n",
                 version, path);
         fclose(f);
         return nullptr;
@@ -356,6 +359,17 @@ static triattention_calibration * triattention_load_calibration(const char * pat
         return nullptr;
     }
     cal->model_name[name_len] = '\0';
+
+    // Version 3 adds a content_dim field for the non-rotary tail stats.
+    cal->content_dim = 0;
+    if (version == TRIATTENTION_VERSION_CONTENT) {
+        if (fread(&cal->content_dim, sizeof(uint32_t), 1, f) != 1) {
+            fprintf(stderr, "[TriAttention] ERROR: truncated content_dim field in %s\n", path);
+            delete cal;
+            fclose(f);
+            return nullptr;
+        }
+    }
 
     // Validate basic field consistency
     if (cal->freq_count != cal->head_dim / 2) {
@@ -431,6 +445,9 @@ static triattention_calibration * triattention_load_calibration(const char * pat
         hs.q_abs_mean   = new float[fc];
         hs.q_mean_abs   = nullptr;  // computed at init time
         hs.extra_weight = nullptr;  // computed at init time
+        hs.content_q_mean      = nullptr;
+        hs.content_q_abs_mean  = nullptr;
+        hs.content_extra_weight = nullptr;
 
         ok = true;
         ok = ok && fread(hs.q_mean_real, sizeof(float), fc, f) == fc;
@@ -442,12 +459,21 @@ static triattention_calibration * triattention_load_calibration(const char * pat
         ok = ok && fread(r_f_tmp, sizeof(float), fc, f) == fc;
         delete[] r_f_tmp;
 
+        if (ok && cal->content_dim > 0) {
+            hs.content_q_mean     = new float[cal->content_dim];
+            hs.content_q_abs_mean = new float[cal->content_dim];
+            ok = ok && fread(hs.content_q_mean,     sizeof(float), cal->content_dim, f) == cal->content_dim;
+            ok = ok && fread(hs.content_q_abs_mean, sizeof(float), cal->content_dim, f) == cal->content_dim;
+        }
+
         if (!ok) {
             fprintf(stderr, "[TriAttention] ERROR: truncated stats for head %u in %s\n", h, path);
             // Free this head's arrays
             delete[] hs.q_mean_real;
             delete[] hs.q_mean_imag;
             delete[] hs.q_abs_mean;
+            delete[] hs.content_q_mean;
+            delete[] hs.content_q_abs_mean;
             // Free previous heads
             for (uint32_t j = 0; j < h; j++) {
                 delete[] cal->head_stats[j].q_mean_real;
@@ -455,6 +481,9 @@ static triattention_calibration * triattention_load_calibration(const char * pat
                 delete[] cal->head_stats[j].q_abs_mean;
                 delete[] cal->head_stats[j].q_mean_abs;
                 delete[] cal->head_stats[j].extra_weight;
+                delete[] cal->head_stats[j].content_q_mean;
+                delete[] cal->head_stats[j].content_q_abs_mean;
+                delete[] cal->head_stats[j].content_extra_weight;
             }
             delete[] cal->sampled_layer;
             delete[] cal->sampled_head;
@@ -484,6 +513,9 @@ static void triattention_free_calibration(triattention_calibration * cal) {
         delete[] cal->head_stats[h].q_abs_mean;
         delete[] cal->head_stats[h].q_mean_abs;
         delete[] cal->head_stats[h].extra_weight;
+        delete[] cal->head_stats[h].content_q_mean;
+        delete[] cal->head_stats[h].content_q_abs_mean;
+        delete[] cal->head_stats[h].content_extra_weight;
     }
     delete[] cal->sampled_layer;
     delete[] cal->sampled_head;
@@ -533,7 +565,12 @@ static uint32_t triattention_build_offsets(float * offsets, uint32_t offset_max)
 //   q_mean_abs[f] = sqrt(q_mean_real[f]^2 + q_mean_imag[f]^2)  = ||E[q_f]||
 //   extra_weight[f] = q_abs_mean[f] - q_mean_abs[f]              = E[||q_f||] - ||E[q_f]||
 // Paper Eq. 8: the "norm excess" term weighted by (1 - R_f)
-static void triattention_precompute_head_derived(triattention_head_stats * hs, uint32_t freq_count, bool disable_mlr) {
+//
+// content_dim > 0 (version 3 files only): also precompute
+//   content_extra_weight[d] = content_q_abs_mean[d] - |content_q_mean[d]|
+// the same norm-excess idea applied to the non-rotary tail, which has no
+// phase/frequency structure since RoPE never rotates it.
+static void triattention_precompute_head_derived(triattention_head_stats * hs, uint32_t freq_count, uint32_t content_dim, bool disable_mlr) {
     hs->q_mean_abs   = new float[freq_count];
     hs->extra_weight = new float[freq_count];
 
@@ -551,6 +588,21 @@ static void triattention_precompute_head_derived(triattention_head_stats * hs, u
             hs->extra_weight[f] = hs->q_abs_mean[f] - hs->q_mean_abs[f];
             if (hs->extra_weight[f] < 0.0f) {
                 hs->extra_weight[f] = 0.0f;  // Numerical safety
+            }
+        }
+    }
+
+    if (content_dim > 0 && hs->content_q_mean && hs->content_q_abs_mean) {
+        hs->content_extra_weight = new float[content_dim];
+        for (uint32_t d = 0; d < content_dim; d++) {
+            float mean_abs = fabsf(hs->content_q_mean[d]);
+            if (disable_mlr) {
+                hs->content_extra_weight[d] = hs->content_q_abs_mean[d];
+            } else {
+                hs->content_extra_weight[d] = hs->content_q_abs_mean[d] - mean_abs;
+                if (hs->content_extra_weight[d] < 0.0f) {
+                    hs->content_extra_weight[d] = 0.0f;
+                }
             }
         }
     }
@@ -609,6 +661,15 @@ void triattention_invert_rope(
                 dst[2 * f + 1] = im * c - re * s;
             }
         }
+
+        // Non-rotary "content" tail (partial-RoPE models): RoPE never
+        // touches these dims, so copy them through unchanged. head_dim here
+        // is the padded model head width, not the rotary width, so this
+        // covers dims [2*freq_count, head_dim).
+        const uint32_t rotary_dim = 2 * freq_count;
+        for (uint32_t d = rotary_dim; d < head_dim; d++) {
+            dst[d] = src[d];
+        }
     }
 }
 
@@ -639,6 +700,9 @@ void triattention_score_keys(
     bool disable_trig)
 {
     const float inv_n_offsets = 1.0f / (float)n_offsets;
+    const uint32_t rotary_dim = 2 * freq_count;
+    const uint32_t content_dim = (head_dim > rotary_dim) ? (head_dim - rotary_dim) : 0;
+    const bool has_content = content_dim > 0 && stats->content_q_mean && stats->content_extra_weight;
 
     for (uint32_t i = 0; i < n_keys; i++) {
         const float * k = pre_rope_k + (size_t)i * head_dim;
@@ -648,6 +712,27 @@ void triattention_score_keys(
         // Using "half" layout: k_re = k[f], k_im = k[f + freq_count]
         // (interleaved would be k[2f], k[2f+1] — handled at invert_rope stage,
         //  output from invert_rope is always in half layout for scoring)
+
+        // Non-rotary "content" term (Eqs. 6/8 without phase/frequency
+        // structure, since these dims are never RoPE-rotated): position-
+        // independent, so computed once per key rather than per offset.
+        //
+        // Scaled by freq_count/content_dim: content_dim (e.g. 192 for
+        // Qwen3.8) is typically much larger than freq_count (32), so an
+        // unscaled sum over that many more terms swamps the calibrated
+        // rotary+norm signal entirely -- verified empirically to make NIAH
+        // retrieval worse, not better (PR #368 discussion). This rescales
+        // the content term's aggregate magnitude to match the rotary term's,
+        // as if content_dim had freq_count terms.
+        float content_score = 0.0f;
+        if (has_content) {
+            for (uint32_t d = 0; d < content_dim; d++) {
+                float kv = k[rotary_dim + d];
+                content_score += stats->content_q_mean[d] * kv
+                               + stats->content_extra_weight[d] * fabsf(kv);
+            }
+            content_score *= (float)freq_count / (float)content_dim;
+        }
 
         float total_score = 0.0f;
 
@@ -703,6 +788,7 @@ void triattention_score_keys(
             }
         }
 
+        total_score += content_score;
         out_scores[i] = total_score;
     }
 }
@@ -851,6 +937,29 @@ triattention_state * triattention_init(
                 "rotary_dim=%u, freq_count=%u\n",
                 head_dim, cal->head_dim, cal->freq_count);
     }
+
+    // Content-dim safety check: CPU/GPU scoring derive the non-rotary tail
+    // width from (model_head_dim - rotary_dim), not from cal->content_dim
+    // directly, so the two must agree exactly or per-head content arrays
+    // (sized by cal->content_dim) would be read out of bounds. Disable the
+    // content term rather than rejecting the whole calibration file --
+    // rotary-only scoring still works fine without it.
+    if (cal->content_dim > 0 && cal->content_dim != (head_dim - cal->head_dim)) {
+        fprintf(stderr,
+                "[TriAttention] WARNING: calibration content_dim=%u does not match "
+                "model non-rotary width=%u; disabling content term for this run\n",
+                cal->content_dim, head_dim - cal->head_dim);
+        for (uint32_t h = 0; h < cal->n_sampled; h++) {
+            delete[] cal->head_stats[h].content_q_mean;
+            delete[] cal->head_stats[h].content_q_abs_mean;
+            delete[] cal->head_stats[h].content_extra_weight;
+            cal->head_stats[h].content_q_mean = nullptr;
+            cal->head_stats[h].content_q_abs_mean = nullptr;
+            cal->head_stats[h].content_extra_weight = nullptr;
+        }
+        cal->content_dim = 0;
+    }
+
     if (cal->num_kv_heads != n_kv_heads) {
         fprintf(stderr, "[TriAttention] ERROR: n_kv_heads mismatch (calibration=%u, model=%u)\n",
                 cal->num_kv_heads, n_kv_heads);
@@ -889,7 +998,7 @@ triattention_state * triattention_init(
 
     // Precompute derived head stats
     for (uint32_t h = 0; h < cal->n_sampled; h++) {
-        triattention_precompute_head_derived(&cal->head_stats[h], fc, cfg->disable_mlr);
+        triattention_precompute_head_derived(&cal->head_stats[h], fc, cal->content_dim, cfg->disable_mlr);
     }
 
     // Allocate cell position tracking
@@ -1109,6 +1218,10 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
     gcfg.k_type       = k_type;
     gcfg.need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0);
     gcfg.disable_trig = cfg.disable_trig;
+    // If need_wht_inv is also true (turbo2/turbo3 with partial RoPE at
+    // head_dim==128), the kernel just skips the content term for that
+    // combo -- see the NEED_WHT_INV guards in triattention-score.cu.
+    gcfg.content_dim  = cal->content_dim;
 
     if (gcfg.need_wht_inv && state->model_head_dim != 128) {
         fprintf(stderr,
@@ -1124,6 +1237,8 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
         gcalibs[h].q_mean_imag  = cal->head_stats[h].q_mean_imag;
         gcalibs[h].q_mean_abs   = cal->head_stats[h].q_mean_abs;
         gcalibs[h].extra_weight = cal->head_stats[h].extra_weight;
+        gcalibs[h].content_q_mean      = cal->head_stats[h].content_q_mean;
+        gcalibs[h].content_extra_weight = cal->head_stats[h].content_extra_weight;
     }
 
     auto * gpu_st = triattention_gpu_init(
