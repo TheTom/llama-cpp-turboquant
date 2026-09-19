@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repo is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (upstream) that adds the TurboQuant feature set on top of a fully-synced upstream base. The local tree always contains all of upstream master plus fork additions; rebasing onto latest upstream is a recurring task.
+This repo is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (upstream) that adds the TurboQuant feature set on top of an upstream base. Upstream changes are cherry-picked selectively, on an ongoing basis, where they add benefit (new model shapes, bug fixes, features that interact with the turbo paths); the tree is NOT required to contain all of upstream master, and upstream is not merged wholesale.
 
 ### What TurboQuant adds
 
@@ -83,7 +83,7 @@ A green run means the cases that ran passed, not that your change was exercised.
 
 - Remotes: `origin` = TheTom/llama-cpp-turboquant (this repo); the fork remote tracks the upstream TurboQuant fork (same repo, two names); add `upstream` = ggml-org/llama.cpp when syncing
 - Main branches: `feature/turboquant-kv-cache` tracks the upstream TurboQuant fork
-- Upstream master is always fully contained in the tree (verified by rebase parity audits; git log is the record of the last sync point)
+- Upstream is cherry-picked, not merged: when bringing in upstream work, pick the commits/PRs that add benefit and adapt them to the fork; do not bulk-merge upstream master, and do not assume a commit that exists upstream also exists here (check git log)
 
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
