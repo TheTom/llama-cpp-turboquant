@@ -131,6 +131,8 @@ On CUDA, TQ4_1S weights are converted to `q8_0` at load time by default (best pr
 | `LLAMA_ATTN_ROT_K_NROT`                   | `64`    | Rotation size for the optional upstream K path |
 | `LLAMA_ATTN_ROT_DISABLE`                  | `0`     | Hard lock-out: force rotation off on both sides (`1` disables) |
 
+This table is a summary for users; [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md) is the single source of truth and may list more variables or different defaults.
+
 ## Common problems
 
 - `Unsupported cache type: turbo3`: you are running an upstream pre-built binary. Build this repository instead.

@@ -41,15 +41,7 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 
 ### Environment knobs
 
-| Variable                    | Default | Effect |
-|-----------------------------|---------|--------|
-| `TURBO_LAYER_ADAPTIVE`      | `0`     | Layer-adaptive KV precision; `7` = Boundary V (edge layers q8_0, middle turbo) |
-| `TURBO_AUTO_ASYMMETRIC`     | `1`     | Auto-select asymmetric K/V types for large-GQA models |
-| `TURBO_SPARSE_V`            | `1`     | Sparse-V dequant skip in flash attention |
-| `GGML_TQ_NATIVE`            | unset    | `1` opts out of load-time TQ->q8_0 conversion, uses fused native TQ kernels (saves ~1.7x VRAM on decode-heavy workloads) |
-| `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
-| `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
-| `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
+The "Environment knobs" section of `docs/KV-cache-quantization.md` is the single source of truth: variable names, defaults and semantics live there, not in this file. Do not maintain a second copy here or in PR descriptions; the README may carry a user-facing summary table, but it must stay labeled as a summary and must not add variables, defaults or semantics the doc does not state. Knobs an agent most often touches: `TURBO_LAYER_ADAPTIVE`, `TURBO_AUTO_ASYMMETRIC`, `TURBO_SPARSE_V`, `GGML_TQ_NATIVE`, `GGML_CUDA_FUSE_CHAIN`, `GGML_CUDA_Q8CACHE`, and the `LLAMA_ATTN_ROT_*` variables. Read the doc for current defaults before setting or documenting any of them.
 
 ### Test gates (all must pass before touching quant/backend code)
 
@@ -57,6 +49,21 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 - `test-quantize-fns` - includes TQ3_1S/TQ4_1S and rotated-domain buffer sizing
 - `test-backend-ops` - full sweep on CPU + CUDA0 (23k+ cases on the RTX 5090 dev box); rejects 0/0 as FAIL
 - `llama-bench` with `-ctk/-ctv turboN`; type parser accepts `tq3_1s`/`tq4_1s`
+
+### Validation by change type
+
+Use the narrowest set of gates that covers the change, with CPU as the numeric reference:
+
+| Change                                                      | Required checks |
+|-------------------------------------------------------------|-----------------|
+| Codec `ggml/src/ggml-turbo-quant.c`                         | `test-turbo-quant`, `test-quantize-fns`, `test-backend-ops` (CPU) |
+| TQ/Turbo CUDA kernels (`ggml/src/ggml-cuda/`, `mmvq-tq.cu`) | `test-backend-ops` `-o MUL_MAT -p type_a=tq4_1s` (or the matching turbo op) on an NVIDIA card AND the AMD run; a clean compile is not a pass |
+| Metal kernels (`ggml/src/ggml-metal/ggml-metal.metal`)      | `[[host_name]]` instantiations present, then `test-backend-ops` with the Metal backend |
+| Vulkan shaders (`ggml/src/ggml-vulkan/`)                    | SET_ROWS pipeline registration incl. TURBO2_0/3_0/4_0, then `test-backend-ops` with the Vulkan backend |
+| Cache/graph wiring (`src/llama-kv-cache.cpp`, `src/llama-graph.cpp`) | `test-backend-ops`, `llama-bench -ctk/-ctv turboN`, and `llama-perplexity --kl-divergence` for any change that can move token probabilities |
+| Docs/README only                                            | no tests |
+
+A change touching several backends requires the checks for all of them, not just the one being developed on.
 
 ### What the test gates do and do not cover
 
@@ -85,7 +92,17 @@ A green run means the cases that ran passed, not that your change was exercised.
 - Main branches: `feature/turboquant-kv-cache` tracks the upstream TurboQuant fork
 - Upstream is cherry-picked, not merged: when bringing in upstream work, pick the commits/PRs that add benefit and adapt them to the fork; do not bulk-merge upstream master, and do not assume a commit that exists upstream also exists here (check git log)
 
+### Hard rules (no exceptions)
+
+- Never bulk-merge, or rebase onto, upstream master. Upstream enters this tree only as cherry-picked commits that add benefit.
+- Never delete an entry from Known pitfalls: a fixed bug stays as a record of how the regression was missed.
+- Never report a test gate as green when your change's cases did not run: 0/0, a filter that matched nothing, or `not supported [backend]` lines are failures of verification, not passes.
+- Never store turbo KV cache types in a GGUF file. They are runtime-only by design.
+- Never run a quantized V cache with flash attention explicitly disabled. That combination is a hard error on purpose.
+
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
+
+Direction rules for the two living lists: Known pitfalls may only grow (see Hard rules). Coverage limits may only shrink: remove an entry only when a new test actually exercises the missed case, and name the test that closed the gap.
 
 - **Metal**: turbo kernels need their `[[host_name]]` instantiations; a missing one is a NULL-pipeline deref on the first turbo KV write.
 - **Vulkan**: SET_ROWS pipeline registration must include TURBO2_0/3_0/4_0 with `require_full_subgroups=true, subgroup_size=32`, or every turbo KV write aborts.
