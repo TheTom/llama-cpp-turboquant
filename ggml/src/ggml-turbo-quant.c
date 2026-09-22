@@ -204,6 +204,110 @@ static int nearest_centroid_4bit(float val) {
     return 15;
 }
 
+/* ---------- TQ6: 64 Lloyd-Max centroids for N(0, 1/128) ----------
+ *
+ * Same generator as the shipped 3-bit and 4-bit tables. Per-coordinate rmse 0.0254 sigma,
+ * vs 0.0975 sigma for the 16-level 4-bit table. Mirrored in the CUDA header.
+ */
+static const float TQ6_CENTROIDS[64] = {
+    -0.330935f, -0.286417f, -0.257865f, -0.236198f,
+    -0.218435f, -0.203203f, -0.189753f, -0.177626f,
+    -0.166522f, -0.156230f, -0.146600f, -0.137517f,
+    -0.128895f, -0.120663f, -0.112765f, -0.105157f,
+    -0.097801f, -0.090663f, -0.083717f, -0.076940f,
+    -0.070310f, -0.063809f, -0.057422f, -0.051133f,
+    -0.044929f, -0.038798f, -0.032729f, -0.026710f,
+    -0.020733f, -0.014787f, -0.008863f, -0.002953f,
+     0.002953f,  0.008863f,  0.014787f,  0.020733f,
+     0.026710f,  0.032729f,  0.038798f,  0.044929f,
+     0.051133f,  0.057422f,  0.063809f,  0.070310f,
+     0.076940f,  0.083717f,  0.090663f,  0.097801f,
+     0.105157f,  0.112765f,  0.120663f,  0.128895f,
+     0.137517f,  0.146600f,  0.156230f,  0.166522f,
+     0.177626f,  0.189753f,  0.203203f,  0.218435f,
+     0.236198f,  0.257865f,  0.286417f,  0.330935f
+};
+
+/* Midpoints between consecutive centroids: code i is chosen when
+ * TQ6_MID[i-1] <= val < TQ6_MID[i]. */
+static const float TQ6_MID[63] = {
+    -0.308676f, -0.272141f, -0.247031f, -0.227316f,
+    -0.210819f, -0.196478f, -0.183690f, -0.172074f,
+    -0.161376f, -0.151415f, -0.142059f, -0.133206f,
+    -0.124779f, -0.116714f, -0.108961f, -0.101479f,
+    -0.094232f, -0.087190f, -0.080329f, -0.073625f,
+    -0.067060f, -0.060616f, -0.054277f, -0.048031f,
+    -0.041864f, -0.035763f, -0.029719f, -0.023722f,
+    -0.017760f, -0.011825f, -0.005908f,  0.000000f,
+     0.005908f,  0.011825f,  0.017760f,  0.023722f,
+     0.029719f,  0.035763f,  0.041864f,  0.048031f,
+     0.054277f,  0.060616f,  0.067060f,  0.073625f,
+     0.080329f,  0.087190f,  0.094232f,  0.101479f,
+     0.108961f,  0.116714f,  0.124779f,  0.133206f,
+     0.142059f,  0.151415f,  0.161376f,  0.172074f,
+     0.183690f,  0.196478f,  0.210819f,  0.227316f,
+     0.247031f,  0.272141f,  0.308676f
+};
+
+/* 64 centroids: binary search over the 63 midpoints (6 steps), not an if/else ladder. */
+static int nearest_centroid_6bit(float val) {
+    int lo = 0;          /* candidate code range [lo, hi] */
+    int hi = 63;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;   /* compare against the lo/hi split at TQ6_MID[mid] */
+        if (val < TQ6_MID[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+/* ---------- TQ5: 32 Lloyd-Max centroids for N(0, 1/128) ----------
+ *
+ * Same generator as the tq6 table. Per-coordinate rmse 0.0501 sigma (tq6: 0.0254, turbo4:
+ * 0.0975). Antisymmetric (c[31-i] == -c[i]). Mirrored in the CUDA header.
+ */
+static const float TQ5_CENTROIDS[32] = {
+    -0.288236f, -0.237892f, -0.204892f, -0.179348f,
+    -0.158003f, -0.139353f, -0.122569f, -0.107141f,
+    -0.092730f, -0.079097f, -0.066064f, -0.053491f,
+    -0.041269f, -0.029304f, -0.017515f, -0.005827f,
+     0.005827f,  0.017515f,  0.029304f,  0.041269f,
+     0.053491f,  0.066064f,  0.079097f,  0.092730f,
+     0.107141f,  0.122569f,  0.139353f,  0.158003f,
+     0.179348f,  0.204892f,  0.237892f,  0.288236f
+};
+
+/* Midpoints between consecutive centroids: code i is chosen when
+ * TQ5_MID[i-1] <= val < TQ5_MID[i]. */
+static const float TQ5_MID[31] = {
+    -0.263064f, -0.221392f, -0.192120f, -0.168675f,
+    -0.148678f, -0.130961f, -0.114855f, -0.099935f,
+    -0.085914f, -0.072580f, -0.059778f, -0.047380f,
+    -0.035287f, -0.023410f, -0.011671f,  0.000000f,
+     0.011671f,  0.023410f,  0.035287f,  0.047380f,
+     0.059778f,  0.072580f,  0.085914f,  0.099935f,
+     0.114855f,  0.130961f,  0.148678f,  0.168675f,
+     0.192120f,  0.221392f,  0.263064f
+};
+
+/* 32 centroids: binary search over the 31 midpoints (5 steps). */
+static int nearest_centroid_5bit(float val) {
+    int lo = 0;
+    int hi = 31;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (val < TQ5_MID[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
 /* ---------- WHT sign arrays (must match CUDA/Metal, seed=42) ---------- */
 
 static const float turbo_cpu_s1[128] = {
@@ -658,6 +762,205 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
         quantize_row_turbo4_0_ref(
             src + row * n_per_row,
             (block_turbo4_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+/* ---------- TQ6_0: 6-bit PolarQuant with WHT rotation ----------
+ *
+ * Same five-step pipeline as quantize_row_turbo4_0_ref, only the codebook and packing differ.
+ */
+void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k) {
+    turbo_init_rotation();
+
+    assert(k % QK_TQ6 == 0);
+    const int nb = k / QK_TQ6;
+    const int d  = QK_TQ6;
+
+    for (int block = 0; block < nb; block++) {
+        const float * src = x + block * d;
+
+        /* Step 1: Extract norm */
+        float norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) norm_sq += src[i] * src[i];
+        float norm = sqrtf(norm_sq);
+
+        /* Normalize */
+        float normalized[TURBO_D];
+        if (norm > 1e-10f) {
+            const float inv = 1.0f / norm;
+            for (int i = 0; i < d; i++) normalized[i] = src[i] * inv;
+        } else {
+            memset(normalized, 0, d * sizeof(float));
+        }
+
+        /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
+        float rotated[TURBO_D];
+        memcpy(rotated, normalized, d * sizeof(float));
+        turbo_cpu_fwht(rotated, d);
+
+        /* Step 3: 6-bit quantization (64 centroids) */
+        uint8_t indices[TURBO_D];
+        for (int i = 0; i < d; i++) {
+            indices[i] = (uint8_t)nearest_centroid_6bit(rotated[i]);
+        }
+
+        /* Step 4: Norm correction */
+        float recon_norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            recon_norm_sq += TQ6_CENTROIDS[indices[i]] * TQ6_CENTROIDS[indices[i]];
+        }
+        float recon_norm = sqrtf(recon_norm_sq);
+        float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
+
+        /* Step 5: Pack. Low nibble plane uses the same element order as block_turbo4_0.qs. */
+        memset(y[block].qs, 0, d / 2);
+        memset(y[block].qh, 0, d / 4);
+        for (int i = 0; i < d; i++) {
+            const uint8_t idx = indices[i] & 0x3F;
+            y[block].qs[i / 2] |= (uint8_t)(( idx       & 0xF) << ((i % 2) * 4));
+            y[block].qh[i / 4] |= (uint8_t)(((idx >> 4) & 0x3) << ((i % 4) * 2));
+        }
+    }
+}
+
+void dequantize_row_tq6_0(const block_tq6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    turbo_init_rotation();
+
+    assert(k % QK_TQ6 == 0);
+    const int nb = k / QK_TQ6;
+    const int d  = QK_TQ6;
+
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float * dst = y + block * d;
+        for (int i = 0; i < d; i++) {
+            const uint8_t lo  = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
+            const uint8_t hi  = (x[block].qh[i / 4] >> ((i % 4) * 2)) & 0x3;
+            const uint8_t idx = (uint8_t)(lo | (hi << 4));
+            dst[i] = TQ6_CENTROIDS[idx] * norm;
+        }
+        /* No inverse WHT, dequant stays in the rotated domain, same convention as turbo4:
+         * Q is WHT-rotated by the graph, so <Q_rot, K_rot> gives correct attention scores, and
+         * the inverse WHT is applied to the attention output via GGML_OP_TURBO_WHT (direction=1).
+         */
+    }
+}
+
+size_t quantize_tq6_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                      int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TQ6 == 0);
+
+    size_t row_size = (n_per_row / QK_TQ6) * sizeof(block_tq6_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_tq6_0_ref(
+            src + row * n_per_row,
+            (block_tq6_0 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
+/* ---------- TQ5_0: 5-bit PolarQuant with WHT rotation ----------
+ *
+ * Same pipeline as quantize_row_tq6_0_ref with 32 centroids and a 1-bit high plane.
+ */
+void quantize_row_tq5_0_ref(const float * GGML_RESTRICT x, block_tq5_0 * GGML_RESTRICT y, int64_t k) {
+    turbo_init_rotation();
+
+    assert(k % QK_TQ5 == 0);
+    const int nb = k / QK_TQ5;
+    const int d  = QK_TQ5;
+
+    for (int block = 0; block < nb; block++) {
+        const float * src = x + block * d;
+
+        /* Step 1: Extract norm */
+        float norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) norm_sq += src[i] * src[i];
+        float norm = sqrtf(norm_sq);
+
+        /* Normalize */
+        float normalized[TURBO_D];
+        if (norm > 1e-10f) {
+            const float inv = 1.0f / norm;
+            for (int i = 0; i < d; i++) normalized[i] = src[i] * inv;
+        } else {
+            memset(normalized, 0, d * sizeof(float));
+        }
+
+        /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
+        float rotated[TURBO_D];
+        memcpy(rotated, normalized, d * sizeof(float));
+        turbo_cpu_fwht(rotated, d);
+
+        /* Step 3: 5-bit quantization (32 centroids) */
+        uint8_t indices[TURBO_D];
+        for (int i = 0; i < d; i++) {
+            indices[i] = (uint8_t)nearest_centroid_5bit(rotated[i]);
+        }
+
+        /* Step 4: Norm correction */
+        float recon_norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            recon_norm_sq += TQ5_CENTROIDS[indices[i]] * TQ5_CENTROIDS[indices[i]];
+        }
+        float recon_norm = sqrtf(recon_norm_sq);
+        float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
+
+        /* Step 5: Pack sign-magnitude: qs nibble = magnitude index (0..15, |c| = c[16+m]), qh bit = 1 if
+         * negative. Nibble plane uses the same element order as block_turbo4_0.qs. */
+        memset(y[block].qs, 0, d / 2);
+        memset(y[block].qh, 0, d / 8);
+        for (int i = 0; i < d; i++) {
+            const uint8_t idx = indices[i] & 0x1F;
+            const uint8_t neg = idx < 16;
+            const uint8_t mag = neg ? (uint8_t)(15 - idx) : (uint8_t)(idx - 16);
+            y[block].qs[i / 2] |= (uint8_t)(mag << ((i % 2) * 4));
+            y[block].qh[i / 8] |= (uint8_t)(neg << (i % 8));
+        }
+    }
+}
+
+void dequantize_row_tq5_0(const block_tq5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    turbo_init_rotation();
+
+    assert(k % QK_TQ5 == 0);
+    const int nb = k / QK_TQ5;
+    const int d  = QK_TQ5;
+
+    for (int block = 0; block < nb; block++) {
+        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float * dst = y + block * d;
+        for (int i = 0; i < d; i++) {
+            const uint8_t mag = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
+            const uint8_t neg = (x[block].qh[i / 8] >> (i % 8)) & 0x1;
+            const uint8_t idx = neg ? (uint8_t)(15 - mag) : (uint8_t)(16 + mag);
+            dst[i] = TQ5_CENTROIDS[idx] * norm;
+        }
+        /* No inverse WHT, dequant stays in the rotated domain, same convention as tq6:
+         * Q is WHT-rotated by the graph, so <Q_rot, K_rot> gives correct attention scores, and
+         * the inverse WHT is applied to the attention output via GGML_OP_TURBO_WHT (direction=1).
+         */
+    }
+}
+
+size_t quantize_tq5_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                      int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TQ5 == 0);
+
+    size_t row_size = (n_per_row / QK_TQ5) * sizeof(block_tq5_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_tq5_0_ref(
+            src + row * n_per_row,
+            (block_tq5_0 *)((char *)dst + row * row_size),
             n_per_row
         );
     }
