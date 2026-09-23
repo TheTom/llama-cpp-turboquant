@@ -487,14 +487,14 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     return sum;
 }
 
-// TQ6 KQ dot product: dequantize K from tq6 blocks, dot with Q (float2/half2)
+// TURBO6 KQ dot product: dequantize K from turbo6 blocks, dot with Q (float2/half2)
 // 6-bit code = low nibble in qs[j/2] + high 2 bits in qh[j/4]. elem0 is even, so elem0
 // and elem0+1 share one qs byte and one qh byte, same pair structure as turbo4.
 template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq6_0(
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo6_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
-    const block_tq6_0 * K_tq6 = (const block_tq6_0 *) K_c;
+    const block_turbo6_0 * K_turbo6 = (const block_turbo6_0 *) K_c;
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
@@ -510,20 +510,20 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq6_0(
             const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
 
             const int elem0 = k_KQ * 2;                   // always even
-            const int ib    = elem0 / QK_TQ6;              // block index
-            const int j0    = elem0 % QK_TQ6;              // always even
+            const int ib    = elem0 / QK_TURBO6;              // block index
+            const int j0    = elem0 % QK_TURBO6;              // always even
 
-            const float   norm    = __half2float(K_tq6[ib].norm);
-            const uint8_t qs_byte = K_tq6[ib].qs[j0 / 2];  // low nibbles of j0 and j0+1
-            const uint8_t qh_byte = K_tq6[ib].qh[j0 / 4];  // high 2 bits of j0 .. j0+3
+            const float   norm    = __half2float(K_turbo6[ib].norm);
+            const uint8_t qs_byte = K_turbo6[ib].qs[j0 / 2];  // low nibbles of j0 and j0+1
+            const uint8_t qh_byte = K_turbo6[ib].qh[j0 / 4];  // high 2 bits of j0 .. j0+3
 
             const int     hshift = (j0 % 4) * 2;           // 0 or 4
             const uint8_t idx0 = ((qs_byte >> 0) & 0xF) | (((qh_byte >> hshift)       & 0x3) << 4);
             const uint8_t idx1 = ((qs_byte >> 4) & 0xF) | (((qh_byte >> (hshift + 2)) & 0x3) << 4);
 
             float2 kv;
-            kv.x = TQ6_CENTROIDS[idx0] * norm;
-            kv.y = TQ6_CENTROIDS[idx1] * norm;
+            kv.x = TURBO6_CENTROIDS[idx0] * norm;
+            kv.y = TURBO6_CENTROIDS[idx1] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -538,14 +538,14 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq6_0(
     return sum;
 }
 
-// TQ5 KQ dot product: dequantize K from tq5 blocks, dot with Q (float2/half2)
+// TURBO5 KQ dot product: dequantize K from turbo5 blocks, dot with Q (float2/half2)
 // 5-bit code = low nibble in qs[j/2] + high bit in qh[j/8] (bit j%8). elem0 is even, so
-// elem0 and elem0+1 share one qs byte and one qh byte, same pair structure as tq6.
+// elem0 and elem0+1 share one qs byte and one qh byte, same pair structure as turbo6.
 template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq5_0(
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
-    const block_tq5_0 * K_tq5 = (const block_tq5_0 *) K_c;
+    const block_turbo5_0 * K_turbo5 = (const block_turbo5_0 *) K_c;
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
@@ -561,20 +561,20 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq5_0(
             const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
 
             const int elem0 = k_KQ * 2;                   // always even
-            const int ib    = elem0 / QK_TQ5;              // block index
-            const int j0    = elem0 % QK_TQ5;              // always even
+            const int ib    = elem0 / QK_TURBO5;              // block index
+            const int j0    = elem0 % QK_TURBO5;              // always even
 
-            const float   norm    = __half2float(K_tq5[ib].norm);
-            const uint8_t qs_byte = K_tq5[ib].qs[j0 / 2];  // magnitude nibbles of j0 and j0+1
-            const uint8_t qh_byte = K_tq5[ib].qh[j0 / 8];  // sign bits of j0 .. j0+7
+            const float   norm    = __half2float(K_turbo5[ib].norm);
+            const uint8_t qs_byte = K_turbo5[ib].qs[j0 / 2];  // magnitude nibbles of j0 and j0+1
+            const uint8_t qh_byte = K_turbo5[ib].qh[j0 / 8];  // sign bits of j0 .. j0+7
 
             const int     hshift = j0 % 8;                 // even, 0..6
-            const uint8_t idx0 = tq5_sm_to_code((qs_byte >> 0) & 0xF, (qh_byte >> hshift)       & 0x1);
-            const uint8_t idx1 = tq5_sm_to_code((qs_byte >> 4) & 0xF, (qh_byte >> (hshift + 1)) & 0x1);
+            const uint8_t idx0 = turbo5_sm_to_code((qs_byte >> 0) & 0xF, (qh_byte >> hshift)       & 0x1);
+            const uint8_t idx1 = turbo5_sm_to_code((qs_byte >> 4) & 0xF, (qh_byte >> (hshift + 1)) & 0x1);
 
             float2 kv;
-            kv.x = TQ5_CENTROIDS[idx0] * norm;
-            kv.y = TQ5_CENTROIDS[idx1] * norm;
+            kv.x = TURBO5_CENTROIDS[idx0] * norm;
+            kv.y = TURBO5_CENTROIDS[idx1] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -1107,15 +1107,15 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     }
 }
 
-// TQ6 V dequantize: extract `ne` float/half values at position i0.
+// TURBO6 V dequantize: extract `ne` float/half values at position i0.
 // The centroid index is rebuilt per element; the 64-entry table is too big to
 // materialise scaled in registers, so it is read from __constant__ and scaled inline.
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_tq6_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    const block_tq6_0 * x = (const block_tq6_0 *) vx;
+static __device__ __forceinline__ void dequantize_V_turbo6_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo6_0 * x = (const block_turbo6_0 *) vx;
 
-    const int64_t ib   = i0 / QK_TQ6;
-    const int     j0   = i0 % QK_TQ6;
+    const int64_t ib   = i0 / QK_TURBO6;
+    const int     j0   = i0 % QK_TURBO6;
     const float   norm = __half2float(x[ib].norm);
 
     static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
@@ -1123,7 +1123,7 @@ static __device__ __forceinline__ void dequantize_V_tq6_0(const void * __restric
     float vals[ne];
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
-        vals[l] = tq6_dequant_element(&x[ib], j0 + l, norm);
+        vals[l] = turbo6_dequant_element(&x[ib], j0 + l, norm);
     }
 
 #ifdef FP16_AVAILABLE
@@ -1144,15 +1144,15 @@ static __device__ __forceinline__ void dequantize_V_tq6_0(const void * __restric
     }
 }
 
-// TQ5 V dequantize: extract `ne` float/half values at position i0.
+// TURBO5 V dequantize: extract `ne` float/half values at position i0.
 // The centroid index is rebuilt per element; the 32-entry table is too big to
 // materialise scaled in registers, so it is read from __constant__ and scaled inline.
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_tq5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    const block_tq5_0 * x = (const block_tq5_0 *) vx;
+static __device__ __forceinline__ void dequantize_V_turbo5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo5_0 * x = (const block_turbo5_0 *) vx;
 
-    const int64_t ib   = i0 / QK_TQ5;
-    const int     j0   = i0 % QK_TQ5;
+    const int64_t ib   = i0 / QK_TURBO5;
+    const int     j0   = i0 % QK_TURBO5;
     const float   norm = __half2float(x[ib].norm);
 
     static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
@@ -1160,7 +1160,7 @@ static __device__ __forceinline__ void dequantize_V_tq5_0(const void * __restric
     float vals[ne];
 #pragma unroll
     for (int l = 0; l < ne; ++l) {
-        vals[l] = tq5_dequant_element(&x[ib], j0 + l, norm);
+        vals[l] = turbo5_dequant_element(&x[ib], j0 + l, norm);
     }
 
 #ifdef FP16_AVAILABLE
@@ -1203,10 +1203,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo2_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_TQ6_0) {
-        return vec_dot_fattn_vec_KQ_tq6_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_TQ5_0) {
-        return vec_dot_fattn_vec_KQ_tq5_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO6_0) {
+        return vec_dot_fattn_vec_KQ_turbo6_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO5_0) {
+        return vec_dot_fattn_vec_KQ_turbo5_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -1235,10 +1235,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo2_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_TQ6_0) {
-        return dequantize_V_tq6_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_TQ5_0) {
-        return dequantize_V_tq5_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO6_0) {
+        return dequantize_V_turbo6_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO5_0) {
+        return dequantize_V_turbo5_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

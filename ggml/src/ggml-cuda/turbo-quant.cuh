@@ -17,8 +17,8 @@
 #define QR_TURBO3 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO2 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO4 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
-#define QR_TQ6    1  // Each dequantize call produces 2 consecutive elements (like q8_0)
-#define QR_TQ5    1  // Each dequantize call produces 2 consecutive elements (like q8_0)
+#define QR_TURBO6    1  // Each dequantize call produces 2 consecutive elements (like q8_0)
+#define QR_TURBO5    1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 
 // ---- 2-bit centroids (Lloyd-Max for N(0, 1/128)) ----
 
@@ -366,9 +366,9 @@ static __device__ __forceinline__ float turbo4_dequant_element(
     return TURBO_CENTROIDS_4BIT[idx] * norm;
 }
 
-// ---- TQ6: 64 centroids (Lloyd-Max for N(0, 1/128)), mirrored from ggml-turbo-quant.c ----
+// ---- TURBO6: 64 centroids (Lloyd-Max for N(0, 1/128)), mirrored from ggml-turbo-quant.c ----
 
-static __constant__ float TQ6_CENTROIDS[64] = {
+static __constant__ float TURBO6_CENTROIDS[64] = {
     -0.330935f, -0.286417f, -0.257865f, -0.236198f,
     -0.218435f, -0.203203f, -0.189753f, -0.177626f,
     -0.166522f, -0.156230f, -0.146600f, -0.137517f,
@@ -389,7 +389,7 @@ static __constant__ float TQ6_CENTROIDS[64] = {
 
 // ---- Midpoints for nearest 6-bit centroid lookup ----
 
-static __constant__ float TQ6_MID[63] = {
+static __constant__ float TURBO6_MID[63] = {
     -0.308676f, -0.272141f, -0.247031f, -0.227316f,
     -0.210819f, -0.196478f, -0.183690f, -0.172074f,
     -0.161376f, -0.151415f, -0.142059f, -0.133206f,
@@ -414,13 +414,13 @@ static __constant__ float TQ6_MID[63] = {
 // codebooks use: 63 sequential compares would cost more than the search.
 // Same result as nearest_centroid_6bit in ggml-turbo-quant.c.
 
-static __device__ __forceinline__ uint8_t tq6_nearest_centroid(float val) {
+static __device__ __forceinline__ uint8_t turbo6_nearest_centroid(float val) {
     int lo = 0;
     int hi = 63;
 #pragma unroll
     for (int step = 0; step < 6; ++step) {
         const int mid = (lo + hi) / 2;
-        if (val < TQ6_MID[mid]) {
+        if (val < TURBO6_MID[mid]) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -429,32 +429,18 @@ static __device__ __forceinline__ uint8_t tq6_nearest_centroid(float val) {
     return (uint8_t) lo;
 }
 
-// ---- Per-block quantize for tq6 (128 elements, expects already-rotated input) ----
+// ---- Inline dequant helper: extract one float from turbo6 block ----
 
-static __device__ void quantize_f32_tq6_0_block(const float * __restrict__ src,
-                                                block_tq6_0 * __restrict__ dst) {
-    for (int j = 0; j < QK_TQ6 / 2; j++) dst->qs[j] = 0;
-    for (int j = 0; j < QK_TQ6 / 4; j++) dst->qh[j] = 0;
-
-    for (int j = 0; j < QK_TQ6; j++) {
-        uint8_t idx = tq6_nearest_centroid(src[j]);
-        dst->qs[j / 2] |= ( idx       & 0xF) << ((j % 2) * 4);
-        dst->qh[j / 4] |= ((idx >> 4) & 0x3) << ((j % 4) * 2);
-    }
-}
-
-// ---- Inline dequant helper: extract one float from tq6 block ----
-
-static __device__ __forceinline__ float tq6_dequant_element(
-        const block_tq6_0 * __restrict__ x, int j, float norm) {
+static __device__ __forceinline__ float turbo6_dequant_element(
+        const block_turbo6_0 * __restrict__ x, int j, float norm) {
     uint8_t lo = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
     uint8_t hi = (x->qh[j / 4] >> ((j % 4) * 2)) & 0x3;
-    return TQ6_CENTROIDS[lo | (hi << 4)] * norm;
+    return TURBO6_CENTROIDS[lo | (hi << 4)] * norm;
 }
 
-// ---- TQ5: 32 centroids (Lloyd-Max for N(0, 1/128)), mirrored from ggml-turbo-quant.c ----
+// ---- TURBO5: 32 centroids (Lloyd-Max for N(0, 1/128)), mirrored from ggml-turbo-quant.c ----
 
-static __constant__ float TQ5_CENTROIDS[32] = {
+static __constant__ float TURBO5_CENTROIDS[32] = {
     -0.288236f, -0.237892f, -0.204892f, -0.179348f,
     -0.158003f, -0.139353f, -0.122569f, -0.107141f,
     -0.092730f, -0.079097f, -0.066064f, -0.053491f,
@@ -467,7 +453,7 @@ static __constant__ float TQ5_CENTROIDS[32] = {
 
 // ---- Midpoints for nearest 5-bit centroid lookup ----
 
-static __constant__ float TQ5_MID[31] = {
+static __constant__ float TURBO5_MID[31] = {
     -0.263064f, -0.221392f, -0.192120f, -0.168675f,
     -0.148678f, -0.130961f, -0.114855f, -0.099935f,
     -0.085914f, -0.072580f, -0.059778f, -0.047380f,
@@ -480,13 +466,13 @@ static __constant__ float TQ5_MID[31] = {
 
 // Same result as nearest_centroid_5bit in ggml-turbo-quant.c (5-step binary search).
 
-static __device__ __forceinline__ uint8_t tq5_nearest_centroid(float val) {
+static __device__ __forceinline__ uint8_t turbo5_nearest_centroid(float val) {
     int lo = 0;
     int hi = 31;
 #pragma unroll
     for (int step = 0; step < 5; ++step) {
         const int mid = (lo + hi) / 2;
-        if (val < TQ5_MID[mid]) {
+        if (val < TURBO5_MID[mid]) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -495,35 +481,21 @@ static __device__ __forceinline__ uint8_t tq5_nearest_centroid(float val) {
     return (uint8_t) lo;
 }
 
-// ---- TQ5 storage is sign-magnitude (see block_tq5_0): qs nibble = magnitude index m, qh bit = 1 if negative ----
+// ---- TURBO5 storage is sign-magnitude (see block_turbo5_0): qs nibble = magnitude index m, qh bit = 1 if negative ----
 
-static __device__ __forceinline__ uint8_t tq5_code_to_mag(uint8_t idx) { return idx >= 16 ? idx - 16 : 15 - idx; }
-static __device__ __forceinline__ uint8_t tq5_code_to_neg(uint8_t idx) { return idx < 16; }
-static __device__ __forceinline__ uint8_t tq5_sm_to_code(uint8_t mag, uint8_t neg) {
+static __device__ __forceinline__ uint8_t turbo5_code_to_mag(uint8_t idx) { return idx >= 16 ? idx - 16 : 15 - idx; }
+static __device__ __forceinline__ uint8_t turbo5_code_to_neg(uint8_t idx) { return idx < 16; }
+static __device__ __forceinline__ uint8_t turbo5_sm_to_code(uint8_t mag, uint8_t neg) {
     return (uint8_t) ((mag ^ (neg * 0xF)) | ((neg ^ 1) << 4));   // neg ? 15-m : 16+m
 }
 
-// ---- Per-block quantize for tq5 (128 elements, expects already-rotated input) ----
+// ---- Inline dequant helper: extract one float from turbo5 block ----
 
-static __device__ void quantize_f32_tq5_0_block(const float * __restrict__ src,
-                                                block_tq5_0 * __restrict__ dst) {
-    for (int j = 0; j < QK_TQ5 / 2; j++) dst->qs[j] = 0;
-    for (int j = 0; j < QK_TQ5 / 8; j++) dst->qh[j] = 0;
-
-    for (int j = 0; j < QK_TQ5; j++) {
-        const uint8_t idx = tq5_nearest_centroid(src[j]);
-        dst->qs[j / 2] |= tq5_code_to_mag(idx) << ((j % 2) * 4);
-        dst->qh[j / 8] |= tq5_code_to_neg(idx) << (j % 8);
-    }
-}
-
-// ---- Inline dequant helper: extract one float from tq5 block ----
-
-static __device__ __forceinline__ float tq5_dequant_element(
-        const block_tq5_0 * __restrict__ x, int j, float norm) {
+static __device__ __forceinline__ float turbo5_dequant_element(
+        const block_turbo5_0 * __restrict__ x, int j, float norm) {
     const uint8_t mag = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
     const uint8_t neg = (x->qh[j / 8] >> (j % 8)) & 0x1;
-    return TQ5_CENTROIDS[tq5_sm_to_code(mag, neg)] * norm;
+    return TURBO5_CENTROIDS[turbo5_sm_to_code(mag, neg)] * norm;
 }
 
 // ---- Nearest 3-bit centroid index ----

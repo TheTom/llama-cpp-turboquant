@@ -1200,19 +1200,19 @@ static void set_rows_cuda_turbo4(
     }
 }
 
-// ---- TQ6 set_rows: 128-element groups with WHT rotation + 6-bit quantization ----
+// ---- TURBO6 set_rows: 128-element groups with WHT rotation + 6-bit quantization ----
 //
 // Same shape as k_set_rows_turbo4: block size IS the WHT group size (128), so 1 CUDA
-// block = 1 tq6 block and thread j handles element j. Only the codebook (64 centroids)
+// block = 1 turbo6 block and thread j handles element j. Only the codebook (64 centroids)
 // and the packing differ: the low nibble goes to qs[] exactly like turbo4, the high
 // 2 bits go to qh[] (4 codes per byte).
 
 template <typename idx_t>
 __launch_bounds__(128)
-static __global__ void k_set_rows_tq6(
+static __global__ void k_set_rows_turbo6(
         const float * __restrict__ src0,
         const idx_t * __restrict__ src1,
-        block_tq6_0 * __restrict__ dst,
+        block_turbo6_0 * __restrict__ dst,
         const int64_t ne00,
         const int64_t ne01,
         const int64_t ne10,
@@ -1233,7 +1233,7 @@ static __global__ void k_set_rows_tq6(
     const int j = threadIdx.x;
 
     // Decode blockIdx.x → (i_blk, i01, i02, i03)
-    const int64_t n_blocks_per_row = ne00 / QK_TQ6;
+    const int64_t n_blocks_per_row = ne00 / QK_TURBO6;
     const int64_t g = blockIdx.x;
     const int64_t i_blk = g % n_blocks_per_row;
     int64_t       tmp   = g / n_blocks_per_row;
@@ -1248,12 +1248,12 @@ static __global__ void k_set_rows_tq6(
 
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
-    block_tq6_0 * dst_row_ptr = (block_tq6_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
-    block_tq6_0 * blk = dst_row_ptr + i_blk;
+    block_turbo6_0 * dst_row_ptr = (block_turbo6_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
+    block_turbo6_0 * blk = dst_row_ptr + i_blk;
 
     // ---- Step 1: Load element j (coalesced) ----
     __shared__ float x[128];
-    x[j] = src_row[i_blk * QK_TQ6 + j];
+    x[j] = src_row[i_blk * QK_TURBO6 + j];
     __syncthreads();
 
     // ---- InnerQ: calibrate on original (unscaled) values ----
@@ -1329,7 +1329,7 @@ static __global__ void k_set_rows_tq6(
 
     // ---- Step 5: Quantize element j to 6-bit centroid ----
     const float rv = x[j];
-    const uint8_t idx = tq6_nearest_centroid(rv);
+    const uint8_t idx = turbo6_nearest_centroid(rv);
 
     // ---- Step 6: Pack qs and qh (warp-cooperative) ----
     // qs: 2 elements per byte (low nibbles). qh: 4 elements per byte (high 2 bits).
@@ -1351,7 +1351,7 @@ static __global__ void k_set_rows_tq6(
     }
 
     // ---- Step 7: Reconstruction norm (parallel) ----
-    const float c = TQ6_CENTROIDS[idx];
+    const float c = TURBO6_CENTROIDS[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
         rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
@@ -1378,19 +1378,19 @@ static __global__ void k_set_rows_tq6(
     GGML_UNUSED(ne13);
 }
 
-// ---- TQ5 set_rows: 128-element groups with WHT rotation + 5-bit quantization ----
+// ---- TURBO5 set_rows: 128-element groups with WHT rotation + 5-bit quantization ----
 //
 // Same shape as k_set_rows_turbo4: block size IS the WHT group size (128), so 1 CUDA
-// block = 1 tq5 block and thread j handles element j. Only the codebook (32 centroids)
+// block = 1 turbo5 block and thread j handles element j. Only the codebook (32 centroids)
 // and the packing differ: the low nibble goes to qs[] exactly like turbo4, the high
 // bit goes to qh[] (8 codes per byte).
 
 template <typename idx_t>
 __launch_bounds__(128)
-static __global__ void k_set_rows_tq5(
+static __global__ void k_set_rows_turbo5(
         const float * __restrict__ src0,
         const idx_t * __restrict__ src1,
-        block_tq5_0 * __restrict__ dst,
+        block_turbo5_0 * __restrict__ dst,
         const int64_t ne00,
         const int64_t ne01,
         const int64_t ne10,
@@ -1411,7 +1411,7 @@ static __global__ void k_set_rows_tq5(
     const int j = threadIdx.x;
 
     // Decode blockIdx.x → (i_blk, i01, i02, i03)
-    const int64_t n_blocks_per_row = ne00 / QK_TQ5;
+    const int64_t n_blocks_per_row = ne00 / QK_TURBO5;
     const int64_t g = blockIdx.x;
     const int64_t i_blk = g % n_blocks_per_row;
     int64_t       tmp   = g / n_blocks_per_row;
@@ -1426,12 +1426,12 @@ static __global__ void k_set_rows_tq5(
 
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
-    block_tq5_0 * dst_row_ptr = (block_tq5_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
-    block_tq5_0 * blk = dst_row_ptr + i_blk;
+    block_turbo5_0 * dst_row_ptr = (block_turbo5_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
+    block_turbo5_0 * blk = dst_row_ptr + i_blk;
 
     // ---- Step 1: Load element j (coalesced) ----
     __shared__ float x[128];
-    x[j] = src_row[i_blk * QK_TQ5 + j];
+    x[j] = src_row[i_blk * QK_TURBO5 + j];
     __syncthreads();
 
     // ---- InnerQ: calibrate on original (unscaled) values ----
@@ -1507,26 +1507,30 @@ static __global__ void k_set_rows_tq5(
 
     // ---- Step 5: Quantize element j to 5-bit centroid ----
     const float rv = x[j];
-    const uint8_t idx = tq5_nearest_centroid(rv);
+    const uint8_t idx = turbo5_nearest_centroid(rv);
 
     // ---- Step 6: Pack qs and qh (warp-cooperative), sign-magnitude ----
     // qs: 2 elements per byte (magnitude index nibbles). qh: 8 elements per byte (sign bit, bit j%8).
-    // A warp holds 32 consecutive elements, so its ballot of sign bits IS the 4 qh bytes
-    // qh[j/8 .. j/8+3] in element order (bit L of the ballot = element j0+L = qh byte L/8 bit L%8).
-    const uint8_t my_nibble = tq5_code_to_mag(idx);
-    const uint8_t my_high   = tq5_code_to_neg(idx);
+    // Each 8-lane group gathers its sign bits via a width-32 shuffle, so the group is
+    // self-contained on wave64 (__ballot_sync truncates the 64-bit mask to uint32_t there).
+    const uint8_t my_nibble = turbo5_code_to_mag(idx);
+    const uint8_t my_high   = turbo5_code_to_neg(idx);
     const uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
     }
 
-    const uint32_t highs = __ballot_sync(0xffffffff, my_high);
-    if (lane < 4) {
-        blk->qh[(j & ~31) / 8 + lane] = (uint8_t)(highs >> (8 * lane));
+    uint8_t qh_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        qh_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_high, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
+    if (lane % 8 == 0) {
+        blk->qh[j / 8] = qh_byte;
     }
 
     // ---- Step 7: Reconstruction norm (parallel) ----
-    const float c = TQ5_CENTROIDS[idx];
+    const float c = TURBO5_CENTROIDS[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
         rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
@@ -1554,7 +1558,7 @@ static __global__ void k_set_rows_tq5(
 }
 
 template<typename idx_t>
-static void set_rows_cuda_tq6(
+static void set_rows_cuda_turbo6(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
@@ -1564,12 +1568,12 @@ static void set_rows_cuda_tq6(
     const idx_t * src1_d = (const idx_t *)src1->data;
 
     GGML_TENSOR_BINARY_OP_LOCALS
-    GGML_ASSERT(ne00 % QK_TQ6 == 0);  // must be block-aligned (128)
+    GGML_ASSERT(ne00 % QK_TURBO6 == 0);  // must be block-aligned (128)
 
     cudaStream_t stream = ctx.stream();
 
-    // tq6 block size = WHT group size = 128, always
-    const int64_t n_blocks = ne00 / QK_TQ6;
+    // turbo6 block size = WHT group size = 128, always
+    const int64_t n_blocks = ne00 / QK_TURBO6;
 
     const int64_t s01 = nb01/sizeof(float);
     const int64_t s02 = nb02/sizeof(float);
@@ -1579,12 +1583,12 @@ static void set_rows_cuda_tq6(
     const int64_t s12 = nb12/sizeof(idx_t);
 
     // InnerQ: check/finalize calibration before kernel launch
-    turbo_innerq_check_finalize(QK_TQ6, ne00);
+    turbo_innerq_check_finalize(QK_TURBO6, ne00);
 
     if (n_blocks > 0) {
         const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
-        k_set_rows_tq6<idx_t><<<(int)ne_total, 128, 0, stream>>>(
-            src0_d, src1_d, (block_tq6_0 *)dst->data,
+        k_set_rows_turbo6<idx_t><<<(int)ne_total, 128, 0, stream>>>(
+            src0_d, src1_d, (block_turbo6_0 *)dst->data,
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
             nb1, nb2, nb3);
@@ -1592,7 +1596,7 @@ static void set_rows_cuda_tq6(
 }
 
 template<typename idx_t>
-static void set_rows_cuda_tq5(
+static void set_rows_cuda_turbo5(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
@@ -1602,12 +1606,12 @@ static void set_rows_cuda_tq5(
     const idx_t * src1_d = (const idx_t *)src1->data;
 
     GGML_TENSOR_BINARY_OP_LOCALS
-    GGML_ASSERT(ne00 % QK_TQ5 == 0);  // must be block-aligned (128)
+    GGML_ASSERT(ne00 % QK_TURBO5 == 0);  // must be block-aligned (128)
 
     cudaStream_t stream = ctx.stream();
 
-    // tq5 block size = WHT group size = 128, always
-    const int64_t n_blocks = ne00 / QK_TQ5;
+    // turbo5 block size = WHT group size = 128, always
+    const int64_t n_blocks = ne00 / QK_TURBO5;
 
     const int64_t s01 = nb01/sizeof(float);
     const int64_t s02 = nb02/sizeof(float);
@@ -1617,12 +1621,12 @@ static void set_rows_cuda_tq5(
     const int64_t s12 = nb12/sizeof(idx_t);
 
     // InnerQ: check/finalize calibration before kernel launch
-    turbo_innerq_check_finalize(QK_TQ5, ne00);
+    turbo_innerq_check_finalize(QK_TURBO5, ne00);
 
     if (n_blocks > 0) {
         const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
-        k_set_rows_tq5<idx_t><<<(int)ne_total, 128, 0, stream>>>(
-            src0_d, src1_d, (block_tq5_0 *)dst->data,
+        k_set_rows_turbo5<idx_t><<<(int)ne_total, 128, 0, stream>>>(
+            src0_d, src1_d, (block_turbo5_0 *)dst->data,
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
             nb1, nb2, nb3);
@@ -1737,10 +1741,10 @@ static void set_rows_cuda(
         set_rows_cuda_turbo2<idx_t>(ctx, src0, src1, dst);
     } else if (dst->type == GGML_TYPE_TURBO4_0) {
         set_rows_cuda_turbo4<idx_t>(ctx, src0, src1, dst);
-    } else if (dst->type == GGML_TYPE_TQ6_0) {
-        set_rows_cuda_tq6<idx_t>(ctx, src0, src1, dst);
-    } else if (dst->type == GGML_TYPE_TQ5_0) {
-        set_rows_cuda_tq5<idx_t>(ctx, src0, src1, dst);
+    } else if (dst->type == GGML_TYPE_TURBO6_0) {
+        set_rows_cuda_turbo6<idx_t>(ctx, src0, src1, dst);
+    } else if (dst->type == GGML_TYPE_TURBO5_0) {
+        set_rows_cuda_turbo5<idx_t>(ctx, src0, src1, dst);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }

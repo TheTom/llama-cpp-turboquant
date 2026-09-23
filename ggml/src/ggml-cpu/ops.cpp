@@ -5158,7 +5158,7 @@ static void ggml_compute_forward_set_rows_impl(
 
     // For turbo types: communicate WHT group size to the quantize function via global
     if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 ||
-        dst->type == GGML_TYPE_TQ6_0 || dst->type == GGML_TYPE_TQ5_0) {
+        dst->type == GGML_TYPE_TURBO5_0 || dst->type == GGML_TYPE_TURBO6_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
         turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
@@ -5840,8 +5840,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
-        case GGML_TYPE_TQ6_0:
-        case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_TURBO6_0:
+        case GGML_TYPE_TURBO5_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:

@@ -204,12 +204,12 @@ static int nearest_centroid_4bit(float val) {
     return 15;
 }
 
-/* ---------- TQ6: 64 Lloyd-Max centroids for N(0, 1/128) ----------
+/* ---------- TURBO6: 64 Lloyd-Max centroids for N(0, 1/128) ----------
  *
  * Same generator as the shipped 3-bit and 4-bit tables. Per-coordinate rmse 0.0254 sigma,
  * vs 0.0975 sigma for the 16-level 4-bit table. Mirrored in the CUDA header.
  */
-static const float TQ6_CENTROIDS[64] = {
+static const float TURBO6_CENTROIDS[64] = {
     -0.330935f, -0.286417f, -0.257865f, -0.236198f,
     -0.218435f, -0.203203f, -0.189753f, -0.177626f,
     -0.166522f, -0.156230f, -0.146600f, -0.137517f,
@@ -229,8 +229,8 @@ static const float TQ6_CENTROIDS[64] = {
 };
 
 /* Midpoints between consecutive centroids: code i is chosen when
- * TQ6_MID[i-1] <= val < TQ6_MID[i]. */
-static const float TQ6_MID[63] = {
+ * TURBO6_MID[i-1] <= val < TURBO6_MID[i]. */
+static const float TURBO6_MID[63] = {
     -0.308676f, -0.272141f, -0.247031f, -0.227316f,
     -0.210819f, -0.196478f, -0.183690f, -0.172074f,
     -0.161376f, -0.151415f, -0.142059f, -0.133206f,
@@ -254,8 +254,8 @@ static int nearest_centroid_6bit(float val) {
     int lo = 0;          /* candidate code range [lo, hi] */
     int hi = 63;
     while (lo < hi) {
-        const int mid = (lo + hi) / 2;   /* compare against the lo/hi split at TQ6_MID[mid] */
-        if (val < TQ6_MID[mid]) {
+        const int mid = (lo + hi) / 2;   /* compare against the lo/hi split at TURBO6_MID[mid] */
+        if (val < TURBO6_MID[mid]) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -264,12 +264,12 @@ static int nearest_centroid_6bit(float val) {
     return lo;
 }
 
-/* ---------- TQ5: 32 Lloyd-Max centroids for N(0, 1/128) ----------
+/* ---------- TURBO5: 32 Lloyd-Max centroids for N(0, 1/128) ----------
  *
- * Same generator as the tq6 table. Per-coordinate rmse 0.0501 sigma (tq6: 0.0254, turbo4:
+ * Same generator as the turbo6 table. Per-coordinate rmse 0.0501 sigma (turbo6: 0.0254, turbo4:
  * 0.0975). Antisymmetric (c[31-i] == -c[i]). Mirrored in the CUDA header.
  */
-static const float TQ5_CENTROIDS[32] = {
+static const float TURBO5_CENTROIDS[32] = {
     -0.288236f, -0.237892f, -0.204892f, -0.179348f,
     -0.158003f, -0.139353f, -0.122569f, -0.107141f,
     -0.092730f, -0.079097f, -0.066064f, -0.053491f,
@@ -281,8 +281,8 @@ static const float TQ5_CENTROIDS[32] = {
 };
 
 /* Midpoints between consecutive centroids: code i is chosen when
- * TQ5_MID[i-1] <= val < TQ5_MID[i]. */
-static const float TQ5_MID[31] = {
+ * TURBO5_MID[i-1] <= val < TURBO5_MID[i]. */
+static const float TURBO5_MID[31] = {
     -0.263064f, -0.221392f, -0.192120f, -0.168675f,
     -0.148678f, -0.130961f, -0.114855f, -0.099935f,
     -0.085914f, -0.072580f, -0.059778f, -0.047380f,
@@ -299,7 +299,7 @@ static int nearest_centroid_5bit(float val) {
     int hi = 31;
     while (lo < hi) {
         const int mid = (lo + hi) / 2;
-        if (val < TQ5_MID[mid]) {
+        if (val < TURBO5_MID[mid]) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -768,16 +768,16 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
-/* ---------- TQ6_0: 6-bit PolarQuant with WHT rotation ----------
+/* ---------- TURBO6_0: 6-bit PolarQuant with WHT rotation ----------
  *
  * Same five-step pipeline as quantize_row_turbo4_0_ref, only the codebook and packing differ.
  */
-void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RESTRICT y, int64_t k) {
+void quantize_row_turbo6_0_ref(const float * GGML_RESTRICT x, block_turbo6_0 * GGML_RESTRICT y, int64_t k) {
     turbo_init_rotation();
 
-    assert(k % QK_TQ6 == 0);
-    const int nb = k / QK_TQ6;
-    const int d  = QK_TQ6;
+    assert(k % QK_TURBO6 == 0);
+    const int nb = k / QK_TURBO6;
+    const int d  = QK_TURBO6;
 
     for (int block = 0; block < nb; block++) {
         const float * src = x + block * d;
@@ -810,7 +810,7 @@ void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RE
         /* Step 4: Norm correction */
         float recon_norm_sq = 0.0f;
         for (int i = 0; i < d; i++) {
-            recon_norm_sq += TQ6_CENTROIDS[indices[i]] * TQ6_CENTROIDS[indices[i]];
+            recon_norm_sq += TURBO6_CENTROIDS[indices[i]] * TURBO6_CENTROIDS[indices[i]];
         }
         float recon_norm = sqrtf(recon_norm_sq);
         float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
@@ -827,12 +827,12 @@ void quantize_row_tq6_0_ref(const float * GGML_RESTRICT x, block_tq6_0 * GGML_RE
     }
 }
 
-void dequantize_row_tq6_0(const block_tq6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+void dequantize_row_turbo6_0(const block_turbo6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     turbo_init_rotation();
 
-    assert(k % QK_TQ6 == 0);
-    const int nb = k / QK_TQ6;
-    const int d  = QK_TQ6;
+    assert(k % QK_TURBO6 == 0);
+    const int nb = k / QK_TURBO6;
+    const int d  = QK_TURBO6;
 
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
@@ -841,7 +841,7 @@ void dequantize_row_tq6_0(const block_tq6_0 * GGML_RESTRICT x, float * GGML_REST
             const uint8_t lo  = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
             const uint8_t hi  = (x[block].qh[i / 4] >> ((i % 4) * 2)) & 0x3;
             const uint8_t idx = (uint8_t)(lo | (hi << 4));
-            dst[i] = TQ6_CENTROIDS[idx] * norm;
+            dst[i] = TURBO6_CENTROIDS[idx] * norm;
         }
         /* No inverse WHT, dequant stays in the rotated domain, same convention as turbo4:
          * Q is WHT-rotated by the graph, so <Q_rot, K_rot> gives correct attention scores, and
@@ -850,32 +850,32 @@ void dequantize_row_tq6_0(const block_tq6_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-size_t quantize_tq6_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+size_t quantize_turbo6_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                       int64_t nrows, int64_t n_per_row, const float * imatrix) {
     GGML_UNUSED(imatrix);
-    assert(n_per_row % QK_TQ6 == 0);
+    assert(n_per_row % QK_TURBO6 == 0);
 
-    size_t row_size = (n_per_row / QK_TQ6) * sizeof(block_tq6_0);
+    size_t row_size = (n_per_row / QK_TURBO6) * sizeof(block_turbo6_0);
     for (int64_t row = 0; row < nrows; row++) {
-        quantize_row_tq6_0_ref(
+        quantize_row_turbo6_0_ref(
             src + row * n_per_row,
-            (block_tq6_0 *)((char *)dst + row * row_size),
+            (block_turbo6_0 *)((char *)dst + row * row_size),
             n_per_row
         );
     }
     return nrows * row_size;
 }
 
-/* ---------- TQ5_0: 5-bit PolarQuant with WHT rotation ----------
+/* ---------- TURBO5_0: 5-bit PolarQuant with WHT rotation ----------
  *
- * Same pipeline as quantize_row_tq6_0_ref with 32 centroids and a 1-bit high plane.
+ * Same pipeline as quantize_row_turbo6_0_ref with 32 centroids and a 1-bit high plane.
  */
-void quantize_row_tq5_0_ref(const float * GGML_RESTRICT x, block_tq5_0 * GGML_RESTRICT y, int64_t k) {
+void quantize_row_turbo5_0_ref(const float * GGML_RESTRICT x, block_turbo5_0 * GGML_RESTRICT y, int64_t k) {
     turbo_init_rotation();
 
-    assert(k % QK_TQ5 == 0);
-    const int nb = k / QK_TQ5;
-    const int d  = QK_TQ5;
+    assert(k % QK_TURBO5 == 0);
+    const int nb = k / QK_TURBO5;
+    const int d  = QK_TURBO5;
 
     for (int block = 0; block < nb; block++) {
         const float * src = x + block * d;
@@ -908,7 +908,7 @@ void quantize_row_tq5_0_ref(const float * GGML_RESTRICT x, block_tq5_0 * GGML_RE
         /* Step 4: Norm correction */
         float recon_norm_sq = 0.0f;
         for (int i = 0; i < d; i++) {
-            recon_norm_sq += TQ5_CENTROIDS[indices[i]] * TQ5_CENTROIDS[indices[i]];
+            recon_norm_sq += TURBO5_CENTROIDS[indices[i]] * TURBO5_CENTROIDS[indices[i]];
         }
         float recon_norm = sqrtf(recon_norm_sq);
         float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
@@ -928,12 +928,12 @@ void quantize_row_tq5_0_ref(const float * GGML_RESTRICT x, block_tq5_0 * GGML_RE
     }
 }
 
-void dequantize_row_tq5_0(const block_tq5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+void dequantize_row_turbo5_0(const block_turbo5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     turbo_init_rotation();
 
-    assert(k % QK_TQ5 == 0);
-    const int nb = k / QK_TQ5;
-    const int d  = QK_TQ5;
+    assert(k % QK_TURBO5 == 0);
+    const int nb = k / QK_TURBO5;
+    const int d  = QK_TURBO5;
 
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
@@ -942,25 +942,25 @@ void dequantize_row_tq5_0(const block_tq5_0 * GGML_RESTRICT x, float * GGML_REST
             const uint8_t mag = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
             const uint8_t neg = (x[block].qh[i / 8] >> (i % 8)) & 0x1;
             const uint8_t idx = neg ? (uint8_t)(15 - mag) : (uint8_t)(16 + mag);
-            dst[i] = TQ5_CENTROIDS[idx] * norm;
+            dst[i] = TURBO5_CENTROIDS[idx] * norm;
         }
-        /* No inverse WHT, dequant stays in the rotated domain, same convention as tq6:
+        /* No inverse WHT, dequant stays in the rotated domain, same convention as turbo6:
          * Q is WHT-rotated by the graph, so <Q_rot, K_rot> gives correct attention scores, and
          * the inverse WHT is applied to the attention output via GGML_OP_TURBO_WHT (direction=1).
          */
     }
 }
 
-size_t quantize_tq5_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+size_t quantize_turbo5_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                       int64_t nrows, int64_t n_per_row, const float * imatrix) {
     GGML_UNUSED(imatrix);
-    assert(n_per_row % QK_TQ5 == 0);
+    assert(n_per_row % QK_TURBO5 == 0);
 
-    size_t row_size = (n_per_row / QK_TQ5) * sizeof(block_tq5_0);
+    size_t row_size = (n_per_row / QK_TURBO5) * sizeof(block_turbo5_0);
     for (int64_t row = 0; row < nrows; row++) {
-        quantize_row_tq5_0_ref(
+        quantize_row_turbo5_0_ref(
             src + row * n_per_row,
-            (block_tq5_0 *)((char *)dst + row * row_size),
+            (block_turbo5_0 *)((char *)dst + row * row_size),
             n_per_row
         );
     }

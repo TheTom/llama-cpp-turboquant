@@ -452,21 +452,21 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
     }
 }
 
-// TQ6: 6-bit PolarQuant (4-bit low plane + 2-bit high plane), block size 128
+// TURBO6: 6-bit PolarQuant (4-bit low plane + 2-bit high plane), block size 128
 // iqs is the element index within the block (even), produces elements iqs and iqs+1
-static __device__ __forceinline__ void dequantize_tq6_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
-    const block_tq6_0 * x = (const block_tq6_0 *) vx;
+static __device__ __forceinline__ void dequantize_turbo6_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo6_0 * x = (const block_turbo6_0 *) vx;
     const float norm = __half2float(x[ib].norm);
-    v.x = tq6_dequant_element(&x[ib], iqs + 0, norm);
-    v.y = tq6_dequant_element(&x[ib], iqs + 1, norm);
+    v.x = turbo6_dequant_element(&x[ib], iqs + 0, norm);
+    v.y = turbo6_dequant_element(&x[ib], iqs + 1, norm);
 }
 
-// TQ5: 5-bit PolarQuant (4-bit magnitude plane + sign plane), block size 128
-static __device__ __forceinline__ void dequantize_tq5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
-    const block_tq5_0 * x = (const block_tq5_0 *) vx;
+// TURBO5: 5-bit PolarQuant (4-bit magnitude plane + sign plane), block size 128
+static __device__ __forceinline__ void dequantize_turbo5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo5_0 * x = (const block_turbo5_0 *) vx;
     const float norm = __half2float(x[ib].norm);
-    v.x = tq5_dequant_element(&x[ib], iqs + 0, norm);
-    v.y = tq5_dequant_element(&x[ib], iqs + 1, norm);
+    v.x = turbo5_dequant_element(&x[ib], iqs + 0, norm);
+    v.y = turbo5_dequant_element(&x[ib], iqs + 1, norm);
 }
 
 // Turbo4: 4-bit PolarQuant (nibble packed), block size 128

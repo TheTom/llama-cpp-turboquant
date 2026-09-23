@@ -438,8 +438,8 @@ extern "C" {
         GGML_TYPE_Q8_CR   = 48, // Q8_0 blocks of a ConvRot-rotated tensor
         GGML_TYPE_Q5_CR   = 49, // Q5_0 blocks of a ConvRot-rotated tensor
         GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
-        GGML_TYPE_TQ6_0   = 51, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_TQ5_0   = 52, // TurboQuant 5-bit KV cache: WHT + 5-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TURBO5_0 = 51, // TurboQuant 5-bit KV cache: WHT + 5-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TURBO6_0 = 52, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_COUNT   = 53,
     };
 

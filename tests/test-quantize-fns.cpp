@@ -149,13 +149,13 @@ static int test_vec_dot_q(bool verbose) {
             continue;
         }
 
-        // TurboQuant KV-cache types (TURBO2_0/TURBO3_0/TURBO4_0/TQ6_0/TQ5_0) intentionally keep
+        // TurboQuant KV-cache types (TURBO2_0/TURBO3_0/TURBO4_0/TURBO6_0/TURBO5_0) intentionally keep
         // their dequantized output in the WHT-rotated domain; the inverse WHT is
         // applied separately via GGML_OP_TURBO_WHT in the attention graph. They do
         // not round-trip through float space, so the total/reference/dot-product
         // error tests in this harness are not applicable.
         if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
-            type == GGML_TYPE_TQ6_0 || type == GGML_TYPE_TQ5_0) {
+            type == GGML_TYPE_TURBO5_0 || type == GGML_TYPE_TURBO6_0) {
             printf("Testing %s (skipped: rotated-domain KV quant)\n", ggml_type_name(type));
             continue;
         }
