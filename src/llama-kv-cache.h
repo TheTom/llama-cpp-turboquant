@@ -12,6 +12,8 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+struct triattention_state;
+struct triattention_config;
 
 //
 // llama_kv_cache
@@ -115,7 +117,7 @@ public:
         const  layer_share_cb & share,
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -245,6 +247,12 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+
+    // TriAttention KV cache eviction
+    void init_triattention(const char * stats_path, const triattention_config * cfg);
+    int32_t triattention_try_prune();
+    bool has_triattention() const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -321,6 +329,9 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // TriAttention eviction state
+    triattention_state * triattention_st = nullptr;
 
     size_t total_size() const;
 
