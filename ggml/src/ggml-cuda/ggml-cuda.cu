@@ -3299,12 +3299,14 @@ static bool ggml_cuda_kv_stream_staged_set_rows_range(
         int64_t * first_row, int64_t * row_count) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    // set_rows_cuda_turbo{2,3,4} (set-rows.cu) write F32 -> turbo K/V but don't
-    // accept a row-base offset, which the true page-staging path below relies
-    // on. Force turbo writes through the online_write mirror fallback instead
-    // (two absolute-position ggml_cuda_op_set_rows calls, no offset needed).
+    // set_rows_cuda_turbo{2,3,4,5,6} (set-rows.cu) write F32 -> turbo K/V but
+    // don't accept a row-base offset, which the true page-staging path below
+    // relies on. Force turbo writes through the online_write mirror fallback
+    // instead (two absolute-position ggml_cuda_op_set_rows calls, no offset
+    // needed).
     if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 ||
-            dst->type == GGML_TYPE_TURBO4_0) {
+            dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO5_0 ||
+            dst->type == GGML_TYPE_TURBO6_0) {
         return false;
     }
     if (runtime == nullptr || runtime->resident_cache == nullptr ||
@@ -6721,8 +6723,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if ((op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0) && op->src[0]->ne[0] % 64 != 0) {
                     return false;
                 }
-                // turbo4 block size is 128, so head_dim must be divisible by 128
-                if (op->type == GGML_TYPE_TURBO4_0 && op->src[0]->ne[0] % 128 != 0) {
+                // turbo4, turbo6 and turbo5 block size is 128, so head_dim must be divisible by 128
+                if ((op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO5_0 || op->type == GGML_TYPE_TURBO6_0) && op->src[0]->ne[0] % 128 != 0) {
                     return false;
                 }
                 return (
@@ -6730,7 +6732,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                                op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
-                               op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO4_0) &&
+                               op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO4_0 ||
+                               op->type == GGML_TYPE_TURBO5_0 || op->type == GGML_TYPE_TURBO6_0) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -6758,6 +6761,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_TURBO6_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_TURBO5_0 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0) {

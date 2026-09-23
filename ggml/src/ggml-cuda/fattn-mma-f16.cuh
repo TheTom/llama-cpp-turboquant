@@ -717,6 +717,319 @@ static __device__ __forceinline__ void flash_attn_ext_turbo2_load_tile(
     }
 }
 
+// Same map as turbo_store_h2 for the loaders that decode four half2 at a time. c must be a
+// multiple of 4, so the 16 bytes sit in one chunk and the swizzle XOR only moves the chunk.
+template<int stride_tile, bool swz>
+static __device__ __forceinline__ void turbo_store_u4(half2 * const __restrict__ tile_KV, const int row, const int c, const uint4 v) {
+    if constexpr (swz) {
+        *(uint4 *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row, c)) = v;
+    } else {
+        *(uint4 *) (tile_KV + row*stride_tile + c) = v;
+    }
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_half2_as_u32(const half2 x) {
+    uint32_t r; memcpy(&r, &x, sizeof(r)); return r;
+}
+
+// prmt.b32 with the full 4-bit selectors: __byte_perm() masks each selector nibble to 3 bits, but PRMT's
+// bit 3 (sign-replicate mode: the selected byte's msb fills the output byte) is what turns a bit sitting on a
+// byte msb into a 0x00/0xFF byte mask in one instruction.
+static __device__ __forceinline__ uint32_t turbo_prmt(const uint32_t a, const uint32_t b, const uint32_t sel) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    uint32_t d;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel));
+    return d;
+#else
+    const uint64_t src = ((uint64_t) b << 32) | a;
+    uint32_t d = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t s = (sel >> (4*i)) & 0xF;
+        uint32_t byte = (uint32_t) (src >> (8*(s & 7))) & 0xFF;
+        if (s & 8) { byte = (byte & 0x80) ? 0xFF : 0x00; }
+        d |= byte << (8*i);
+    }
+    return d;
+#endif
+}
+
+// turbo6 (6-bit PolarQuant) tile loader for the MMA decode path. Same row / half2-col
+// layout as the turbo4 loader, block_turbo6_0 = norm + qs[64] (low nibbles) + qh[32] (high
+// 2 bits, 4 codes per byte).
+//
+// Layout proof: half2 column c of a row holds elements (2c, 2c+1). Element j has its low
+// nibble in qs[j/2] nibble (j&1) and its high 2 bits in qh[j/4] at shift (j%4)*2. For
+// j = 2c and j+1 both nibbles are in qs[c] and both 2-bit fields are in qh[c/2], at
+// shifts (c%2)*4 and (c%2)*4+2. So one qs byte plus one qh byte yield the half2 for
+// tile column c.
+//
+// Unlike turbo4 this does NOT materialise a scaled[] centroid array in registers: 64
+// entries per block would blow the MMA kernel register budget (and spill).
+//
+// A 6-bit code is divergent across lanes: a divergent __constant__ read is replayed once
+// per distinct address by the constant unit (~27 replays for random 6-bit indices) and a
+// divergent shared-memory table costs bank conflicts. The TURBO6 centroids are exactly
+// antisymmetric (c[63-i] == -c[i]), so the warp only needs the 32 positive magnitudes:
+// lane L keeps c[32+L] in one register and a lookup is a single __shfl_sync, which routes
+// an arbitrary per-lane source lane in one instruction. For idx < 32 the source lane is
+// mirrored (31-idx) and the sign bit is flipped.
+static __device__ __forceinline__ float flash_attn_ext_turbo6_centroid(const float mag, const int idx) {
+    const int neg = ((idx >> 5) & 1) - 1; // 0 for idx >= 32, -1 (all ones) for idx < 32
+    const float v = __shfl_sync(0xFFFFFFFF, mag, (idx ^ neg) & 31, 32);
+    return __uint_as_float(__float_as_uint(v) ^ ((uint32_t) neg & 0x80000000u));
+}
+
+// One lane decodes sixteen consecutive values (eight half2) per iteration and writes two
+// aligned uint4: every thread of the block works, and the packed reads of a row stay
+// inside one cache line. Sixteen values need only six 16-bit loads (eight qs bytes, four
+// qh bytes) plus the block norm. The iteration space is the flat (row, chunk) product so
+// that every lane of a warp reaches the centroid shuffles.
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_turbo6_load_tile(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int stride_bytes, const int col_offset, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid  = threadIdx.y * warp_size + threadIdx.x;
+    const int lane = threadIdx.x % 32; // the shuffles below are 32 wide
+    constexpr int half2_per_chunk = 8;
+    static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 8");
+    constexpr int chunks_per_row = D2 / half2_per_chunk;
+    constexpr int nchunks = nbatch_fa * chunks_per_row;
+    // every lane must reach the shuffles, so no lane may leave the loop early
+    static_assert(nchunks % nthreads == 0, "nchunks must be a multiple of nthreads");
+
+    const float mag = TURBO6_CENTROIDS[32 + lane]; // this lane's positive magnitude
+
+    for (int linear = tid; linear < nchunks; linear += nthreads) {
+        const int row = linear / chunks_per_row;
+        const int chunk = linear - row * chunks_per_row;
+        const int col = chunk * half2_per_chunk;
+        const bool oob = oob_check && row >= i_sup;
+
+        float norm = 0.0f;
+        uint32_t qs0 = 0, qs1 = 0, qh = 0;
+        if (!oob) {
+            const char * row_ptr = KV_raw + (int64_t) row * stride_bytes;
+            const int j0 = 2*(col_offset + col); // first of sixteen values, multiple of 16
+            const block_turbo6_0 * blk = (const block_turbo6_0 *) row_ptr + j0 / QK_TURBO6;
+            const int in_blk = j0 % QK_TURBO6;
+            // qs offset in_blk/2 is a multiple of 8 and qh offset in_blk/4 a multiple of 4 -> 16-bit aligned
+            const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk/2);
+            const uint16_t * qhp = (const uint16_t *) (blk->qh + in_blk/4);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            norm = __half2float(__ldcs((const half *) &blk->norm));
+            qs0  = __byte_perm((uint32_t) __ldcs(qsp + 0), (uint32_t) __ldcs(qsp + 1), 0x5410); // low nibbles, values 0..7
+            qs1  = __byte_perm((uint32_t) __ldcs(qsp + 2), (uint32_t) __ldcs(qsp + 3), 0x5410); // low nibbles, values 8..15
+            qh   = __byte_perm((uint32_t) __ldcs(qhp + 0), (uint32_t) __ldcs(qhp + 1), 0x5410); // high 2 bits, 2 per value
+#else
+            norm = __half2float(blk->norm);
+            qs0  = __byte_perm((uint32_t) qsp[0], (uint32_t) qsp[1], 0x5410);
+            qs1  = __byte_perm((uint32_t) qsp[2], (uint32_t) qsp[3], 0x5410);
+            qh   = __byte_perm((uint32_t) qhp[0], (uint32_t) qhp[1], 0x5410);
+#endif
+        }
+
+        uint4 decoded[2];
+        half2 * values = reinterpret_cast<half2 *>(decoded);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t qsw = k < 4 ? qs0 : qs1; // byte k&3 of this word holds the pair
+            const int idx0 = ((qsw >> (8*(k & 3)    )) & 0xF) | (((qh >> (4*k    )) & 0x3) << 4);
+            const int idx1 = ((qsw >> (8*(k & 3) + 4)) & 0xF) | (((qh >> (4*k + 2)) & 0x3) << 4);
+            values[k] = __floats2half2_rn(flash_attn_ext_turbo6_centroid(mag, idx0) * norm,
+                                          flash_attn_ext_turbo6_centroid(mag, idx1) * norm);
+        }
+        turbo_store_u4<stride_tile, swz>(tile_KV, row, col,     oob ? uint4{} : decoded[0]);
+        turbo_store_u4<stride_tile, swz>(tile_KV, row, col + 4, oob ? uint4{} : decoded[1]);
+    }
+}
+
+// turbo5 (5-bit PolarQuant) tile loader for the MMA decode path. block_turbo5_0 = norm + qs[64] (magnitude
+// nibbles) + qh[16] (sign bit, 8 codes per byte, bit i%8). One lane decodes 32 consecutive values (a
+// quarter block: sixteen half2, four aligned uint4) per iteration: eight 16-bit qs loads, two 16-bit
+// qh loads and the norm.
+//
+// The 32 centroids are exactly antisymmetric (c[31-i] == -c[i]) and the stored code is sign-magnitude
+// (qh bit set = negative = c[15-m], clear = c[16+m] = +m). So the lookup is a 16-entry fp16 magnitude
+// table T[m] = rn(c[16+m] * norm) built once per chunk and kept as byte planes (four registers of low
+// bytes, four of high bytes); each group of four values is one PRMT select per plane and table half,
+// merged by bit 3 of the index, and the sign is XORed into the high byte. rn(-x) == -rn(x), so the
+// decoded tile matches the scalar reference exactly.
+//
+// Layout proof: half2 column c of a row holds elements (2c, 2c+1); element j has its magnitude nibble
+// in qs[j/2] nibble (j&1) and its sign in qh[j/8] bit (j%8), so 32 consecutive values starting at a
+// multiple of 32 are 16 qs bytes (nibble k of 32-bit word w = value 8w+k) and 4 qh bytes (bit v = value v).
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_turbo5_load_tile(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int stride_bytes, const int col_offset, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    constexpr int half2_per_chunk = 16; // 32 values per lane: one quarter of a 128-value block
+    static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 16");
+    constexpr int chunks_per_row = D2 / half2_per_chunk;
+    constexpr int nchunks = nbatch_fa * chunks_per_row;
+
+    for (int linear = tid; linear < nchunks; linear += nthreads) {
+        const int row = linear / chunks_per_row;
+        const int chunk = linear - row * chunks_per_row;
+        const int col = chunk * half2_per_chunk;
+        if (oob_check && row >= i_sup) {
+#pragma unroll
+            for (int c = 0; c < half2_per_chunk; c += 4) {
+                turbo_store_u4<stride_tile, swz>(tile_KV, row, col + c, uint4{});
+            }
+            continue;
+        }
+
+        const char * row_ptr = KV_raw + (int64_t) row * stride_bytes;
+        const int j0 = 2*(col_offset + col);                // first of 32 values, multiple of 32
+        const block_turbo5_0 * blk = (const block_turbo5_0 *) row_ptr + j0 / QK_TURBO5;
+        const int in_blk = j0 % QK_TURBO5;                      // 0, 32, 64 or 96
+        // qs offset in_blk/2 is a multiple of 16 and qh offset in_blk/8 a multiple of 4 -> 16-bit aligned
+        const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk/2);
+        const uint16_t * qhp = (const uint16_t *) (blk->qh + in_blk/8);
+        float norm; uint32_t qs[4]; uint32_t qh;             // qs[w] nibble k = magnitude index of value 8w+k; qh bit v = 1: value v negative
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        norm = __half2float(__ldcs((const half *) &blk->norm));
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            qs[w] = __byte_perm((uint32_t) __ldcs(qsp + 2*w), (uint32_t) __ldcs(qsp + 2*w + 1), 0x5410);
+        }
+        qh = __byte_perm((uint32_t) __ldcs(qhp), (uint32_t) __ldcs(qhp + 1), 0x5410);
+#else
+        norm = __half2float(blk->norm);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            qs[w] = __byte_perm((uint32_t) qsp[2*w], (uint32_t) qsp[2*w + 1], 0x5410);
+        }
+        qh = __byte_perm((uint32_t) qhp[0], (uint32_t) qhp[1], 0x5410);
+#endif
+
+        // fp16 magnitude table T[m] = rn(c[16+m] * norm), m = 0..15 (TURBO5_CENTROIDS[16..31]), as byte planes
+        const uint32_t W0 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[16] * norm, TURBO5_CENTROIDS[17] * norm));
+        const uint32_t W1 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[18] * norm, TURBO5_CENTROIDS[19] * norm));
+        const uint32_t W2 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[20] * norm, TURBO5_CENTROIDS[21] * norm));
+        const uint32_t W3 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[22] * norm, TURBO5_CENTROIDS[23] * norm));
+        const uint32_t W4 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[24] * norm, TURBO5_CENTROIDS[25] * norm));
+        const uint32_t W5 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[26] * norm, TURBO5_CENTROIDS[27] * norm));
+        const uint32_t W6 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[28] * norm, TURBO5_CENTROIDS[29] * norm));
+        const uint32_t W7 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO5_CENTROIDS[30] * norm, TURBO5_CENTROIDS[31] * norm));
+        const uint32_t A_lo = __byte_perm(W0, W1, 0x6420), A_hi = __byte_perm(W0, W1, 0x7531); // T0..T3
+        const uint32_t B_lo = __byte_perm(W2, W3, 0x6420), B_hi = __byte_perm(W2, W3, 0x7531); // T4..T7
+        const uint32_t C_lo = __byte_perm(W4, W5, 0x6420), C_hi = __byte_perm(W4, W5, 0x7531); // T8..T11
+        const uint32_t D_lo = __byte_perm(W6, W7, 0x6420), D_hi = __byte_perm(W6, W7, 0x7531); // T12..T15
+
+        uint4 decoded[4];
+        uint32_t * out = reinterpret_cast<uint32_t *>(decoded);
+        // Per 32-bit qs word (8 values) the byte-msb copy of index bit 3 is made once; per 4-value group
+        // the work is the selector, the bit-3 byte mask, the two table selects per byte plane and the sign XOR.
+#pragma unroll
+        for (int w = 0; w < 4; ++w) { // values 8w..8w+7
+            const uint32_t idx32 = qs[w];
+            const uint32_t idxs4 = idx32 << 4;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) { // values 8w+4h..8w+4h+3
+                const uint32_t sel = (idx32 >> (16*h)) & 0x7777u;             // PRMT selector: index bits 0..2
+                // 0xFF in byte k where index k has bit 3 set: bit 4k+3 lands on a byte msb in idxs4 for k even
+                // and in idx32 for k odd; PRMT replicate mode (selector bit 3) spreads that msb over the byte
+                const uint32_t bm3 = turbo_prmt(idxs4, idx32, h ? 0xFBEA : 0xD9C8);
+                const uint32_t neg = (qh >> (8*w + 4*h)) & 0xFu;              // bit k = 1: value 8w+4h+k negative
+                // sign into bit 7 of high byte k: neg bit k * 2^(7+7k) is bit 8k+7 (no carries), masked to the msbs
+                const uint32_t sgn = (neg * 0x10204080u) & 0x80808080u;
+                const uint32_t lo  = (__byte_perm(A_lo, B_lo, sel) & ~bm3) | (__byte_perm(C_lo, D_lo, sel) & bm3);
+                const uint32_t hi  = ((__byte_perm(A_hi, B_hi, sel) & ~bm3) | (__byte_perm(C_hi, D_hi, sel) & bm3)) ^ sgn;
+                out[4*w + 2*h    ] = __byte_perm(lo, hi, 0x5140); // values 8w+4h,   8w+4h+1
+                out[4*w + 2*h + 1] = __byte_perm(lo, hi, 0x7362); // values 8w+4h+2, 8w+4h+3
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            turbo_store_u4<stride_tile, swz>(tile_KV, row, col + 4*c, decoded[c]);
+        }
+    }
+}
+
+// turbo4 V tile loader for the turbo6/turbo5 K pairs, same shape as the turbo5 loader: one lane decodes 32
+// consecutive values (a quarter block, four aligned uint4) per iteration from sixteen packed nibble
+// bytes, so a 256-wide row is eight lanes of contiguous packed reads. The 16 centroids are exactly
+// antisymmetric (c[15-i] == -c[i]), so the lookup uses an 8-entry fp16 magnitude table
+// T[m] = rn(c[8+m] * norm) built ONCE per 32 values and selected with PRMT; the sign bit is XORed in
+// afterwards. rn(-x) == -rn(x), so the decoded tile is bit-identical to flash_attn_ext_turbo4_load_tile.
+// block_turbo4_0 = norm + qs[64] (66 B): rows are only 2-byte aligned, hence the 16-bit packed loads.
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile_flat(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int stride_bytes, const int col_offset, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    constexpr int half2_per_chunk = 16; // 32 decoded values per lane: one table build per four uint4 stores
+    static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 16");
+    constexpr int chunks_per_row = D2 / half2_per_chunk;
+    constexpr int nchunks = nbatch_fa * chunks_per_row;
+
+    for (int linear = tid; linear < nchunks; linear += nthreads) {
+        const int row = linear / chunks_per_row;
+        const int chunk = linear - row * chunks_per_row;
+        const int col = chunk * half2_per_chunk;
+        if (oob_check && row >= i_sup) {
+#pragma unroll
+            for (int c = 0; c < half2_per_chunk; c += 4) {
+                turbo_store_u4<stride_tile, swz>(tile_KV, row, col + c, uint4{});
+            }
+            continue;
+        }
+
+        const char * row_ptr = KV_raw + (int64_t) row * stride_bytes;
+        const int j0 = 2 * (col_offset + col);          // first of 32 values, multiple of 32
+        const block_turbo4_0 * blk = (const block_turbo4_0 *) row_ptr + j0 / QK_TURBO4;
+        const int in_blk = j0 % QK_TURBO4;              // qs offset in_blk/2 is a multiple of 16 -> 16-bit aligned
+        const uint16_t * qsp = (const uint16_t *) (blk->qs + in_blk / 2);
+        float norm; uint32_t x[4];                      // nibble k of x[w] is the 4-bit code of value 8w+k
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        norm = __half2float(__ldcs((const half *) &blk->norm));
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            x[w] = __byte_perm((uint32_t) __ldcs(qsp + 2*w), (uint32_t) __ldcs(qsp + 2*w + 1), 0x5410);
+        }
+#else
+        norm = __half2float(blk->norm);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            x[w] = __byte_perm((uint32_t) qsp[2*w], (uint32_t) qsp[2*w + 1], 0x5410);
+        }
+#endif
+
+        // per-chunk fp16 table T[m] = norm * TURBO_CENTROIDS_4BIT[8+m], m = 0..7, split into low / high byte planes for PRMT
+        const uint32_t W0 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO_CENTROIDS_4BIT[8] * norm, TURBO_CENTROIDS_4BIT[9] * norm));
+        const uint32_t W1 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO_CENTROIDS_4BIT[10] * norm, TURBO_CENTROIDS_4BIT[11] * norm));
+        const uint32_t W2 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO_CENTROIDS_4BIT[12] * norm, TURBO_CENTROIDS_4BIT[13] * norm));
+        const uint32_t W3 = ggml_cuda_half2_as_u32(__floats2half2_rn(TURBO_CENTROIDS_4BIT[14] * norm, TURBO_CENTROIDS_4BIT[15] * norm));
+        const uint32_t A_lo = __byte_perm(W0, W1, 0x6420), A_hi = __byte_perm(W0, W1, 0x7531); // T0..T3 low / high bytes
+        const uint32_t B_lo = __byte_perm(W2, W3, 0x6420), B_hi = __byte_perm(W2, W3, 0x7531); // T4..T7
+
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            // code >= 8: +T[code-8]; code < 8: -T[7-code]
+            const uint32_t hi   = (x[w] >> 3) & 0x11111111u;                 // bit 3 of each code (1 = positive)
+            const uint32_t idx  = (x[w] & 0x77777777u) ^ ((hi ^ 0x11111111u) * 7u); // 3-bit magnitude selectors
+            const uint32_t neg  = hi ^ 0x11111111u;                          // 1 in nibble k where value k is negative
+
+            const uint32_t sel0 = idx & 0xFFFFu, sel1 = idx >> 16;
+            const uint32_t lo0 = __byte_perm(A_lo, B_lo, sel0), hi0 = __byte_perm(A_hi, B_hi, sel0); // values 0..3
+            const uint32_t lo1 = __byte_perm(A_lo, B_lo, sel1), hi1 = __byte_perm(A_hi, B_hi, sel1); // values 4..7
+            uint4 decoded;
+            // sign: word v holds values 2v (bit 15) and 2v+1 (bit 31); nibbles 2v, 2v+1 of neg sit at bits 8v and 8v+4
+            decoded.x = __byte_perm(lo0, hi0, 0x5140) ^ ((((neg      ) & 0x11u) * 0x08008000u) & 0x80008000u);
+            decoded.y = __byte_perm(lo0, hi0, 0x7362) ^ ((((neg >>  8) & 0x11u) * 0x08008000u) & 0x80008000u);
+            decoded.z = __byte_perm(lo1, hi1, 0x5140) ^ ((((neg >> 16) & 0x11u) * 0x08008000u) & 0x80008000u);
+            decoded.w = __byte_perm(lo1, hi1, 0x7362) ^ ((((neg >> 24) & 0x11u) * 0x08008000u) & 0x80008000u);
+            turbo_store_u4<stride_tile, swz>(tile_KV, row, col + 4*w, decoded);
+        }
+    }
+}
+
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
@@ -894,14 +1207,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = k0_stop - k0_start;
             // turbo4: stride_K is a RAW BYTE pitch (nb11). Dequantize the (sub)tile of
             // K columns [k0_start, k0_start+k0_diff) into SRAM, then a single sync.
-            static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0,
-                          "only turbo2/3/4 K supported on the MMA turbo path");
+            static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 ||
+                          type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0,
+                          "only turbo2/3/4, turbo6 or turbo5 K supported on the MMA turbo path");
             static_assert(nbatch_K2 == DKQ/2, "turbo MMA load assumes full-row K tiles (nbatch_K2==DKQ/2)");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * K_raw = (const char *) K_h2 + int64_t(k_VKQ_0) * stride_K;
             if constexpr (type_K == GGML_TYPE_TURBO4_0) {
                 flash_attn_ext_turbo4_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
+            } else if constexpr (type_K == GGML_TYPE_TURBO6_0) {
+                flash_attn_ext_turbo6_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check>
+                    (K_raw, tile_K, stride_K, k0_start, k_VKQ_sup);
+            } else if constexpr (type_K == GGML_TYPE_TURBO5_0) {
+                flash_attn_ext_turbo5_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check>
+                    (K_raw, tile_K, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
                 flash_attn_ext_turbo3_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
@@ -1266,15 +1586,28 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int i0_diff = i0_stop - i0_start;
             // turbo4 V: stride_V is a RAW BYTE pitch (nb21), V_is_K_view is false.
             // Dequantize the V (sub)tile of columns [i0_start/2, ...) into SRAM, then sync.
-            static_assert(type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0,
-                          "only turbo2/3/4 V supported on the MMA turbo path");
+            static_assert(type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 ||
+                          type_V == GGML_TYPE_TURBO5_0 || type_V == GGML_TYPE_TURBO6_0,
+                          "only turbo2/3/4, turbo6 or turbo5 V supported on the MMA turbo path");
             static_assert(!V_is_K_view, "turbo MMA path never uses V_is_K_view");
             static_assert(nbatch_V2 == DV/2, "turbo MMA load assumes full-row V tiles (nbatch_V2==DV/2)");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * V_raw = (const char *) V_h2 + int64_t(k_VKQ_0) * stride_V;
             if constexpr (type_V == GGML_TYPE_TURBO4_0) {
-                flash_attn_ext_turbo4_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
-                    (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+                if constexpr (type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0) {
+                    // turbo6/turbo5 K only ever pairs with full-row V tiles, so the wider flat loader applies
+                    flash_attn_ext_turbo4_load_tile_flat<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
+                        (V_raw, tile_V, stride_V, i0_start/2, k_VKQ_sup);
+                } else {
+                    flash_attn_ext_turbo4_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
+                        (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+                }
+            } else if constexpr (type_V == GGML_TYPE_TURBO6_0) {
+                flash_attn_ext_turbo6_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
+                    (V_raw, tile_V, stride_V, i0_start/2, k_VKQ_sup);
+            } else if constexpr (type_V == GGML_TYPE_TURBO5_0) {
+                flash_attn_ext_turbo5_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
+                    (V_raw, tile_V, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
                 flash_attn_ext_turbo3_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);

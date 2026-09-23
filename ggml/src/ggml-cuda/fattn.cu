@@ -808,12 +808,13 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_t
     // TurboQuant cross-type native kernels are only instantiated for a
     // deliberately narrow set of pairings (turbo K/V combined with {f16,
     // q8_0} and with each other) - see fattn-vec.cuh's EXTERN_DECL_FATTN_VEC_CASE
-    // blocks for turbo2/3/4. Every other case below must be compile-time
+    // blocks for turbo2/3/4/5/6. Every other case below must be compile-time
     // excluded (if constexpr, not a runtime check) whenever it isn't one of
     // those instantiated pairs, or taking the function's address would be an
     // undefined reference at link time for a pairing nobody built.
     constexpr bool k_is_turbo =
-        type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0;
+        type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
+        type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0;
     switch (type_v) {
         case GGML_TYPE_F16:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
@@ -869,6 +870,18 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_t
                     KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TURBO4_0>;
             }
             return nullptr;
+        case GGML_TYPE_TURBO5_0:
+            if constexpr (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || k_is_turbo) {
+                return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                    KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TURBO5_0>;
+            }
+            return nullptr;
+        case GGML_TYPE_TURBO6_0:
+            if constexpr (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || k_is_turbo) {
+                return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                    KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TURBO6_0>;
+            }
+            return nullptr;
         default:
             return nullptr;
     }
@@ -889,6 +902,8 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO2_0);
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO3_0);
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO4_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO5_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO6_0);
         default: return nullptr;
     }
 #undef KV_STREAM_NATIVE_K_CASE
@@ -935,7 +950,7 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // TurboQuant: WHT-rotated, per-group nearest-centroid quantized K/V
         // types. Real backing storage (storage=true falls out below, since
         // they aren't the Q8_1/Q8_K auxiliary types), writable directly from
-        // F32 via set_rows_cuda_turbo{2,3,4} (set-rows.cu), and dequantizable
+        // F32 via set_rows_cuda_turbo{2,3,4,5,6} (set-rows.cu), and dequantizable
         // to F16 via ggml_get_to_fp16_cuda (convert.cu) - so they qualify for
         // ATTENTION_F16 mode below whenever direct_attention isn't available
         // for a given pair (see the direct_attention switch below - a native
@@ -948,6 +963,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.classified = true;
             break;
         default:
@@ -969,6 +986,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.online_write = true;
             break;
         default:
@@ -1005,6 +1024,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.decode_f16 = true;
             break;
         default:
@@ -1025,13 +1046,15 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // non-streaming FA dispatch - the comment above the `classified`
         // switch previously claiming no such kernel exists was stale. Only
         // instantiated for turbo paired with {f16, q8_0, turbo2, turbo3,
-        // turbo4} (see kv_stream_resolve_native_partial_for_v below, which
+        // turbo4, turbo5, turbo6} (see kv_stream_resolve_native_partial_for_v below, which
         // gates on exactly this set); other pairings fall back to
         // ATTENTION_F16 via the storage/online_write/decode_f16 capabilities
         // set above.
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.direct_attention = true;
             break;
         default:
@@ -1051,7 +1074,7 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
 // The original direct_attention type set (F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
 // is a fully-connected cross product - every pair among them has a native
 // kernel instantiated. TurboQuant breaks that assumption: turbo only pairs
-// natively with {f16, q8_0, turbo2, turbo3, turbo4} (see
+// natively with {f16, q8_0, turbo2, turbo3, turbo4, turbo5, turbo6} (see
 // kv_stream_resolve_native_partial_for_v above), not with Q4_0/Q4_1/Q5_0/
 // Q5_1/BF16. direct_attention is a per-type capability flag, so without this
 // explicit pairwise check, get_attention_mode would wrongly select DIRECT
@@ -1060,7 +1083,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
 // exactly that.
 static bool kv_stream_direct_attention_pair_supported(ggml_type type_k, ggml_type type_v) {
     const auto is_turbo = [](ggml_type t) {
-        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+               t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
     };
     if (!is_turbo(type_k) && !is_turbo(type_v)) {
         return true;
@@ -1098,7 +1122,8 @@ ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_
 // here would be too small for what llama-kv-cache.cpp actually writes.
 static inline uint32_t ggml_cuda_kv_stream_padded_head_dim(ggml_type type, uint32_t head_dim) {
     const bool is_turbo =
-        type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+        type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+        type == GGML_TYPE_TURBO5_0 || type == GGML_TYPE_TURBO6_0;
     if (!is_turbo) {
         return head_dim;
     }
@@ -2932,6 +2957,62 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
 
+    // turbo5_0 / turbo6_0 KV cache types. Their blocks hold 128 values, so only head dims
+    // 128 and 256 are instantiated. The default build carries the measured pairs; q8_0 K is
+    // included because the auto-asymmetric rule rewrites turbo5/turbo6 K to q8_0 at high GQA.
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO6_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO6_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO6_0,    GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO6_0,    GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO5_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO5_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO5_0,    GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO5_0,    GGML_TYPE_F16)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO5_0)
+
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    // Unmeasured turbo5_0 / turbo6_0 cross pairs.
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_F16,      GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_F16,      GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_F16,      GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_F16,      GGML_TYPE_TURBO5_0)
+#endif // GGML_CUDA_FA_ALL_QUANTS
+
     GGML_ABORT("fatal error");
 }
 
@@ -2964,9 +3045,38 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
             // turbo KV types; head-dim geometry is validated separately in
             // ggml_cuda_get_best_fattn_kernel (multiples of 64 only)
             return true;
+        case GGML_TYPE_TURBO6_0:
+        case GGML_TYPE_TURBO5_0:
+            // turbo6/turbo5 KV types; their blocks hold 128 values, so the head dim must be a
+            // multiple of 128 (checked in ggml_cuda_get_best_fattn_kernel)
+            return true;
         default:
             return false;
     }
+}
+
+// K/V pairs with a turbo5_0 or turbo6_0 side that have vec instances compiled in (see
+// ggml_cuda_flash_attn_ext_vec). Any other pairing would pass the type checks and then abort at decode.
+static bool ggml_cuda_fattn_turbo56_pair_supported(ggml_type k, ggml_type v) {
+    auto is_turbo56 = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
+    };
+    if (!is_turbo56(k) && !is_turbo56(v)) {
+        return true;
+    }
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    auto is_pair_type = [&](ggml_type t) {
+        return is_turbo56(t) || t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+               t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16;
+    };
+    return is_pair_type(k) && is_pair_type(v);
+#else
+    if (is_turbo56(k)) {
+        return v == k || v == GGML_TYPE_TURBO3_0 || v == GGML_TYPE_TURBO4_0 || v == GGML_TYPE_Q8_0 || v == GGML_TYPE_F16 ||
+               (k == GGML_TYPE_TURBO6_0 && v == GGML_TYPE_TURBO5_0);
+    }
+    return k == GGML_TYPE_Q8_0;
+#endif // GGML_CUDA_FA_ALL_QUANTS
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -3062,12 +3172,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type != V->type) {
         // Allow mixed KV types for combinations that have FA template instances compiled in:
         // - turbo2/3/4 + q8_0 (turbo cache work)
+        // - turbo5_0/turbo6_0 pairs listed in ggml_cuda_fattn_turbo56_pair_supported
         // - f16/bf16 + q8_0 (common K=f16, V=q8_0 setup)
         auto is_kv_compat = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
+                || t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0
                 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
         };
         if (!is_kv_compat(K->type) || !is_kv_compat(V->type)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // bf16 only has mixed vec instances with q8_0
+        if ((K->type == GGML_TYPE_BF16 && V->type != GGML_TYPE_Q8_0) ||
+            (V->type == GGML_TYPE_BF16 && K->type != GGML_TYPE_Q8_0)) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
@@ -3084,6 +3201,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         };
         if ((is_turbo(K->type) && K->ne[0] % 64 != 0) ||
             (is_turbo(V->type) && V->ne[0] % 64 != 0)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // turbo5_0/turbo6_0 pack 128 values per block and are instantiated for head dims 128 and 256 only
+        auto is_turbo56 = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
+        };
+        auto turbo56_head_size_ok = [](int64_t ne0) {
+            return ne0 == 128 || ne0 == 256;
+        };
+        if ((is_turbo56(K->type) && !turbo56_head_size_ok(K->ne[0])) ||
+            (is_turbo56(V->type) && !turbo56_head_size_ok(V->ne[0]))) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (!ggml_cuda_fattn_turbo56_pair_supported(K->type, V->type)) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
@@ -3268,15 +3399,42 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const bool turbo_matched = (K->type == V->type &&
-            (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0));
+        const bool turbo_matched =
+            (K->type == V->type &&
+             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 ||
+              K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0)) ||
+            // turbo6_0 / turbo5_0 K over a turbo3 V: the pair they are meant for, K and V decoded by
+            // their own tile loaders into the same GQA-packed tile.
+            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO3_0) ||
+            // turbo4 V under a turbo6_0 / turbo5_0 K, and turbo5_0 V under a turbo6_0 K (head dim 256 only)
+            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
+            (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0 && Q->ne[0] == 256);
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
+            if (V->type == GGML_TYPE_TURBO3_0 && (K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0)) {
+                if (Q->ne[0] == 128) {
+                    if (K->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
+                    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                }
+                if (Q->ne[0] == 256) {
+                    if (K->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
+                    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                }
+            }
+            if (Q->ne[0] == 256 && V->type == GGML_TYPE_TURBO4_0) {
+                if (K->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
+                if (K->type == GGML_TYPE_TURBO5_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
+            }
+            if (Q->ne[0] == 256 && K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0) {
+                ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0>(ctx, dst); return;
+            }
             if (Q->ne[0] == 128) {
                 switch (K->type) {
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
+                    case GGML_TYPE_TURBO6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO6_0>(ctx, dst); return;
+                    case GGML_TYPE_TURBO5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO5_0>(ctx, dst); return;
                     default: break;
                 }
             }
@@ -3284,6 +3442,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 switch (K->type) {
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                    case GGML_TYPE_TURBO6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO6_0>(ctx, dst); return;
+                    case GGML_TYPE_TURBO5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO5_0>(ctx, dst); return;
                     // turbo2 + head_dim 256: intentionally NO fused case (routes to VEC via
                     // default below). At 2-bit KV the fused path's GQA-pack saving is tiny while the
                     // dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and

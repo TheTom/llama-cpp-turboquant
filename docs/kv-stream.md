@@ -82,7 +82,7 @@ inside cache construction.
 Streamed attention picks between two CUDA code paths per (K type, V type)
 pair, independent of everything else in this document:
 
-- **`direct_attention`** - the same native turbo2/3/4 kernel (and the
+- **`direct_attention`** - the same native turbo2/3/4/5/6 kernel (and the
   classic F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 kernels) ordinary non-streamed
   Flash Attention already uses, adapted to read resident/streamed pages
   directly. No extra workspace, no precision loss beyond the KV type's own
