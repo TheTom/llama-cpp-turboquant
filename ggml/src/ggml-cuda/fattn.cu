@@ -808,12 +808,13 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_t
     // TurboQuant cross-type native kernels are only instantiated for a
     // deliberately narrow set of pairings (turbo K/V combined with {f16,
     // q8_0} and with each other) - see fattn-vec.cuh's EXTERN_DECL_FATTN_VEC_CASE
-    // blocks for turbo2/3/4. Every other case below must be compile-time
+    // blocks for turbo2/3/4/5/6. Every other case below must be compile-time
     // excluded (if constexpr, not a runtime check) whenever it isn't one of
     // those instantiated pairs, or taking the function's address would be an
     // undefined reference at link time for a pairing nobody built.
     constexpr bool k_is_turbo =
-        type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0;
+        type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
+        type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0;
     switch (type_v) {
         case GGML_TYPE_F16:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
@@ -869,6 +870,18 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_t
                     KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TURBO4_0>;
             }
             return nullptr;
+        case GGML_TYPE_TURBO5_0:
+            if constexpr (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || k_is_turbo) {
+                return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                    KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TURBO5_0>;
+            }
+            return nullptr;
+        case GGML_TYPE_TURBO6_0:
+            if constexpr (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || k_is_turbo) {
+                return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                    KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TURBO6_0>;
+            }
+            return nullptr;
         default:
             return nullptr;
     }
@@ -889,6 +902,8 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO2_0);
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO3_0);
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO4_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO5_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO6_0);
         default: return nullptr;
     }
 #undef KV_STREAM_NATIVE_K_CASE
@@ -935,7 +950,7 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // TurboQuant: WHT-rotated, per-group nearest-centroid quantized K/V
         // types. Real backing storage (storage=true falls out below, since
         // they aren't the Q8_1/Q8_K auxiliary types), writable directly from
-        // F32 via set_rows_cuda_turbo{2,3,4} (set-rows.cu), and dequantizable
+        // F32 via set_rows_cuda_turbo{2,3,4,5,6} (set-rows.cu), and dequantizable
         // to F16 via ggml_get_to_fp16_cuda (convert.cu) - so they qualify for
         // ATTENTION_F16 mode below whenever direct_attention isn't available
         // for a given pair (see the direct_attention switch below - a native
@@ -948,6 +963,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.classified = true;
             break;
         default:
@@ -969,6 +986,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.online_write = true;
             break;
         default:
@@ -1005,6 +1024,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.decode_f16 = true;
             break;
         default:
@@ -1025,13 +1046,15 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // non-streaming FA dispatch - the comment above the `classified`
         // switch previously claiming no such kernel exists was stale. Only
         // instantiated for turbo paired with {f16, q8_0, turbo2, turbo3,
-        // turbo4} (see kv_stream_resolve_native_partial_for_v below, which
+        // turbo4, turbo5, turbo6} (see kv_stream_resolve_native_partial_for_v below, which
         // gates on exactly this set); other pairings fall back to
         // ATTENTION_F16 via the storage/online_write/decode_f16 capabilities
         // set above.
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             result.direct_attention = true;
             break;
         default:
@@ -1051,7 +1074,7 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
 // The original direct_attention type set (F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
 // is a fully-connected cross product - every pair among them has a native
 // kernel instantiated. TurboQuant breaks that assumption: turbo only pairs
-// natively with {f16, q8_0, turbo2, turbo3, turbo4} (see
+// natively with {f16, q8_0, turbo2, turbo3, turbo4, turbo5, turbo6} (see
 // kv_stream_resolve_native_partial_for_v above), not with Q4_0/Q4_1/Q5_0/
 // Q5_1/BF16. direct_attention is a per-type capability flag, so without this
 // explicit pairwise check, get_attention_mode would wrongly select DIRECT
@@ -1060,7 +1083,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
 // exactly that.
 static bool kv_stream_direct_attention_pair_supported(ggml_type type_k, ggml_type type_v) {
     const auto is_turbo = [](ggml_type t) {
-        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+               t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
     };
     if (!is_turbo(type_k) && !is_turbo(type_v)) {
         return true;
@@ -1098,7 +1122,8 @@ ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_
 // here would be too small for what llama-kv-cache.cpp actually writes.
 static inline uint32_t ggml_cuda_kv_stream_padded_head_dim(ggml_type type, uint32_t head_dim) {
     const bool is_turbo =
-        type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+        type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+        type == GGML_TYPE_TURBO5_0 || type == GGML_TYPE_TURBO6_0;
     if (!is_turbo) {
         return head_dim;
     }
