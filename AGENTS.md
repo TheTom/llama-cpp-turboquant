@@ -2,34 +2,39 @@
 
 ## Project Overview
 
-This repo is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (upstream) that adds the TurboQuant feature set on top of an upstream base. Upstream changes are cherry-picked selectively, on an ongoing basis, where they add benefit (new model shapes, bug fixes, features that interact with the turbo paths); the tree is NOT required to contain all of upstream master, and upstream is not merged wholesale.
+This repo is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (upstream) that adds the TurboQuant feature set on top of an upstream base. Upstream work is normally cherry-picked where it adds benefit (new model shapes, bug fixes, features that interact with the turbo paths); the tree is NOT required to contain all of upstream master. History has one wholesale sync, `a34005435` (upstream `15586e2d7`, 2026-08-10, PR #287), so do not claim bulk syncs never happened, and do not assume a commit that exists upstream also exists here (check git log).
 
 ### What TurboQuant adds
 
 TurboQuant compresses the KV cache far beyond the standard `q8_0` by applying a fixed 128x128 orthonormal Walsh-Hadamard rotation (`GGML_OP_TURBO_WHT`) to cache vectors before quantization, which Gaussianizes the distribution, and inverse-rotating after dequantization. Head dims that are not multiples of 128 are zero-padded. MLA models (DeepSeek) have no separate V cache, so V rotation/padding is skipped for them, and K/V cache types must be identical.
 
-The five fork-only GGML types (registered in `ggml/include/ggml.h`):
+The eight fork-only GGML types (registered in `ggml/include/ggml.h`):
 
-| Type   | Enum                       | Purpose                             | Size         |
-|--------|----------------------------|-------------------------------------|--------------|
-| turbo2 | `GGML_TYPE_TURBO2_0` (43)  | KV cache only                       | 2 bits/value |
-| turbo3 | `GGML_TYPE_TURBO3_0` (44)  | KV cache only                       | 3.25 bits    |
-| turbo4 | `GGML_TYPE_TURBO4_0` (47)  | KV cache only                       | 4.25 bits    |
-| TQ3_1S | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max| 3 bits, block 32 |
-| TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights                       | 4 bits, block 32 |
+| Type   | Enum                       | Purpose                             | Size         | Backends            |
+|--------|----------------------------|-------------------------------------|--------------|---------------------|
+| turbo2 | `GGML_TYPE_TURBO2_0` (43)  | KV cache only                       | 2.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo3 | `GGML_TYPE_TURBO3_0` (44)  | KV cache only                       | 3.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo4 | `GGML_TYPE_TURBO4_0` (47)  | KV cache only                       | 4.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| TQ3_1S | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max| 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
+| TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max| 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
+| Q8_CR  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot              | 8.5 bits, group 256 | CPU, CUDA/HIP, Metal |
+| Q5_CR  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot              | 5.5 bits, group 256 | CPU, CUDA/HIP, Metal |
+| Q6_CR  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot              | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
 
-Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S are first-class weight types with CPU, CUDA/HIP (warp-cooperative mmvq), Metal, Vulkan, and SYCL kernels, exposed as `llama-quantize` targets.
+The turbo blocks hold 128 values each (34, 50, 66 bytes); the `static_assert`s in `ggml/src/ggml-common.h` are the authority, not the struct comments. ggml-sycl has no TQ weight kernels (TQ tensors fall back to CPU there) and Vulkan/SYCL reject the `*_CR` types in `supports_op`.
+
+Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S and Q8_CR/Q5_CR/Q6_CR are `llama-quantize` targets.
 
 ### Key files
 
 - `ggml/src/ggml-turbo-quant.c` - the codec (keep byte-identical to fork tip)
-- `ggml/include/ggml.h` - type enum 43-47, `GGML_OP_TURBO_WHT`
+- `ggml/include/ggml.h` - type enum 43-50, `GGML_OP_TURBO_WHT`
 - `src/llama-kv-cache.cpp` - cache wiring, `get_k_idx`, layer-adaptive precision
 - `src/llama-graph.cpp` - inverse-WHT post-processing (FA and non-FA paths)
-- `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (`GGML_TQ_NATIVE=1`)
+- `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (only reached with `GGML_TQ_NATIVE=1`; by default `TQ4_1S` is converted to `q8_0` at load in `ggml-cuda.cu`)
 - `ggml/src/ggml-vulkan/` - turbo FA, SET_ROWS, dequant shaders
 - `ggml/src/ggml-metal/ggml-metal.metal` - TurboFlash kernels
-- `docs/KV-cache-quantization.md` - authoritative usage doc (read before touching cache types)
+- `docs/KV-cache-quantization.md` - usage doc (read before touching cache types; its "Environment knobs" section is currently shorter than the table above and needs a refresh)
 
 ### Usage
 
@@ -37,17 +42,31 @@ Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S are firs
 llama-cli -m model.gguf -c 8192 -ngl 99 --cache-type-k q8_0 --cache-type-v turbo3
 ```
 
-Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is supported. Turbo cache types require flash attention; it is auto-enabled with a warning. Quantized V with FA explicitly disabled is an error (upstream behavior). The same flags work in `llama-server`, `llama-bench`, `llama-perplexity`.
+Any combination of `f32`/`f16`/`bf16`/`q8_0`/`q4_0`/`q4_1`/`iq4_nl`/`q5_0`/`q5_1`/`turbo2`/`turbo3`/`turbo4` for K and V is supported. Turbo cache types require flash attention; it is auto-enabled with a warning before upstream's quantized-V check runs, so a turbo V cache never trips that error (it applies to the other quantized V types). On Metal, flash attention asserts unless the mixed K/V pair is turbo+turbo, turbo+q8_0 or q8_0+turbo. The same flags work in `llama-server`, `llama-bench`, `llama-perplexity`.
 
 ### Environment knobs
 
-The "Environment knobs" section of `docs/KV-cache-quantization.md` is the single source of truth: variable names, defaults and semantics live there, not in this file. Do not maintain a second copy here or in PR descriptions; the README may carry a user-facing summary table, but it must stay labeled as a summary and must not add variables, defaults or semantics the doc does not state. Knobs an agent most often touches: `TURBO_LAYER_ADAPTIVE`, `TURBO_AUTO_ASYMMETRIC`, `TURBO_SPARSE_V`, `GGML_TQ_NATIVE`, `GGML_CUDA_FUSE_CHAIN`, `GGML_CUDA_Q8CACHE`, and the `LLAMA_ATTN_ROT_*` variables. Read the doc for current defaults before setting or documenting any of them.
+This table is the source of truth for variable names, defaults and semantics. `docs/KV-cache-quantization.md` carries a user-facing copy of it; if the two ever disagree, the code wins and both need fixing in the same PR. Do not document a knob only in a PR description.
+
+| Variable                    | Default | Effect |
+|-----------------------------|---------|--------|
+| `TURBO_LAYER_ADAPTIVE`      | auto    | Layer-adaptive KV precision, see below |
+| `TURBO_AUTO_ASYMMETRIC`     | `1`     | Auto-select asymmetric K/V types for large-GQA models (`0` disables) |
+| `TURBO_SPARSE_V`            | `1`     | Sparse-V dequant skip in flash attention, Metal and `turbo3` V only (`0` disables) |
+| `GGML_TQ_NATIVE`            | unset   | CUDA: `1` keeps `TQ4_1S` weights native and uses the fused TQ kernels instead of converting them to `q8_0` at load; decode about 30% faster and weight VRAM about 1.7x smaller, prefill about 2x slower |
+| `GGML_CUDA_FUSE_CHAIN`      | unset   | CUDA: `0` disables elementwise chain fusion, so ADD/MUL/DIV/SCALE/CLAMP/SQR and the SILU/SIGMOID/SOFTPLUS/GELU/RELU/NEG unaries run as separate kernels |
+| `GGML_CUDA_Q8CACHE`         | unset   | CUDA: `0` disables the per-graph shared `q8_1` activation cache in `mmvq`, so a repeated activation is quantized again per use |
+| `LLAMA_ATTN_ROT_K_OVERRIDE` / `LLAMA_ATTN_ROT_V_OVERRIDE` | off | Optional upstream attention rotation for K / V (TurboQuant manages its own rotation); needs a quantized type and a head dim that is a multiple of 64 |
+| `LLAMA_ATTN_ROT_K_NROT`     | `64`    | Rotation tile size for the optional upstream K path (`0` = upstream's largest power-of-two divisor of the head dim) |
+| `LLAMA_ATTN_ROT_DISABLE`    | `0`     | Hard lock-out: force rotation off on both sides (`1` disables) |
+
+`TURBO_LAYER_ADAPTIVE` is not simply `0`. With the variable unset, Boundary V (mode 7) turns on automatically when the V cache type is `turbo2` and the model has 8 or more layers: the first two and last two V layers become `q8_0` and every other V layer becomes `turbo2`. `TURBO_LAYER_ADAPTIVE=0` opts out. Setting the variable explicitly selects the mode, and modes 5, 6 and 7 assign the V type per layer regardless of `-ctv`: mode 7 on a `-ctv turbo3` or `-ctv turbo4` run downgrades the non-edge V layers to `turbo2`. The full mode legend is in `src/llama-kv-cache.cpp` (`kv_adaptive_mode`).
 
 ### Test gates (all must pass before touching quant/backend code)
 
 - `test-turbo-quant` - turbo3 basis MSE=0/Cosine=1.0, turbo4 Cosine=0.9956
 - `test-quantize-fns` - includes TQ3_1S/TQ4_1S and rotated-domain buffer sizing
-- `test-backend-ops` - full sweep on CPU + CUDA0 (23k+ cases on the RTX 5090 dev box); rejects 0/0 as FAIL
+- `test-backend-ops` - full sweep on the GPU backends under test (CUDA0 and the AMD card on the dev box; 23k+ cases on the RTX 5090); CPU is the reference and is skipped unless `-b CPU`; rejects 0/0 as FAIL
 - `llama-bench` with `-ctk/-ctv turboN`; type parser accepts `tq3_1s`/`tq4_1s`
 
 ### Validation by change type
@@ -56,14 +75,16 @@ Use the narrowest set of gates that covers the change, with CPU as the numeric r
 
 | Change                                                      | Required checks |
 |-------------------------------------------------------------|-----------------|
-| Codec `ggml/src/ggml-turbo-quant.c`                         | `test-turbo-quant`, `test-quantize-fns`, `test-backend-ops` (CPU) |
-| TQ/Turbo CUDA kernels (`ggml/src/ggml-cuda/`, `mmvq-tq.cu`) | `test-backend-ops` `-o MUL_MAT -p type_a=tq4_1s` (or the matching turbo op) on an NVIDIA card AND the AMD run; a clean compile is not a pass |
+| Codec `ggml/src/ggml-turbo-quant.c`                         | `test-turbo-quant` and `test-quantize-fns`, the two suites that execute the CPU codec directly |
+| TQ/Turbo CUDA kernels (`ggml/src/ggml-cuda/`, `mmvq-tq.cu`) | `test-backend-ops` `-o MUL_MAT -p type_a=tq4_1s` (or the matching turbo op) on an NVIDIA card; a clean compile is not a pass. Changes to the `mmvq-tq.cu` centroid LUT additionally require the AMD run (see Known pitfalls) |
 | Metal kernels (`ggml/src/ggml-metal/ggml-metal.metal`)      | `[[host_name]]` instantiations present, then `test-backend-ops` with the Metal backend |
 | Vulkan shaders (`ggml/src/ggml-vulkan/`)                    | SET_ROWS pipeline registration incl. TURBO2_0/3_0/4_0, then `test-backend-ops` with the Vulkan backend |
-| Cache/graph wiring (`src/llama-kv-cache.cpp`, `src/llama-graph.cpp`) | `test-backend-ops`, `llama-bench -ctk/-ctv turboN`, and `llama-perplexity --kl-divergence` for any change that can move token probabilities |
+| Cache/graph wiring (`src/llama-kv-cache.cpp`, `src/llama-graph.cpp`) | `test-backend-ops`, `llama-bench -ctk/-ctv turboN`, and `llama-perplexity --kl-divergence`: the first two cannot see a `src/` change, only the KL run compares against an `f16` baseline |
 | Docs/README only                                            | no tests |
 
 A change touching several backends requires the checks for all of them, not just the one being developed on.
+
+`test-backend-ops` skips the CPU backend unless `-b CPU` is passed, and `-b CPU` compares the CPU reference against itself, so it is a crash/NaN smoke check and not a numeric gate. Use `-b CUDA0` (or the relevant device) for anything numeric.
 
 ### What the test gates do and do not cover
 
@@ -90,19 +111,16 @@ A green run means the cases that ran passed, not that your change was exercised.
 
 - Remotes: `origin` = TheTom/llama-cpp-turboquant (this repo); the fork remote tracks the upstream TurboQuant fork (same repo, two names); add `upstream` = ggml-org/llama.cpp when syncing
 - Main branches: `feature/turboquant-kv-cache` tracks the upstream TurboQuant fork
-- Upstream is cherry-picked, not merged: when bringing in upstream work, pick the commits/PRs that add benefit and adapt them to the fork; do not bulk-merge upstream master, and do not assume a commit that exists upstream also exists here (check git log)
+- Cherry-picking is the default way to bring upstream work in: pick the commits or PRs that add benefit, adapt them to the fork, and do not assume a commit that exists upstream also exists here (check git log). There has been one wholesale upstream merge, `a34005435` (PR #287); a further one is a deliberate decision, not a default, and should be called out in its PR.
 
 ### Hard rules (no exceptions)
 
-- Never bulk-merge, or rebase onto, upstream master. Upstream enters this tree only as cherry-picked commits that add benefit.
-- Never delete an entry from Known pitfalls: a fixed bug stays as a record of how the regression was missed.
 - Never report a test gate as green when your change's cases did not run: 0/0, a filter that matched nothing, or `not supported [backend]` lines are failures of verification, not passes.
 - Never store turbo KV cache types in a GGUF file. They are runtime-only by design.
-- Never run a quantized V cache with flash attention explicitly disabled. That combination is a hard error on purpose.
 
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
-Direction rules for the two living lists: Known pitfalls may only grow (see Hard rules). Coverage limits may only shrink: remove an entry only when a new test actually exercises the missed case, and name the test that closed the gap.
+Direction rules for the two living lists: add a Known pitfalls entry as soon as a bug is fixed, so the next reader can recognise the regression; remove one only together with the code or config that made it possible. A Coverage limits entry stays until a new test actually exercises the missed case: remove it in the PR that closes the gap, and name the test that closed it.
 
 - **Metal**: turbo kernels need their `[[host_name]]` instantiations; a missing one is a NULL-pipeline deref on the first turbo KV write.
 - **Vulkan**: SET_ROWS pipeline registration must include TURBO2_0/3_0/4_0 with `require_full_subgroups=true, subgroup_size=32`, or every turbo KV write aborts.
