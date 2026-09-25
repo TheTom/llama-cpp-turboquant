@@ -49,12 +49,13 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ASSERT(V->ne[0] == K->ne[0]);
             ggml_cuda_flash_attn_ext_tile_case<512, 512>(ctx, dst);
         } break;
-#ifndef GGML_USE_HIP
-        // D>=576 tile kernels exceed HIP local memory limit (67584 > 65536)
+        // 576 fits: at ncols=32 the fp16 path needs 63488 B of LDS. Only 640 overflows
+        // (67584 > 65536), which is the figure the original guard was measuring.
         case 576: {
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_tile_case<576, 512>(ctx, dst);
         } break;
+#ifndef GGML_USE_HIP
         case 640: {
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_tile_case<640, 512>(ctx, dst);
