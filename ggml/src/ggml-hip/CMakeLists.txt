@@ -62,8 +62,9 @@ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
-# Exclude D>=576 tile kernels: exceed HIP local memory limit (67584 > 65536)
-list(FILTER SRCS EXCLUDE REGEX "dkq(576|640)")
+# Exclude the D=640 tile kernel: at ncols=32 the fp16 path needs 67584 B of LDS
+# against a 65536 B limit. D=576 needs 63488 B at the same config and does fit.
+list(FILTER SRCS EXCLUDE REGEX "dkq640")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
