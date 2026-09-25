@@ -21,7 +21,7 @@ The eight fork-only GGML types (registered in `ggml/include/ggml.h`):
 | Q5_CR  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot              | 5.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q6_CR  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot              | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
 
-The turbo blocks hold 128 values each (34, 50, 66 bytes); the `static_assert`s in `ggml/src/ggml-common.h` are the authority, not the struct comments. ggml-sycl has no TQ weight kernels (TQ tensors fall back to CPU there) and Vulkan/SYCL reject the `*_CR` types in `supports_op`.
+The turbo blocks hold 128 values each (34, 50, 66 bytes); the `static_assert`s in `ggml/src/ggml-common.h` are the authority, not the struct comments. ggml-sycl has no TQ weight kernels, and its generic dequantize path leaves TQ weights in the WHT-rotated domain, so TQ models are unsupported there. Vulkan and SYCL reject the `*_CR` types in `supports_op`.
 
 Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S and Q8_CR/Q5_CR/Q6_CR are `llama-quantize` targets.
 
@@ -66,7 +66,7 @@ This table is the source of truth for variable names, defaults and semantics. `d
 
 - `test-turbo-quant` - turbo3 basis MSE=0/Cosine=1.0, turbo4 Cosine=0.9956
 - `test-quantize-fns` - includes TQ3_1S/TQ4_1S and rotated-domain buffer sizing
-- `test-backend-ops` - full sweep on the GPU backends under test (CUDA0 and the AMD card on the dev box; 23k+ cases on the RTX 5090); CPU is the reference and is skipped unless `-b CPU`; rejects 0/0 as FAIL
+- `test-backend-ops` - full sweep on the backend under test (23k+ cases on the RTX 5090 CUDA box; the same cases on the MI210 AMD box when CUDA/HIP kernels changed); CPU is the numeric reference and is skipped unless `-b CPU`; rejects 0/0 as FAIL
 - `llama-bench` with `-ctk/-ctv turboN`; type parser accepts `tq3_1s`/`tq4_1s`
 
 ### Validation by change type
@@ -79,7 +79,7 @@ Use the narrowest set of gates that covers the change, with CPU as the numeric r
 | TQ/Turbo CUDA kernels (`ggml/src/ggml-cuda/`, `mmvq-tq.cu`) | `test-backend-ops` `-o MUL_MAT -p type_a=tq4_1s` (or the matching turbo op) on an NVIDIA card; a clean compile is not a pass. Changes to the `mmvq-tq.cu` centroid LUT additionally require the AMD run (see Known pitfalls) |
 | Metal kernels (`ggml/src/ggml-metal/ggml-metal.metal`)      | `[[host_name]]` instantiations present, then `test-backend-ops` with the Metal backend |
 | Vulkan shaders (`ggml/src/ggml-vulkan/`)                    | SET_ROWS pipeline registration incl. TURBO2_0/3_0/4_0, then `test-backend-ops` with the Vulkan backend |
-| Cache/graph wiring (`src/llama-kv-cache.cpp`, `src/llama-graph.cpp`) | `test-backend-ops`, `llama-bench -ctk/-ctv turboN`, and `llama-perplexity --kl-divergence`: the first two cannot see a `src/` change, only the KL run compares against an `f16` baseline |
+| Cache/graph wiring (`src/llama-kv-cache.cpp`, `src/llama-graph.cpp`) | `test-backend-ops`, `llama-bench -ctk/-ctv turboN`, and `llama-perplexity --kl-divergence` against a saved baseline run (usually `f16`): the first two only exercise the kernels, only the KL run compares token probabilities |
 | Docs/README only                                            | no tests |
 
 A change touching several backends requires the checks for all of them, not just the one being developed on.
