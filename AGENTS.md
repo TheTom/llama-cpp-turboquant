@@ -120,7 +120,7 @@ A green run means the cases that ran passed, not that your change was exercised.
 
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
-Direction rules for the two living lists: add a Known pitfalls entry as soon as a bug is fixed, so the next reader can recognise the regression; remove one only together with the code or config that made it possible. A Coverage limits entry stays until a new test actually exercises the missed case: remove it in the PR that closes the gap, and name the test that closed it.
+Direction rules for the two living lists: both grow freely. Add an entry as soon as a bug is fixed, so the next reader recognises the regression. Remove an entry only in the PR that closes its gap - the new test that now exercises the missed case, or the change that removed the cause - and name it in the entry.
 
 - **Metal**: turbo kernels need their `[[host_name]]` instantiations; a missing one is a NULL-pipeline deref on the first turbo KV write.
 - **Vulkan**: SET_ROWS pipeline registration must include TURBO2_0/3_0/4_0 with `require_full_subgroups=true, subgroup_size=32`, or every turbo KV write aborts.
