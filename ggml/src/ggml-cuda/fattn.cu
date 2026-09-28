@@ -3041,12 +3041,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
-        case 576:
         case 640:
 #ifdef GGML_USE_HIP
-            // The matching tile kernels exceed HIP's local memory limit and are not compiled.
+            // The D=640 tile kernel exceeds HIP's local memory limit and is not compiled:
+            // at ncols=32 the fp16 path needs 67584 B against a 65536 B limit. D=576 needs
+            // 63488 B at the same config and is compiled, so it is handled above.
             return BEST_FATTN_KERNEL_NONE;
 #endif
+        case 576:
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
             }
