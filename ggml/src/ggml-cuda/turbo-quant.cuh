@@ -17,6 +17,8 @@
 #define QR_TURBO3 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO2 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO4 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
+#define QR_TURBO6    1  // Each dequantize call produces 2 consecutive elements (like q8_0)
+#define QR_TURBO5    1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 
 // ---- 2-bit centroids (Lloyd-Max for N(0, 1/128)) ----
 
@@ -362,6 +364,138 @@ static __device__ __forceinline__ float turbo4_dequant_element(
         const block_turbo4_0 * __restrict__ x, int j, float norm) {
     uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
     return TURBO_CENTROIDS_4BIT[idx] * norm;
+}
+
+// ---- TURBO6: 64 centroids (Lloyd-Max for N(0, 1/128)), mirrored from ggml-turbo-quant.c ----
+
+static __constant__ float TURBO6_CENTROIDS[64] = {
+    -0.330935f, -0.286417f, -0.257865f, -0.236198f,
+    -0.218435f, -0.203203f, -0.189753f, -0.177626f,
+    -0.166522f, -0.156230f, -0.146600f, -0.137517f,
+    -0.128895f, -0.120663f, -0.112765f, -0.105157f,
+    -0.097801f, -0.090663f, -0.083717f, -0.076940f,
+    -0.070310f, -0.063809f, -0.057422f, -0.051133f,
+    -0.044929f, -0.038798f, -0.032729f, -0.026710f,
+    -0.020733f, -0.014787f, -0.008863f, -0.002953f,
+     0.002953f,  0.008863f,  0.014787f,  0.020733f,
+     0.026710f,  0.032729f,  0.038798f,  0.044929f,
+     0.051133f,  0.057422f,  0.063809f,  0.070310f,
+     0.076940f,  0.083717f,  0.090663f,  0.097801f,
+     0.105157f,  0.112765f,  0.120663f,  0.128895f,
+     0.137517f,  0.146600f,  0.156230f,  0.166522f,
+     0.177626f,  0.189753f,  0.203203f,  0.218435f,
+     0.236198f,  0.257865f,  0.286417f,  0.330935f
+};
+
+// ---- Midpoints for nearest 6-bit centroid lookup ----
+
+static __constant__ float TURBO6_MID[63] = {
+    -0.308676f, -0.272141f, -0.247031f, -0.227316f,
+    -0.210819f, -0.196478f, -0.183690f, -0.172074f,
+    -0.161376f, -0.151415f, -0.142059f, -0.133206f,
+    -0.124779f, -0.116714f, -0.108961f, -0.101479f,
+    -0.094232f, -0.087190f, -0.080329f, -0.073625f,
+    -0.067060f, -0.060616f, -0.054277f, -0.048031f,
+    -0.041864f, -0.035763f, -0.029719f, -0.023722f,
+    -0.017760f, -0.011825f, -0.005908f,  0.000000f,
+     0.005908f,  0.011825f,  0.017760f,  0.023722f,
+     0.029719f,  0.035763f,  0.041864f,  0.048031f,
+     0.054277f,  0.060616f,  0.067060f,  0.073625f,
+     0.080329f,  0.087190f,  0.094232f,  0.101479f,
+     0.108961f,  0.116714f,  0.124779f,  0.133206f,
+     0.142059f,  0.151415f,  0.161376f,  0.172074f,
+     0.183690f,  0.196478f,  0.210819f,  0.227316f,
+     0.247031f,  0.272141f,  0.308676f
+};
+
+// ---- Nearest 6-bit centroid index ----
+//
+// 6-step binary search over the midpoints, not the if/else ladder the 2/3/4-bit
+// codebooks use: 63 sequential compares would cost more than the search.
+// Same result as nearest_centroid_6bit in ggml-turbo-quant.c.
+
+static __device__ __forceinline__ uint8_t turbo6_nearest_centroid(float val) {
+    int lo = 0;
+    int hi = 63;
+#pragma unroll
+    for (int step = 0; step < 6; ++step) {
+        const int mid = (lo + hi) / 2;
+        if (val < TURBO6_MID[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return (uint8_t) lo;
+}
+
+// ---- Inline dequant helper: extract one float from turbo6 block ----
+
+static __device__ __forceinline__ float turbo6_dequant_element(
+        const block_turbo6_0 * __restrict__ x, int j, float norm) {
+    uint8_t lo = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    uint8_t hi = (x->qh[j / 4] >> ((j % 4) * 2)) & 0x3;
+    return TURBO6_CENTROIDS[lo | (hi << 4)] * norm;
+}
+
+// ---- TURBO5: 32 centroids (Lloyd-Max for N(0, 1/128)), mirrored from ggml-turbo-quant.c ----
+
+static __constant__ float TURBO5_CENTROIDS[32] = {
+    -0.288236f, -0.237892f, -0.204892f, -0.179348f,
+    -0.158003f, -0.139353f, -0.122569f, -0.107141f,
+    -0.092730f, -0.079097f, -0.066064f, -0.053491f,
+    -0.041269f, -0.029304f, -0.017515f, -0.005827f,
+     0.005827f,  0.017515f,  0.029304f,  0.041269f,
+     0.053491f,  0.066064f,  0.079097f,  0.092730f,
+     0.107141f,  0.122569f,  0.139353f,  0.158003f,
+     0.179348f,  0.204892f,  0.237892f,  0.288236f
+};
+
+// ---- Midpoints for nearest 5-bit centroid lookup ----
+
+static __constant__ float TURBO5_MID[31] = {
+    -0.263064f, -0.221392f, -0.192120f, -0.168675f,
+    -0.148678f, -0.130961f, -0.114855f, -0.099935f,
+    -0.085914f, -0.072580f, -0.059778f, -0.047380f,
+    -0.035287f, -0.023410f, -0.011671f,  0.000000f,
+     0.011671f,  0.023410f,  0.035287f,  0.047380f,
+     0.059778f,  0.072580f,  0.085914f,  0.099935f,
+     0.114855f,  0.130961f,  0.148678f,  0.168675f,
+     0.192120f,  0.221392f,  0.263064f
+};
+
+// Same result as nearest_centroid_5bit in ggml-turbo-quant.c (5-step binary search).
+
+static __device__ __forceinline__ uint8_t turbo5_nearest_centroid(float val) {
+    int lo = 0;
+    int hi = 31;
+#pragma unroll
+    for (int step = 0; step < 5; ++step) {
+        const int mid = (lo + hi) / 2;
+        if (val < TURBO5_MID[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return (uint8_t) lo;
+}
+
+// ---- TURBO5 storage is sign-magnitude (see block_turbo5_0): qs nibble = magnitude index m, qh bit = 1 if negative ----
+
+static __device__ __forceinline__ uint8_t turbo5_code_to_mag(uint8_t idx) { return idx >= 16 ? idx - 16 : 15 - idx; }
+static __device__ __forceinline__ uint8_t turbo5_code_to_neg(uint8_t idx) { return idx < 16; }
+static __device__ __forceinline__ uint8_t turbo5_sm_to_code(uint8_t mag, uint8_t neg) {
+    return (uint8_t) ((mag ^ (neg * 0xF)) | ((neg ^ 1) << 4));   // neg ? 15-m : 16+m
+}
+
+// ---- Inline dequant helper: extract one float from turbo5 block ----
+
+static __device__ __forceinline__ float turbo5_dequant_element(
+        const block_turbo5_0 * __restrict__ x, int j, float norm) {
+    const uint8_t mag = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    const uint8_t neg = (x->qh[j / 8] >> (j % 8)) & 0x1;
+    return TURBO5_CENTROIDS[turbo5_sm_to_code(mag, neg)] * norm;
 }
 
 // ---- Nearest 3-bit centroid index ----

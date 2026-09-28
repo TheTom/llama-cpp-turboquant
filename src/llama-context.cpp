@@ -4504,8 +4504,10 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     // TurboQuant cache types require flash attention — auto-enable if disabled
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
         (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 ||
-         params.type_k == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO2_0 ||
-         params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
+         params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO6_0 ||
+         params.type_k == GGML_TYPE_TURBO5_0 || params.type_v == GGML_TYPE_TURBO2_0 ||
+         params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 ||
+         params.type_v == GGML_TYPE_TURBO6_0 || params.type_v == GGML_TYPE_TURBO5_0)) {
         LLAMA_LOG_WARN("%s: turbo cache types require flash_attn — enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
@@ -4524,7 +4526,8 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size  = ggml_blck_size(params.type_k);
         const bool     k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 ||
-                                 params.type_k == GGML_TYPE_TURBO4_0);
+                                 params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO6_0 ||
+                                 params.type_k == GGML_TYPE_TURBO5_0);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
             // Turbo types zero-pad heads to next multiple of 128 in llama-kv-cache.cpp
@@ -4542,7 +4545,8 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size  = ggml_blck_size(params.type_v);
         const bool     v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 ||
-                                 params.type_v == GGML_TYPE_TURBO4_0);
+                                 params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO6_0 ||
+                                 params.type_v == GGML_TYPE_TURBO5_0);
         const bool     is_mla     = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             uint32_t head_v = model->hparams.n_embd_head_v(il);
