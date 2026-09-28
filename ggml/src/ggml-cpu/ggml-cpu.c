@@ -3986,11 +3986,139 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
 // unchanged too and results are bit-identical to the previous implementation.
 #define GGML_TQ_DOT_CHUNK 256
 
+// TurboQuant row dequant for the CPU backend. The ggml-base to_float is scalar (one table load and
+// multiply per value). Here the block norm is folded into the centroid table once per block and 16
+// codes at a time are looked up with an in-register permute. Each output is the same c[idx] * norm
+// product as the scalar path, so results are bit-identical. Tables mirror ggml-turbo-quant.c.
+#if defined(__AVX512F__)
+static const float turbo_cpu_c3[16] = {
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f, 0.021663f, 0.066822f, 0.118786f, 0.190207f,
+};
+static const float turbo_cpu_c4[16] = {
+    -0.241529f, -0.182877f, -0.143016f, -0.111036f, -0.083292f, -0.058050f, -0.034299f, -0.011349f,
+     0.011349f,  0.034299f,  0.058050f,  0.083292f,  0.111036f,  0.143016f,  0.182877f,  0.241529f,
+};
+// turbo5 magnitudes: c[16 + m]; c[15 - m] == -c[16 + m]
+static const float turbo_cpu_c5_mag[16] = {
+     0.005827f,  0.017515f,  0.029304f,  0.041269f,  0.053491f,  0.066064f,  0.079097f,  0.092730f,
+     0.107141f,  0.122569f,  0.139353f,  0.158003f,  0.179348f,  0.204892f,  0.237892f,  0.288236f,
+};
+static const float turbo_cpu_c6[64] = {
+    -0.330935f, -0.286417f, -0.257865f, -0.236198f, -0.218435f, -0.203203f, -0.189753f, -0.177626f,
+    -0.166522f, -0.156230f, -0.146600f, -0.137517f, -0.128895f, -0.120663f, -0.112765f, -0.105157f,
+    -0.097801f, -0.090663f, -0.083717f, -0.076940f, -0.070310f, -0.063809f, -0.057422f, -0.051133f,
+    -0.044929f, -0.038798f, -0.032729f, -0.026710f, -0.020733f, -0.014787f, -0.008863f, -0.002953f,
+     0.002953f,  0.008863f,  0.014787f,  0.020733f,  0.026710f,  0.032729f,  0.038798f,  0.044929f,
+     0.051133f,  0.057422f,  0.063809f,  0.070310f,  0.076940f,  0.083717f,  0.090663f,  0.097801f,
+     0.105157f,  0.112765f,  0.120663f,  0.128895f,  0.137517f,  0.146600f,  0.156230f,  0.166522f,
+     0.177626f,  0.189753f,  0.203203f,  0.218435f,  0.236198f,  0.257865f,  0.286417f,  0.330935f,
+};
+
+// 16 nibbles (8 bytes, element 2i in the low nibble of byte i) -> 16 int32 lanes
+static inline __m512i turbo_cpu_nib16(const uint8_t * p) {
+    const __m128i b = _mm_loadl_epi64((const __m128i *) p);
+    const __m512i w = _mm512_cvtepu8_epi32(_mm_unpacklo_epi8(b, b));
+    return _mm512_and_si512(_mm512_srlv_epi32(w, _mm512_set_epi32(4,0,4,0,4,0,4,0,4,0,4,0,4,0,4,0)),
+                            _mm512_set1_epi32(0xF));
+}
+
+// 16 2-bit fields (4 bytes, element 4i+j at bits 2j of byte i) -> 16 int32 lanes
+static inline __m512i turbo_cpu_crumb16(const uint8_t * p) {
+    int32_t v;
+    memcpy(&v, p, sizeof(v));
+    const __m128i b = _mm_shuffle_epi8(_mm_cvtsi32_si128(v), _mm_set_epi8(3,3,3,3,2,2,2,2,1,1,1,1,0,0,0,0));
+    const __m512i w = _mm512_cvtepu8_epi32(b);
+    return _mm512_and_si512(_mm512_srlv_epi32(w, _mm512_set_epi32(6,4,2,0,6,4,2,0,6,4,2,0,6,4,2,0)),
+                            _mm512_set1_epi32(0x3));
+}
+
+// 16 bits (2 bytes, element i at bit i%8 of byte i/8) -> lane mask
+static inline __mmask16 turbo_cpu_bits16(const uint8_t * p) {
+    uint16_t m;
+    memcpy(&m, p, sizeof(m));
+    return (__mmask16) m;
+}
+
+static void turbo3_to_f32_avx512(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    const __m512 c = _mm512_loadu_ps(turbo_cpu_c3);
+    for (int64_t ib = 0; ib < k / QK_TURBO3; ib++, y += QK_TURBO3) {
+        const __m512 t = _mm512_mul_ps(c, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].norm)));
+        for (int j = 0; j < QK_TURBO3 / 16; j++) {
+            const __m512i lo  = turbo_cpu_crumb16(x[ib].qs + 4*j);
+            const __m512i idx = _mm512_mask_add_epi32(lo, turbo_cpu_bits16(x[ib].signs + 2*j), lo, _mm512_set1_epi32(4));
+            _mm512_storeu_ps(y + 16*j, _mm512_permutexvar_ps(idx, t));
+        }
+    }
+}
+
+#if TURBO4_USE_4BIT
+static void turbo4_to_f32_avx512(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    const __m512 c = _mm512_loadu_ps(turbo_cpu_c4);
+    for (int64_t ib = 0; ib < k / QK_TURBO4; ib++, y += QK_TURBO4) {
+        const __m512 t = _mm512_mul_ps(c, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].norm)));
+        for (int j = 0; j < QK_TURBO4 / 16; j++) {
+            _mm512_storeu_ps(y + 16*j, _mm512_permutexvar_ps(turbo_cpu_nib16(x[ib].qs + 8*j), t));
+        }
+    }
+}
+#endif
+
+static void turbo5_to_f32_avx512(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    const block_turbo5_0 * x = (const block_turbo5_0 *) vx;
+    const __m512 c    = _mm512_loadu_ps(turbo_cpu_c5_mag);
+    const __m512 zero = _mm512_setzero_ps();
+    for (int64_t ib = 0; ib < k / QK_TURBO5; ib++, y += QK_TURBO5) {
+        const __m512 t = _mm512_mul_ps(c, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].norm)));
+        for (int j = 0; j < QK_TURBO5 / 16; j++) {
+            const __m512 v = _mm512_permutexvar_ps(turbo_cpu_nib16(x[ib].qs + 8*j), t);
+            _mm512_storeu_ps(y + 16*j, _mm512_mask_sub_ps(v, turbo_cpu_bits16(x[ib].qh + 2*j), zero, v));
+        }
+    }
+}
+
+static void turbo6_to_f32_avx512(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    const block_turbo6_0 * x = (const block_turbo6_0 *) vx;
+    const __m512i bit5 = _mm512_set1_epi32(32);
+    for (int64_t ib = 0; ib < k / QK_TURBO6; ib++, y += QK_TURBO6) {
+        const __m512 n  = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].norm));
+        const __m512 t0 = _mm512_mul_ps(_mm512_loadu_ps(turbo_cpu_c6 +  0), n);
+        const __m512 t1 = _mm512_mul_ps(_mm512_loadu_ps(turbo_cpu_c6 + 16), n);
+        const __m512 t2 = _mm512_mul_ps(_mm512_loadu_ps(turbo_cpu_c6 + 32), n);
+        const __m512 t3 = _mm512_mul_ps(_mm512_loadu_ps(turbo_cpu_c6 + 48), n);
+        for (int j = 0; j < QK_TURBO6 / 16; j++) {
+            const __m512i idx = _mm512_or_si512(turbo_cpu_nib16(x[ib].qs + 8*j),
+                                                _mm512_slli_epi32(turbo_cpu_crumb16(x[ib].qh + 4*j), 4));
+            const __m512 lo = _mm512_permutex2var_ps(t0, idx, t1);
+            const __m512 hi = _mm512_permutex2var_ps(t2, idx, t3);
+            _mm512_storeu_ps(y + 16*j, _mm512_mask_blend_ps(_mm512_test_epi32_mask(idx, bit5), lo, hi));
+        }
+    }
+}
+#endif
+
+ggml_to_float_t ggml_cpu_get_to_float(enum ggml_type type) {
+#if defined(__AVX512F__)
+    switch (type) {
+        case GGML_TYPE_TURBO3_0: return turbo3_to_f32_avx512;
+#if TURBO4_USE_4BIT
+        case GGML_TYPE_TURBO4_0: return turbo4_to_f32_avx512;
+#endif
+        case GGML_TYPE_TURBO5_0: return turbo5_to_f32_avx512;
+        case GGML_TYPE_TURBO6_0: return turbo6_to_f32_avx512;
+        default: break;
+    }
+#endif
+    return ggml_get_type_traits(type)->to_float;
+}
+
 // vy is plain f32 — used by CPU flash attention against a TurboQuant KV cache
 // for head dims the GPU backends do not support (e.g. D=192).
 static void ggml_vec_dot_turbo_f32_impl(enum ggml_type type_x, int n, float * GGML_RESTRICT s,
                                         const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
     const struct ggml_type_traits * trx = ggml_get_type_traits(type_x);
+    ggml_to_float_t const to_float = ggml_cpu_get_to_float(type_x);
 
     const int64_t blk = trx->blck_size;
     GGML_ASSERT(n % blk == 0);
@@ -4006,10 +4134,10 @@ static void ggml_vec_dot_turbo_f32_impl(enum ggml_type type_x, int n, float * GG
 
     for (int64_t i = 0; i < n; i += chunk) {
         const int64_t nc = MIN(chunk, n - i);
-        trx->to_float(px, xb, nc);
-        for (int64_t j = 0; j < nc; j++) {
-            sum += xb[j] * y[i + j];
-        }
+        to_float(px, xb, nc);
+        float part;
+        ggml_vec_dot_f32((int) nc, &part, 0, xb, 0, y + i, 0, 1);
+        sum += part;
         px += (nc / blk) * trx->type_size;
     }
 

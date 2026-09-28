@@ -8586,7 +8586,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    ggml_to_float_t   const v_to_float     = ggml_cpu_get_to_float(v->type);
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
@@ -8790,8 +8790,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    GGML_ASSERT(k->type == v->type);
-    const ggml_type kv_type = k->type;
+    const ggml_type k_type = k->type;
+    const ggml_type v_type = v->type;
+
+    // quantized K/V: dequantized to f32 while packing the tile, so the GEMMs below are type-agnostic
+    ggml_to_float_t const k_to_float = ggml_cpu_get_to_float(k_type);
+    ggml_to_float_t const v_to_float = ggml_cpu_get_to_float(v_type);
 
 
     // broadcast factors
@@ -8919,7 +8923,13 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
-                if (kv_type == GGML_TYPE_F16) {
+                if (k_type != GGML_TYPE_F16 && k_type != GGML_TYPE_F32) {
+                    // V32 is not in use until the V pack below, so it doubles as the row buffer
+                    k_to_float(k_data, V32, DK);
+                    for (int64_t dk = 0; dk < DK; dk++) {
+                        K_f32[dk * KV_TILE_SZ + tk] = V32[dk];
+                    }
+                } else if (k_type == GGML_TYPE_F16) {
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
                         K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
@@ -8984,8 +8994,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Pack V tile to contiguous F32, zero-padded
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
-                if (kv_type == GGML_TYPE_F16) {
+                if (v_type == GGML_TYPE_F16) {
                     ggml_fp16_to_fp32_row((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+                } else if (v_type != GGML_TYPE_F32) {
+                    v_to_float(v_data, V32 + tk * DV, DV);
                 } else {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
                 }
@@ -9213,10 +9225,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+        // any K/V type with a to_float works: the tiled path dequantizes each tile once and shares it
+        // across Q_TILE_SZ query rows, where the one_chunk path dequantizes every KV row per query row
+        const auto has_to_float = [](const ggml_tensor * t) {
+            return t->type == GGML_TYPE_F32 || ggml_get_type_traits(t->type)->to_float != nullptr;
+        };
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
-                                kv_is_f32_or_f16 &&
-                                k->type == v->type &&
+                                has_to_float(k) && has_to_float(v) &&
                                 neq1 >= Q_TILE_SZ);
 #ifdef GGML_SIMD
 #if defined(__ARM_FEATURE_SVE)
