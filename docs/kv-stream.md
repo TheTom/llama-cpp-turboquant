@@ -126,8 +126,7 @@ keeps widening with context - which is the regime this feature exists for.
 Arena size barely matters either way: 4096 MiB lands within 3% of 1024 MiB
 at every length in both builds.
 
-Every benchmark number in the PR description and `benchmarks/results/` was
-measured with the flag on. A default build remains functionally correct -
+Every benchmark number in the PR description was measured with the flag on. A default build remains functionally correct -
 output is unchanged - but treat the flag as a practical requirement rather
 than an optimization. Since it is off by default, `llama_kv_cache` logs a
 one-time warning at startup naming the K/V pair that fell back.
