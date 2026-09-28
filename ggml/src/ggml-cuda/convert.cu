@@ -348,6 +348,82 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
+// turbo3/turbo4 -> f16, a half-warp per 128-value block, 8 values per lane. The generic path above
+// reads the centroid table from __constant__ memory with per-thread indices, which serializes;
+// here each lane holds a table entry in a register and lookups are warp shuffles.
+template <ggml_type type>
+static __global__ void k_dequantize_turbo_f16(const void * __restrict__ vx, half * __restrict__ y,
+        const uint32_t nblk, const uint3 nbr, const uint3 ne01, const uint3 ne02,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int lane = threadIdx.x;
+    const int l    = lane % 16;
+    const float c  = type == GGML_TYPE_TURBO3_0 ? TURBO_CENTROIDS_3BIT[lane % 8] : TURBO_CENTROIDS_4BIT[lane % 16];
+
+    // The loop bound is warp-uniform so every lane reaches the shuffles.
+    for (uint32_t w = blockIdx.x*blockDim.y + threadIdx.y; 2*w < nblk; w += gridDim.x*blockDim.y) {
+        const uint32_t ib    = 2*w + lane/16;
+        const bool     valid = ib < nblk;
+        const uint32_t ibc   = valid ? ib : 2*w;
+
+        const uint2 row = fast_div_modulo(ibc, nbr);   // x = row, y = block in row
+        const uint2 r1  = fast_div_modulo(row.x, ne01); // x = i02*ne03 part, y = i01
+        const uint2 r2  = fast_div_modulo(r1.x, ne02);  // x = i03, y = i02
+        const int64_t src = r2.x*s03 + r2.y*s02 + r1.y*s01 + row.y;
+
+        uint32_t qs;       // turbo4: element m at bits 4m; turbo3: low 2 bits of element m at bits 2m
+        [[maybe_unused]] uint32_t hi = 0; // turbo3: high bit of element m at bit m
+        float norm;
+        if constexpr (type == GGML_TYPE_TURBO3_0) {
+            const block_turbo3_0 * b = (const block_turbo3_0 *) vx + src;
+            qs   = *(const uint16_t *) (b->qs + 2*l);
+            hi   = b->signs[l];
+            norm = __half2float(b->norm);
+        } else {
+            static_assert(sizeof(block_turbo4_0) == 66, "4-bit turbo4 layout expected");
+            const block_turbo4_0 * b = (const block_turbo4_0 *) vx + src;
+            qs   = uint32_t(*(const uint16_t *) (b->qs + 4*l)) | (uint32_t(*(const uint16_t *) (b->qs + 4*l + 2)) << 16);
+            norm = __half2float(b->norm);
+        }
+
+        half2 out[4];
+#pragma unroll
+        for (int m = 0; m < 8; m += 2) {
+            float v[2];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int idx = type == GGML_TYPE_TURBO3_0 ?
+                    ((qs >> (2*(m + k))) & 0x3) | (((hi >> (m + k)) & 1) << 2) :
+                    (qs >> (4*(m + k))) & 0xF;
+                v[k] = __shfl_sync(0xFFFFFFFF, c, idx, 32) * norm;
+            }
+            out[m/2] = __floats2half2_rn(v[0], v[1]);
+        }
+        if (valid) {
+            *(uint4 *) (y + int64_t(ib)*128 + 8*l) = *(const uint4 *) out;
+        }
+    }
+}
+
+template <ggml_type type>
+static void dequantize_turbo_f16_nc_cuda(const void * vx, half * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 128 == 0);
+    const int64_t nbr  = ne00 / 128;
+    const int64_t nblk = nbr*ne01*ne02*ne03;
+    GGML_ASSERT(nblk < (int64_t(1) << 31));
+    const dim3 block_dims(32, 8, 1); // 32 lanes = two blocks, also on 64-wide wavefronts
+    const int64_t nwarps  = (nblk + 1) / 2;
+    const int64_t nblocks = std::min<int64_t>((nwarps + 7) / 8, 1 << 20);
+    k_dequantize_turbo_f16<type><<<nblocks, block_dims, 0, stream>>>(vx, y, uint32_t(nblk),
+        init_fastdiv_values(nbr), init_fastdiv_values(ne01), init_fastdiv_values(ne02), s01, s02, s03);
+}
+
+template <ggml_type type>
+static void dequantize_turbo_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    dequantize_turbo_f16_nc_cuda<type>(vx, y, k, 1, 1, 1, k/128, k/128, k/128, stream);
+}
+
 // Fast warp-cooperative TQ4_1S dequant: one warp per 32-element block.
 // WHT via __shfl_xor_sync — 16× less compute than the per-element generic template.
 template <typename dst_t>
@@ -727,11 +803,11 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
         case GGML_TYPE_TURBO3_0:
-            return dequantize_block_cont_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
+            return dequantize_turbo_f16_cuda<GGML_TYPE_TURBO3_0>;
         case GGML_TYPE_TURBO2_0:
             return dequantize_block_cont_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
-            return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+            return dequantize_turbo_f16_cuda<GGML_TYPE_TURBO4_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_tq4_1s_warp_cuda<half>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
@@ -837,11 +913,11 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_TURBO3_0:
-            return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
+            return dequantize_turbo_f16_nc_cuda<GGML_TYPE_TURBO3_0>;
         case GGML_TYPE_TURBO2_0:
             return dequantize_block_cuda<QK_TURBO2, QR_TURBO2, dequantize_turbo2_0>;
         case GGML_TYPE_TURBO4_0:
-            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+            return dequantize_turbo_f16_nc_cuda<GGML_TYPE_TURBO4_0>;
         case GGML_TYPE_TQ4_1S:
             return dequantize_block_cuda<QK_TQ4_1S, QR_TQ4_1S, dequantize_tq4_1s>;
         case GGML_TYPE_TQ3_1S:

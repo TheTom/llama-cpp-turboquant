@@ -528,6 +528,9 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 }
 #endif
 
+// row dequant for the CPU backend: a SIMD kernel where one exists, else the ggml-base to_float
+ggml_to_float_t ggml_cpu_get_to_float(enum ggml_type type);
+
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
