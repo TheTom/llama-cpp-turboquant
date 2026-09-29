@@ -3173,7 +3173,11 @@ struct ggml_cplan ggml_graph_plan(
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
-                        cur += MAX(prefill, decode);
+                        // Grouped decode (quantized K/V, few query rows): tiled scratch + per-row partials, up to n_tasks chunks per row
+                        const int64_t neq1 = node->src[0]->ne[1];
+                        size_t grouped = neq1 < GGML_FA_TILE_Q ? prefill + sizeof(float)*(CACHE_LINE_SIZE_F32*n_tasks + neq1*neq2*n_tasks*(2+DV)) : 0;
+
+                        cur += MAX(MAX(prefill, decode), grouped);
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
