@@ -317,10 +317,30 @@ ggml_backend_cuda_context::moe_expert_slab * ggml_backend_cuda_context::moe_expe
     e.n_routed  = n_routed;
     e.dev       = dev;
 
+    // The slabs are allocated lazily at the first decode, after the compute buffers are reserved,
+    // so without a margin they take every byte that is left. Attention scratch at long context
+    // then has nowhere to grow and the next deep prompt fails with out-of-memory. Keep a reserve
+    // free and let any tensor that does not fit read its experts from host memory instead.
+    static const size_t reserve = [] {
+        const char * env = getenv("GGML_MOE_PAGE_RESERVE_MB");
+        const long   v   = env ? atol(env) : 1024;
+        return (size_t) (v > 0 ? v : 0) << 20;
+    }();
+    bool fits = true;
+    {
+        size_t free_mem = 0, total_mem = 0;
+        ggml_cuda_set_device(dev);
+        if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
+            fits = free_mem >= (size_t) e.n_slots * nb_expert + reserve;
+        }
+        (void) cudaGetLastError();
+    }
+
     auto alloc = [&](void ** p, size_t bytes) {
         return ggml_cuda_device_malloc(p, bytes, dev) == cudaSuccess;
     };
-    if (!alloc(&e.slab, (size_t) e.n_slots * nb_expert) ||
+    if (!fits ||
+        !alloc(&e.slab, (size_t) e.n_slots * nb_expert) ||
         !alloc((void **) &e.slot_expert, (size_t) e.n_slots * sizeof(int32_t)) ||
         !alloc((void **) &e.claim,       (size_t) e.n_slots * sizeof(int32_t)) ||
         !alloc((void **) &e.hit,         (size_t) n_routed * sizeof(int32_t)) ||
