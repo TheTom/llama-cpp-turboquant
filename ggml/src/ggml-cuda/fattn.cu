@@ -1954,11 +1954,11 @@ void ggml_cuda_flash_attn_ext_streamed(
     // encodes the same set, and the VEC dispatch has no BF16/Q4_x/Q5_x
     // x turbo instances.
     const auto turbo_kv = [](ggml_type t) {
-        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
-    };
-    const auto turbo_fast_side = [](ggml_type t) {
         return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
-            || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16;
+            || t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
+    };
+    const auto turbo_fast_side = [&](ggml_type t) {
+        return turbo_kv(t) || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16;
     };
     const bool turbo_pair =
         turbo_fast_side(K->type) && turbo_fast_side(V->type) &&

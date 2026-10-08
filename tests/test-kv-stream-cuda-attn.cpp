@@ -1083,6 +1083,7 @@ int main() {
         constexpr int64_t n_batch = 4;
         const ggml_type turbo_types[] = {
             GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
+            GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0,
         };
 
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -1092,6 +1093,10 @@ int main() {
 
         for (const ggml_type type_k : turbo_types) {
             for (const ggml_type type_v : turbo_types) {
+                // turbo5/turbo6 cross pairs without a vec instance in this build
+                if (!backend_supports_plain_kv_pair(backend.get(), type_k, type_v)) {
+                    continue;
+                }
                 const attention_inputs inputs =
                     make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
                 const std::vector<float> expected = run_attention(
