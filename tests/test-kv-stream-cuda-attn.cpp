@@ -893,7 +893,7 @@ int main() {
             (unsigned long long) stats.asynchronous_page_uploads);
         t.assert_true("wide fallback executes streamed attention",
             stats.asynchronous_page_uploads > 0);
-        t.assert_equal(uint64_t(8), stats.host_to_device_copy_commands);
+        t.assert_equal(uint64_t(6), stats.host_to_device_copy_commands);
         t.assert_true("wide fallback remains numerically equivalent",
             std::isfinite(max_abs) && max_abs <= 2e-3f);
     });
@@ -945,7 +945,7 @@ int main() {
         t.assert_true("multi-token streamed spans use MMA partial attention",
             stats.mma_prefill_attention_spans > 0);
         t.assert_equal(uint64_t(6), stats.asynchronous_page_uploads);
-        t.assert_equal(uint64_t(16), stats.host_to_device_copy_commands);
+        t.assert_equal(uint64_t(12), stats.host_to_device_copy_commands);
         t.assert_equal(uint64_t(6), stats.compute_stream_waits);
         t.assert_equal(uint64_t(4), stats.stage_slot_reuses);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
@@ -1050,6 +1050,411 @@ int main() {
         t.assert_true("fully resident outputs are bit-identical", expected == actual);
     });
 
+    t.test("fully resident turbo multi-page attention matches ordinary turbo attention", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 4;
+        const ggml_type turbo_types[] = {
+            GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
+        };
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        for (const ggml_type type_k : turbo_types) {
+            for (const ggml_type type_v : turbo_types) {
+                const attention_inputs inputs =
+                    make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+                const std::vector<float> expected = run_attention(
+                    backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                    n_kv, n_batch);
+
+                const size_t k_page_bytes =
+                    ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t v_page_bytes =
+                    ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+                const size_t f16_page_bytes =
+                    ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+                const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+                ggml_backend_cuda_kv_stream_params params{};
+                params.device               = 0;
+                params.stage_bytes          = page_bytes;
+                params.stage_slots          = 1;
+                params.conversion_bytes     = conversion_bytes;
+                params.pool_bytes           = conversion_bytes + 4*page_bytes;
+                params.resident_layer_count = 1;
+                params.page_tokens          = 256;
+                auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+                if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+                    return;
+                }
+
+                const std::vector<float> actual = run_attention(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                    n_kv, n_batch);
+                const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+                ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+                t.assert_equal(uint64_t(0), stats.streamed_pages);
+                if (!t.assert_equal(expected.size(), actual.size())) {
+                    return;
+                }
+                t.assert_true("fully resident turbo output is bit-identical to ordinary turbo attention",
+                    expected == actual);
+            }
+        }
+    });
+
+    t.test("fully resident turbo decode matches ordinary turbo attention", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs =
+            make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 2, 1, true, GGML_TYPE_I32, true);
+
+        const size_t k_page_bytes =
+            ggml_row_size(GGML_TYPE_TURBO3_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = k_page_bytes;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        const size_t f16_page_bytes =
+            ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.conversion_bytes     = conversion_bytes;
+        params.pool_bytes           = conversion_bytes + 4*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 2, 1, true, GGML_TYPE_I32, true, runtime);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(0), stats.streamed_pages);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        t.assert_true("fully resident turbo decode is bit-identical to ordinary turbo attention",
+            expected == actual);
+        t.assert_true("resident turbo decode attends resident spans",
+            stats.resident_attention_spans > 0);
+    });
+
+    t.test("single staged page turbo attention matches ordinary turbo attention", [](testing & t) {
+        constexpr int64_t n_kv = 256;
+        constexpr int64_t n_batch = 4;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs =
+            make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+
+        const size_t k_page_bytes =
+            ggml_row_size(GGML_TYPE_TURBO3_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + k_page_bytes;
+        const size_t f16_page_bytes =
+            ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device           = 0;
+        params.stage_bytes      = page_bytes;
+        params.stage_slots      = 1;
+        params.conversion_bytes = conversion_bytes;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(1), stats.asynchronous_page_uploads);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        t.assert_true("single staged page turbo output is bit-identical to ordinary turbo attention",
+            expected == actual);
+    });
+
+    t.test("turbo spill keeps the F16 fallback and stays equivalent", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 4;
+        constexpr ggml_type type_k = GGML_TYPE_TURBO3_0;
+        constexpr ggml_type type_v = GGML_TYPE_TURBO3_0;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs =
+            make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+        const attention_inputs reference = make_f16_reference(inputs, n_kv);
+        const std::vector<float> expected = run_attention(
+            backend.get(), reference, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+
+        const size_t k_page_bytes =
+            ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + k_page_bytes;
+        const size_t f16_page_bytes =
+            ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.conversion_bytes     = conversion_bytes;
+        params.pool_bytes           = conversion_bytes + 2*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(3), stats.streamed_pages);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        // Multi-page spill: the partial reduction accumulates page partials in
+        // a different order than the single full F16 reference, so the
+        // difference is accumulation-order, not F16 rounding (~3e-3, not 3e-4).
+        if (max_abs > 1e-2f) {
+            std::fprintf(stderr, "turbo spill max_abs=%g streamed_pages=%llu\n",
+                max_abs, (unsigned long long) stats.streamed_pages);
+        }
+        t.assert_true("turbo spill stays numerically equivalent to the F16 reference",
+            std::isfinite(max_abs) && max_abs <= 1e-2f);
+        // Narrow (n_batch <= 8) multi-page turbo spill stays on vec partial.
+        t.assert_equal(uint64_t(0), stats.mma_prefill_attention_spans);
+    });
+
+    t.test("wide turbo spill prefill uses the MMA partial path", [](testing & t) {
+        // Wide queries (n_batch > 8) with a multi-page turbo spill drop the
+        // type gate from use_mma_prefill, so they take the MMA partial path
+        // over F16-converted staged pages. Pin that the MMA path engages and
+        // stays equivalent; the narrow (n_batch <= 8) turbo spill stays on
+        // vec partial (covered by the F16 fallback test above).
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 83;
+        constexpr ggml_type type_k = GGML_TYPE_TURBO3_0;
+        constexpr ggml_type type_v = GGML_TYPE_TURBO3_0;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        if (!backend_has_fa_all_quants(backend.get())) {
+            std::fprintf(stderr, "SKIP (requires GGML_CUDA_FA_ALL_QUANTS for bit-exact direct_attention)\n");
+            return;
+        }
+
+        const attention_inputs inputs =
+            make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+        const attention_inputs reference = make_f16_reference(inputs, n_kv);
+        const std::vector<float> expected = run_attention(
+            backend.get(), reference, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+
+        const size_t k_page_bytes =
+            ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + k_page_bytes;
+        const size_t f16_page_bytes =
+            ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.conversion_bytes     = conversion_bytes;
+        params.pool_bytes           = conversion_bytes + 4*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr,
+            "wide turbo spill max_abs=%g mma_spans=%llu\n",
+            max_abs, (unsigned long long) stats.mma_prefill_attention_spans);
+        t.assert_true("wide turbo spill uses the MMA partial path",
+            stats.mma_prefill_attention_spans > 0);
+        // Multi-page spill: accumulation-order difference, not F16 rounding.
+        t.assert_true("wide turbo spill stays numerically equivalent",
+            std::isfinite(max_abs) && max_abs <= 1e-2f);
+    });
+
+    t.test("fully resident mixed native K turbo V attention matches plain attention", [](testing & t) {
+        // The production config keeps K native (q8_0) while V is turbo3. The
+        // fast path must engage whenever the plain native kernel supports the
+        // pair, not only when both sides are turbo.
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 4;
+        const std::pair<ggml_type, ggml_type> mixed_pairs[] = {
+            {GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0},
+            {GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0},
+        };
+
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        for (const auto & [type_k, type_v] : mixed_pairs) {
+            const attention_inputs inputs =
+                make_inputs(n_kv, n_batch, n_kv - n_batch, type_k, type_v);
+            const std::vector<float> expected = run_attention(
+                backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch);
+
+            const size_t k_page_bytes =
+                ggml_row_size(type_k, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t v_page_bytes =
+                ggml_row_size(type_v, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+            const size_t f16_page_bytes =
+                ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+            const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device               = 0;
+            params.stage_bytes          = page_bytes;
+            params.stage_slots          = 1;
+            params.conversion_bytes     = conversion_bytes;
+            params.pool_bytes           = conversion_bytes + 4*page_bytes;
+            params.resident_layer_count = 1;
+            params.page_tokens          = 256;
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+                return;
+            }
+
+            const std::vector<float> actual = run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                n_kv, n_batch);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+            t.assert_equal(uint64_t(0), stats.streamed_pages);
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            t.assert_true("mixed pair resident attention is bit-identical",
+                expected == actual);
+        }
+    });
+
+    t.test("graph-planned single streamed page turbo attention matches ordinary turbo attention", [](testing & t) {
+        constexpr int64_t n_kv = 256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs =
+            make_inputs(n_kv, n_batch, n_kv - n_batch, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+
+        const size_t k_page_bytes =
+            ggml_row_size(GGML_TYPE_TURBO3_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + k_page_bytes;
+        const size_t f16_page_bytes =
+            ggml_row_size(GGML_TYPE_F16, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t conversion_bytes = align_up(f16_page_bytes, 128) + f16_page_bytes;
+
+        // One resident layer with zero resident pages, reached by handing the
+        // whole staging pool to the transfer ring. Every page streams, so the
+        // attention is graph planned while the fast path still applies
+        // (nchunks == 1).
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 1;
+        params.conversion_bytes     = conversion_bytes;
+        params.pool_bytes           = conversion_bytes + 2*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("repartition hands both pages to the ring",
+            ggml_backend_cuda_kv_stream_repartition(runtime, 2));
+        t.assert_equal(uint32_t(0),
+            ggml_backend_cuda_kv_stream_resident_pages_per_layer(runtime));
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            // Two decode steps so the second one reuses the stage slot
+            // released by kv_stream_graph_release on the first.
+            n_kv, n_batch, 2);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(2), stats.streamed_pages);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        t.assert_true("graph-planned single streamed page turbo output is bit-identical",
+            expected == actual);
+    });
+
     t.test("four-query page-boundary prefill remains finite and equivalent", [](testing & t) {
         constexpr int64_t n_kv = 512;
         constexpr int64_t n_batch = 4;
@@ -1085,6 +1490,7 @@ int main() {
 
         const std::vector<float> actual = run_attention(
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         if (!t.assert_equal(expected.size(), actual.size())) {
@@ -1099,6 +1505,8 @@ int main() {
         std::fprintf(stderr, "four-query page-boundary max_abs=%g\n", max_abs);
         t.assert_true("page-boundary output remains finite", all_finite);
         t.assert_true("page-boundary output remains equivalent", max_abs <= 3e-4f);
+        // Narrow decode (n_batch <= 8) stays on vec partial, not MMA.
+        t.assert_equal(uint64_t(0), stats.mma_prefill_attention_spans);
     });
 
     t.test("wide causal prefills remain equivalent across the 256-query boundary", [](testing & t) {

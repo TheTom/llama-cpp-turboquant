@@ -106,6 +106,15 @@ static double log_softmax(int n_vocab, const float * logits, uint16_t * log_prob
     return max_logit + log_sum_exp - logits[tok];
 }
 
+// First scored position of a chunk: the second half by default. LLAMA_PPL_SCORE_TAIL=N scores only
+// the last N tokens instead, so a long context can be evaluated at its deep end without buffering
+// logits (and base log-probs) for half the window. Both KLD passes must use the same value.
+static int ppl_first_scored(int n_ctx) {
+    const char * env = getenv("LLAMA_PPL_SCORE_TAIL");
+    const int tail = env ? atoi(env) : 0;
+    return tail > 0 && tail < n_ctx - 1 ? n_ctx - 1 - tail : n_ctx/2;
+}
+
 static void process_logits(
     int n_vocab, const float * logits, const int * tokens, int n_token, std::vector<std::thread> & workers,
     double & nll, double & nll2, float * logit_history, float * prob_history
@@ -477,8 +486,10 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
 
-    if (int(tokens.size()) < 2*n_ctx) {
-        LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,2*n_ctx,
+    const int first = ppl_first_scored(n_ctx);
+    const int min_tokens = first == n_ctx/2 ? 2*n_ctx : n_ctx;
+    if (int(tokens.size()) < min_tokens) {
+        LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,min_tokens,
                 n_ctx);
         LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
         return {std::move(tokens), 0., {}, {}};
@@ -511,7 +522,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        logits.reserve(size_t(n_ctx - first) * n_vocab);
     }
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
@@ -524,7 +535,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
         const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize(size_t(n_ctx) * nv);
+        log_probs.resize(size_t(n_ctx - first) * nv);
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -538,8 +549,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     //
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
-    // process the entire prompt.
-    const int first = n_ctx/2;
+    // process the entire prompt. (first is computed above, see ppl_first_scored.)
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1755,12 +1765,13 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     llama_batch batch = llama_batch_init(std::min(n_batch, static_cast<int>(n_ctx)*n_seq), 0, 1);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
-    std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
-    std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    const int first = ppl_first_scored(n_ctx);
+    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - first) * nv);
+    std::vector<float>    kld_values(size_t(n_ctx - 1 - first)*n_chunk);
+    std::vector<float> p_diff_values(size_t(n_ctx - 1 - first)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
+        logits.reserve(size_t(n_ctx - first) * n_vocab);
     }
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
@@ -1788,8 +1799,6 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     kl_divergence_result kld;
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
-
-    const int first = n_ctx/2;
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;

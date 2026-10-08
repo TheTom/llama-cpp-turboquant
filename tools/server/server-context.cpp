@@ -1999,13 +1999,24 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                const bool saved = ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // try to restore a better-matching entry (also covers the case where the
+                // save failed transiently but an older entry still matches the new prompt)
+                const bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+
+                // clear only when the save actually put the state into the cache and
+                // nothing better matched. when the save failed (cannot serialize, budget
+                // alloc failure) and nothing restored, the in-slot state is the only copy
+                // - keep it and let the prefix-reuse path handle the new prompt; clearing
+                // would trade a still-valid state for a full re-prefill.
+                if (saved && !loaded) {
                     ret->prompt_clear();
                 }
 
-                prompt_cache->update();
+                if (saved || loaded) {
+                    prompt_cache->update();
+                }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2801,6 +2812,16 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        // a context that cannot serialize its KV state reports size zero; keeping the
+        // metadata-only entry would let a later restore skip the data load while
+        // proceeding on pos/n_tokens bookkeeping. drop it instead.
+        if (cur.empty()) {
+            SLT_WRN(slot, "dropping empty context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ") - context cannot serialize KV state\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens);
+            slot.prompt.checkpoints.pop_back();
+            return;
+        }
+
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
@@ -2867,13 +2888,17 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const bool saved = slot.prompt_save(*prompt_cache);
+                                if (saved) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && saved) {
                                     // [TAG_IDLE_SLOT_CLEAR]
+                                    // only clear when the state actually made it into the
+                                    // prompt cache - a failed save means the cache cannot
+                                    // hold it, and clearing would destroy the only copy
                                     slot.prompt_clear();
                                 }
                             }
