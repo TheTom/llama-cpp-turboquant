@@ -23,20 +23,21 @@ compute buffers, and large enough to hold your working set. See
 
 ## Operational limitations
 
-Read this before enabling the arena on a server. Three features a running
+Read this before enabling the arena on a server. Two features a running
 deployment normally has are unavailable while streaming, because the host
 cache is authoritative and the GPU holds only a mirror of it:
 
 | Feature | Behaviour with an arena | Why |
 |---|---|---|
-| **Prompt caching / `llama_state_*` save+restore** | Disabled. The server logs `prompt cache disabled: this context cannot save KV cache state` once, then **every request re-prefills its whole prompt**. | The KV cache cannot be serialized: pages live in host memory under the runtime's own layout, and `llama_kv_cache::state_write_data` refuses. |
 | **Context shift** (`--context-shift`) | Disabled at startup. `get_can_shift()` reports false, so `common_init_from_params` turns it off with `KV cache shifting is not supported for this context, disabling KV cache shifting`. Generation stops at the context limit instead of sliding the window. | K-shift rewrites K in place on the GPU; `seq_add` refuses. |
 | **Shared / copied sequences** (`seq_cp`) | Unavailable. | `seq_cp` aliases one slot into a second sequence, which the resident mirror's per-page bookkeeping does not model. Streaming already requires `-np 1`, so this mainly rules out shared-prompt and multi-slot features. |
 
-The practical cost is the first row: at long context, re-prefilling every
-request can easily outweigh the decode-side win, so the arena suits
-single-shot or long-generation workloads far better than chat-style traffic
-that would otherwise hit a warm prompt cache. Measure both before deploying.
+Prompt caching and `llama_state_*` save/restore do work with an arena: the
+streamed KV buffer is a full-size pinned host buffer that holds every cell,
+so the flat cell-order read and write are valid, and a restore resets the GPU
+resident mirror. Checked on a GB10 with q8_0/turbo3 and turbo3/turbo3: a
+6.8K-token prompt restored from the server prompt cache after a different
+request processed 4 tokens instead of 6,792, with identical greedy output.
 
 `seq_rm` **is** supported - it only edits cell bookkeeping - so ordinary
 request turnover, slot reuse and speculative-draft rollback all work

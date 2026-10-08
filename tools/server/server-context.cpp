@@ -2816,7 +2816,7 @@ private:
         // metadata-only entry would let a later restore skip the data load while
         // proceeding on pos/n_tokens bookkeeping. drop it instead.
         if (cur.empty()) {
-            SLT_WRN(slot, "dropping empty context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %lld) - context cannot serialize KV state\n",
+            SLT_WRN(slot, "dropping empty context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ") - context cannot serialize KV state\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens);
             slot.prompt.checkpoints.pop_back();
             return;
