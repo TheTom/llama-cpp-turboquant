@@ -9,6 +9,10 @@ extern void quantize_row_turbo3_0_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo3_0(const void * x, float * y, long long k);
 extern void quantize_row_turbo4_0_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo4_0(const void * x, float * y, long long k);
+extern void quantize_row_turbo6_0_ref(const float * x, void * y, long long k);
+extern void dequantize_row_turbo6_0(const void * x, float * y, long long k);
+extern void quantize_row_turbo5_0_ref(const float * x, void * y, long long k);
+extern void dequantize_row_turbo5_0(const void * x, float * y, long long k);
 extern void turbo_cpu_fwht_inverse(float * x, int group_size);
 
 /* Must match GGML_TQ_DOT_CHUNK in ggml/src/ggml-cpu/ggml-cpu.c. */
@@ -132,7 +136,65 @@ int main(void) {
     printf("  Out: [%.4f, %.4f, %.4f, %.4f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
-    printf("  MSE=%.8f Cosine=%.6f\n\n",  (double)(mse/d), (double)(cosv/sqrtf(ni)/sqrtf(no)));
+    printf("  MSE=%.8f RMSE=%.6f sigma Cosine=%.6f\n\n",  (double)(mse/d), (double)(sqrtf(mse/ni)), (double)(cosv/sqrtf(ni)/sqrtf(no)));
+
+    /* Test 3b: turbo6
+     *
+     * Same convention and the same input as the turbo4 test above, so the two lines are
+     * directly comparable: 64 Lloyd-Max levels instead of 16 should cut the per-coordinate
+     * rmse from ~0.097 sigma to ~0.025 sigma. Dequant leaves the output in the rotated
+     * domain, so apply the inverse WHT before comparing. */
+    for (int i = 0; i < d; i++) input[i] = cosf(i*0.2f) * 5.0f;
+    quantize_row_turbo6_0_ref(input, buf, d);
+    dequantize_row_turbo6_0(buf, output, d);
+    turbo_cpu_fwht_inverse(output, d);
+    printf("Test 3b (turbo6): cos*5\n");
+    printf("  In:  [%.4f, %.4f, %.4f, %.4f]\n",  (double)(input[0]), (double)(input[1]), (double)(input[2]), (double)(input[3]));
+    printf("  Out: [%.4f, %.4f, %.4f, %.4f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
+    mse = cosv = ni = no = 0;
+    for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
+    /* rmse per rotated coordinate in units of sigma = norm/sqrt(128): 0.025 expected for 64
+     * Lloyd-Max levels, 0.097 for turbo4's 16. */
+    printf("  MSE=%.8f RMSE=%.6f sigma Cosine=%.6f\n",  (double)(mse/d), (double)(sqrtf(mse/ni)), (double)(cosv/sqrtf(ni)/sqrtf(no)));
+    {
+        const float cos_turbo6  = cosv/sqrtf(ni)/sqrtf(no);
+        const float rmse_turbo6 = sqrtf(mse/ni);
+        if (!(cos_turbo6 > 0.999f) || !(rmse_turbo6 < 0.04f)) {
+            printf("=== FAILED: turbo6 cosine %.6f rmse %.6f sigma (want > 0.999, < 0.04) ===\n",
+                   (double) cos_turbo6, (double) rmse_turbo6);
+            return 1;
+        }
+    }
+    printf("\n");
+
+    /* Test 3c: turbo5
+     *
+     * Same convention and the same input as the turbo4 test above, so the two lines are
+     * directly comparable: 32 Lloyd-Max levels give a per-coordinate rmse of ~0.050 sigma
+     * (turbo6 0.025, turbo4 0.097). Dequant leaves the output in the rotated domain, so apply
+     * the inverse WHT before comparing. */
+    for (int i = 0; i < d; i++) input[i] = cosf(i*0.2f) * 5.0f;
+    quantize_row_turbo5_0_ref(input, buf, d);
+    dequantize_row_turbo5_0(buf, output, d);
+    turbo_cpu_fwht_inverse(output, d);
+    printf("Test 3c (turbo5): cos*5\n");
+    printf("  In:  [%.4f, %.4f, %.4f, %.4f]\n",  (double)(input[0]), (double)(input[1]), (double)(input[2]), (double)(input[3]));
+    printf("  Out: [%.4f, %.4f, %.4f, %.4f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
+    mse = cosv = ni = no = 0;
+    for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
+    /* rmse per rotated coordinate in units of sigma = norm/sqrt(128): 0.050 expected for 32
+     * Lloyd-Max levels. */
+    printf("  MSE=%.8f RMSE=%.6f sigma Cosine=%.6f\n",  (double)(mse/d), (double)(sqrtf(mse/ni)), (double)(cosv/sqrtf(ni)/sqrtf(no)));
+    {
+        const float cos_turbo5  = cosv/sqrtf(ni)/sqrtf(no);
+        const float rmse_turbo5 = sqrtf(mse/ni);
+        if (!(cos_turbo5 > 0.998f) || !(rmse_turbo5 < 0.07f)) {   // 5-bit Lloyd-Max: rmse ~0.05 sigma -> cos ~ 1 - rmse^2/2 = 0.99875
+            printf("=== FAILED: turbo5 cosine %.6f rmse %.6f sigma (want > 0.998, < 0.07) ===\n",
+                   (double) cos_turbo5, (double) rmse_turbo5);
+            return 1;
+        }
+    }
+    printf("\n");
 
     /* Test 4: chunk-boundary invariant for every type with a chunked vec_dot */
     printf("Test 4: chunked dequant == whole-row dequant\n");
@@ -140,8 +202,9 @@ int main(void) {
         const enum ggml_type types[] = {
             GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S,
             GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
+            GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0,
         };
-        const char * names[] = { "tq3_1s", "tq4_1s", "turbo2_0", "turbo3_0", "turbo4_0" };
+        const char * names[] = { "tq3_1s", "tq4_1s", "turbo2_0", "turbo3_0", "turbo4_0", "turbo6_0", "turbo5_0" };
         /* straddle TQ_DOT_CHUNK from both sides, plus a realistic row */
         const int64_t lens[] = { 128, 256, 384, 512, 4096 };
 
