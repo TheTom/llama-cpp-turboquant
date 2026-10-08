@@ -176,6 +176,16 @@ static __global__ void flash_attn_ext_vec(
     constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
     __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
 
+    // turbo5/turbo6 V: the 32/64-entry centroid table lives in __constant__ memory, which
+    // serializes a warp's lookups over every distinct index (up to 32-way). Stage it in shared
+    // memory once per block instead: at most a 2-way bank conflict, and the same c[idx] * norm
+    // products, so results are unchanged. Used by the f32 V path below (CUDA).
+    constexpr bool V_is_turbo56 = type_V == GGML_TYPE_TURBO5_0 || type_V == GGML_TYPE_TURBO6_0;
+    constexpr int  n_turbo56_V  = type_V == GGML_TYPE_TURBO6_0 ? 64 : (type_V == GGML_TYPE_TURBO5_0 ? 32 : 1);
+#ifndef V_DOT2_F32_F16_AVAILABLE
+    __shared__ float turbo56_V_tab[n_turbo56_V];
+#endif // V_DOT2_F32_F16_AVAILABLE
+
     // Sparse V: skip V dequant for positions with negligible attention weights.
     // At long context, most V positions contribute < 1e-6 to the output — skipping
     // their dequant saves significant compute (especially for quantized V types).
@@ -315,6 +325,15 @@ static __global__ void flash_attn_ext_vec(
         }
         __syncthreads();
     }
+
+#ifndef V_DOT2_F32_F16_AVAILABLE
+    if constexpr (V_is_turbo56) {
+        for (int i = tid; i < n_turbo56_V; i += nthreads) {
+            turbo56_V_tab[i] = type_V == GGML_TYPE_TURBO6_0 ? TURBO6_CENTROIDS[i] : TURBO5_CENTROIDS[i];
+        }
+        __syncthreads();
+    }
+#endif // V_DOT2_F32_F16_AVAILABLE
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
@@ -609,6 +628,47 @@ static __global__ void flash_attn_ext_vec(
                         VKQ[j][i_VKQ_0/nthreads_V + 0].y += sc[idx1]*KQ_k[j];
                         VKQ[j][i_VKQ_0/nthreads_V + 1].x += sc[idx2]*KQ_k[j];
                         VKQ[j][i_VKQ_0/nthreads_V + 1].y += sc[idx3]*KQ_k[j];
+                    }
+                }
+            } else if constexpr (V_is_turbo56) {
+                static_assert(V_rows_per_thread == 4);
+                static_assert(QK_TURBO5 == QK_TURBO6);
+
+#pragma unroll
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                    const int i0 = 2*i_VKQ_0 + (threadIdx.x % nthreads_V)*V_rows_per_thread;
+                    const int ib = i0 / QK_TURBO6;
+                    const int j0 = i0 % QK_TURBO6; // multiple of 4
+
+                    float v[4];
+                    if constexpr (type_V == GGML_TYPE_TURBO6_0) {
+                        const block_turbo6_0 * vb = (const block_turbo6_0 *)(V + k*nb21);
+                        const float   norm = __half2float(vb[ib].norm);
+                        const uint8_t qs0  = vb[ib].qs[j0 / 2];     // low nibbles of j0, j0+1
+                        const uint8_t qs1  = vb[ib].qs[j0 / 2 + 1]; // low nibbles of j0+2, j0+3
+                        const uint8_t qh   = vb[ib].qh[j0 / 4];     // high 2 bits of j0 .. j0+3
+                        v[0] = turbo56_V_tab[((qs0 >> 0) & 0xF) | (((qh >> 0) & 0x3) << 4)] * norm;
+                        v[1] = turbo56_V_tab[((qs0 >> 4) & 0xF) | (((qh >> 2) & 0x3) << 4)] * norm;
+                        v[2] = turbo56_V_tab[((qs1 >> 0) & 0xF) | (((qh >> 4) & 0x3) << 4)] * norm;
+                        v[3] = turbo56_V_tab[((qs1 >> 4) & 0xF) | (((qh >> 6) & 0x3) << 4)] * norm;
+                    } else {
+                        const block_turbo5_0 * vb = (const block_turbo5_0 *)(V + k*nb21);
+                        const float   norm = __half2float(vb[ib].norm);
+                        const uint8_t qs0  = vb[ib].qs[j0 / 2];     // magnitudes of j0, j0+1
+                        const uint8_t qs1  = vb[ib].qs[j0 / 2 + 1]; // magnitudes of j0+2, j0+3
+                        const uint8_t sg   = vb[ib].qh[j0 / 8] >> (j0 % 8); // signs of j0 .. j0+3 in bits 0..3
+                        v[0] = turbo56_V_tab[turbo5_sm_to_code((qs0 >> 0) & 0xF, (sg >> 0) & 0x1)] * norm;
+                        v[1] = turbo56_V_tab[turbo5_sm_to_code((qs0 >> 4) & 0xF, (sg >> 1) & 0x1)] * norm;
+                        v[2] = turbo56_V_tab[turbo5_sm_to_code((qs1 >> 0) & 0xF, (sg >> 2) & 0x1)] * norm;
+                        v[3] = turbo56_V_tab[turbo5_sm_to_code((qs1 >> 4) & 0xF, (sg >> 3) & 0x1)] * norm;
+                    }
+
+#pragma unroll
+                    for (int j = 0; j < ncols; ++j) {
+                        VKQ[j][i_VKQ_0/nthreads_V + 0].x += v[0]*KQ_k[j];
+                        VKQ[j][i_VKQ_0/nthreads_V + 0].y += v[1]*KQ_k[j];
+                        VKQ[j][i_VKQ_0/nthreads_V + 1].x += v[2]*KQ_k[j];
+                        VKQ[j][i_VKQ_0/nthreads_V + 1].y += v[3]*KQ_k[j];
                     }
                 }
             } else {
