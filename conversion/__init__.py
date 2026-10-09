@@ -237,6 +237,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "SeedOssForCausalLM": "olmo",
     "SmallThinkerForCausalLM": "smallthinker",
     "SmolLM3ForCausalLM": "llama",
+    "Spark2_5ForCausalLM": "spark2_5",
     "SolarOpenForCausalLM": "glm",
     "StableLMEpochForCausalLM": "stablelm",
     "StableLmForCausalLM": "stablelm",
