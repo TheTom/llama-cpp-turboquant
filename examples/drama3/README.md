@@ -46,7 +46,7 @@ PYTHONPATH="$PWD/../sglang-omni" ../drama3-venv/bin/python examples/drama3/exter
 
 The compact runtime contains only the 192 original audio tensors, codec, tokenizer and configuration, about 4.04 GiB. The backbone is the separate 28,942,612,608-byte GGUF. `--runtime-manifest` verifies every asset and the GGUF SHA256, plus the complete audio tensor names, shapes and dtypes. It does not impersonate the original checkpoint receipt. The full original checkpoint path with `--verified-source-receipt` remains supported below.
 
-`setup_runtime.sh` pins the known working CUDA 13 Torch 2.13.0 / TorchAudio 2.11.0 pair and imported package census. It installs SGLang packages without their unrelated full serving extras. A clean environment does not need the private experiment's filtered base-package view. The private vLLM image tag used during bringup is not a public dependency or a pull command. See `check_runtime.py` for the CPU import check; importing successfully does not prove GPU or speech execution.
+`setup_runtime.sh` pins the known working CUDA 13 Torch 2.13.0 / TorchAudio 2.11.0 pair and imported package census. It installs SGLang packages without their unrelated full serving extras. A clean environment does not need the private experiment's filtered base-package view. The private vLLM image tag used during bringup is not a public dependency or a pull command. See `check_runtime.py` for the CPU import check; importing successfully does not prove GPU or speech execution. A fresh isolated aarch64 environment installed the public pinned wheels and passed this check plus `hf --help` on October 14, 2026, with CUDA devices hidden. Fresh x86 installation and GPU execution with that new environment remain unverified.
 
 ## Backbone conversion
 

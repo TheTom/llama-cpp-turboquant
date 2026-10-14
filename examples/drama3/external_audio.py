@@ -282,10 +282,14 @@ def main():
             token_embeddings = backbone.token_embeddings(frame[:, 0], device, dtype)
             hidden, logits = backbone.forward(decoder.embed_backbone(frame, token_embeddings), device, dtype)
         else:
+            timings["generation_loop_seconds"] = stamp() - generation_started
+            timings["process_to_failure_seconds"] = stamp() - PROCESS_STARTED
             args.out.parent.mkdir(parents=True, exist_ok=True)
             atomic_json(args.out.with_suffix(".failed.frames.json"), [frame.tolist() for frame in generated])
             atomic_json(args.out.with_suffix(".failure.json"), {"eos": False, "reason": "frame_limit_without_eos", "frames": len(generated),
-                        "max_frames": args.max_frames, "prompt": args.text, "seed": args.seed, "gguf_sha256": model_hash,
+                        "max_frames": args.max_frames, "prompt": args.text, "prompt_rows": len(frames),
+                        "seed": args.seed, "gguf_sha256": model_hash, "timings": timings,
+                        "timing_scope": "monotonic process entry through failure; no complete WAV or audio RTF",
                         "quality_status": "UNQUALIFIED failed diagnostic; no complete WAV published"})
             raise RuntimeError("Frame limit reached without EOS; refusing to report complete speech")
         if not generated:
