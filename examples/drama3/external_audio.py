@@ -125,6 +125,8 @@ def main():
     parser.add_argument("--gguf-sha256", help="Previously computed SHA256 of this immutable GGUF; otherwise hash it once here")
     args = parser.parse_args()
     timings = {}
+    def progress(phase, **details):
+        print(json.dumps({"phase": phase, "process_seconds": round(time.monotonic() - PROCESS_STARTED, 3), **details}), file=sys.stderr, flush=True)
     def stamp():
         if torch.cuda.is_available() and args.device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -158,6 +160,7 @@ def main():
     if len(model_hash) != 64 or any(c not in "0123456789abcdef" for c in model_hash):
         raise ValueError("Expected a lowercase SHA256 digest")
     load_started = stamp()
+    progress("audio_tower_load_started")
     config = FishOmniConfig(**json.loads((source / "config.json").read_text()))
     index = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
     for shard in set(index.values()):
@@ -172,6 +175,7 @@ def main():
     finally:
         torch.set_default_dtype(old_dtype)
     load_audio_decoder_weights(decoder, checkpoint_tensors(source, index, lambda name: name.startswith(("audio_decoder.", "audio_decoder_mtp_shared.", "audio_decoder_mtp."))))
+    progress("audio_tower_load_finished")
     references = []
     if args.references:
         for descriptor in json.loads(args.references.read_text()):
@@ -180,10 +184,13 @@ def main():
     if frames.shape[0] + args.max_frames > args.context:
         raise ValueError("Prompt and requested generation exceed context")
     attention = DenseAttention(config.audio_decoder_config.n_head, config.audio_decoder_config.n_local_heads, config.audio_decoder_config.head_dim)
+    progress("backbone_load_started")
     backbone = Backbone(args.binary, args.gguf, args.gpu_layers, args.context, config)
+    progress("backbone_load_finished")
     timings["model_and_audio_tower_load_seconds"] = stamp() - load_started
     try:
         prefill_started = stamp()
+        progress("prefill_started", rows=int(frames.shape[0]))
         all_hidden = []
         for start in range(0, frames.shape[0], 64):
             chunk = frames[start:start + 64]
@@ -196,6 +203,7 @@ def main():
         attention.bind(positions)
         decoder.prefill(torch.cat(all_hidden), positions, frames, labels, attention)
         timings["prompt_prefill_seconds"] = stamp() - prefill_started
+        progress("prefill_finished")
         position = frames.shape[0] - 1
         frame = frames[-1:]
         previous = torch.full((1, 16), -1, device=device, dtype=torch.int64)
@@ -210,11 +218,15 @@ def main():
             frame = decoder.decode_step(logits[-1:], hidden[-1:], pos, frame, previous, torch.tensor([1.0], device=device), torch.tensor([30], device=device), torch.tensor([0.9], device=device), attention)
             if int(frame[0, 0]) == config.eos_token_id:
                 eos = True
+                progress("generation_eos", frames=len(generated))
                 break
             generated.append(frame[0].cpu())
             if len(generated) == 1:
                 timings["first_audio_code_frame_since_process_seconds"] = stamp() - PROCESS_STARTED
                 timings["first_audio_code_frame_since_generation_seconds"] = stamp() - generation_started
+                progress("first_audio_code_frame")
+            elif len(generated) % 32 == 0:
+                progress("generation_progress", frames=len(generated))
             previous = torch.cat((previous[:, 1:], frame[:, :1]), dim=-1)
             position += 1
             token_embeddings = backbone.token_embeddings(frame[:, 0], device, dtype)
@@ -226,8 +238,10 @@ def main():
         timings["generation_loop_seconds"] = stamp() - generation_started
         code_rows = torch.stack(generated)
         codec_started = stamp()
+        progress("codec_load_started")
         codec = load_local_codec(source, device, decode_only=True)
         timings["codec_load_seconds"] = stamp() - codec_started
+        progress("codec_load_finished")
         vocode_started = stamp()
         audio = codec.from_indices(code_rows[:, 1:].T.unsqueeze(0).to(device))
         samples = audio.squeeze().float().cpu().numpy()
@@ -258,6 +272,7 @@ def main():
                   "backend": {"backbone": "TheTom/llama-cpp-turboquant", "gpu_layers": args.gpu_layers, "audio": "SGLang-Omni PyTorch DenseAttention bridge", "codec": "local source DAC F32 decode-only modules"}}
         atomic_json(args.out.with_suffix(".run.json"), report)
         atomic_json(args.out.with_suffix(".complete.json"), {"wav": args.out.name, "sha256": hashlib.sha256(args.out.read_bytes()).hexdigest(), "eos": True, "audio_seconds": duration})
+        progress("complete_wav", path=str(args.out), audio_seconds=duration)
     finally:
         backbone.close()
 
