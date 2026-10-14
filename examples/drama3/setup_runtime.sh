@@ -17,5 +17,6 @@ python="$venv/bin/python"
 "$python" -m pip install --no-cache-dir --no-deps -r "$script_dir/requirements-runtime.lock"
 CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH="$omni" \
     "$python" "$script_dir/check_runtime.py"
+"$venv/bin/hf" --help >/dev/null
 "$python" -m pip freeze > "$venv/drama3-installed.txt"
 printf 'Runtime ready. Use %s with PYTHONPATH=%s\n' "$python" "$omni"
