@@ -1085,6 +1085,14 @@ class ModelBase:
         return func
 
     @classmethod
+    def example(cls, *hf_repos: str) -> Callable[[AnyModel], AnyModel]:
+        del hf_repos
+
+        def func(modelcls: AnyModel) -> AnyModel:
+            return modelcls
+        return func
+
+    @classmethod
     def print_registered_models(cls):
         for model_type, model_classes in cls._model_classes.items():
             logger.error(f"{model_type.name} models:")
