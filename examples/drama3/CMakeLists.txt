@@ -1,0 +1,7 @@
+set(TARGET llama-drama3-backbone)
+add_executable(${TARGET} backbone.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
