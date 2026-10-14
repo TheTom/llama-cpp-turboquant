@@ -11,7 +11,7 @@ python examples/drama3/prepare_backbone.py /models/drama-3 /models/drama-3-backb
 python convert_hf_to_gguf.py /models/drama-3-backbone --outtype bf16 --outfile /models/drama-3-backbone-bf16.gguf
 ```
 
-The staging command creates metadata and symlinks, without copying weights. The full `FishOmniModel` architecture stays unsupported by the ordinary converter. The staged architecture is explicitly `FishOmniBackboneForCausalLM`: it selects the Qwen3.5 MoE tensor/graph layout with noninterleaved partial RoPE and no MTP. Audio tensors stay in the original source for the external runtime.
+The staging command creates metadata and symlinks, without copying weights. Put the staging directory on a filesystem that supports symlinks; a CIFS NAS may reject them. Local staging links can point at NAS weights, while output and scratch files stay on the NAS. Mount the source at the same absolute path named in its verification receipt. The full `FishOmniModel` architecture stays unsupported by the ordinary converter. The staged architecture is explicitly `FishOmniBackboneForCausalLM`: it selects the Qwen3.5 MoE tensor/graph layout with noninterleaved partial RoPE and no MTP. Audio tensors stay in the original source for the external runtime.
 
 The published expert FP8 tensors are expanded using their 128x128 F32 block multipliers. BF16 expansion needs more memory than source FP8 and must count toward the complete runtime budget. Do not silently use `--fp8-as-q8` for protected boundary layers and then describe them as unchanged.
 
@@ -22,7 +22,7 @@ The moderate Config I policy protects the first and last two layers, quantizes i
 ```sh
 python examples/drama3/packed_to_gguf.py /models/drama-3 /models/C0 /models/drama-3-backbone-C0.gguf \
   --verified-source-receipt /models/download.complete.json \
-  --staged-metadata /models/C0-backbone-metadata --temp-dir /models/gguf-scratch
+  --staged-metadata /local/C0-backbone-metadata --temp-dir /models/gguf-scratch
 ```
 
 ## Runtime bridge
