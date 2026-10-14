@@ -14,6 +14,7 @@ PROCESS_STARTED = time.monotonic()
 import torch
 from safetensors import safe_open
 from prepare_backbone import verified_source
+from runtime_assets import verified_runtime_assets
 
 
 class DenseAttention:
@@ -110,7 +111,9 @@ def load_local_codec(source, device, decode_only=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--verified-source-receipt", required=True, type=Path)
+    integrity = parser.add_mutually_exclusive_group(required=True)
+    integrity.add_argument("--verified-source-receipt", type=Path)
+    integrity.add_argument("--runtime-manifest", type=Path, help="Audio-only release assets manifest; verifies all assets and GGUF hashes")
     parser.add_argument("--gguf", required=True, type=Path)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--omni-source", required=True, type=Path)
@@ -147,10 +150,18 @@ def main():
     import soundfile
 
     source = args.source.resolve(strict=True)
-    verified_source(source, args.verified_source_receipt)
+    runtime = None
+    if args.runtime_manifest:
+        progress("runtime_asset_verification_started")
+        runtime = verified_runtime_assets(source, args.runtime_manifest, args.gguf)
+        progress("runtime_asset_verification_finished")
+    else:
+        verified_source(source, args.verified_source_receipt)
     if args.out.exists():
         raise FileExistsError(args.out)
-    model_hash = args.gguf_sha256
+    model_hash = runtime["gguf"]["sha256"] if runtime else args.gguf_sha256
+    if runtime and args.gguf_sha256 is not None and args.gguf_sha256 != model_hash:
+        raise ValueError("Explicit GGUF digest differs from the verified runtime manifest")
     if model_hash is None:
         digest = hashlib.sha256()
         with args.gguf.open("rb") as stream:
@@ -162,7 +173,7 @@ def main():
     load_started = stamp()
     progress("audio_tower_load_started")
     config = FishOmniConfig(**json.loads((source / "config.json").read_text()))
-    index = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
+    index = json.loads((source / (runtime["audio_index"] if runtime else "model.safetensors.index.json")).read_text())["weight_map"]
     for shard in set(index.values()):
         if not (source / shard).is_file():
             raise FileNotFoundError(source / shard)
@@ -232,6 +243,11 @@ def main():
             token_embeddings = backbone.token_embeddings(frame[:, 0], device, dtype)
             hidden, logits = backbone.forward(decoder.embed_backbone(frame, token_embeddings), device, dtype)
         else:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json(args.out.with_suffix(".failed.frames.json"), [frame.tolist() for frame in generated])
+            atomic_json(args.out.with_suffix(".failure.json"), {"eos": False, "reason": "frame_limit_without_eos", "frames": len(generated),
+                        "max_frames": args.max_frames, "prompt": args.text, "seed": args.seed, "gguf_sha256": model_hash,
+                        "quality_status": "UNQUALIFIED failed diagnostic; no complete WAV published"})
             raise RuntimeError("Frame limit reached without EOS; refusing to report complete speech")
         if not generated:
             raise RuntimeError("No audio frames generated")
@@ -263,7 +279,7 @@ def main():
         timings["generation_rtf"] = timings["generation_loop_seconds"] / duration
         timings["total_rtf"] = timings["process_to_wav_seconds"] / duration
         atomic_json(args.out.with_suffix(".frames.json"), code_rows.tolist())
-        report = {"source_revision": source.name, "gguf_sha256": model_hash, "prompt": args.text,
+        report = {"source_revision": runtime["source_revision"] if runtime else source.name, "gguf_sha256": model_hash, "prompt": args.text,
                   "eos": eos, "frames": len(generated), "audio_seconds": duration, "sample_rate": codec.sample_rate,
                   "timings": timings, "timing_scope": "monotonic Python process entry through complete WAV; code-frame latency is not audible TTFA",
                   "cold_warm": "new backbone process and audio tower/codec per invocation; filesystem cache state uncontrolled",

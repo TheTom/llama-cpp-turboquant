@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 from prepare_backbone import verified_source
+from runtime_assets import verified_runtime_assets
 from external_audio import load_local_codec
 
 
@@ -16,7 +17,9 @@ from external_audio import load_local_codec
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--verified-source-receipt", required=True, type=Path)
+    integrity = parser.add_mutually_exclusive_group(required=True)
+    integrity.add_argument("--verified-source-receipt", type=Path)
+    integrity.add_argument("--runtime-manifest", type=Path)
     parser.add_argument("--omni-source", required=True, type=Path)
     parser.add_argument("--audio", required=True, type=Path)
     parser.add_argument("--text", required=True)
@@ -25,7 +28,10 @@ def main():
     args = parser.parse_args()
     for variable in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         os.environ[variable] = "1"
-    verified_source(args.source, args.verified_source_receipt)
+    if args.runtime_manifest:
+        verified_runtime_assets(args.source, args.runtime_manifest)
+    else:
+        verified_source(args.source, args.verified_source_receipt)
     if args.out.exists():
         raise FileExistsError(args.out)
     sys.path.insert(0, str(args.omni_source.resolve()))
