@@ -46,7 +46,7 @@ def main():
                 "max_absolute": float((actual - reference).abs().max()),
                 "cosine": float(torch.nn.functional.cosine_similarity(actual.flatten(), reference.flatten(), dim=0))}
     top = min(10, len(reference))
-    report = {"scope": "C0 quantization error against captured official source forward; requires human review",
+    report = {"scope": "Candidate backend and precision difference against captured official source forward; not isolated quantization error",
               "reference_commit": teacher["reference_commit"], "rows": len(hidden), "hidden": errors(hidden, expected),
               "semantic_logits": errors(actual, reference),
               "semantic_top1_same": int(actual.argmax()) == int(reference.argmax()),
