@@ -200,6 +200,8 @@ def main():
         frame = frames[-1:]
         previous = torch.full((1, 16), -1, device=device, dtype=torch.int64)
         generated = []
+        # Match the reference harness at the first actual sampling boundary.
+        torch.manual_seed(args.seed)
         generation_started = stamp()
         eos = False
         for _ in range(args.max_frames):
