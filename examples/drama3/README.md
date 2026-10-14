@@ -1,9 +1,9 @@
 # Drama-3 experimental speech bridge
 
 > [!IMPORTANT]
-> **MADE SPECIFICALLY FOR [THETOM'S TURBOQUANT LLAMA.CPP FORK](https://github.com/TheTom/llama-cpp-turboquant). CUSTOM RUNTIME REQUIRED.**
+> **COMPATIBILITY NOTE: DEVELOPED AND TESTED WITH [THETOM'S TURBOQUANT LLAMA.CPP FORK](https://github.com/TheTom/llama-cpp-turboquant).**
 >
-> Use the Drama-3 implementation in [PR #399](https://github.com/TheTom/llama-cpp-turboquant/pull/399) and its [build/run instructions](https://github.com/TheTom/llama-cpp-turboquant/blob/codex/drama3-backbone-adapter/examples/drama3/README.md). This is not a drop-in TTS model for upstream llama.cpp, stock `llama-cli`, or generic GGUF applications. Speech requires this fork's `llama-drama3-backbone` bridge **plus the pinned external audio tower and codec**. Experimental: RTX 5090 fit and speed are still being verified.
+> Anyone is welcome to run or adapt this work under the applicable licenses. The tested speech route requires this fork's custom `llama-drama3-backbone` bridge plus the pinned external audio tower and codec. Other engines have not been validated and may not work; a `.gguf` file does not imply plug-and-play compatibility. See [PR #399](https://github.com/TheTom/llama-cpp-turboquant/pull/399) and the [setup instructions](https://github.com/TheTom/llama-cpp-turboquant/blob/feature/turboquant-kv-cache/examples/drama3/README.md). RTX 5090 fit and speed are still being verified.
 
 This lane runs the Fish Drama-3 backbone in this fork and the unmodified audio tower/codec in SGLang-Omni. It is a one-stream experimental bridge, not native FishOmni TTS support. Keep the original checkpoint's license with any derived model distribution.
 
@@ -23,7 +23,7 @@ The RTX 5090 with 32 GiB is a target, not a verified platform. On Spark, llama r
 Linux, Python 3.12, a C++ compiler, CUDA 13 toolkit/NVCC, Git, libsndfile and ffmpeg are required. For Ubuntu 24.04, install the host packages with `sudo apt-get install python3.12-venv build-essential git libsndfile1 ffmpeg`. Install CUDA 13 using [NVIDIA's Linux installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/) for your platform before the native build. Keep the downloaded model's LICENSE and NOTICE.
 
 ```sh
-git clone --branch codex/drama3-backbone-adapter https://github.com/TheTom/llama-cpp-turboquant.git
+git clone --branch feature/turboquant-kv-cache https://github.com/TheTom/llama-cpp-turboquant.git
 cd llama-cpp-turboquant
 git clone https://github.com/sgl-project/sglang-omni.git ../sglang-omni
 git -C ../sglang-omni checkout 2cfb3b67becb437b70751defe37e63d3af4eedb0
