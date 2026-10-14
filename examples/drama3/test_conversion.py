@@ -15,7 +15,7 @@ from conversion import get_model_class
 from conversion.base import ModelBase, gguf
 from conversion.fish_omni import FishOmniBackboneModel
 from conversion.qwen import Qwen3_5MoeTextModel
-from external_audio import DenseAttention, move_decode_modules
+from external_audio import DenseAttention, move_decode_modules, validate_single_speaker
 from prepare_backbone import stage
 import packed_to_gguf
 from safetensors.torch import save_file
@@ -239,6 +239,14 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(router.tensor_type, gguf.GGMLQuantizationType.F32)
             np.testing.assert_array_equal(router.data, np.full((2, 256), np.float32(0.1234567)))
             self.assertEqual(len(json.loads(output.with_suffix(".import.json").read_text())["packed_byte_roundtrip"]), 6)
+
+
+class SpeakerScopeTests(unittest.TestCase):
+    def test_single_speaker_scope_fails_closed(self):
+        validate_single_speaker(["Plain text", "<|speaker:0|> [whispering] Hello."])
+        for text in ("<|speaker:1|> Hello", "<|speaker:0|> Hello <|speaker:2|> Hi", "<|audio_separator|>"):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "speaker 0 only"):
+                validate_single_speaker(["Valid target", text])
 
 
 if __name__ == "__main__":

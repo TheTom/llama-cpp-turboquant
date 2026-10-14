@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,6 +16,12 @@ import torch
 from safetensors import safe_open
 from prepare_backbone import verified_source
 from runtime_assets import verified_runtime_assets
+
+
+def validate_single_speaker(texts):
+    for text in texts:
+        if "<|audio_separator|>" in text or any(match.group(1) != "0" for match in re.finditer(r"<\|speaker:([0-9]+)\|>", text)):
+            raise ValueError("Experimental bridge supports speaker 0 only; speaker/separator generation is not implemented")
 
 
 class DenseAttention:
@@ -129,6 +136,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gguf-sha256", help="Previously computed SHA256 of this immutable GGUF; otherwise hash it once here")
     args = parser.parse_args()
+    reference_descriptors = json.loads(args.references.read_text()) if args.references else []
+    validate_single_speaker([args.text, *(item["text"] for item in reference_descriptors)])
     timings = {}
     def progress(phase, **details):
         print(json.dumps({"phase": phase, "process_seconds": round(time.monotonic() - PROCESS_STARTED, 3), **details}), file=sys.stderr, flush=True)
@@ -191,7 +200,7 @@ def main():
     progress("audio_tower_load_finished")
     references = []
     if args.references:
-        for descriptor in json.loads(args.references.read_text()):
+        for descriptor in reference_descriptors:
             references.append(ReferencePart(transcript=descriptor["text"], audio_codes=torch.tensor(descriptor["vq_codes"], dtype=torch.int64)))
     frames = build_prompt_rows(args.text, references, Tokenizer.from_file(str(source / "tokenizer.json")), num_codebooks=decoder.num_codebooks, codebook_size=decoder.codebook_size).to(device)
     if frames.shape[0] + args.max_frames > args.context:
