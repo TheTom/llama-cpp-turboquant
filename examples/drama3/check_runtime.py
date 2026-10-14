@@ -1,6 +1,8 @@
 """Import the speech bridge dependencies without loading weights or using a GPU."""
 import json
 import platform
+import shutil
+import subprocess
 import torch
 import torchaudio
 from sglang_omni.models.fishaudio_drama3.audio_decoder import AudioDecoder
@@ -13,8 +15,12 @@ from omegaconf import OmegaConf
 from tokenizers import Tokenizer
 import soundfile
 
+if shutil.which('ninja') is None:
+    raise RuntimeError('Ninja is required for FlashInfer CUDA JIT; activate the runtime venv before running')
+ninja_version = subprocess.check_output(['ninja', '--version'], text=True).strip()
+
 assert torch.__version__ == '2.13.0+cu130', torch.__version__
 assert torchaudio.__version__ == '2.11.0+cu130', torchaudio.__version__
 print(json.dumps({'imports': 'passed', 'architecture': platform.machine(),
-                  'torch': torch.__version__, 'torchaudio': torchaudio.__version__,
+                  'torch': torch.__version__, 'torchaudio': torchaudio.__version__, 'ninja': ninja_version,
                   'scope': 'CPU imports only; no model weights or GPU execution'}))

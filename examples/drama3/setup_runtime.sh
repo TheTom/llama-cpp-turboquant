@@ -10,6 +10,7 @@ test ! -e "$venv"
 test "$(git -C "$omni" rev-parse HEAD)" = 2cfb3b67becb437b70751defe37e63d3af4eedb0
 "$python_bin" -m venv "$venv"
 python="$venv/bin/python"
+export PATH="$venv/bin:$PATH"
 "$python" -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 'torch==2.13.0+cu130'
 # This exact pair is used by the pinned reference. Do not let another resolver replace Torch.
 "$python" -m pip install --no-cache-dir --no-deps --index-url https://download.pytorch.org/whl/cu130 \
