@@ -48,6 +48,8 @@ The reference bridge keeps tower KV across the entire sequence for four shared a
 
 The bridge reads selected embedding rows from the actual GGUF model through the llama backend and its format decoder. It keeps no duplicate source embedding table. An embedding-quantized candidate therefore uses its own quantized rows instead of accidentally hiding their error with the source BF16 table. Rows enter the external audio embedding mix in BF16, matching the reference tower's activation dtype.
 
+Synthesis moves only the codec decoder, codebooks, post-module and upsampler to the device. The encoder, pre-module and downsampler stay on CPU because `from_indices` does not call them. On the pinned source this reduces codec device weight storage from about 1.74 GiB to 0.70 GiB without changing weight precision. Runtime scratch and caches still need measurement.
+
 ## Gates before sharing results
 
 ```sh

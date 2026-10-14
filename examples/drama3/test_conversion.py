@@ -15,7 +15,7 @@ from conversion import get_model_class
 from conversion.base import ModelBase, gguf
 from conversion.fish_omni import FishOmniBackboneModel
 from conversion.qwen import Qwen3_5MoeTextModel
-from external_audio import DenseAttention
+from external_audio import DenseAttention, move_decode_modules
 from prepare_backbone import stage
 import packed_to_gguf
 from safetensors.torch import save_file
@@ -142,6 +142,22 @@ class ConversionTests(unittest.TestCase):
         result = attention(0, queries[:1], keys[:1], torch.tensor([[6.0, 8.0]]))
         torch.testing.assert_close(result[0], torch.tensor([4.0, 6.0, 4.0, 6.0]))
         self.assertEqual(len(attention.cache[0]), 2)
+
+    def test_codec_keeps_encode_only_weights_off_device(self):
+        codec = torch.nn.Module()
+        codec.encoder = torch.nn.Linear(2, 2)
+        codec.decoder = torch.nn.Linear(2, 2)
+        codec.quantizer = torch.nn.Module()
+        for name in ("semantic_quantizer", "quantizer", "post_module", "upsample", "pre_module", "downsample"):
+            setattr(codec.quantizer, name, torch.nn.Linear(2, 2))
+        move_decode_modules(codec, "meta")
+        self.assertEqual(codec.encoder.weight.device.type, "cpu")
+        self.assertEqual(codec.quantizer.pre_module.weight.device.type, "cpu")
+        self.assertEqual(codec.quantizer.downsample.weight.device.type, "cpu")
+        self.assertEqual(codec.decoder.weight.device.type, "meta")
+        for name in ("semantic_quantizer", "quantizer", "post_module", "upsample"):
+            self.assertEqual(getattr(codec.quantizer, name).weight.device.type, "meta")
+            self.assertEqual(getattr(codec.quantizer, name).weight.dtype, torch.float32)
 
     def test_packed_expert_gguf_roundtrip(self):
         with tempfile.TemporaryDirectory() as temp:

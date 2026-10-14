@@ -82,7 +82,14 @@ def checkpoint_tensors(source, index, predicate):
                 yield name, reader.get_tensor(name)
 
 
-def load_local_codec(source, device):
+def move_decode_modules(codec, device):
+    codec.decoder.to(device)
+    for name in ("semantic_quantizer", "quantizer", "post_module", "upsample"):
+        getattr(codec.quantizer, name).to(device)
+    return codec
+
+
+def load_local_codec(source, device, decode_only=False):
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
     from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.dac import modded_dac
@@ -92,7 +99,8 @@ def load_local_codec(source, device):
     state = torch.load(source / "codec.pth", map_location="cpu", mmap=True, weights_only=True)
     codec.load_state_dict(state, strict=False, assign=True)
     del state
-    return codec.eval().to(device)
+    codec.eval()
+    return move_decode_modules(codec, device) if decode_only else codec.to(device)
 
 
 @torch.inference_mode()
@@ -180,7 +188,7 @@ def main():
         if not generated:
             raise RuntimeError("No audio frames generated")
         code_rows = torch.stack(generated)
-        codec = load_local_codec(source, device)
+        codec = load_local_codec(source, device, decode_only=True)
         audio = codec.from_indices(code_rows[:, 1:].T.unsqueeze(0).to(device))
         soundfile.write(args.out, audio.squeeze().float().cpu().numpy(), codec.sample_rate)
         args.out.with_suffix(".frames.json").write_text(json.dumps(code_rows.tolist()))
