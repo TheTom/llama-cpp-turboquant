@@ -50,6 +50,10 @@ The bridge reads selected embedding rows from the actual GGUF model through the 
 
 Synthesis moves only the codec decoder, codebooks, post-module and upsampler to the device. The encoder, pre-module and downsampler stay on CPU because `from_indices` does not call them. On the pinned source this reduces codec device weight storage from about 1.74 GiB to 0.70 GiB without changing weight precision. Runtime scratch and caches still need measurement.
 
+Each invocation starts a fresh backbone process and loads the audio tower and codec. `--seed` defaults to 42. A successful invocation writes the WAV through a temporary file, then `.frames.json`, `.run.json` and finally `.complete.json`. Only consume samples with that last receipt. The run report includes model hash, prompt, settings, hardware and monotonic load, prefill, code-frame, generation, codec, vocode and write timings, plus generation and total RTF. First code-frame latency is not audible TTFA: this bridge vocodes after generation finishes. Filesystem cache state is uncontrolled. An outer batch runner should measure subprocess wall time separately. `--gguf-sha256` can reuse a digest previously computed for the same immutable GGUF.
+
+`compare_teacher.py` replays mixed input embeddings captured from the official reference and reports final hidden-state and semantic-logit errors and top-token agreement. Its report describes quantization error; it does not declare equivalence or impose an arbitrary passing threshold. Review real measurements before a listening batch. Source capture instrumentation belongs to the isolated reference lane and must preserve its forward arithmetic.
+
 ## Gates before sharing results
 
 ```sh

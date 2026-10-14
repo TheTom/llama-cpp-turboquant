@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """One-stream experimental llama backbone + pinned SGLang-Omni audio runtime."""
 import argparse
+import hashlib
 import json
 import math
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+PROCESS_STARTED = time.monotonic()
 import torch
 from safetensors import safe_open
 from prepare_backbone import verified_source
@@ -118,7 +121,19 @@ def main():
     parser.add_argument("--gpu-layers", type=int, default=99)
     parser.add_argument("--context", type=int, default=16384)
     parser.add_argument("--max-frames", type=int, default=1024)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gguf-sha256", help="Previously computed SHA256 of this immutable GGUF; otherwise hash it once here")
     args = parser.parse_args()
+    timings = {}
+    def stamp():
+        if torch.cuda.is_available() and args.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        return time.monotonic()
+    def atomic_json(path, value):
+        temporary = path.with_name(path.name + ".partial")
+        temporary.write_text(json.dumps(value, indent=2) + "\n")
+        temporary.replace(path)
+    torch.manual_seed(args.seed)
     for variable in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         os.environ[variable] = "1"
     sys.path.insert(0, str(args.omni_source.resolve()))
@@ -133,6 +148,16 @@ def main():
     verified_source(source, args.verified_source_receipt)
     if args.out.exists():
         raise FileExistsError(args.out)
+    model_hash = args.gguf_sha256
+    if model_hash is None:
+        digest = hashlib.sha256()
+        with args.gguf.open("rb") as stream:
+            while block := stream.read(8 * 1024 * 1024):
+                digest.update(block)
+        model_hash = digest.hexdigest()
+    if len(model_hash) != 64 or any(c not in "0123456789abcdef" for c in model_hash):
+        raise ValueError("Expected a lowercase SHA256 digest")
+    load_started = stamp()
     config = FishOmniConfig(**json.loads((source / "config.json").read_text()))
     index = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
     for shard in set(index.values()):
@@ -156,7 +181,9 @@ def main():
         raise ValueError("Prompt and requested generation exceed context")
     attention = DenseAttention(config.audio_decoder_config.n_head, config.audio_decoder_config.n_local_heads, config.audio_decoder_config.head_dim)
     backbone = Backbone(args.binary, args.gguf, args.gpu_layers, args.context, config)
+    timings["model_and_audio_tower_load_seconds"] = stamp() - load_started
     try:
+        prefill_started = stamp()
         all_hidden = []
         for start in range(0, frames.shape[0], 64):
             chunk = frames[start:start + 64]
@@ -168,17 +195,24 @@ def main():
         labels[-1, 0] = config.eos_token_id
         attention.bind(positions)
         decoder.prefill(torch.cat(all_hidden), positions, frames, labels, attention)
+        timings["prompt_prefill_seconds"] = stamp() - prefill_started
         position = frames.shape[0] - 1
         frame = frames[-1:]
         previous = torch.full((1, 16), -1, device=device, dtype=torch.int64)
         generated = []
+        generation_started = stamp()
+        eos = False
         for _ in range(args.max_frames):
             pos = torch.tensor([position], device=device)
             attention.bind(pos)
             frame = decoder.decode_step(logits[-1:], hidden[-1:], pos, frame, previous, torch.tensor([1.0], device=device), torch.tensor([30], device=device), torch.tensor([0.9], device=device), attention)
             if int(frame[0, 0]) == config.eos_token_id:
+                eos = True
                 break
             generated.append(frame[0].cpu())
+            if len(generated) == 1:
+                timings["first_audio_code_frame_since_process_seconds"] = stamp() - PROCESS_STARTED
+                timings["first_audio_code_frame_since_generation_seconds"] = stamp() - generation_started
             previous = torch.cat((previous[:, 1:], frame[:, :1]), dim=-1)
             position += 1
             token_embeddings = backbone.token_embeddings(frame[:, 0], device, dtype)
@@ -187,11 +221,41 @@ def main():
             raise RuntimeError("Frame limit reached without EOS; refusing to report complete speech")
         if not generated:
             raise RuntimeError("No audio frames generated")
+        timings["generation_loop_seconds"] = stamp() - generation_started
         code_rows = torch.stack(generated)
+        codec_started = stamp()
         codec = load_local_codec(source, device, decode_only=True)
+        timings["codec_load_seconds"] = stamp() - codec_started
+        vocode_started = stamp()
         audio = codec.from_indices(code_rows[:, 1:].T.unsqueeze(0).to(device))
-        soundfile.write(args.out, audio.squeeze().float().cpu().numpy(), codec.sample_rate)
-        args.out.with_suffix(".frames.json").write_text(json.dumps(code_rows.tolist()))
+        samples = audio.squeeze().float().cpu().numpy()
+        timings["vocode_seconds"] = stamp() - vocode_started
+        if samples.ndim != 1 or samples.size == 0 or not torch.isfinite(audio).all() or codec.sample_rate <= 0:
+            raise RuntimeError("Invalid synthesized waveform")
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        partial = args.out.with_name(args.out.stem + ".partial.wav")
+        write_started = stamp()
+        soundfile.write(partial, samples, codec.sample_rate, format="WAV")
+        info = soundfile.info(partial)
+        if info.frames != samples.size or info.samplerate != codec.sample_rate:
+            raise RuntimeError("Written waveform failed sanity checks")
+        partial.replace(args.out)
+        timings["wav_write_seconds"] = stamp() - write_started
+        timings["first_complete_wav_since_process_seconds"] = stamp() - PROCESS_STARTED
+        duration = samples.size / codec.sample_rate
+        timings["process_to_wav_seconds"] = stamp() - PROCESS_STARTED
+        timings["generation_rtf"] = timings["generation_loop_seconds"] / duration
+        timings["total_rtf"] = timings["process_to_wav_seconds"] / duration
+        atomic_json(args.out.with_suffix(".frames.json"), code_rows.tolist())
+        report = {"source_revision": source.name, "gguf_sha256": model_hash, "prompt": args.text,
+                  "eos": eos, "frames": len(generated), "audio_seconds": duration, "sample_rate": codec.sample_rate,
+                  "timings": timings, "timing_scope": "monotonic Python process entry through complete WAV; code-frame latency is not audible TTFA",
+                  "cold_warm": "new backbone process and audio tower/codec per invocation; filesystem cache state uncontrolled",
+                  "settings": {"seed": args.seed, "context": args.context, "max_frames": args.max_frames, "temperature": 1.0, "top_k": 30, "top_p": 0.9, "native_microbatch": 8},
+                  "hardware": {"device": str(device), "name": torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU", "torch": torch.__version__},
+                  "backend": {"backbone": "TheTom/llama-cpp-turboquant", "gpu_layers": args.gpu_layers, "audio": "SGLang-Omni PyTorch DenseAttention bridge", "codec": "local source DAC F32 decode-only modules"}}
+        atomic_json(args.out.with_suffix(".run.json"), report)
+        atomic_json(args.out.with_suffix(".complete.json"), {"wav": args.out.name, "sha256": hashlib.sha256(args.out.read_bytes()).hexdigest(), "eos": True, "audio_seconds": duration})
     finally:
         backbone.close()
 
