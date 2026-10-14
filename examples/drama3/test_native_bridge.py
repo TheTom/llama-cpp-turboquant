@@ -67,6 +67,8 @@ def main():
                 process.stdin.write(json.dumps({"embeddings": actual_embeddings.tolist(), "candidate_ids": [2, 9]}) + "\n")
                 process.stdin.flush()
                 result = json.loads(process.stdout.readline())
+                assert result["timings"]["decode_synchronized_seconds"] >= 0
+                assert result["timings"]["output_gather_seconds"] >= 0
                 # Every residual projection is zero, so the output is only the final RMS norm.
                 expected_hidden = actual_embeddings / np.sqrt(np.mean(actual_embeddings ** 2, axis=-1, keepdims=True) + 1e-6) * norm_weights
                 np.testing.assert_allclose(result["hidden_states"], expected_hidden, rtol=2e-6, atol=2e-6)

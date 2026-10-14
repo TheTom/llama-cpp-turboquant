@@ -54,6 +54,7 @@ class Backbone:
         self.process.stdin.write(json.dumps({"token_ids": token_ids.cpu().tolist()}) + "\n")
         self.process.stdin.flush()
         result = json.loads(self.process.stdout.readline())
+        self.last_lookup_timing = result.get("timings", {})
         return torch.tensor(result["token_embeddings"], device=device, dtype=dtype)
 
     def forward(self, embeddings, device, dtype):
@@ -61,6 +62,7 @@ class Backbone:
         self.process.stdin.write(json.dumps(request) + "\n")
         self.process.stdin.flush()
         result = json.loads(self.process.stdout.readline())
+        self.last_forward_timing = result.get("timings", {})
         if result.get("candidate_ids") != self.candidates:
             raise ValueError("Backbone candidate order mismatch")
         hidden = torch.tensor(result["hidden_states"], device=device, dtype=dtype)
@@ -203,18 +205,46 @@ def main():
         prefill_started = stamp()
         progress("prefill_started", rows=int(frames.shape[0]))
         all_hidden = []
+        prefill_parts = {key: 0.0 for key in ("token_embedding_lookup_seconds", "audio_embedding_mix_seconds", "backbone_forward_ipc_seconds", "native_decode_synchronized_seconds", "native_output_gather_seconds", "native_embedding_lookup_seconds")}
+        native_timing_available = True
         for start in range(0, frames.shape[0], 64):
             chunk = frames[start:start + 64]
+            phase_started = stamp()
             token_embeddings = backbone.token_embeddings(chunk[:, 0], device, dtype)
-            hidden, logits = backbone.forward(decoder.embed_backbone(chunk, token_embeddings), device, dtype)
+            prefill_parts["token_embedding_lookup_seconds"] += stamp() - phase_started
+            lookup = getattr(backbone, "last_lookup_timing", {})
+            if "embedding_lookup_seconds" in lookup:
+                prefill_parts["native_embedding_lookup_seconds"] += lookup["embedding_lookup_seconds"]
+            else:
+                native_timing_available = False
+            phase_started = stamp()
+            mixed_embeddings = decoder.embed_backbone(chunk, token_embeddings)
+            prefill_parts["audio_embedding_mix_seconds"] += stamp() - phase_started
+            phase_started = stamp()
+            hidden, logits = backbone.forward(mixed_embeddings, device, dtype)
+            prefill_parts["backbone_forward_ipc_seconds"] += stamp() - phase_started
+            native = getattr(backbone, "last_forward_timing", {})
+            if not {"decode_synchronized_seconds", "output_gather_seconds"} <= native.keys():
+                native_timing_available = False
+            else:
+                prefill_parts["native_decode_synchronized_seconds"] += native["decode_synchronized_seconds"]
+                prefill_parts["native_output_gather_seconds"] += native["output_gather_seconds"]
             all_hidden.append(hidden)
         positions = torch.arange(frames.shape[0], device=device)
         labels = torch.cat((frames[1:], frames.new_zeros((1, frames.shape[1]))))
         labels[-1, 0] = config.eos_token_id
         attention.bind(positions)
+        phase_started = stamp()
         decoder.prefill(torch.cat(all_hidden), positions, frames, labels, attention)
+        prefill_parts["audio_decoder_prefill_seconds"] = stamp() - phase_started
         timings["prompt_prefill_seconds"] = stamp() - prefill_started
-        progress("prefill_finished")
+        prefill_parts["native_timing_available"] = native_timing_available
+        if not native_timing_available:
+            prefill_parts["native_decode_synchronized_seconds"] = None
+            prefill_parts["native_output_gather_seconds"] = None
+            prefill_parts["native_embedding_lookup_seconds"] = None
+        timings["prefill_breakdown"] = prefill_parts
+        progress("prefill_finished", breakdown=prefill_parts)
         position = frames.shape[0] - 1
         frame = frames[-1:]
         previous = torch.full((1, 16), -1, device=device, dtype=torch.int64)
@@ -280,7 +310,7 @@ def main():
         timings["total_rtf"] = timings["process_to_wav_seconds"] / duration
         atomic_json(args.out.with_suffix(".frames.json"), code_rows.tolist())
         report = {"source_revision": runtime["source_revision"] if runtime else source.name, "gguf_sha256": model_hash, "prompt": args.text,
-                  "eos": eos, "frames": len(generated), "audio_seconds": duration, "sample_rate": codec.sample_rate,
+                  "prompt_rows": int(frames.shape[0]), "eos": eos, "frames": len(generated), "audio_seconds": duration, "sample_rate": codec.sample_rate,
                   "timings": timings, "timing_scope": "monotonic Python process entry through complete WAV; code-frame latency is not audible TTFA",
                   "cold_warm": "new backbone process and audio tower/codec per invocation; filesystem cache state uncontrolled",
                   "settings": {"seed": args.seed, "context": args.context, "max_frames": args.max_frames, "temperature": 1.0, "top_k": 30, "top_p": 0.9, "native_microbatch": 8},

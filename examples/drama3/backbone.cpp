@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "nlohmann/json.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -53,6 +54,7 @@ int main(int argc, char ** argv) {
                 if (ids.empty() || ids.size() > 64) {
                     throw std::runtime_error("Expected 1..64 token IDs");
                 }
+                const auto lookup_started = std::chrono::steady_clock::now();
                 const size_t row_bytes = ggml_row_size(embedding_tensor->type, n_embd);
                 std::vector<uint8_t> encoded(row_bytes);
                 std::vector<std::vector<float>> embeddings;
@@ -71,7 +73,8 @@ int main(int argc, char ** argv) {
                         throw std::runtime_error("Unsupported native embedding type");
                     }
                 }
-                std::cout << json({{"token_embeddings", embeddings}}).dump() << std::endl;
+                const double lookup_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - lookup_started).count();
+                std::cout << json({{"token_embeddings", embeddings}, {"timings", {{"embedding_lookup_seconds", lookup_seconds}}}}).dump() << std::endl;
                 continue;
             }
             if (request.value("reset", false)) {
@@ -109,11 +112,15 @@ int main(int argc, char ** argv) {
                 batch.seq_id[row][0] = 0;
                 batch.logits[row] = 1;
             }
+            const auto decode_started = std::chrono::steady_clock::now();
             const int status = llama_decode(ctx, batch);
+            llama_synchronize(ctx);
+            const double decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_started).count();
             llama_batch_free(batch);
             if (status != 0) {
                 throw std::runtime_error("Backbone decode failed: " + std::to_string(status));
             }
+            const auto gather_started = std::chrono::steady_clock::now();
             std::vector<std::vector<float>> hidden, logits;
             for (size_t row = 0; row < rows.size(); ++row) {
                 const auto * h = llama_get_embeddings_ith(ctx, row);
@@ -127,7 +134,8 @@ int main(int argc, char ** argv) {
                     logits.back().push_back(l[id]);
                 }
             }
-            std::cout << json({{"position", position}, {"hidden_states", hidden}, {"candidate_ids", ids}, {"candidate_logits", logits}}).dump() << std::endl;
+            const double gather_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - gather_started).count();
+            std::cout << json({{"timings", {{"decode_synchronized_seconds", decode_seconds}, {"output_gather_seconds", gather_seconds}}}, {"position", position}, {"hidden_states", hidden}, {"candidate_ids", ids}, {"candidate_logits", logits}}).dump() << std::endl;
             position += rows.size();
         }
     } catch (const std::exception & error) {
