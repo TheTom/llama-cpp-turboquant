@@ -1,5 +1,10 @@
 # Drama-3 experimental speech bridge
 
+> [!IMPORTANT]
+> **MADE SPECIFICALLY FOR [THETOM'S TURBOQUANT LLAMA.CPP FORK](https://github.com/TheTom/llama-cpp-turboquant). CUSTOM RUNTIME REQUIRED.**
+>
+> Use the Drama-3 implementation in [PR #399](https://github.com/TheTom/llama-cpp-turboquant/pull/399) and its [build/run instructions](https://github.com/TheTom/llama-cpp-turboquant/blob/codex/drama3-backbone-adapter/examples/drama3/README.md). This is not a drop-in TTS model for upstream llama.cpp, stock `llama-cli`, or generic GGUF applications. Speech requires this fork's `llama-drama3-backbone` bridge **plus the pinned external audio tower and codec**. Experimental: RTX 5090 fit and speed are still being verified.
+
 This lane runs the Fish Drama-3 backbone in this fork and the unmodified audio tower/codec in SGLang-Omni. It is a one-stream experimental bridge, not native FishOmni TTS support. Keep the original checkpoint's license with any derived model distribution.
 
 Use a verified local `fishaudio/drama-3` checkpoint. Download once on the quantization machine and copy locally as needed. Every command below uses local files; set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` in the runtime environment.
