@@ -1699,7 +1699,7 @@ void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx,
 // pooled f32 scratch and run the stock MMQ with the TQ4_1S int8-centroid load_tiles (the weight
 // stays as rotated-domain centroids). Env-gated by GGML_TQ_MMQ. src1/dst assumed contiguous f32
 // with ne10 % QK_TQ4_1S == 0 (checked by the caller's tq_fast_path_ok).
-void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_tq_mmq_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_act    = ggml_nelements(src1);   // contiguous f32
@@ -1718,6 +1718,17 @@ void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_te
     ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, nullptr, dst, false);
 }
 
+void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_tq_mmq_impl(ctx, src0, src1, dst);
+}
+
+// TQ3_1S uses the same 32-element block-local WHT (tq3_0_rht_forward) and the same
+// sign pattern as TQ4_1S, so the activation pre-rotation is identical; only the
+// int8-centroid load_tiles differ, and those are selected from src0->type.
+void ggml_cuda_mul_mat_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_tq_mmq_impl(ctx, src0, src1, dst);
+}
+
 // Phase 2 (MoE): native MFMA-i8 MMQ prefill for TQ4_1S experts (gfx90a). Same trick as the dense
 // wrapper above -- the block-local turbo WHT is per-hidden-vector and identical across experts, so
 // we pre-rotate the whole activation once, then let the stock MMQ_ID (ggml_cuda_mul_mat_q with ids)
@@ -1725,8 +1736,11 @@ void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_te
 // dequant-to-f16 cuBLAS fallback for native (GGML_TQ_NATIVE) MoE, so experts can stay at native
 // 5bpw (avoiding the ~1.7x-VRAM Q8_0 load-time conversion) without the prefill penalty. Env-gated
 // by GGML_TQ_MMQ. src1 assumed contiguous f32 with ne10 % QK_TQ4_1S == 0.
-void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
-                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+// The TQ types share the MoE MMQ path: the block-local turbo WHT is cancelled on the
+// activation side, so the pre-rotation is identical for TQ3_1S and TQ4_1S and only
+// the int8-centroid load_tiles differ (selected from src0->type).
+static void ggml_cuda_mul_mat_id_tq_mmq_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                             const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_act    = ggml_nelements(src1);   // contiguous f32
@@ -1743,4 +1757,14 @@ void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml
     src1_rot.data = act_buf.get();
 
     ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, ids, dst, false);
+}
+
+void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_id_tq_mmq_impl(ctx, src0, src1, ids, dst);
+}
+
+void ggml_cuda_mul_mat_id_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_id_tq_mmq_impl(ctx, src0, src1, ids, dst);
 }
