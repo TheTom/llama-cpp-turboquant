@@ -1041,7 +1041,8 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
     int64_t ne0 = tensor->ne[0];
 
     // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space if opted in
-    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
+    const bool tq4_1s_converted = ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S;
+    if (tq4_1s_converted) {
         // q8_0 block: 34 bytes per 32 elements. TQ4_1S block: 20 bytes per 32 elements.
         const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
         size = n_blocks * sizeof(block_q8_0);
@@ -1050,7 +1051,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
-            size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+            // a converted tensor holds q8_0 rows, so the padding must be q8_0 too
+            size += ggml_row_size(tq4_1s_converted ? GGML_TYPE_Q8_0 : tensor->type,
+                                  MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
     }
 
