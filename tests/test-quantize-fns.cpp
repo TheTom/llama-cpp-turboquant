@@ -215,6 +215,107 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+// The 3-bit index extraction of the TQ3_1S MMQ tile loader, transcribed from
+// ggml/src/ggml-cuda/mmq-load-tiles.cuh (tq3_1s_qs_to_int8x4). The CUDA side
+// picks one of four groups and returns four indices; this copy does the same so
+// the test can compare it with the CPU codec's unpacking.
+//
+// Keep in sync with the CUDA loader: the test below fails if the two disagree.
+static void tq3_1s_unpack_indices_cuda(const uint8_t * qs, int kqsx, int idx[4]) {
+    const int g    = kqsx >> 1;        // group 0..3
+    const int sub  = (kqsx & 1) * 4;   // first element within the group
+    const uint8_t * qp = qs + 3*g;
+    const uint32_t packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
+    idx[0] = (packed >> (3*sub + 0)) & 7;
+    idx[1] = (packed >> (3*sub + 3)) & 7;
+    idx[2] = (packed >> (3*sub + 6)) & 7;
+    idx[3] = (packed >> (3*sub + 9)) & 7;
+}
+
+// The CPU codec's unpacking of one group of eight indices, transcribed from
+// ggml/src/ggml-turbo-quant.c (dequantize_row_tq3_1s).
+static void tq3_1s_unpack_indices_cpu(const uint8_t * qp, int idx[8]) {
+    idx[0] =  qp[0]       & 7;
+    idx[1] = (qp[0] >> 3) & 7;
+    idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
+    idx[3] = (qp[1] >> 1) & 7;
+    idx[4] = (qp[1] >> 4) & 7;
+    idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
+    idx[6] = (qp[2] >> 2) & 7;
+    idx[7] = (qp[2] >> 5) & 7;
+}
+
+// The TQ3_1S centroids and the int8 table the CUDA loader uses, transcribed
+// from ggml/src/ggml-turbo-quant.c (TQ3_0_CENTROIDS) and
+// ggml/src/ggml-common.h (kvalues_tq3).
+static const float tq3_1s_centroids[8] = {
+    -1.996684f, -1.291398f, -0.740341f, -0.247508f, 0.230106f, 0.725222f, 1.277503f, 1.988943f
+};
+
+static const int8_t tq3_1s_kvalues[8] = { -127, -82, -47, -16, 15, 46, 81, 127 };
+
+// The loader must select the same index for every element the CPU codec reads,
+// for every possible 3-byte group. Exhaustive over 2^24 words per group: this is
+// the contract that lets the MMQ path stand in for the CPU codec.
+//
+// Each group gets a different word, so the group selection is covered too: a
+// loader that read the wrong group would disagree with the CPU for three of the
+// four groups.
+static bool test_tq3_1s_mmq_unpack_matches_cpu() {
+    static const uint32_t group_xor[4] = { 0x000000, 0x010203, 0x040506, 0x070809 };
+
+    for (uint32_t w = 0; w < (1u << 24); w++) {
+        uint8_t qs[12];
+        for (int g = 0; g < 4; g++) {
+            const uint32_t v = w ^ group_xor[g];
+            qs[3*g + 0] = (v >>  0) & 0xff;
+            qs[3*g + 1] = (v >>  8) & 0xff;
+            qs[3*g + 2] = (v >> 16) & 0xff;
+        }
+
+        for (int g = 0; g < 4; g++) {
+            int cpu[8];
+            tq3_1s_unpack_indices_cpu(qs + 3*g, cpu);
+
+            for (int half = 0; half < 2; half++) {
+                int cuda[4];
+                tq3_1s_unpack_indices_cuda(qs, 2*g + half, cuda);
+                for (int j = 0; j < 4; j++) {
+                    if (cuda[j] != cpu[4*half + j]) {
+                        fprintf(stderr, "%s: word %06x group %d quad %d: cuda %d != cpu %d\n",
+                                __func__, w, g, 2*g + half, cuda[j], cpu[4*half + j]);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// The int8 table the loader uses must be the CPU centroid table scaled to 127,
+// and the rescale must bring it back: kvalues[i] * (max|c|/127) ~ c[i].
+static bool test_tq3_1s_mmq_centroid_table() {
+    const float max_abs = 1.996684f;   // max|CENTROID|, from TQ3_0_CENTROIDS
+    const float rescale = max_abs / 127.0f;
+    for (int i = 0; i < 8; i++) {
+        const int expected = (int) roundf(tq3_1s_centroids[i] * 127.0f / max_abs);
+        if (tq3_1s_kvalues[i] != expected) {
+            fprintf(stderr, "%s: entry %d is %d, expected %d\n",
+                    __func__, i, tq3_1s_kvalues[i], expected);
+            return false;
+        }
+        const float reconstructed = tq3_1s_kvalues[i] * rescale;
+        const float err = fabsf(reconstructed - tq3_1s_centroids[i]) / max_abs;
+        if (err > 0.03f) {
+            fprintf(stderr, "%s: entry %d reconstructs to %f, expected %f (%.1f%% of full scale)\n",
+                    __func__, i, reconstructed, tq3_1s_centroids[i], 100*err);
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -236,6 +337,21 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+
+    // The TQ3_1S MMQ tile loader (ggml/src/ggml-cuda/mmq-load-tiles.cuh) replaces the
+    // CPU codec's unpacking with an equivalent bit extraction, so the two must agree.
+    {
+        const bool unpack_ok = test_tq3_1s_mmq_unpack_matches_cpu();
+        const bool table_ok  = test_tq3_1s_mmq_centroid_table();
+        if (!unpack_ok || !table_ok) {
+            num_failed++;
+        }
+        if (!unpack_ok || !table_ok || verbose) {
+            // RESULT_STR is indexed by the failure flag, not by a success bool
+            printf("%5s TQ3_1S MMQ unpack matches the CPU codec: %s\n", RESULT_STR[!unpack_ok], RESULT_STR[!unpack_ok]);
+            printf("%5s TQ3_1S MMQ centroid table:               %s\n", RESULT_STR[!table_ok],  RESULT_STR[!table_ok]);
+        }
+    }
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);
