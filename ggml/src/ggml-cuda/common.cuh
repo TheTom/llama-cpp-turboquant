@@ -1028,6 +1028,15 @@ struct ggml_cuda_type_traits<GGML_TYPE_TQ4_1S> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ3_1S> {
+    static constexpr int qk = QK_TQ3_0;
+    static constexpr int qr = 1;              // QR_TQ3_1S
+    // Not the ggml QI convention (a TQ3_1S block holds 3 uint32 of qs): this is the
+    // loader's int8-quad count per block, as for TQ4_1S. Only the MMQ loader reads it.
+    static constexpr int qi = QK_TQ3_0 / 4;   // = QK/(4*QR): 8 int8-quads per block
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;

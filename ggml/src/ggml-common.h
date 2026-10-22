@@ -1236,6 +1236,11 @@ GGML_TABLE_BEGIN(int8_t, kvalues_tq4, 16)
     -127, -96, -75, -58, -44, -31, -18, -6, 6, 18, 31, 44, 58, 75, 96, 127,
 GGML_TABLE_END()
 
+// TQ3_1S 8-level centroids scaled to int8 (127 / max|CENTROID| = 127 / 1.996684)
+GGML_TABLE_BEGIN(int8_t, kvalues_tq3, 8)
+    -127, -82, -47, -16, 15, 46, 81, 127,
+GGML_TABLE_END()
+
 // e2m1 values (doubled), shared by MXFP4 and NVFP4
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
