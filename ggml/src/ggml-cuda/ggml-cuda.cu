@@ -3072,12 +3072,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
         return;
     }
-    if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S
+    if (is_tq_weight && tq_fast_path_ok && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S)
             && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
             && ggml_cuda_tq_mmq_supported(src0, cc)) {
-        // Phase 2 (gfx90a): native MFMA-i8 MMQ prefill via activation pre-rotation.
+        // Phase 2: native int8 MMQ prefill via activation pre-rotation.
         // A/B against the cuBLAS path below (unset GGML_TQ_MMQ to fall back).
-        ggml_cuda_mul_mat_tq4_1s_mmq(ctx, src0, src1, dst);
+        if (src0->type == GGML_TYPE_TQ3_1S) {
+            ggml_cuda_mul_mat_tq3_1s_mmq(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_tq4_1s_mmq(ctx, src0, src1, dst);
+        }
         return;
     }
     if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S) {
@@ -3138,9 +3142,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // Pre-rotates the activation once, then runs MMQ_ID with the TQ4_1S int8-centroid load_tiles,
         // avoiding the 2x-slower dequant-to-f16 cuBLAS fallback so native (GGML_TQ_NATIVE) experts
         // keep their ~1.7x-smaller 5bpw footprint without a prefill penalty. Env-gated by GGML_TQ_MMQ.
-        if (is_tq_weight_id && src0->type == GGML_TYPE_TQ4_1S && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
+        if (is_tq_weight_id && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S)
+                && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
                 && ggml_is_contiguous(src1) && ggml_cuda_tq_mmq_supported(src0, cc)) {
-            ggml_cuda_mul_mat_id_tq4_1s_mmq(ctx, src0, src1, ids, dst);
+            if (src0->type == GGML_TYPE_TQ3_1S) {
+                ggml_cuda_mul_mat_id_tq3_1s_mmq(ctx, src0, src1, ids, dst);
+            } else {
+                ggml_cuda_mul_mat_id_tq4_1s_mmq(ctx, src0, src1, ids, dst);
+            }
             return;
         }
 
