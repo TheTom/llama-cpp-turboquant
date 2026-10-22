@@ -618,6 +618,11 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     // See comments in init_tensor.
     rpc_get |= ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr);
 
+    // TQ4_1S is converted to q8_0 at load time on the server, so the server
+    // allocates q8_0-sized space for it (1.7x the tensor's nbytes). The
+    // client must not assume nbytes: ask the server for the real size.
+    rpc_get |= tensor->type == GGML_TYPE_TQ4_1S;
+
     // ops that require additional memory for fleeting data on certain backends
     // ref: https://github.com/ggml-org/llama.cpp/pull/15966
     rpc_get |= tensor->op == GGML_OP_FLASH_ATTN_EXT;
