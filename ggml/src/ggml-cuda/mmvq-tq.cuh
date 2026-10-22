@@ -17,11 +17,13 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
 // Large prefill: runtime TQ4_1S → q8_0 scratch + cuBLAS
 void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
-// Phase 2: native MFMA-i8 MMQ prefill for TQ4_1S (gfx90a). Pre-rotates the activation (forward WHT)
-// then runs the stock MMQ with a TQ4_1S int8-centroid load_tiles. Env-gated by GGML_TQ_MMQ.
+// Phase 2: native int8 MMQ prefill for TQ4_1S. Pre-rotates the activation (forward WHT) then runs
+// the stock MMQ with a TQ4_1S int8-centroid load_tiles. Env-gated by GGML_TQ_MMQ.
 void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
-// Phase 2 (MoE): native MFMA-i8 MMQ prefill for TQ4_1S experts (gfx90a). Pre-rotates the activation
-// once, then runs the stock MMQ_ID (ggml_cuda_mul_mat_q with ids). Env-gated by GGML_TQ_MMQ.
+void ggml_cuda_mul_mat_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+void ggml_cuda_mul_mat_id_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+// Phase 2 (MoE): native int8 MMQ prefill for TQ4_1S experts. Pre-rotates the activation once, then
+// runs the stock MMQ_ID (ggml_cuda_mul_mat_q with ids). Env-gated by GGML_TQ_MMQ.
 void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
 // Load-time conversion: TQ4_1S → q8_0 in VRAM (dequant + requantize)
