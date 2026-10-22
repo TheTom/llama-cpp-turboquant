@@ -554,6 +554,15 @@ static __device__ __forceinline__ int tq4_1s_qs_to_int8x4(const uint8_t * __rest
 // 3-byte group read serves the quad. The group is read as three bytes, not one
 // 32-bit load: the fourth byte of a 32-bit load would run past the end of the
 // block for its last group.
+//
+// The index extraction is mirrored by tests/test-quantize-fns.cpp, which checks
+// it against the CPU codec exhaustively over all 2^24 group words. Keep the two
+// in sync.
+//
+// Unlike the TQ4 loader above, this selects the centroids with four table
+// loads instead of a byte permute, because the 8-entry table does not fit the
+// v_perm_b32 path. A register-resident selection is the obvious next lever and
+// has not been measured.
 static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __restrict__ qs, const int kqsx) {
     const int g   = kqsx >> 1;        // group 0..3
     const int sub = (kqsx & 1) * 4;    // first element within the group
