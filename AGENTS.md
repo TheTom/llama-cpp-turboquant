@@ -29,6 +29,7 @@ Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S are firs
 - `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (`GGML_TQ_NATIVE=1`)
 - `ggml/src/ggml-vulkan/` - turbo FA, SET_ROWS, dequant shaders
 - `ggml/src/ggml-metal/ggml-metal.metal` - TurboFlash kernels
+- `common/fit-strategy.cpp` / `common/fit.cpp` - rpc-aware fit placement solver (see `common/AGENTS.md` for scan-direction and probe-artifact traps)
 - `docs/KV-cache-quantization.md` - authoritative usage doc (read before touching cache types)
 
 ### Usage
@@ -46,8 +47,9 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 | `TURBO_LAYER_ADAPTIVE`      | `0`     | Layer-adaptive KV precision; `7` = Boundary V (edge layers q8_0, middle turbo) |
 | `TURBO_AUTO_ASYMMETRIC`     | `1`     | Auto-select asymmetric K/V types for large-GQA models |
 | `TURBO_SPARSE_V`            | `1`     | Sparse-V dequant skip in flash attention |
+| `TQ_FIT_EXPERT_SPLIT`       | unset   | `1` opts into partial expert splits (static residency / RPC offload); CPU pool + MoE cache is the default and measured faster |
 | `GGML_TQ_NATIVE`            | unset    | `1` opts out of load-time TQ->q8_0 conversion, uses fused native TQ kernels (saves ~1.7x VRAM on decode-heavy workloads) |
-| `GGML_TQ_MMQ`               | unset    | `1` opts into the native int8 MMQ path for TQ3_1S/TQ4_1S prefill (keeps the weights in the TQ format instead of converting them to q8_0). AMD only: the TQ MMQ config exists for RDNA4 (TQ3_1S) and for CDNA/RDNA2/RDNA3/RDNA4 (TQ4_1S). Off by default |
+| `GGML_TQ_MMQ`               | unset    | `1` opts into the native int8 MMQ path for TQ3_1S/TQ4_1S prefill instead of the dequant-to-f16 + cuBLAS fallback. AMD only: the TQ MMQ config exists for RDNA4 (TQ3_1S) and for CDNA/RDNA2/RDNA3/RDNA4 (TQ4_1S). Off by default. TQ4_1S also needs `GGML_TQ_NATIVE=1`, because otherwise the weights are converted to q8_0 at load and this path is not reached; TQ3_1S is never converted, so it needs only this knob |
 | `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
 | `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
 | `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
@@ -85,6 +87,13 @@ A green run means the cases that ran passed, not that your change was exercised.
 - Remotes: `origin` = TheTom/llama-cpp-turboquant (this repo); the fork remote tracks the upstream TurboQuant fork (same repo, two names); add `upstream` = ggml-org/llama.cpp when syncing
 - Main branches: `feature/turboquant-kv-cache` tracks the upstream TurboQuant fork
 - Upstream master is always fully contained in the tree (verified by rebase parity audits; git log is the record of the last sync point)
+
+### Local Windows CUDA build runner
+
+- Personal Libvirt/SSH build processes live under `local-processes/`; read `local-processes/README.md` before using or cherry-picking them.
+- Run the profile-driven host runner with `--dry-run` first. It discovers the VM address dynamically and verifies the pinned SSH host-key fingerprint and guest hostname; do not hard-code the VM IP or accept an unknown host key.
+- The Windows runner verifies the mapped source commit, builds on a temporary qcow2 data disk under `/mnt/build`, and exports binaries, logs, and a hash manifest to the host artifact directory. Do not put the build tree on the `Z:` share or the VM system disk.
+- Coordinate before starting a real build because the Libvirt VM is shared. If SSH disconnects during a build, the runner intentionally leaves the scratch disk attached and preserves its image; inspect the VM and runner output before attempting cleanup.
 
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
