@@ -98,6 +98,8 @@ struct llama_memory_context_i {
     // TurboQuant InnerQ: get per-channel scale_inv tensor for Q/V equalization
     // Returns nullptr when InnerQ is not active. Override in KV cache contexts.
     virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
+    // Device-local copy for layer il (layer-split multi-GPU); defaults to the shared tensor.
+    virtual ggml_tensor * get_turbo_innerq_scale_inv(int32_t il) const { GGML_UNUSED(il); return get_turbo_innerq_scale_inv(); }
 
     // Block KV streaming: this ubatch's live state for whichever of this
     // memory's sub-cache(s) have a streaming runtime attached. Empty for

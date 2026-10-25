@@ -277,6 +277,9 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    // TurboQuant: InnerQ scale_inv copy per KV device context (see turbo_innerq_copies)
+    std::map<ggml_context *, ggml_tensor *> turbo_innerq_by_ctx;
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
@@ -683,6 +686,30 @@ llama_kv_cache::llama_kv_cache(
             // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
             turbo_innerq_scale_inv = ggml_new_tensor_1d(turbo_ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
+            turbo_innerq_by_ctx[turbo_ctx] = turbo_innerq_scale_inv;
+            turbo_innerq_copies.push_back(turbo_innerq_scale_inv);
+        }
+
+        // TurboQuant InnerQ: give every layer a scale_inv in its own KV context. TURBO_WHT reads
+        // it, and the scheduler places an op on the backend of its weight-like inputs, so a single
+        // shared tensor pulled each attention layer of a layer-split model onto the first device:
+        // 4 cross-GPU splits per layer, which also serialized pipeline parallelism.
+        if (turbo_innerq_scale_inv != nullptr) {
+            ggml_context * turbo_ctx = ctx;
+            if (kv_stream_buft != nullptr && buft == kv_stream_buft) {
+                turbo_ctx = ctx_for_buft(ggml_backend_dev_buffer_type(kv_stream_dev));
+                if (!turbo_ctx) {
+                    throw std::runtime_error("failed to create ggml context for turbo InnerQ tensors");
+                }
+            }
+            auto it = turbo_innerq_by_ctx.find(turbo_ctx);
+            if (it == turbo_innerq_by_ctx.end()) {
+                ggml_tensor * t = ggml_new_tensor_1d(turbo_ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
+                ggml_format_name(t, "turbo_innerq_scale_inv_%zu", turbo_innerq_copies.size());
+                turbo_innerq_copies.push_back(t);
+                it = turbo_innerq_by_ctx.emplace(turbo_ctx, t).first;
+            }
+            layers.back().turbo_innerq_scale_inv = it->second;
         }
     }
 
@@ -742,10 +769,14 @@ llama_kv_cache::llama_kv_cache(
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
 
             // Initialize InnerQ scale_inv to all 1.0 (identity scaling)
-            if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
+            {
                 float ones[INNERQ_MAX_CHANNELS];
                 for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
-                ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+                for (ggml_tensor * t : turbo_innerq_copies) {
+                    if (t->buffer != nullptr) {
+                        ggml_backend_tensor_set(t, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+                    }
+                }
             }
 
             LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
@@ -882,10 +913,14 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
 
             // Re-initialize InnerQ scale_inv to all 1.0
-            if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
+            {
                 float ones[INNERQ_MAX_CHANNELS];
                 for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
-                ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+                for (ggml_tensor * t : turbo_innerq_copies) {
+                    if (t->buffer != nullptr) {
+                        ggml_backend_tensor_set(t, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+                    }
+                }
             }
         }
     }
@@ -3460,11 +3495,16 @@ bool llama_kv_cache_context::apply() {
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update
     if (kv->get_turbo_innerq_scale_inv() != nullptr && turbo_innerq_needs_tensor_update()) {
-        ggml_tensor * t = kv->get_turbo_innerq_scale_inv();
-        if (t->buffer != nullptr) {
-            ggml_backend_tensor_set(t, g_innerq_scale_inv_host, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+        bool updated = false;
+        for (ggml_tensor * t : kv->get_turbo_innerq_copies()) {
+            if (t->buffer != nullptr) {
+                ggml_backend_tensor_set(t, g_innerq_scale_inv_host, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+                updated = true;
+            }
+        }
+        if (updated) {
             turbo_innerq_mark_tensor_updated();
-            LLAMA_LOG_INFO("%s: InnerQ scale_inv tensor updated\n", __func__);
+            LLAMA_LOG_INFO("%s: InnerQ scale_inv tensor updated (%zu device copies)\n", __func__, kv->get_turbo_innerq_copies().size());
         }
     }
 
@@ -3530,6 +3570,18 @@ ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
 
 ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
     return kv->get_turbo_innerq_scale_inv();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv(int32_t il) const {
+    return kv->get_turbo_innerq_scale_inv(il);
+}
+
+ggml_tensor * llama_kv_cache::get_turbo_innerq_scale_inv(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it != map_layer_ids.end() && layers[it->second].turbo_innerq_scale_inv != nullptr) {
+        return layers[it->second].turbo_innerq_scale_inv;
+    }
+    return turbo_innerq_scale_inv;
 }
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);

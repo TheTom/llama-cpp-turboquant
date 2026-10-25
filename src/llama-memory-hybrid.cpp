@@ -299,6 +299,10 @@ ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
     return ctx_attn ? ctx_attn->get_turbo_rot_inverse() : nullptr;
 }
 
+ggml_tensor * llama_memory_hybrid_context::get_turbo_innerq_scale_inv(int32_t il) const {
+    return ctx_attn ? ctx_attn->get_turbo_innerq_scale_inv(il) : nullptr;
+}
+
 ggml_tensor * llama_memory_hybrid_context::get_turbo_innerq_scale_inv() const {
     return ctx_attn ? ctx_attn->get_turbo_innerq_scale_inv() : nullptr;
 }
