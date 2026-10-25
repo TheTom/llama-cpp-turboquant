@@ -2917,15 +2917,33 @@ static bool ggml_cuda_can_chunk_mmf(ggml_backend_cuda_context & ctx,
 // Slice along ne[1] and run mmvf per <=MMVF_MAX_BATCH_SIZE block.
 static void ggml_cuda_mul_mat_vec_f_chunked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const int64_t ncols = src1->ne[1];
-    for (int64_t c0 = 0; c0 < ncols; c0 += MMVF_MAX_BATCH_SIZE) {
-        const int64_t cn = MIN((int64_t) MMVF_MAX_BATCH_SIZE, ncols - c0);
+    // One launch instead of ncols/MMVF_MAX_BATCH_SIZE: view the full column blocks of src1/dst
+    // as channels of MMVF_MAX_BATCH_SIZE columns each and let mmvf broadcast the single src0
+    // channel over them (channel_x = channel_dst / channel_ratio). Prefill on a mixed-arch
+    // qwen3.8 split used to issue ~98k 8-column launches per 4K prompt (~8% of GPU time).
+    const int64_t ncols   = src1->ne[1];
+    const int64_t nfull   = ncols / MMVF_MAX_BATCH_SIZE;
+    const int64_t c_tail  = nfull * MMVF_MAX_BATCH_SIZE;
+    if (nfull > 0) {
         ggml_tensor s1 = *src1;
-        s1.ne[1] = cn;
-        s1.data  = (char *) src1->data + c0*src1->nb[1];
+        s1.ne[1] = MMVF_MAX_BATCH_SIZE;
+        s1.ne[2] = nfull;
+        s1.nb[2] = MMVF_MAX_BATCH_SIZE*src1->nb[1];
+        s1.nb[3] = nfull*s1.nb[2];
         ggml_tensor d = *dst;
-        d.ne[1] = cn;
-        d.data  = (char *) dst->data + c0*dst->nb[1];
+        d.ne[1] = MMVF_MAX_BATCH_SIZE;
+        d.ne[2] = nfull;
+        d.nb[2] = MMVF_MAX_BATCH_SIZE*dst->nb[1];
+        d.nb[3] = nfull*d.nb[2];
+        ggml_cuda_mul_mat_vec_f(ctx, src0, &s1, nullptr, &d);
+    }
+    if (c_tail < ncols) {
+        ggml_tensor s1 = *src1;
+        s1.ne[1] = ncols - c_tail;
+        s1.data  = (char *) src1->data + c_tail*src1->nb[1];
+        ggml_tensor d = *dst;
+        d.ne[1] = ncols - c_tail;
+        d.data  = (char *) dst->data + c_tail*dst->nb[1];
         ggml_cuda_mul_mat_vec_f(ctx, src0, &s1, nullptr, &d);
     }
 }
