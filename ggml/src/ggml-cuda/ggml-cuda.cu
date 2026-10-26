@@ -2855,6 +2855,11 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
 // GEMMs onto ggml's own per-arch mmf kernel instead of cuBLAS.
 static bool ggml_cuda_mixed_gpu_archs() {
     static const bool mixed = [] {
+        // Escape hatch to test whether the ROCm in use still needs the workaround
+        // (rocBLAS "solution library per gfx", ROCm/rocm-libraries#4781, ROCm >= 7.12).
+        if (getenv("GGML_CUDA_NO_MIXED_ARCH_WORKAROUND") != nullptr) {
+            return false;
+        }
         const ggml_cuda_device_info & info = ggml_cuda_info();
         for (int id = 1; id < info.device_count; ++id) {
             if (info.devices[id].cc != info.devices[0].cc) {
