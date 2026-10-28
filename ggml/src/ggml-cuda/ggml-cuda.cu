@@ -2854,6 +2854,7 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
 // (program ISA gfx1200 not compatible with device ISA gfx1201). Used to steer float
 // GEMMs onto ggml's own per-arch mmf kernel instead of cuBLAS.
 static bool ggml_cuda_mixed_gpu_archs() {
+#if defined(GGML_USE_HIP)
     static const bool mixed = [] {
         // Escape hatch to test whether the ROCm in use still needs the workaround
         // (rocBLAS "solution library per gfx", ROCm/rocm-libraries#4781, ROCm >= 7.12).
@@ -2869,6 +2870,10 @@ static bool ggml_cuda_mixed_gpu_archs() {
         return false;
     }();
     return mixed;
+#else
+    // cuBLAS has no cross-arch code-object cache, so mixed NVIDIA archs keep the cuBLAS path.
+    return false;
+#endif // defined(GGML_USE_HIP)
 }
 
 // mmf can substitute for cuBLAS on the mixed-arch path, but its non-MUL_MAT_ID kernel
