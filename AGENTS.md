@@ -49,6 +49,7 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 | `GGML_TQ_NATIVE`            | unset    | `1` opts out of load-time TQ->q8_0 conversion, uses fused native TQ kernels (saves ~1.7x VRAM on decode-heavy workloads) |
 | `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
 | `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
+| `GGML_CUDA_MOE_REDUCE`      | unset    | `0` disables the MoE expert-reduce tail fusion (`MUL_MAT_ID -> MUL -> PERMUTE -> CONT -> SUM_ROWS` at decode becomes the matmul plus one weighted sum, `ggml_cuda_op_moe_reduce`); bit-identical to the unfused tail |
 | `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
 
 ### Test gates (all must pass before touching quant/backend code)

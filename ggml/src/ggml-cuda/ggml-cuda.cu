@@ -69,6 +69,7 @@
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/chain.cuh"
+#include "ggml-cuda/moe-reduce.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -4960,6 +4961,51 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // MoE expert-reduce tail, the decode form build_moe_ffn emits:
+    // MUL_MAT_ID -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS  ==>  matmul + one weighted sum.
+    // The CONT is a full transpose copy of the per-slot output; the tail reads the MUL_MAT_ID
+    // output once instead. Any weight type. GGML_CUDA_MOE_REDUCE=0 turns it off.
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        static const bool disable_moe_reduce = getenv("GGML_CUDA_MOE_REDUCE") != nullptr && std::atoi(getenv("GGML_CUDA_MOE_REDUCE")) == 0;
+        const int64_t nrows  = node->ne[0];
+        const int64_t n_used = node->ne[1];
+        const int64_t ntok   = node->ne[2];
+        do {
+            if (disable_moe_reduce) break;
+            if (n_used < 2 || n_used > MOE_REDUCE_MAX_USED || i + 5 > cgraph->n_nodes) break;
+            if (node->type != GGML_TYPE_F32) break;
+            if ((size_t) nrows * ntok * sizeof(float) > (64u << 20)) break;   // pool scratch cap
+
+            const ggml_op ops[5] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS };
+            int out_node = i + 4;
+            if (!ggml_can_fuse_subgraph(cgraph, i, 5, ops, &out_node, 1)) break;
+
+            ggml_tensor * mul  = cgraph->nodes[i + 1];
+            ggml_tensor * perm = cgraph->nodes[i + 2];
+            ggml_tensor * cont = cgraph->nodes[i + 3];
+            ggml_tensor * out  = cgraph->nodes[i + 4];
+
+            if (mul->src[0] != node) break;
+            ggml_tensor * w = mul->src[1];
+            if (w->type != GGML_TYPE_F32 || w->ne[0] != 1 || w->ne[1] != n_used || w->ne[2] != ntok) break;
+
+            // permute swaps rows/slots: [nrows, n_used, ntok] -> [n_used, nrows, ntok]
+            if (perm->src[0] != mul || perm->ne[0] != n_used || perm->ne[1] != nrows || perm->ne[2] != ntok) break;
+            if (cont->src[0] != perm || !ggml_is_contiguous(cont)) break;
+            // sum over the slot axis: [n_used, nrows, ntok] -> [1, nrows, ntok]
+            if (out->src[0] != cont || out->ne[0] != 1 || out->ne[1] != nrows || out->ne[2] != ntok) break;
+            if (!ggml_is_contiguous(out)) break;
+
+            // Bit-identical to the unfused tail (see k_moe_wsum). The weighted sum goes to pool
+            // scratch and is copied to the output last, so the output may alias any tensor that
+            // dies inside the tail without a memory-range veto.
+            ggml_cuda_mul_mat_id(*cuda_ctx, node);
+            ggml_cuda_op_moe_reduce(*cuda_ctx, node, w, out);
+            cuda_ctx->fusion_stats.moe_reduce++;
+            return 4;
+        } while (0);
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
@@ -7156,6 +7202,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "mul_mat_glu") == 0) {
         return ctx->fusion_stats.mul_mat_glu;
+    }
+    if (strcmp(name, "moe_reduce") == 0) {
+        return ctx->fusion_stats.moe_reduce;
     }
     return -1;
 }

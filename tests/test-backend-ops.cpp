@@ -6846,7 +6846,8 @@ struct test_elem_chain_fusion : public test_case {
 };
 
 // MUL_MAT_ID -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS, the MoE expert-reduce tail as
-// llama.cpp builds it, compared against the CPU graph. Coverage of the tail, not of a fusion.
+// llama.cpp builds it, compared against the CPU graph. On CUDA the tail is fused unless
+// GGML_CUDA_MOE_REDUCE=0, and the moe_reduce counter must advance.
 struct test_moe_reduce_fusion : public test_case {
     const ggml_type type;
     const int64_t m;
@@ -6867,6 +6868,11 @@ struct test_moe_reduce_fusion : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_REDUCE";
+    }
+
+    const char * required_fusion() override {
+        const char * e = getenv("GGML_CUDA_MOE_REDUCE");
+        return e != nullptr && atoi(e) == 0 ? nullptr : "moe_reduce";
     }
 
     // the graph ends in a quantized matvec, so the same tolerance as test_mul_mat for quantized types
