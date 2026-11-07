@@ -646,6 +646,220 @@ static __global__ void mul_mat_tq3_1s_dp4a_multi(
     }
 }
 
+// Multi-row variant of the TQ3_1S dp4a kernel.
+//
+// The single-row kernel's cost is (fixed + marginal * ncols_dst): weight traffic is constant
+// in ncols_dst, but every row-warp independently re-reads the same activation blocks through
+// L1/L2, so each extra column adds a full activation pass over the matrix. Measured on gfx90a
+// (m=4096, k=14336) that marginal term is ~13.95 us/column against a ~19 us fixed cost, which
+// is why a width-3 speculative verify costs 1.87x a width-1 decode instead of ~1x.
+//
+// Here each warp owns nrows_per_warp rows and loads each activation block once, reusing it for
+// every row it owns. That divides the activation term by nrows_per_warp and leaves the weight
+// traffic (one coalesced load per row) unchanged.
+template <int ncols_dst, int nrows_per_warp>
+static __global__ void mul_mat_tq3_1s_dp4a_multirow(
+        const void       * __restrict__ vx,
+        const block_q8_1 * __restrict__ vy_q8,
+        float            * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int stride_col_y,
+        const int stride_col_dst) {
+
+    const int row0 = (blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y) * nrows_per_warp;
+    if (row0 >= nrows_x) return;
+
+    const int lane = threadIdx.x;
+    const int blocks_per_row = ncols_x / QK_TQ3_0;
+    const block_tq3_1s * x_base = (const block_tq3_1s *) vx;
+
+    float sumf[nrows_per_warp][ncols_dst] = {};
+
+    for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
+        // Activation blocks: read once per ib, reused across every row this warp owns.
+        int   a_qs[ncols_dst][8];
+        float d_act[ncols_dst];
+        #pragma unroll
+        for (int j = 0; j < ncols_dst; j++) {
+            const block_q8_1 * a_blk = &vy_q8[j * stride_col_y + ib];
+            d_act[j] = __half2float((__half)a_blk->ds.x);
+            const int * p = (const int *)(a_blk->qs);
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                a_qs[j][t] = p[t];
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < nrows_per_warp; r++) {
+            const int row = row0 + r;
+            if (nrows_per_warp > 1 && row >= nrows_x) {
+                break;
+            }
+
+            const block_tq3_1s * blk = x_base + (int64_t) row * blocks_per_row + ib;
+            const float fd0 = __half2float(blk->d0);
+            const float fd1 = __half2float(blk->d1);
+
+            uint32_t g0, g1, g2, g3;
+            tq3_groups(blk->qs, g0, g1, g2, g3);
+
+            int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
+            tq3_cents8_reg(g0, c0_0, c1_0);
+            tq3_cents8_reg(g1, c0_1, c1_1);
+            tq3_cents8_reg(g2, c0_2, c1_2);
+            tq3_cents8_reg(g3, c0_3, c1_3);
+
+            #pragma unroll
+            for (int j = 0; j < ncols_dst; j++) {
+                const int s0 = ggml_cuda_dp4a(c0_0, a_qs[j][0], ggml_cuda_dp4a(c1_0, a_qs[j][1],
+                               ggml_cuda_dp4a(c0_1, a_qs[j][2], ggml_cuda_dp4a(c1_1, a_qs[j][3], 0))));
+                const int s1 = ggml_cuda_dp4a(c0_2, a_qs[j][4], ggml_cuda_dp4a(c1_2, a_qs[j][5],
+                               ggml_cuda_dp4a(c0_3, a_qs[j][6], ggml_cuda_dp4a(c1_3, a_qs[j][7], 0))));
+
+                sumf[r][j] += d_act[j] * (fd0 * (float) s0 + fd1 * (float) s1);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < nrows_per_warp; r++) {
+        #pragma unroll
+        for (int j = 0; j < ncols_dst; j++) {
+            sumf[r][j] *= TQ3_CENTROID_I8_RESCALE;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int r = 0; r < nrows_per_warp; r++) {
+            #pragma unroll
+            for (int j = 0; j < ncols_dst; j++) {
+                sumf[r][j] += __shfl_xor_sync(0xffffffff, sumf[r][j], offset);
+            }
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < nrows_per_warp; r++) {
+            const int row = row0 + r;
+            if (nrows_per_warp > 1 && row >= nrows_x) {
+                break;
+            }
+            #pragma unroll
+            for (int j = 0; j < ncols_dst; j++) {
+                dst[j * stride_col_dst + row] = sumf[r][j];
+            }
+        }
+    }
+}
+
+// Multi-row variant of the TQ4_1S dp4a kernel; see mul_mat_tq3_1s_dp4a_multirow for the
+// rationale. Same trade: each warp owns nrows_per_warp rows and reads each activation block
+// once instead of once per row, halving the marginal per-column cost at ncols_dst >= 3.
+template <int ncols_dst, int nrows_per_warp>
+static __global__ void mul_mat_tq4_1s_dp4a_multirow(
+        const void       * __restrict__ vx,
+        const block_q8_1 * __restrict__ vy_q8,
+        float            * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int stride_col_y,
+        const int stride_col_dst) {
+
+    const int row0 = (blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y) * nrows_per_warp;
+    if (row0 >= nrows_x) return;
+
+    const int lane = threadIdx.x;
+    const int blocks_per_row = ncols_x / QK_TQ4_1S;
+    const block_tq4_1s * x_base = (const block_tq4_1s *) vx;
+
+    float sumf[nrows_per_warp][ncols_dst] = {};
+
+    for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
+        // Activation blocks: read once per ib, reused across every row this warp owns.
+        int   a_qs[ncols_dst][8];
+        float d_act[ncols_dst];
+        #pragma unroll
+        for (int j = 0; j < ncols_dst; j++) {
+            const block_q8_1 * a_blk = &vy_q8[j * stride_col_y + ib];
+            d_act[j] = __half2float((__half)a_blk->ds.x);
+            const int * p = (const int *)(a_blk->qs);
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                a_qs[j][t] = p[t];
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < nrows_per_warp; r++) {
+            const int row = row0 + r;
+            if (nrows_per_warp > 1 && row >= nrows_x) {
+                break;
+            }
+
+            const block_tq4_1s * blk = x_base + (int64_t) row * blocks_per_row + ib;
+            const float fd0 = __half2float(blk->d0);
+            const float fd1 = __half2float(blk->d1);
+
+            const uint32_t * qs32 = (const uint32_t *)(blk->qs);
+            const uint32_t w0 = qs32[0], w1 = qs32[1], w2 = qs32[2], w3 = qs32[3];
+
+            int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
+            tq4_cents8_reg(w0, c0_0, c1_0);
+            tq4_cents8_reg(w1, c0_1, c1_1);
+            tq4_cents8_reg(w2, c0_2, c1_2);
+            tq4_cents8_reg(w3, c0_3, c1_3);
+
+            #pragma unroll
+            for (int j = 0; j < ncols_dst; j++) {
+                const int s0 = ggml_cuda_dp4a(c0_0, a_qs[j][0], ggml_cuda_dp4a(c1_0, a_qs[j][1],
+                               ggml_cuda_dp4a(c0_1, a_qs[j][2], ggml_cuda_dp4a(c1_1, a_qs[j][3], 0))));
+                const int s1 = ggml_cuda_dp4a(c0_2, a_qs[j][4], ggml_cuda_dp4a(c1_2, a_qs[j][5],
+                               ggml_cuda_dp4a(c0_3, a_qs[j][6], ggml_cuda_dp4a(c1_3, a_qs[j][7], 0))));
+
+                sumf[r][j] += d_act[j] * (fd0 * (float) s0 + fd1 * (float) s1);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < nrows_per_warp; r++) {
+        #pragma unroll
+        for (int j = 0; j < ncols_dst; j++) {
+            sumf[r][j] *= TQ4_CENTROID_I8_RESCALE;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int r = 0; r < nrows_per_warp; r++) {
+            #pragma unroll
+            for (int j = 0; j < ncols_dst; j++) {
+                sumf[r][j] += __shfl_xor_sync(0xffffffff, sumf[r][j], offset);
+            }
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < nrows_per_warp; r++) {
+            const int row = row0 + r;
+            if (nrows_per_warp > 1 && row >= nrows_x) {
+                break;
+            }
+            #pragma unroll
+            for (int j = 0; j < ncols_dst; j++) {
+                dst[j * stride_col_dst + row] = sumf[r][j];
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Multi-token TQ3_1S scalar kernel (ncols_dst ≤ 8)
 // ============================================================================
@@ -770,11 +984,30 @@ static __global__ void mul_mat_tq4_1s_scalar_multi(
 // AMD: uses scalar half path for TQ4_1S (dp4a regresses on RDNA4)
 // ============================================================================
 
+template <int ncols_dst, int nrows_per_warp>
+static void launch_tq4_1s_multirow_impl(
+        const void * src0_d, const block_q8_1 * q8_buf,
+        float * dst_d, int ncols_x, int nrows_x,
+        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+    const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
+    const int rows_per_block = MMVQ_TQ_NWARPS * nrows_per_warp;
+    const dim3 grid((nrows_x + rows_per_block - 1) / rows_per_block);
+    mul_mat_tq4_1s_dp4a_multirow<ncols_dst, nrows_per_warp><<<grid, block, 0, stream>>>(
+        src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
+}
+
 template <int ncols_dst>
 static void launch_tq4_1s_multi(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+    // Same crossover as the TQ3_1S path (launch_tq3_1s_dp4a_multi): two rows per warp only
+    // pays from ncols_dst >= 3.
+    if constexpr (ncols_dst >= 3) {
+        launch_tq4_1s_multirow_impl<ncols_dst, 2>(
+            src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);
+        return;
+    }
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
     mul_mat_tq4_1s_dp4a_multi<ncols_dst><<<grid, block, 0, stream>>>(
@@ -803,11 +1036,32 @@ static void launch_tq3_1s_multi(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
+template <int ncols_dst, int nrows_per_warp>
+static void launch_tq3_1s_dp4a_multirow_impl(
+        const void * src0_d, const block_q8_1 * q8_buf,
+        float * dst_d, int ncols_x, int nrows_x,
+        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+    const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
+    const int rows_per_block = MMVQ_TQ_NWARPS * nrows_per_warp;
+    const dim3 grid((nrows_x + rows_per_block - 1) / rows_per_block);
+    mul_mat_tq3_1s_dp4a_multirow<ncols_dst, nrows_per_warp><<<grid, block, 0, stream>>>(
+        src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
+}
+
 template <int ncols_dst>
 static void launch_tq3_1s_dp4a_multi(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+    // Rows handled per warp. Two rows halve the per-column activation reload but add ~4 us of
+    // fixed cost (extra weight streams + register pressure), so the crossover is ncols_dst >= 3.
+    // Measured on gfx90a, m=4096 k=14336: 0.88x at n=1, 0.99x at n=2, then 1.12x (n=3), 1.26x
+    // (n=4), 1.31x (n=5), 1.47x (n=8). Four or more rows per warp regress everywhere (occupancy).
+    if constexpr (ncols_dst >= 3) {
+        launch_tq3_1s_dp4a_multirow_impl<ncols_dst, 2>(
+            src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);
+        return;
+    }
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
     mul_mat_tq3_1s_dp4a_multi<ncols_dst><<<grid, block, 0, stream>>>(
