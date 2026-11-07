@@ -316,6 +316,56 @@ static bool test_tq3_1s_mmq_centroid_table() {
     return true;
 }
 
+// The TQ3_1S MMQ loader selects the four centroids of a quad with one byte permute over
+// two constants holding the int8 table, transcribed here from
+// ggml/src/ggml-cuda/mmq-load-tiles.cuh (tq3_1s_qs_to_int8x4).
+static const uint32_t tq3_1s_kv_lo = 0xF0D1AE81u;
+static const uint32_t tq3_1s_kv_hi = 0x7F512E0Fu;
+
+// v_perm_b32(s0, s1, sel): output byte k is byte sel[8k+7:8k] of the 8-byte value {s0, s1},
+// s1 being bytes 0-3. Only selector values 0-7 are used, so the special values above 7 are
+// not modelled.
+static uint32_t emulate_v_perm_b32(uint32_t s0, uint32_t s1, uint32_t sel) {
+    const uint64_t src = ((uint64_t) s0 << 32) | s1;
+    uint32_t r = 0;
+    for (int k = 0; k < 4; k++) {
+        const uint32_t s = (sel >> (8*k)) & 0xff;
+        r |= (uint32_t) ((src >> (8*s)) & 0xff) << (8*k);
+    }
+    return r;
+}
+
+// __byte_perm(x, y, s): output byte k is byte s[4k+2:4k] of the 8-byte value {y, x}, x being
+// bytes 0-3. The sign-replicate mode (bit 3 of each nibble) is not used, so not modelled.
+static uint32_t emulate_byte_perm(uint32_t x, uint32_t y, uint32_t s) {
+    const uint64_t src = ((uint64_t) y << 32) | x;
+    uint32_t r = 0;
+    for (int k = 0; k < 4; k++) {
+        const uint32_t n = (s >> (4*k)) & 0x7;
+        r |= (uint32_t) ((src >> (8*n)) & 0xff) << (8*k);
+    }
+    return r;
+}
+
+// Both selector packings must give the four table entries for every possible quad of indices.
+static bool test_tq3_1s_mmq_byte_permute() {
+    for (uint32_t q = 0; q < 8*8*8*8; q++) {
+        const uint32_t i0 = q & 7, i1 = (q >> 3) & 7, i2 = (q >> 6) & 7, i3 = (q >> 9) & 7;
+        const uint32_t want = (uint32_t) (uint8_t) tq3_1s_kvalues[i0]
+                            | ((uint32_t) (uint8_t) tq3_1s_kvalues[i1] << 8)
+                            | ((uint32_t) (uint8_t) tq3_1s_kvalues[i2] << 16)
+                            | ((uint32_t) (uint8_t) tq3_1s_kvalues[i3] << 24);
+        const uint32_t hip  = emulate_v_perm_b32(tq3_1s_kv_hi, tq3_1s_kv_lo, i0 | (i1 << 8) | (i2 << 16) | (i3 << 24));
+        const uint32_t cuda = emulate_byte_perm (tq3_1s_kv_lo, tq3_1s_kv_hi, i0 | (i1 << 4) | (i2 <<  8) | (i3 << 12));
+        if (hip != want || cuda != want) {
+            fprintf(stderr, "%s: indices %u %u %u %u: want %08x, v_perm form %08x, prmt form %08x\n",
+                    __func__, i0, i1, i2, i3, want, hip, cuda);
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -343,13 +393,15 @@ int main(int argc, char * argv[]) {
     {
         const bool unpack_ok = test_tq3_1s_mmq_unpack_matches_cpu();
         const bool table_ok  = test_tq3_1s_mmq_centroid_table();
-        if (!unpack_ok || !table_ok) {
+        const bool perm_ok   = test_tq3_1s_mmq_byte_permute();
+        if (!unpack_ok || !table_ok || !perm_ok) {
             num_failed++;
         }
-        if (!unpack_ok || !table_ok || verbose) {
+        if (!unpack_ok || !table_ok || !perm_ok || verbose) {
             // RESULT_STR is indexed by the failure flag, not by a success bool
             printf("%5s TQ3_1S MMQ unpack matches the CPU codec: %s\n", RESULT_STR[!unpack_ok], RESULT_STR[!unpack_ok]);
             printf("%5s TQ3_1S MMQ centroid table:               %s\n", RESULT_STR[!table_ok],  RESULT_STR[!table_ok]);
+            printf("%5s TQ3_1S MMQ byte-permute centroid lookup: %s\n", RESULT_STR[!perm_ok],   RESULT_STR[!perm_ok]);
         }
     }
 
