@@ -1446,7 +1446,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
 
     const int ncols_x   = src0->ne[0];
     const int nrows_x   = src0->ne[1];
-    const int ncols_dst = src1->ne[1];
+    const int ncols_dst = ggml_nrows(src1);   // every src1 row: the caller passes contiguous src1/dst and a 2D weight
     GGML_ASSERT(ncols_x % 32 == 0);
 
     const void  * src0_d = src0->data;
@@ -1653,7 +1653,7 @@ void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx,
     const int64_t ne00 = src0->ne[0];  // K (hidden dim)
     const int64_t ne01 = src0->ne[1];  // M (rows = output features)
     const int64_t ne10 = src1->ne[0];  // K
-    const int64_t ne11 = src1->ne[1];  // N (tokens)
+    const int64_t ne11 = ggml_nrows(src1);  // N: every src1 row (contiguous src1/dst, 2D weight; see the caller)
     GGML_ASSERT(ne00 == ne10);
 
     const int id = ggml_cuda_get_device();
