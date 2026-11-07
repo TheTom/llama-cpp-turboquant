@@ -601,10 +601,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #else
     // dp4a consumes a different tile layout: rows are padded by one int and the scales start
     // after the (padded) quant region, not at a fixed 2*MMQ_TILE_NE_K offset.
-    // Unreachable today: TQ3_1S has an MMQ config entry only in mmq-config-rdna4.cuh, and
-    // RDNA4 defines AMD_WMMA_AVAILABLE, so it always takes the branch above. This branch
-    // becomes live when an arch that lacks MFMA/WMMA/MMA gets a TQ3_1S config entry, and
-    // it needs a run on that arch first.
+    // Taken on RDNA2, which has a TQ3_1S config entry but neither MFMA nor WMMA.
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_TQ3_1S, I);
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + txs.qs);
