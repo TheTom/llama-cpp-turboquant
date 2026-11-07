@@ -618,7 +618,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multi(
 
 // Multi-token TQ3_1S dp4a kernel (ncols_dst <= 8): the TQ4_1S kernel above with the 3-bit
 // unpack. The four 8-element index groups of a block expand through tq3_cents8_reg.
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>   // T: TQ3_1S or TQ3_4S, see tq3_block_at
 static __global__ void mul_mat_tq3_1s_dp4a_multi(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,
@@ -633,19 +633,18 @@ static __global__ void mul_mat_tq3_1s_dp4a_multi(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row = ((const block_tq3_1s *) vx) + (int64_t)row * blocks_per_row;
+    const char * x_row = (const char *) vx + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
 
     float sumf[ncols_dst] = {};
 
     for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
-        const block_tq3_1s * blk = &x_row[ib];
-        const float fd0 = __half2float(blk->d0);
-        const float fd1 = __half2float(blk->d1);
+        float fd0, fd1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, fd0, fd1);
 
         // Load weight once, reuse across all tokens. 3-bit indices pack 8-per-3-bytes,
         // so the block's 12 qs bytes give four 8-element groups.
         uint32_t g0, g1, g2, g3;
-        tq3_groups(blk->qs, g0, g1, g2, g3);
+        tq3_groups(qs, g0, g1, g2, g3);
 
         int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
         tq3_cents8_reg(g0, c0_0, c1_0);
@@ -698,7 +697,7 @@ static __global__ void mul_mat_tq3_1s_dp4a_multi(
 // Here each warp owns nrows_per_warp rows and loads each activation block once, reusing it for
 // every row it owns. That divides the activation term by nrows_per_warp and leaves the weight
 // traffic (one coalesced load per row) unchanged.
-template <int ncols_dst, int nrows_per_warp>
+template <int ncols_dst, int nrows_per_warp, ggml_type T = GGML_TYPE_TQ3_1S>   // T: see tq3_block_at
 static __global__ void mul_mat_tq3_1s_dp4a_multirow(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,
@@ -713,7 +712,8 @@ static __global__ void mul_mat_tq3_1s_dp4a_multirow(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_base = (const block_tq3_1s *) vx;
+    const char * x_base = (const char *) vx;
+    const int64_t row_bytes = tq3_row_bytes<T>(blocks_per_row);
 
     float sumf[nrows_per_warp][ncols_dst] = {};
 
@@ -739,12 +739,11 @@ static __global__ void mul_mat_tq3_1s_dp4a_multirow(
                 break;
             }
 
-            const block_tq3_1s * blk = x_base + (int64_t) row * blocks_per_row + ib;
-            const float fd0 = __half2float(blk->d0);
-            const float fd1 = __half2float(blk->d1);
+            float fd0, fd1;
+            const uint8_t * qs = tq3_block_at<T>(x_base + (int64_t) row * row_bytes, ib, fd0, fd1);
 
             uint32_t g0, g1, g2, g3;
-            tq3_groups(blk->qs, g0, g1, g2, g3);
+            tq3_groups(qs, g0, g1, g2, g3);
 
             int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
             tq3_cents8_reg(g0, c0_0, c1_0);
@@ -905,7 +904,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multirow(
 // Multi-token TQ3_1S scalar kernel (ncols_dst ≤ 8)
 // ============================================================================
 
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>   // T: TQ3_1S or TQ3_4S, see tq3_block_at
 static __global__ void mul_mat_tq3_1s_multi(
         const void  * __restrict__ vx,
         const float * __restrict__ vy_rot,
@@ -928,13 +927,15 @@ static __global__ void mul_mat_tq3_1s_multi(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row = ((const block_tq3_1s *) vx) + (int64_t)row * blocks_per_row;
+    const char * x_row = (const char *) vx + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
 
     float sumf[ncols_dst] = {};
 
     for (int ib = 0; ib < blocks_per_row; ib++) {
-        const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+        float d0, d1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, d0, d1);
+        const float d = (lane < 16) ? d0 : d1;
+        const uint32_t idx = tq3_extract_index_fast(qs, lane);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         const float w = tq3_cent_reg(idx) * d;
 #else
@@ -1066,18 +1067,18 @@ static void launch_tq4_1s_scalar_multi(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>
 static void launch_tq3_1s_multi(
         const void * src0_d, const float * act_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
-    mul_mat_tq3_1s_multi<ncols_dst><<<grid, block, 0, stream>>>(
+    mul_mat_tq3_1s_multi<ncols_dst, T><<<grid, block, 0, stream>>>(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
-template <int ncols_dst, int nrows_per_warp>
+template <int ncols_dst, int nrows_per_warp, ggml_type T>
 static void launch_tq3_1s_dp4a_multirow_impl(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
@@ -1085,11 +1086,11 @@ static void launch_tq3_1s_dp4a_multirow_impl(
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const int rows_per_block = MMVQ_TQ_NWARPS * nrows_per_warp;
     const dim3 grid((nrows_x + rows_per_block - 1) / rows_per_block);
-    mul_mat_tq3_1s_dp4a_multirow<ncols_dst, nrows_per_warp><<<grid, block, 0, stream>>>(
+    mul_mat_tq3_1s_dp4a_multirow<ncols_dst, nrows_per_warp, T><<<grid, block, 0, stream>>>(
         src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>
 static void launch_tq3_1s_dp4a_multi(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
@@ -1099,13 +1100,13 @@ static void launch_tq3_1s_dp4a_multi(
     // Measured on gfx90a, m=4096 k=14336: 0.88x at n=1, 0.99x at n=2, then 1.12x (n=3), 1.26x
     // (n=4), 1.31x (n=5), 1.47x (n=8). Four or more rows per warp regress everywhere (occupancy).
     if constexpr (ncols_dst >= 3) {
-        launch_tq3_1s_dp4a_multirow_impl<ncols_dst, 2>(
+        launch_tq3_1s_dp4a_multirow_impl<ncols_dst, 2, T>(
             src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);
         return;
     }
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
-    mul_mat_tq3_1s_dp4a_multi<ncols_dst><<<grid, block, 0, stream>>>(
+    mul_mat_tq3_1s_dp4a_multi<ncols_dst, T><<<grid, block, 0, stream>>>(
         src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
@@ -1977,7 +1978,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                            const ggml_tensor * src0,
                            const ggml_tensor * src1,
                            ggml_tensor * dst) {
-    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -1985,6 +1986,8 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
     const int nrows_x   = src0->ne[1];
     const int ncols_dst = src1->ne[1];
     GGML_ASSERT(ncols_x % 32 == 0);
+    // TQ3_4S has kernels for the decode widths only (the caller sends ncols_dst <= MMVQ_MAX_BATCH_SIZE).
+    GGML_ASSERT(src0->type != GGML_TYPE_TQ3_4S || (ncols_x % 128 == 0 && ncols_dst <= 8));
 
     const void  * src0_d = src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -2013,29 +2016,30 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
         }
 
         // Phase 2: dispatch based on ncols_dst
-        const bool is_tq3 = src0->type == GGML_TYPE_TQ3_1S;
         const int stride_col_y   = ncols_x / 32;  // q8_1 blocks per column
         const int stride_col_dst = nrows_x;
 
+        #define TQ_LAUNCH_DENSE_DP4A(N) do {                                                           \
+            if (src0->type == GGML_TYPE_TQ3_1S) {                                                      \
+                launch_tq3_1s_dp4a_multi<N>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);              \
+            } else if (src0->type == GGML_TYPE_TQ3_4S) {                                               \
+                launch_tq3_1s_dp4a_multi<N, GGML_TYPE_TQ3_4S>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); \
+            } else {                                                                                   \
+                launch_tq4_1s_multi<N>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);                   \
+            }                                                                                          \
+        } while (0)
         if (ncols_dst <= 8) {
             switch (ncols_dst) {
-                case 1: is_tq3 ? launch_tq3_1s_dp4a_multi<1>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<1>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 2: is_tq3 ? launch_tq3_1s_dp4a_multi<2>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<2>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 3: is_tq3 ? launch_tq3_1s_dp4a_multi<3>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<3>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 4: is_tq3 ? launch_tq3_1s_dp4a_multi<4>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<4>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 5: is_tq3 ? launch_tq3_1s_dp4a_multi<5>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<5>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 6: is_tq3 ? launch_tq3_1s_dp4a_multi<6>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<6>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 7: is_tq3 ? launch_tq3_1s_dp4a_multi<7>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<7>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 8: is_tq3 ? launch_tq3_1s_dp4a_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 1: TQ_LAUNCH_DENSE_DP4A(1); break;
+                case 2: TQ_LAUNCH_DENSE_DP4A(2); break;
+                case 3: TQ_LAUNCH_DENSE_DP4A(3); break;
+                case 4: TQ_LAUNCH_DENSE_DP4A(4); break;
+                case 5: TQ_LAUNCH_DENSE_DP4A(5); break;
+                case 6: TQ_LAUNCH_DENSE_DP4A(6); break;
+                case 7: TQ_LAUNCH_DENSE_DP4A(7); break;
+                case 8: TQ_LAUNCH_DENSE_DP4A(8); break;
             }
+            #undef TQ_LAUNCH_DENSE_DP4A
         } else {
 #if defined(GGML_CUDA_USE_WMMA)
             if (fp16_mma_hardware_available(cc)) {
@@ -2089,6 +2093,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
         // Macro to dispatch to the right kernel based on quant type
         #define LAUNCH_SCALAR(N, src0_ptr, act_ptr, dst_ptr) \
             if (is_tq4) { launch_tq4_1s_scalar_multi<N>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); } \
+            else if (src0->type == GGML_TYPE_TQ3_4S) { launch_tq3_1s_multi<N, GGML_TYPE_TQ3_4S>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); } \
             else        { launch_tq3_1s_multi<N>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); }
 
         if (ncols_dst <= 8) {
