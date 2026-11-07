@@ -4979,6 +4979,7 @@ class GGMLQuantizationType(IntEnum):
     Q8_CR   = 48
     Q5_CR   = 49
     Q6_CR   = 50
+    TQ3_4S  = 53
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5173,6 +5174,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
     GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
+    GGMLQuantizationType.TQ3_4S:  (128, 2 + 6 + 48),
     # same layout as Q8_0, but the rows are rotated in groups of 256 (ConvRot)
     GGMLQuantizationType.Q8_CR:   (256, 8 * (2 + 32)),
     # same layout as Q5_0, but the rows are rotated in groups of 256 (ConvRot)

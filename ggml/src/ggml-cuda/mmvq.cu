@@ -285,6 +285,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // TQ3_4S has no kernel here: its MoE decode runs in mmvq-tq.cu, and dense weights of that
+    // type are dequantized for cuBLAS.
+    if (type == GGML_TYPE_TQ3_4S) {
+        return false;
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {

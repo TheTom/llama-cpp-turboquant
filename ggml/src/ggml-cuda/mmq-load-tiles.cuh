@@ -721,6 +721,74 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// TQ3_4S: the TQ3_1S loader with super-block scales. A tile row is 2*MMQ_TILE_NE_K ints = 256
+// values = two super-blocks, so x + kbx0 + i*stride is the first of them, and the 32-value
+// sub-block inside a super-block takes the place of the TQ3_1S block index. The tile it
+// produces is identical in layout to the TQ3_1S one, so the same vec_dot consumes it.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_4s(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    constexpr float TQ3_CENTROID_I8_RESCALE = 1.996684f / 127.0f;
+    constexpr int   QI_TQ = 32 / 4;   // 8 ints (int8-quads) per 32-value sub-block
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_TQ3_4S, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi  = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int sub  = txi / QI_TQ;   // sub-block within the super-block of this 32-int half
+    const int kqsx = txi % QI_TQ;   // int within the sub-block
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const block_tq3_4s * bxi = (const block_tq3_4s *) x + kbx0 + i*stride;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*sram_stride           + 0             + txi] = tq3_1s_qs_to_int8x4(bxi[0].qs + 12*sub, kqsx);
+        x_qs[i*sram_stride           + MMQ_TILE_NE_K + txi] = tq3_1s_qs_to_int8x4(bxi[1].qs + 12*sub, kqsx);
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = tq3_1s_qs_to_int8x4(bxi[0].qs + 12*sub, kqsx);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = tq3_1s_qs_to_int8x4(bxi[1].qs + 12*sub, kqsx);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+
+    // Two per-16 scales per sub-block: slot 2*b = first half, slot 2*b+1 = second half, for the
+    // eight sub-blocks b of the two super-blocks.
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI_TQ;   // 8 sub-blocks
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;            // sub-block 0..7
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const block_tq3_4s * bxi = (const block_tq3_4s *) x + kbx0 + i*stride + kbxd/4;
+        const float2 d = tq3_4s_sub_scales(bxi, kbxd % 4);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                             + 2*kbxd + 0] = d.x * TQ3_CENTROID_I8_RESCALE;
+        x_df[i*sram_stride                             + 2*kbxd + 1] = d.y * TQ3_CENTROID_I8_RESCALE;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbxd + 0] = d.x * TQ3_CENTROID_I8_RESCALE;
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbxd + 1] = d.y * TQ3_CENTROID_I8_RESCALE;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_K(

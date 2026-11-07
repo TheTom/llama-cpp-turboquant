@@ -1037,6 +1037,25 @@ struct ggml_cuda_type_traits<GGML_TYPE_TQ3_1S> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ3_4S> {
+    static constexpr int qk = QK_TQ3_4S;
+    static constexpr int qr = 1;
+    static constexpr int qi = QK_TQ3_4S / 4;  // 32 int8-quads per super-block
+};
+
+// TQ3_4S: the two half-block scales of 32-value sub-block `sub` (0..3) of a super-block. The
+// 8-byte header {d, sc} is read as one little-endian word, in which q[j] sits at bit 16 + 6j.
+// Super-blocks are 56 bytes and every row is a whole number of them, so the header is always
+// 8-byte aligned.
+static __device__ __forceinline__ float2 tq3_4s_sub_scales(const block_tq3_4s * __restrict__ sb, const int sub) {
+    const uint2    h = *(const uint2 *) sb;
+    const uint64_t w = ((uint64_t) h.y << 32) | h.x;
+    const float    d = __half2float(sb->d);
+    const int     sh = 16 + 12*sub;
+    return make_float2(d * (float) ((w >> sh) & 63u), d * (float) ((w >> (sh + 6)) & 63u));
+}
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
