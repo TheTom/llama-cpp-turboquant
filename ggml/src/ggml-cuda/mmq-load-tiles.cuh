@@ -559,27 +559,34 @@ static __device__ __forceinline__ int tq4_1s_qs_to_int8x4(const uint8_t * __rest
 // it against the CPU codec exhaustively over all 2^24 group words. Keep the two
 // in sync.
 //
-// Unlike the TQ4 loader above, this selects the centroids with four table
-// loads instead of a byte permute, because the 8-entry table does not fit the
-// v_perm_b32 path. A register-resident selection is the obvious next lever and
-// has not been measured.
+// The centroids are selected with one byte permute, not four table loads: the
+// 8-entry int8 table is exactly 8 bytes, which is the source window of a byte
+// permute (v_perm_b32 on AMD, prmt on NVIDIA), so the four 3-bit indices only
+// need to be placed in selector fields. The table is held as two constants,
+// TQ3_KV_LO = kvalues_tq3[0..3] and TQ3_KV_HI = kvalues_tq3[4..7], one byte per
+// entry, least significant first; tests/test-quantize-fns.cpp checks both
+// constants and both selector packings against kvalues_tq3.
 static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __restrict__ qs, const int kqsx) {
     const int g   = kqsx >> 1;        // group 0..3
     const int sub = (kqsx & 1) * 4;    // first element within the group
     const uint8_t * qp = qs + 3*g;
     const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
-    const int i0 = (packed >> (3*sub + 0)) & 7;
-    const int i1 = (packed >> (3*sub + 3)) & 7;
-    const int i2 = (packed >> (3*sub + 6)) & 7;
-    const int i3 = (packed >> (3*sub + 9)) & 7;
-    // Cast through uint8_t: a negative int8 would otherwise sign-extend into the
-    // upper bytes of the packed word. The shifts are done in uint32_t for the same
-    // reason - (int) 0x81 << 24 overflows a signed int.
-    const uint32_t w = (uint32_t) (uint8_t) kvalues_tq3[i0]
-                     | ((uint32_t) (uint8_t) kvalues_tq3[i1] << 8)
-                     | ((uint32_t) (uint8_t) kvalues_tq3[i2] << 16)
-                     | ((uint32_t) (uint8_t) kvalues_tq3[i3] << 24);
-    return (int) w;
+    const uint32_t i0 = (packed >> (3*sub + 0)) & 7;
+    const uint32_t i1 = (packed >> (3*sub + 3)) & 7;
+    const uint32_t i2 = (packed >> (3*sub + 6)) & 7;
+    const uint32_t i3 = (packed >> (3*sub + 9)) & 7;
+    constexpr uint32_t TQ3_KV_LO = 0xF0D1AE81u;   // { -127, -82, -47, -16 }
+    constexpr uint32_t TQ3_KV_HI = 0x7F512E0Fu;   // {   15,  46,  81, 127 }
+#if defined(GGML_USE_HIP)
+    // v_perm_b32: one selector byte per output byte; source bytes 0-3 are the second
+    // operand and 4-7 the first. Keep the builtin here: __byte_perm() with a runtime
+    // selector is emulated on HIP through a dynamically indexed byte array.
+    return (int) __builtin_amdgcn_perm(TQ3_KV_HI, TQ3_KV_LO, i0 | (i1 << 8) | (i2 << 16) | (i3 << 24));
+#else
+    // prmt: one selector nibble per output byte; source bytes 0-3 are the first
+    // operand and 4-7 the second. Same result as the HIP form.
+    return (int) __byte_perm(TQ3_KV_LO, TQ3_KV_HI, i0 | (i1 << 4) | (i2 << 8) | (i3 << 12));
+#endif // defined(GGML_USE_HIP)
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_1s(
