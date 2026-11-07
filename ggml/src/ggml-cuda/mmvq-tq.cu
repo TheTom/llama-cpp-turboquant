@@ -77,9 +77,14 @@ static constexpr float TQ4_CENTROID_I8_RESCALE = 2.733f / 127.0f;
 static constexpr float TQ3_CENTROID_I8_RESCALE = 1.996684f / 127.0f;
 
 // Decode-path selection for the TQ weight types: the int8 dp4a kernels or the scalar float ones.
-// dp4a where the hardware has real dot4 throughput: NVIDIA and CDNA, as before. TQ3_1S takes it
-// on HIP only: its centroid expansion (tq3_cents8_reg) has an nvcc branch that has not been built
-// or run, and the fused TQ3_1S path is not taken on NVIDIA anyway (see ggml_cuda_mul_mat).
+// dp4a where the hardware has real dot4 throughput: NVIDIA, CDNA, and RDNA2/RDNA3 (sdot4 and
+// sudot4). The scalar path is one lane per weight and instruction-bound on RDNA. RDNA1 has no dot4
+// instruction and RDNA4 was measured slower on dp4a, so both keep the scalar path.
+// GGML_TQ_DP4A=1 / =0 forces either way, e.g. to measure RDNA4 again.
+//
+// TQ3_1S takes dp4a on HIP only: its centroid expansion (tq3_cents8_reg) has an nvcc branch that
+// has not been built or run, and the fused TQ3_1S path is not taken on NVIDIA anyway (see
+// ggml_cuda_mul_mat).
 static bool tq_use_dp4a(int cc, ggml_type type) {
     if (type != GGML_TYPE_TQ4_1S && type != GGML_TYPE_TQ3_1S) {
         return false;
@@ -89,7 +94,15 @@ static bool tq_use_dp4a(int cc, ggml_type type) {
         return false;
     }
 #endif
-    return !GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+    static const int force = getenv("GGML_TQ_DP4A") ? atoi(getenv("GGML_TQ_DP4A")) : -1;
+    if (force == 1) {
+        return true;
+    }
+    if (force == 0) {
+        return false;
+    }
+    return !GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
+           GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc);
 }
 
 // Register-based centroid lookup: maps 4 qs bytes (1 uint32) to 2 packed 4× centroid_i8 for dp4a.
