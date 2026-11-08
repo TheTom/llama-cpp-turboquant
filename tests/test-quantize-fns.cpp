@@ -227,10 +227,11 @@ static void tq3_1s_unpack_indices_cuda(const uint8_t * qs, int kqsx, int idx[4])
     const int sub  = (kqsx & 1) * 4;   // first element within the group
     const uint8_t * qp = qs + 3*g;
     const uint32_t packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
-    idx[0] = (packed >> (3*sub + 0)) & 7;
-    idx[1] = (packed >> (3*sub + 3)) & 7;
-    idx[2] = (packed >> (3*sub + 6)) & 7;
-    idx[3] = (packed >> (3*sub + 9)) & 7;
+    const uint32_t q = packed >> (3*sub);
+    idx[0] =  q       & 7;
+    idx[1] = (q >> 3) & 7;
+    idx[2] = (q >> 6) & 7;
+    idx[3] = (q >> 9) & 7;
 }
 
 // The CPU codec's unpacking of one group of eight indices, transcribed from
