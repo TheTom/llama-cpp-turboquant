@@ -571,10 +571,13 @@ static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __rest
     const int sub = (kqsx & 1) * 4;    // first element within the group
     const uint8_t * qp = qs + 3*g;
     const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
-    const uint32_t i0 = (packed >> (3*sub + 0)) & 7;
-    const uint32_t i1 = (packed >> (3*sub + 3)) & 7;
-    const uint32_t i2 = (packed >> (3*sub + 6)) & 7;
-    const uint32_t i3 = (packed >> (3*sub + 9)) & 7;
+    // One variable shift, then fixed-offset fields: shifting by 3*sub + 3*j for each j
+    // measured 9% slower on CDNA2 (gfx90a) prefill.
+    const uint32_t q  = packed >> (3*sub);   // the quad's four 3-bit indices in bits 0-11
+    const uint32_t i0 =  q       & 7;
+    const uint32_t i1 = (q >> 3) & 7;
+    const uint32_t i2 = (q >> 6) & 7;
+    const uint32_t i3 = (q >> 9) & 7;
     constexpr uint32_t TQ3_KV_LO = 0xF0D1AE81u;   // { -127, -82, -47, -16 }
     constexpr uint32_t TQ3_KV_HI = 0x7F512E0Fu;   // {   15,  46,  81, 127 }
 #if defined(GGML_USE_HIP)
