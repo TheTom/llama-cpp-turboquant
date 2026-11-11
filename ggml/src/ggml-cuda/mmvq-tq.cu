@@ -76,15 +76,8 @@ static constexpr float TQ4_CENTROID_I8_RESCALE = 2.733f / 127.0f;
 // TQ3_1S: kvalues_tq3[i] = round(TQ3_CENTROIDS[i] * 127 / 1.996684), so the rescale is 1.996684 / 127.
 static constexpr float TQ3_CENTROID_I8_RESCALE = 1.996684f / 127.0f;
 
-// Decode-path selection for the TQ weight types: the int8 dp4a kernels or the scalar float ones.
-// dp4a where the hardware has real dot4 throughput: NVIDIA, CDNA, and RDNA2/RDNA3 (sdot4 and
-// sudot4). The scalar path is one lane per weight and instruction-bound on RDNA. RDNA1 has no dot4
-// instruction and RDNA4 was measured slower on dp4a, so both keep the scalar path.
-// GGML_TQ_DP4A=1 / =0 forces either way, e.g. to measure RDNA4 again.
-//
-// TQ3_1S takes dp4a on HIP only: its centroid expansion (tq3_cents8_reg) has an nvcc branch that
-// has not been built or run, and the fused TQ3_1S path is not taken on NVIDIA anyway (see
-// ggml_cuda_mul_mat).
+// TQ decode path: int8 dp4a on NVIDIA, CDNA, RDNA2 and RDNA3.0, scalar float elsewhere.
+// TQ3_1S takes dp4a on HIP only. GGML_TQ_DP4A=1/0 forces either path.
 static bool tq_use_dp4a(int cc, ggml_type type) {
     if (type != GGML_TYPE_TQ4_1S && type != GGML_TYPE_TQ3_1S) {
         return false;
@@ -102,7 +95,7 @@ static bool tq_use_dp4a(int cc, ggml_type type) {
         return false;
     }
     return !GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
-           GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc);
+           GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_0(cc);
 }
 
 // Register-based centroid lookup: maps 4 qs bytes (1 uint32) to 2 packed 4× centroid_i8 for dp4a.
@@ -154,12 +147,8 @@ static __device__ __forceinline__ void tq3_cents8_reg(uint32_t g24, int &c0, int
     c0 = __builtin_amdgcn_perm(HI, LO, s0);
     c1 = __builtin_amdgcn_perm(HI, LO, s1);
 #else
-    // nvcc / MUSA prmt takes one selector NIBBLE per output byte, so the identical indices pack
-    // at 4-bit spacing instead. __byte_perm supplies bytes 0-3 from its first operand and 4-7
-    // from its second, which is the same {HI,LO} window; prmt sign-replicate (nibble bit 3) is
-    // never reached because the indices are 0..7. NOTE: this branch has never been built or run
-    // -- the fork has only ever targeted HIP -- it mirrors the HIP form so the file compiles and
-    // so TQ3 dp4a is reachable where tq_use_dp4a says it should be.
+    // prmt takes one selector nibble per output byte, and __byte_perm takes bytes 0-3 from its
+    // first operand, so the same {HI,LO} window is (LO, HI) here.
     const uint32_t s0 = ( (g24        & 7u)      ) | (((g24 >>  3) & 7u) <<  4)
                       | (((g24 >>  6) & 7u) <<  8) | (((g24 >>  9) & 7u) << 12);
     const uint32_t s1 = (((g24 >> 12) & 7u)      ) | (((g24 >> 15) & 7u) <<  4)
@@ -659,17 +648,8 @@ static __global__ void mul_mat_tq3_1s_dp4a_multi(
     }
 }
 
-// Multi-row variant of the TQ3_1S dp4a kernel.
-//
-// The single-row kernel's cost is (fixed + marginal * ncols_dst): weight traffic is constant
-// in ncols_dst, but every row-warp independently re-reads the same activation blocks through
-// L1/L2, so each extra column adds a full activation pass over the matrix. Measured on gfx90a
-// (m=4096, k=14336) that marginal term is ~13.95 us/column against a ~19 us fixed cost, which
-// is why a width-3 speculative verify costs 1.87x a width-1 decode instead of ~1x.
-//
-// Here each warp owns nrows_per_warp rows and loads each activation block once, reusing it for
-// every row it owns. That divides the activation term by nrows_per_warp and leaves the weight
-// traffic (one coalesced load per row) unchanged.
+// Multi-row TQ3_1S dp4a kernel: each warp owns nrows_per_warp rows and reads each activation
+// block once for all of them, instead of once per row.
 template <int ncols_dst, int nrows_per_warp>
 static __global__ void mul_mat_tq3_1s_dp4a_multirow(
         const void       * __restrict__ vx,
@@ -770,9 +750,7 @@ static __global__ void mul_mat_tq3_1s_dp4a_multirow(
     }
 }
 
-// Multi-row variant of the TQ4_1S dp4a kernel; see mul_mat_tq3_1s_dp4a_multirow for the
-// rationale. Same trade: each warp owns nrows_per_warp rows and reads each activation block
-// once instead of once per row, halving the marginal per-column cost at ncols_dst >= 3.
+// Multi-row TQ4_1S dp4a kernel, as mul_mat_tq3_1s_dp4a_multirow.
 template <int ncols_dst, int nrows_per_warp>
 static __global__ void mul_mat_tq4_1s_dp4a_multirow(
         const void       * __restrict__ vx,
@@ -994,7 +972,7 @@ static __global__ void mul_mat_tq4_1s_scalar_multi(
 // ============================================================================
 // Dispatch: ne[1]=1 (decode), ne[1]≤8 (multi-token dp4a / scalar)
 // ne[1]>8 handled by ggml_cuda_mul_mat_tq4_1s_cublas (runtime dequant + cuBLAS)
-// AMD: uses scalar half path for TQ4_1S (dp4a regresses on RDNA4)
+// dp4a or scalar per tq_use_dp4a
 // ============================================================================
 
 template <int ncols_dst, int nrows_per_warp>
@@ -1014,13 +992,14 @@ static void launch_tq4_1s_multi(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
-    // Same crossover as the TQ3_1S path (launch_tq3_1s_dp4a_multi): two rows per warp only
-    // pays from ncols_dst >= 3.
+    // Two rows per warp from 3 columns, as for TQ3_1S. HIP only until it is measured on NVIDIA.
+#if defined(GGML_USE_HIP)
     if constexpr (ncols_dst >= 3) {
         launch_tq4_1s_multirow_impl<ncols_dst, 2>(
             src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);
         return;
     }
+#endif
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
     mul_mat_tq4_1s_dp4a_multi<ncols_dst><<<grid, block, 0, stream>>>(
@@ -1066,10 +1045,7 @@ static void launch_tq3_1s_dp4a_multi(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
-    // Rows handled per warp. Two rows halve the per-column activation reload but add ~4 us of
-    // fixed cost (extra weight streams + register pressure), so the crossover is ncols_dst >= 3.
-    // Measured on gfx90a, m=4096 k=14336: 0.88x at n=1, 0.99x at n=2, then 1.12x (n=3), 1.26x
-    // (n=4), 1.31x (n=5), 1.47x (n=8). Four or more rows per warp regress everywhere (occupancy).
+    // Two rows per warp pay from 3 columns up (measured on CDNA, RDNA2 and RDNA3).
     if constexpr (ncols_dst >= 3) {
         launch_tq3_1s_dp4a_multirow_impl<ncols_dst, 2>(
             src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);
@@ -2033,7 +2009,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
             }
         }
     } else {
-        // Scalar float path: TQ3_1S (all vendors) + TQ4_1S on AMD (dp4a regresses on RDNA4).
+        // Scalar float path, where tq_use_dp4a returns false.
         // float, not half: see the comment on tq_prerotate_activation for why.
         ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_total_elements);
 

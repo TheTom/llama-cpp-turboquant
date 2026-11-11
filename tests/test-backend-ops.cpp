@@ -9991,6 +9991,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 24, nb, 16384, {1, 1}, {1, 1}));
     }
 
+    // TQ3_1S / TQ4_1S: odd m at n = 3..8, so the last warp of the two-row decode kernels owns one
+    // real row and one past the end.
+    for (ggml_type type_a : { GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S }) {
+        for (int m : { 1, 5, 33 }) {
+            for (int n = 3; n <= 8; n++) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
