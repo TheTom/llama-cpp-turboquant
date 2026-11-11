@@ -1704,8 +1704,11 @@ static const block_q8_1 * tq_prerotate_q8_1_cached(ggml_backend_cuda_context & c
                 rc.retired.push_back({ rc.ptr, rc.cap, rc.dev });
             }
             // Plain device memory, not pool memory: the pool frees strict LIFO, and this
-            // buffer is taken while transient pool allocations sit below it. CUDA graph
-            // capture runs in relaxed mode, which allows cudaMalloc during capture.
+            // buffer is taken while transient pool allocations sit below it. Growing it
+            // inside a graph capture is not portable: HIP on RDNA2 captures in ThreadLocal
+            // mode, where the malloc fails and invalidates the capture. It does not happen
+            // in practice because each graph runs once uncaptured before it is captured,
+            // which sizes the buffer first.
             CUDA_CHECK(ggml_cuda_device_malloc((void **) &rc.ptr, bytes, ctx.device));
             rc.cap = bytes;
             rc.dev = ctx.device;
