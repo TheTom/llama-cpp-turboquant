@@ -1340,11 +1340,8 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
 #else
     static const bool page_in_on = getenv("GGML_MOE_PAGE_IN") != nullptr;
 #endif
-    // Every call that reads the table must page, whatever its batch size. Table entries are only
-    // repointed for the experts a call routes, so an expert evicted from its slot by an earlier call
-    // still has an entry naming that slot, which now holds a different expert. Skipping the plan for
-    // batches of more than one token, as this once did, made those batches read the wrong weights.
-    const int ids_stride_tbl = ids->nb[1] / ggml_type_size(ids->type);
+    // Every call that reads the table must run the plan, whatever its batch size: only routed
+    // experts get their entries repointed, so a skipped call can read a slot holding another expert.
     const int n_routed       = n_expert_used * n_tokens;
     if (page_in_on && expert_tab && nb_expert % (int64_t) sizeof(uint4) == 0) {
         const int n_expert_total = (int) src0->ne[2];
@@ -1357,10 +1354,10 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
             CUDA_CHECK(cudaMemsetAsync(cache->claim, 0x7f, (size_t) cache->n_slots * sizeof(int32_t), stream));
             CUDA_CHECK(cudaMemsetAsync(cache->n_miss, 0, sizeof(int32_t), stream));
             tq_cache_probe<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_routed, n_expert_used, ids_stride_tbl,
+                ids_d, n_routed, n_expert_used, ids_stride,
                 cache->n_slots, cache->slot_expert, cache->claim, cache->hit);
             tq_cache_award<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_routed, n_expert_used, ids_stride_tbl, cache->n_slots, cache->claim, cache->hit,
+                ids_d, n_routed, n_expert_used, ids_stride, cache->n_slots, cache->claim, cache->hit,
                 cache->slot_expert, cache->miss_expert, cache->miss_slot, cache->n_miss, cache->won);
 
             const int64_t n_vec  = nb_expert / (int64_t) sizeof(uint4);
@@ -1375,7 +1372,7 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
                 (char *) cache->slab, n_vec);
 
             tq_table_point<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_routed, n_expert_used, ids_stride_tbl, cache->n_slots, cache->won,
+                ids_d, n_routed, n_expert_used, ids_stride, cache->n_slots, cache->won,
                 (const char *) src0->data, (char *) cache->slab, nb_expert, expert_tab);
         }
     }
