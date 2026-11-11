@@ -10204,6 +10204,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 1, 3*ggml_blck_size(type_a)));
     }
 
+    // TQ weight against a src1 with batch dims. A hybrid model's GDN output projection takes
+    // [K, n_seq_tokens, n_seqs], so with several sequences in one ubatch the other sequences sit
+    // in ne[2]. nr = {s, 1} gives a 2D weight and src1 [K, n, s, 1]; n*s spans both sides of the
+    // fused decode limit (MMVQ_MAX_BATCH_SIZE columns). TQ4_1S needs GGML_TQ_NATIVE=1 to stay
+    // TQ4_1S on the device.
+    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+        for (int n : {1, 3, 8}) {
+            for (int s : {2, 3}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 512, {1, 1}, {s, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 1, 512, {1, 1}, {2, 2}));
+    }
+
     // TurboQuant MUL_MAT_ID. TQ3_1S/TQ4_1S are in all_types but not base_types, so the
     // two cases above are their only MUL_MAT_ID coverage and the rich sweep below never
     // reaches them. Cover both sides of the n <= 8 threshold that
