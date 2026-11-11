@@ -25,14 +25,21 @@ llama-cli -m model.gguf -c 8192 -ngl 99 \
     --cache-type-k q8_0 --cache-type-v turbo3
 ```
 
-Any combination of `f16`, `q8_0`, `turbo2`, `turbo3`, `turbo4` for K and V is
-supported; mixing quantized V with unquantized K is the common configuration.
-`turbo5` and `turbo6` support a smaller set of pairs, listed below.
+The flag parser accepts any combination of `f32`, `f16`, `bf16`, `q8_0`,
+`q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` and `turbo2` to `turbo6` for K and V.
+Which combinations have backend kernels is narrower and backend-dependent;
+`turbo5` and `turbo6` support a smaller set of pairs, listed below. Mixing
+quantized V with unquantized K is the common configuration.
+
+On Metal, flash attention accepts exactly three mixed pairs: turbo K + turbo V,
+`q8_0` K + turbo V, and turbo K + `q8_0` V, where turbo is `turbo2/3/4`. Any
+other mixed pair aborts in `ggml_metal_op_flash_attn_ext`.
 
 Turbo KV types require flash attention. If a turbo cache type is requested
 with flash attention disabled, it is enabled automatically (a warning is
-printed). A quantized V cache with flash attention explicitly disabled is an
-error, matching upstream behavior for all quantized V types.
+printed) before the quantized-V check runs, so a turbo V cache never reaches
+that error. A quantized V cache of another type with flash attention explicitly
+disabled is an error, matching upstream behavior.
 
 The same flags work in `llama-server`, `llama-bench`, and `llama-perplexity`.
 
@@ -88,18 +95,34 @@ K and V vectors are rotated by a fixed 128x128 orthonormal Walsh-Hadamard
 matrix before quantization and inverse-rotated after dequantization. Head
 dimensions that are not multiples of 128 are zero-padded to the next multiple
 of 128 for turbo types. MLA models have no separate V cache (V is a view of
-K), so V rotation and padding are skipped for them.
+K), so V rotation and padding are skipped for them, and the K and V cache types
+must be identical.
 
 ## Environment knobs
 
+This table is the source of truth for these variables. If it and the code ever
+disagree, the code wins and both need fixing in the same PR.
+
 | Variable                        | Default | Effect                                                          |
 |---------------------------------|---------|-----------------------------------------------------------------|
-| `TURBO_LAYER_ADAPTIVE`          | `0`     | Layer-adaptive KV precision; `7` = Boundary V (first/last layers in `q8_0`, middle in turbo) |
+| `TURBO_LAYER_ADAPTIVE`          | auto    | Layer-adaptive KV precision. Unset: Boundary V (mode 7) auto-enables when V is `turbo2` and the model has 8+ layers; `0` opts out |
 | `TURBO_AUTO_ASYMMETRIC`         | `1`     | Auto-select asymmetric K/V types for large-GQA models (`0` disables) |
-| `TURBO_SPARSE_V`                | `1`     | Sparse-V dequant skip in flash attention (`0` disables)        |
-| `LLAMA_ATTN_ROT_K_OVERRIDE`     | off     | Enable upstream #21038 attention rotation for K                |
-| `LLAMA_ATTN_ROT_V_OVERRIDE`     | off     | Enable upstream #21038 attention rotation for V                |
+| `TURBO_SPARSE_V`                | `1`     | Metal: sparse-V dequant skip for `turbo3` V (`0` disables)     |
+| `GGML_TQ_NATIVE`                | unset   | CUDA: `1` keeps `TQ4_1S` weights native and uses the fused TQ kernels instead of converting them to `q8_0` at load; decode about 30% faster and weight VRAM about 1.7x smaller, prefill about 2x slower |
+| `GGML_CUDA_FUSE_CHAIN`          | unset   | CUDA: `0` disables elementwise chain fusion, so ADD/MUL/DIV/SCALE/CLAMP/SQR and the SILU/SIGMOID/SOFTPLUS/GELU/RELU/NEG unaries run as separate kernels |
+| `GGML_CUDA_Q8CACHE`             | unset   | CUDA: `0` disables the per-graph shared `q8_1` activation cache in `mmvq`, so a repeated activation is quantized again per use |
+| `LLAMA_ATTN_ROT_K_OVERRIDE` / `LLAMA_ATTN_ROT_V_OVERRIDE` | off | Enable upstream #21038 attention rotation for K / V; needs a quantized type and a head dim that is a multiple of 64 |
+| `LLAMA_ATTN_ROT_K_NROT`         | `64`    | Rotation tile size for the optional upstream K path (`0` = upstream's largest power-of-two divisor of the head dim) |
 | `LLAMA_ATTN_ROT_DISABLE`        | `0`     | Hard lock-out: force rotation off on both sides (`1` disables) |
+
+`TURBO_LAYER_ADAPTIVE` is not simply `0`. With the variable unset, Boundary V
+(mode 7) turns on automatically when the V cache type is `turbo2` and the model
+has 8 or more layers: the first two and last two V layers become `q8_0` and
+every other V layer becomes `turbo2`. Setting the variable explicitly selects
+the mode; modes 5, 6 and 7 assign the V type per layer regardless of `-ctv`,
+so mode 7 on a `-ctv turbo3` or `-ctv turbo4` run downgrades the non-edge V
+layers to `turbo2`. The full mode legend is in `src/llama-kv-cache.cpp`
+(`kv_adaptive_mode`).
 
 Upstream attention rotation is off by default: TurboQuant manages rotation
 itself (the WHT applied at cache write is equivalent and interacts with the
@@ -112,6 +135,9 @@ path for models that benefit from it.
 llama-quantize model-f16.gguf model-tq4.gguf TQ4_1S
 ```
 
-`TQ3_1S` and `TQ4_1S` are first-class weight types with CUDA/HIP (warp
-cooperative mmvq), Metal, and Vulkan kernels. MoE models disable CUDA graphs
-for TQ `MUL_MAT_ID` automatically.
+`TQ3_1S` and `TQ4_1S` are first-class weight types with CPU, CUDA/HIP (warp
+cooperative mmvq), Metal, and Vulkan kernels. ggml-sycl has no TQ kernels, and
+its generic dequantize path leaves TQ weights in the WHT-rotated domain, so TQ
+models are unsupported on SYCL. For TQ MoE weights, the small-batch
+`MUL_MAT_ID` path routes experts on device and stays CUDA-graph capturable;
+only the large-batch fallback dequantizes to f16 and synchronizes the stream.
