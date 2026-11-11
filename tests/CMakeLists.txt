@@ -293,6 +293,9 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+# The test exits 77 when every backend was skipped and nothing was filtered
+# (e.g. a CPU-only runner in test mode); SKIP_RETURN_CODE records that as a skip.
+set_tests_properties(test-backend-ops PROPERTIES SKIP_RETURN_CODE 77)
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build(test-moe-cache.cpp)
     if (GGML_CUDA)
