@@ -422,6 +422,21 @@ typedef struct {
 } block_tq4_1s;                         // 20 bytes total
 static_assert(sizeof(block_tq4_1s) == 20, "wrong tq4_1s block size");
 
+// TQ3_4S: TQ3_1S with cheaper scales. Four consecutive 32-value sub-blocks (128 values) share
+// one fp16 scale d, the largest of their eight half-block scales, and each half-block scale is a
+// 6-bit fraction of it: half h of sub-block b has scale d * q[2*b + h] / 63, q in 0..63. q[j] is bits 6j..6j+5 of sc[] read as a
+// little-endian bit string, so the 8-byte header {d, sc} read as one little-endian 64-bit word
+// holds q[j] at bit 16 + 6j. The 3-bit indices of sub-block b are qs[12*b .. 12*b + 11], packed
+// exactly as in block_tq3_1s, so the TQ3_1S decode applies to each sub-block unchanged.
+// 2 + 6 + 48 = 56 bytes per 128 values = 3.5 bits/value
+#define QK_TQ3_4S 128
+typedef struct {
+    ggml_half d;                        //  2 bytes: super-block scale
+    uint8_t   sc[6];                    //  6 bytes: eight 6-bit half-block scale multiples
+    uint8_t   qs[QK_TQ3_4S * 3 / 8];    // 48 bytes: 3-bit indices, 12 bytes per sub-block
+} block_tq3_4s;                         // 56 bytes total
+static_assert(sizeof(block_tq3_4s) == 56, "wrong tq3_4s block size");
+
 //
 // Super-block quantization structures
 //
@@ -1264,6 +1279,11 @@ GGML_TABLE_END()
 
 GGML_TABLE_BEGIN(int8_t, kvalues_tq4, 16)
     -127, -96, -75, -58, -44, -31, -18, -6, 6, 18, 31, 44, 58, 75, 96, 127,
+GGML_TABLE_END()
+
+// TQ3_1S 8-level centroids scaled to int8 (127 / max|CENTROID| = 127 / 1.996684)
+GGML_TABLE_BEGIN(int8_t, kvalues_tq3, 8)
+    -127, -82, -47, -16, 15, 46, 81, 127,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4

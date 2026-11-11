@@ -1208,6 +1208,141 @@ size_t quantize_tq3_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     return nrows * row_size;
 }
 
+/* ---------- TQ3_4S quantization ---------- */
+
+/* Scale for one 16-value half-block: the TQ3_1S search (9 grid points around the RMS, then 6
+ * least-squares refinements), run for each half on its own. TQ3_1S searches one grid multiplier
+ * for both halves of a block; fitting them separately lowers the weight error by about 7%. */
+static float tq3_fit_half(const float * x, float rms) {
+    static const float grid[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
+    float best = rms, best_err = 1e30f;
+    for (int g = 0; g < 9; g++) {
+        const float d   = rms * grid[g];
+        const float inv = (d > 1e-10f) ? 1.0f / d : 0.0f;
+        float err = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            const float diff = x[j] - TQ3_0_CENTROIDS[tq3_0_choose_index(x[j] * inv)] * d;
+            err += diff * diff;
+        }
+        if (err < best_err) {
+            best_err = err;
+            best = d;
+        }
+    }
+    for (int iter = 0; iter < 6; iter++) {
+        const float inv = (best > 1e-10f) ? 1.0f / best : 0.0f;
+        float num = 0.0f, den = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            const float c = TQ3_0_CENTROIDS[tq3_0_choose_index(x[j] * inv)];
+            num += x[j] * c;
+            den += c * c;
+        }
+        if (den > 1e-10f) best = num / den;
+    }
+    return best;
+}
+
+void quantize_row_tq3_4s_ref(const float * GGML_RESTRICT x, block_tq3_4s * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_4S == 0);
+    const int64_t nb = k / QK_TQ3_4S;
+
+    for (int64_t ib = 0; ib < nb; ib++) {
+        block_tq3_4s * blk = &y[ib];
+
+        /* 1. Rotate each 32-value sub-block and fit each half-block scale on its own */
+        float buf[4][TQ_BLOCK_SIZE];
+        float dh[8];
+        float dmax = 0.0f;
+        for (int b = 0; b < 4; b++) {
+            memcpy(buf[b], x + ib * QK_TQ3_4S + b * TQ_BLOCK_SIZE, TQ_BLOCK_SIZE * sizeof(float));
+            tq3_0_rht_forward(buf[b]);
+            for (int h = 0; h < 2; h++) {
+                const float * xh = buf[b] + h * 16;
+                float ss = 0.0f;
+                for (int j = 0; j < 16; j++) ss += xh[j] * xh[j];
+                dh[2*b + h] = fabsf(tq3_fit_half(xh, sqrtf(ss / 16.0f)));
+                dmax = fmaxf(dmax, dh[2*b + h]);
+            }
+        }
+
+        /* 2. Store the largest scale in fp16 and the eight scales as 6-bit fractions of it. The
+         *    fp16 holds dmax itself, not dmax / 63, so small rows keep the fp16 range. A non-zero
+         *    scale is never rounded down to 0, which would wipe out its half-block. */
+        const ggml_fp16_t d16 = GGML_FP32_TO_FP16(fminf(dmax, 65504.0f));
+        const float d = GGML_FP16_TO_FP32(d16) * (1.0f / 63.0f);
+        float ds[8];
+        uint64_t sc = 0;
+        for (int j = 0; j < 8; j++) {
+            int q = (d > 0.0f) ? (int) roundf(dh[j] / d) : 0;
+            if (q < 1 && dh[j] > 0.0f && d > 0.0f) q = 1;
+            if (q > 63) q = 63;
+            sc |= (uint64_t) q << (6 * j);
+            ds[j] = d * (float) q;
+        }
+        blk->d = d16;
+        for (int i = 0; i < 6; i++) blk->sc[i] = (uint8_t) (sc >> (8 * i));
+
+        /* 3. Choose the indices against the scales as stored, and pack them as TQ3_1S does */
+        for (int b = 0; b < 4; b++) {
+            const float inv0 = (ds[2*b + 0] > 0.0f) ? 1.0f / ds[2*b + 0] : 0.0f;
+            const float inv1 = (ds[2*b + 1] > 0.0f) ? 1.0f / ds[2*b + 1] : 0.0f;
+            for (int g = 0; g < 4; g++) {
+                uint8_t indices[8];
+                for (int i = 0; i < 8; i++) {
+                    const int j = g * 8 + i;
+                    indices[i] = (uint8_t) tq3_0_choose_index(buf[b][j] * (j < 16 ? inv0 : inv1));
+                }
+                uint8_t * qp = blk->qs + b * 12 + g * 3;
+                qp[0] = (indices[0] & 7) | ((indices[1] & 7) << 3) | ((indices[2] & 3) << 6);
+                qp[1] = ((indices[2] >> 2) & 1) | ((indices[3] & 7) << 1) | ((indices[4] & 7) << 4) | ((indices[5] & 1) << 7);
+                qp[2] = ((indices[5] >> 1) & 3) | ((indices[6] & 7) << 2) | ((indices[7] & 7) << 5);
+            }
+        }
+    }
+}
+
+void dequantize_row_tq3_4s(const block_tq3_4s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_4S == 0);
+    const int64_t nb = k / QK_TQ3_4S;
+
+    for (int64_t ib = 0; ib < nb; ib++) {
+        const float d = GGML_FP16_TO_FP32(x[ib].d) * (1.0f / 63.0f);
+        uint64_t sc = 0;
+        for (int i = 0; i < 6; i++) sc |= (uint64_t) x[ib].sc[i] << (8 * i);
+
+        for (int b = 0; b < 4; b++) {
+            const float d0 = d * (float) ((sc >> (12 * b    )) & 63);
+            const float d1 = d * (float) ((sc >> (12 * b + 6)) & 63);
+
+            float buf[32];
+            for (int g = 0; g < 4; g++) {
+                const uint8_t * qp = x[ib].qs + b * 12 + g * 3;
+                const uint32_t packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
+                for (int i = 0; i < 8; i++) {
+                    const int j = g * 8 + i;
+                    buf[j] = TQ3_0_CENTROIDS[(packed >> (3 * i)) & 7] * (j < 16 ? d0 : d1);
+                }
+            }
+            tq3_0_rht_inverse(buf);
+            memcpy(y + ib * QK_TQ3_4S + b * TQ_BLOCK_SIZE, buf, TQ_BLOCK_SIZE * sizeof(float));
+        }
+    }
+}
+
+size_t quantize_tq3_4s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                        int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    /* The rotation spreads every input channel over its whole 32-value block, so per-channel
+     * importance carries no information here. */
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TQ3_4S == 0);
+
+    const size_t row_size = (n_per_row / QK_TQ3_4S) * sizeof(block_tq3_4s);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_tq3_4s_ref(src + row * n_per_row, (block_tq3_4s *) ((char *) dst + row * row_size), n_per_row);
+    }
+    return nrows * row_size;
+}
+
 /* ---------- TQ4_1S quantization ---------- */
 
 void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1s * GGML_RESTRICT y, int64_t k) {
