@@ -3029,7 +3029,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // The fused TQ kernels index src1/dst as flat contiguous buffers (no nb[] stride handling in
     // mmvq-tq.cu), so permuted/viewed activations (e.g. DeepSeek-V4 MLA projections) must take the
     // stride-aware cuBLAS fallback below, which dequantizes TQ via ggml_get_to_fp16_cuda.
-    const bool tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+    // They also treat src1 as one [K, N] matrix. For contiguous src1 and dst against a 2D weight
+    // that is exact with N = ne11*ne12*ne13, so the column count below folds the batch dims in: a
+    // hybrid model's GDN output projection takes [K, n_seq_tokens, n_seqs], and with several
+    // sequences in a ubatch only the first sequence's columns used to be computed. A batched
+    // (3D/4D) weight is not one matrix, so it takes the cuBLAS fallback.
+    const bool    tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                                    src0->ne[2] == 1 && src0->ne[3] == 1;
+    const int64_t tq_ncols        = ggml_nrows(src1);
 
     // GGML_TYPE_TQ3_1S: the fused warp-scalar kernel (mul_mat_tq3_1s_multi /
     // tq_prerotate_activation in mmvq-tq.cu) is disabled here pending a fix.
@@ -3066,7 +3073,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
 #endif
 
-    if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+    if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && tq_ncols <= MMVQ_MAX_BATCH_SIZE) {
         // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
         // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
         ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
