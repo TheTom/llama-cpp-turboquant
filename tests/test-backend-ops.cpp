@@ -8947,6 +8947,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_reduce_fusion(type, 64, 256, 8, 4, ntok));
         }
     }
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_TQ3_4S, 64, n, 256));
+    }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
