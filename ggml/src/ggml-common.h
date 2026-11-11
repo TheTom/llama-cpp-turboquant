@@ -423,8 +423,8 @@ typedef struct {
 static_assert(sizeof(block_tq4_1s) == 20, "wrong tq4_1s block size");
 
 // TQ3_4S: TQ3_1S with cheaper scales. Four consecutive 32-value sub-blocks (128 values) share
-// one fp16 scale d, and each of their eight half-block scales is a 6-bit multiple of it: half h
-// of sub-block b has scale d * q[2*b + h], q in 0..63. q[j] is bits 6j..6j+5 of sc[] read as a
+// one fp16 scale d, the largest of their eight half-block scales, and each half-block scale is a
+// 6-bit fraction of it: half h of sub-block b has scale d * q[2*b + h] / 63, q in 0..63. q[j] is bits 6j..6j+5 of sc[] read as a
 // little-endian bit string, so the 8-byte header {d, sc} read as one little-endian 64-bit word
 // holds q[j] at bit 16 + 6j. The 3-bit indices of sub-block b are qs[12*b .. 12*b + 11], packed
 // exactly as in block_tq3_1s, so the TQ3_1S decode applies to each sub-block unchanged.

@@ -1265,10 +1265,11 @@ void quantize_row_tq3_4s_ref(const float * GGML_RESTRICT x, block_tq3_4s * GGML_
             }
         }
 
-        /* 2. Store the eight scales as 6-bit multiples of one fp16 scale. A non-zero scale is
-         *    never rounded down to 0, which would wipe out its half-block. */
-        const ggml_fp16_t d16 = GGML_FP32_TO_FP16(dmax / 63.0f);
-        const float d = GGML_FP16_TO_FP32(d16);
+        /* 2. Store the largest scale in fp16 and the eight scales as 6-bit fractions of it. The
+         *    fp16 holds dmax itself, not dmax / 63, so small rows keep the fp16 range. A non-zero
+         *    scale is never rounded down to 0, which would wipe out its half-block. */
+        const ggml_fp16_t d16 = GGML_FP32_TO_FP16(fminf(dmax, 65504.0f));
+        const float d = GGML_FP16_TO_FP32(d16) * (1.0f / 63.0f);
         float ds[8];
         uint64_t sc = 0;
         for (int j = 0; j < 8; j++) {
@@ -1305,7 +1306,7 @@ void dequantize_row_tq3_4s(const block_tq3_4s * GGML_RESTRICT x, float * GGML_RE
     const int64_t nb = k / QK_TQ3_4S;
 
     for (int64_t ib = 0; ib < nb; ib++) {
-        const float d = GGML_FP16_TO_FP32(x[ib].d);
+        const float d = GGML_FP16_TO_FP32(x[ib].d) * (1.0f / 63.0f);
         uint64_t sc = 0;
         for (int i = 0; i < 6; i++) sc |= (uint64_t) x[ib].sc[i] << (8 * i);
 
