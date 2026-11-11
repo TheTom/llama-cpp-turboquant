@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include "convert.cuh"
 
-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, bool unroll_x = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
@@ -135,6 +135,9 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
+        // unroll_x: a thread's loads go out together. At small row counts (e.g. a 128-row MoE router) the grid is
+        // too small to hide DRAM latency with occupancy alone.
+#pragma unroll (unroll_x ? 4 : 1)
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
@@ -404,6 +407,20 @@ static void mul_mat_vec_f_switch_fusion(
 
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
+    if constexpr (std::is_same_v<T, float> && !is_multi_token_id) {
+        static const bool unroll_x = [] {
+            const char * e = getenv("GGML_CUDA_MMVF_UNROLL");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (unroll_x) {
+            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, true>, launch_params,
+                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -435,6 +452,17 @@ void launch_mul_mat_vec_f_cuda(
     int64_t block_size_best = warp_size;
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
     int64_t max_block_size  = 256;
+    // 65-128 rows (e.g. a 128-expert MoE router): cap blocks at 128 threads on RDNA4. With 256-thread blocks the f32
+    // 128 x 2048 GEMV ran at 13.2 us on gfx1200 vs 3.1 us with 128 (gfx1201: 2.05 vs 2.0). Smaller grids need the
+    // wider blocks for parallelism (Qwen3.8's 48-row ssm_alpha/beta lost 8% decode with the cap); larger ones are
+    // unaffected. GGML_CUDA_MMVF_SMALL_BS=0 disables.
+    static const bool small_bs = [] {
+        const char * e = getenv("GGML_CUDA_MMVF_SMALL_BS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (small_bs && nrows > 64 && nrows <= 128 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
+        max_block_size = 128;
+    }
     if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
         max_block_size = 128;
     }

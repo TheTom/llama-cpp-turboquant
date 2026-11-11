@@ -131,6 +131,7 @@ public:
     ggml_tensor * get_turbo_rot_forward() const override;
     ggml_tensor * get_turbo_rot_inverse() const override;
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
+    ggml_tensor * get_turbo_innerq_scale_inv(int32_t il) const override;
 
     bool has_kv_stream_targets() const override;
     std::vector<llama_kv_stream_active_target> get_kv_stream_active_targets() const override;

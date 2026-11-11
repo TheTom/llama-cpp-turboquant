@@ -80,11 +80,27 @@ static __global__ void rope_norm(const T *            x,
     // The rope output is viewed as a 1D tensor and offset based on a row index in row_indices.
     if (set_rows_stride != 0) {
         idst = i1 * s1 + i0;
-        idst += row_indices[i2] * set_rows_stride;
+        if constexpr (!std::is_same_v<block_q8_0, D>) {
+            idst += row_indices[i2] * set_rows_stride;
+        }
     }
 
     const auto & store_coaelsced = [&](float x0, float x1) {
-        if constexpr (std::is_same_v<float, D>) {
+        if constexpr (std::is_same_v<block_q8_0, D>) {
+            // q8_0 KV cache (fused path only): the 16 consecutive threads of a 32-wide block share
+            // its scale. Same math as quantize_f32_q8_0_block, so the cache is bit-identical to the
+            // unfused SET_ROWS. idst is the element offset within the row; set_rows_stride is in blocks.
+            const float amax = warp_reduce_max<QK8_0/2>(fmaxf(fabsf(x0), fabsf(x1)));
+            const float d    = amax / ((1 << 7) - 1);
+            const float id   = d ? 1.0f/d : 0.0f;
+            block_q8_0 * y = dst + row_indices[i2] * set_rows_stride + idst / QK8_0;
+            const int    j = idst % QK8_0;
+            y->qs[j + 0] = roundf(x0*id);
+            y->qs[j + 1] = roundf(x1*id);
+            if (j == 0) {
+                y->d = d;
+            }
+        } else if constexpr (std::is_same_v<float, D>) {
             float2 v = make_float2(x0, x1);
             ggml_cuda_memcpy_1<8>(dst + idst, &v);
         } else if constexpr (std::is_same_v<half, D>) {
@@ -650,6 +666,11 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                  set_rows_stride, stream);
         } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
             rope_norm_cuda<forward, half, half>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
+                                                s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
+                                                ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
+                                                set_rows_stride, stream);
+        } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_Q8_0) {
+            rope_norm_cuda<forward, float, block_q8_0>((const float *) src0_d, (block_q8_0 *) dst_d, ne00, ne01, ne02, s01, s02,
                                                 s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                 ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
                                                 set_rows_stride, stream);

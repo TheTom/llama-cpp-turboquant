@@ -19,7 +19,7 @@ static __global__ void k_elem_chain(const float * __restrict__ src,
 #pragma unroll 1
     for (int k = 0; k < desc.n_ops; ++k) {
         const float * o_ptr = desc.other[k];
-        const float   o     = o_ptr ? (desc.bcast[k] ? o_ptr[0] : o_ptr[i]) : 0.0f;
+        const float   o     = o_ptr ? (desc.bcast[k] == 1 ? o_ptr[0] : desc.bcast[k] == 2 ? o_ptr[i % desc.row_len] : o_ptr[i]) : 0.0f;
 
         switch (desc.code[k]) {
             case TQ_CHAIN_ADD:      v = v + o; break;

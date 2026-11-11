@@ -840,7 +840,20 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    // Gate + GLU only (no biases/scales) for 2-4 columns; see ggml_cuda_should_fuse_mul_mat_vec_q().
+    if constexpr (c_ncols_dst <= 4) {
+        if (has_fusion && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+                fusion.x_scale == nullptr && fusion.gate_scale == nullptr) {
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
+                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+
+    GGML_ASSERT(!has_fusion && "biased fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
@@ -940,6 +953,40 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         return use;
     };
+
+    // fork: single-token MUL_MAT_ID on RDNA4 also uses the dedicated MoE kernel (one warp per 2 rows
+    // per expert slot). The generic kernel runs 8 warps per row there, which leaves most lanes idle on
+    // short expert rows (north-mini-code, 128x top-8, K = 768/2048: navi48 Q5_K down 146 -> 86 us,
+    // decode 58 -> 73 t/s). GGML_CUDA_MMVQ_MOE_N1=0 disables.
+    static const bool moe_n1 = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_MOE_N1");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (has_ids && ncols_dst == 1 && moe_n1 && GGML_CUDA_CC_IS_RDNA4(cc) && nsamples_dst == 1 &&
+            fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+            fusion.x_scale == nullptr && fusion.gate_scale == nullptr) {
+        if (fusion.gate == nullptr) {
+            mul_mat_vec_q_moe_launch<type>(
+                vx, vy, ids, nullptr, nullptr, nullptr, dst,
+                ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst,
+                0.0f, 0.0f, 0.0f, 0.0f, stream);
+            return;
+        }
+        if (fusion.glu_op == GGML_GLU_OP_SWIGLU) {
+            // gate experts are selected by the same ids as up
+            mul_mat_vec_q_moe_launch<type, true, false>(
+                vx, vy, ids, nullptr, fusion.gate, ids, dst,
+                ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst,
+                0.0f, 0.0f, 0.0f, 0.0f, stream);
+            return;
+        }
+    }
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
@@ -1222,7 +1269,10 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // multi-column dense fusion: gate + GLU only, see ggml_cuda_should_fuse_mul_mat_vec_q()
+        GGML_ASSERT(  ids || dst->ne[1] == 1 ||
+                    (dst->ne[1] <= 4 && fusion->x_bias == nullptr && fusion->gate_bias == nullptr &&
+                     fusion->x_scale == nullptr && fusion->gate_scale == nullptr));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1272,48 +1322,81 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    // Shared-quantize cache: reuse the previous quantization when the same src1 tensor is
-    // consumed again in this graph eval with the same layout (see q8_cache in common.cuh).
-    // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
-    auto & qc = ctx.q8_cache;
+    // Shared-quantize cache: reuse an earlier quantization of the same activation in this graph
+    // eval (see q8_cache in common.cuh). Hits need the same underlying tensor and data pointer and
+    // an identical q8_1 layout: same padded row and either both contiguous with the same row count
+    // (so a MUL_MAT_ID broadcast view [n_embd, 1, n_tokens] shares a MUL_MAT [n_embd, n_tokens]
+    // quantization) or the exact same ne11..13 and strides. ConvRot types and oversized batches
+    // stay uncached. Not keyed on src0->type: the q8_1 layout does not depend on it
+    // (quantize_row_q8_1_cuda ignores type_src0), so matvecs of different weight types on one
+    // input share it too, e.g. Qwen3.5/3.8 attn_qkv (Q5_K) + attn_gate (IQ4_XS).
     static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
-    const bool q8_cacheable = !q8_cache_disabled && !convrot && ids == nullptr && q8_bytes <= (1u << 20) &&
-                              ctx.curr_stream_no == 0;
-    const bool q8_hit = q8_cacheable && qc.epoch == ctx.graph_epoch && qc.src1 == src1 &&
-                        qc.data == src1->data && qc.size == q8_bytes &&
-                        qc.ne10_padded == ne10_padded && qc.type == src0->type &&
-                        qc.dev == ctx.device;
+    const bool q8_cacheable = !q8_cache_disabled && !convrot && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
+    const ggml_tensor * q8_root   = src1->view_src ? src1->view_src : src1;
+    const bool          q8_contig = ggml_is_contiguous(src1);
+    const int64_t       q8_nrows  = ne11*ne12*ne13;
+
+    auto * qc = &ctx.q8_cache[0];
+    bool q8_hit = false;
+    if (q8_cacheable) {
+        for (auto & e : ctx.q8_cache) {
+            const bool same_layout = (e.contig && q8_contig && e.nrows == q8_nrows) ||
+                (e.ne[0] == ne11 && e.ne[1] == ne12 && e.ne[2] == ne13 &&
+                 e.nb[0] == nb11 && e.nb[1] == nb12 && e.nb[2] == nb13);
+            if (e.epoch == ctx.graph_epoch && e.root == q8_root && e.data == src1->data && e.size == q8_bytes &&
+                    e.ne10_padded == ne10_padded && e.dev == ctx.device && same_layout) {
+                qc = &e;
+                q8_hit = true;
+                break;
+            }
+        }
+        if (!q8_hit) {
+            // replace a stale entry first, else the least recently used one
+            for (auto & e : ctx.q8_cache) {
+                const bool e_stale  = e.epoch != ctx.graph_epoch;
+                const bool qc_stale = qc->epoch != ctx.graph_epoch;
+                if ((e_stale && !qc_stale) || (e_stale == qc_stale && e.used < qc->used)) {
+                    qc = &e;
+                }
+            }
+        }
+    }
 
     ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
     char * src1_q8_1 = nullptr;
 
     if (q8_hit) {
         ctx.fusion_stats.q8_cache_hits++;
-        src1_q8_1 = qc.ptr;
+        qc->used = ++ctx.q8_cache_clock;
+        src1_q8_1 = qc->ptr;
     } else {
         if (q8_cacheable) {
-            if (qc.dev != ctx.device || qc.cap < q8_bytes) {
+            if (qc->dev != ctx.device || qc->cap < q8_bytes) {
                 // Never free a buffer here: a CUDA graph captured earlier may still replay
                 // kernels that point at it (several graphs per context with --n-cpu-moe splits).
                 // Retire it and release everything at context teardown instead.
-                if (qc.ptr != nullptr) {
-                    qc.retired.push_back({ qc.ptr, qc.cap, qc.dev });
+                if (qc->ptr != nullptr) {
+                    qc->retired.push_back({ qc->ptr, qc->cap, qc->dev });
                 }
                 // Plain device memory, not pool memory: the pool frees strict LIFO, and this
                 // buffer is taken while transient pool allocations sit below it. CUDA graph
                 // capture runs in relaxed mode, which allows cudaMalloc during capture.
-                CUDA_CHECK(ggml_cuda_device_malloc((void **) &qc.ptr, q8_bytes, ctx.device));
-                qc.cap = q8_bytes;
-                qc.dev = ctx.device;
+                CUDA_CHECK(ggml_cuda_device_malloc((void **) &qc->ptr, q8_bytes, ctx.device));
+                qc->cap = q8_bytes;
+                qc->dev = ctx.device;
             }
-            src1_q8_1 = qc.ptr;
-            qc.src1        = src1;
-            qc.data        = src1->data;
-            qc.epoch       = ctx.graph_epoch;
-            qc.size        = q8_bytes;
-            qc.ne10_padded = ne10_padded;
-            qc.type        = src0->type;
+            src1_q8_1        = qc->ptr;
+            qc->root         = q8_root;
+            qc->data         = src1->data;
+            qc->epoch        = ctx.graph_epoch;
+            qc->used         = ++ctx.q8_cache_clock;
+            qc->size         = q8_bytes;
+            qc->ne10_padded  = ne10_padded;
+            qc->contig       = q8_contig;
+            qc->nrows        = q8_nrows;
+            qc->ne[0] = ne11; qc->ne[1] = ne12; qc->ne[2] = ne13;
+            qc->nb[0] = nb11; qc->nb[1] = nb12; qc->nb[2] = nb13;
         } else {
             src1_q8_1 = src1_q8_1_local.alloc(q8_bytes);
         }

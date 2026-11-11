@@ -286,7 +286,8 @@ llama_model_cohere2moe::graph::graph(const llama_model & model, const llm_graph_
 
     cur = build_lora_mm(model.output, cur);
 
-    if (f_logit_scale) {
+    // x*1.0f is exact, so a unit scale (North-Mini-Code) is skipped rather than launched every token
+    if (f_logit_scale && f_logit_scale != 1.0f) {
         cur = ggml_scale(ctx0, cur, f_logit_scale);
     }
 
@@ -436,7 +437,7 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
     GGML_ASSERT(head_w && "COHERE2MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : nullptr);
 
-    if (hparams.f_logit_scale) {
+    if (hparams.f_logit_scale && hparams.f_logit_scale != 1.0f) {
         cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
     }
 

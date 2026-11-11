@@ -234,6 +234,248 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// Row-per-warp variant (port of ggml-org PR #22587 onto this fork's kernel contract).
+// Each warp owns GDN_ROWS_D_V_PER_WARP rows of the transposed state (= output columns) and its
+// lanes shard the QK axis in contiguous chunks, so q/k are loaded once per warp for several
+// columns (vectorized) instead of once per column. Output/state semantics are identical to
+// gated_delta_net_cuda above, including keep_rs_t snapshots, emit_ingredients_t ingredient slots,
+// the pre-window checkpoint and the trailing final-state block.
+constexpr int GDN_ROWS_D_V_PER_WARP = 4;
+constexpr int GDN_ROWS_NUM_WARPS    = 4;
+constexpr int GDN_ROWS_BLOCK_DV     = GDN_ROWS_NUM_WARPS * GDN_ROWS_D_V_PER_WARP;  // 16
+
+template <int S_v, bool KDA, bool keep_rs_t, bool emit_ingredients_t>
+__global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * GDN_ROWS_NUM_WARPS, 2)
+gated_delta_net_rows_cuda(const float * __restrict__ q,
+                          const float * __restrict__ k,
+                          const float * __restrict__ v,
+                          const float * __restrict__ g,
+                          const float * __restrict__ beta,
+                          const float * __restrict__ curr_state,
+                          float *       __restrict__ dst,
+                          float *                    state,
+                          int64_t       H,
+                          int64_t       n_tokens,
+                          int64_t       n_seqs,
+                          int64_t       sq1,
+                          int64_t       sq2,
+                          int64_t       sq3,
+                          int64_t       sv1,
+                          int64_t       sv2,
+                          int64_t       sv3,
+                          int64_t       sb1,
+                          int64_t       sb2,
+                          int64_t       sb3,
+                          const uint3   neqk1_magic,
+                          const uint3   rq3_magic,
+                          float         scale,
+                          int64_t       state_slot_stride,
+                          int           K) {
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int active_lanes  = (S_v < warp_size) ? S_v : warp_size;
+    constexpr int d_qk_per_lane = S_v / active_lanes;
+    constexpr int d_v_per_warp  = GDN_ROWS_D_V_PER_WARP;
+    static_assert(d_qk_per_lane >= 1, "S_v must be >= 1");
+    static_assert(S_v % active_lanes == 0, "S_v must be a multiple of active_lanes");
+    static_assert(S_v % GDN_ROWS_BLOCK_DV == 0, "S_v must be a multiple of GDN_ROWS_BLOCK_DV");
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      lane     = threadIdx.x;
+    const int      warp_id  = threadIdx.y;
+
+    // this warp's state rows (= output columns) and this lane's QK chunk
+    const uint32_t dv_base  = blockIdx.z * GDN_ROWS_BLOCK_DV + warp_id * d_v_per_warp;
+    const uint32_t dqk_base = lane * d_qk_per_lane;
+    // the warp owning column 0 writes the column-independent ingredients (k, g, beta)
+    const bool     col0_warp = dv_base == 0;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    float * attn_data = dst + ((int64_t) sequence * n_tokens * H + h_idx) * S_v;
+    curr_state += (int64_t) sequence * H * S_v * S_v + (int64_t) h_idx * S_v * S_v;
+
+    float * state_out;
+    if constexpr (emit_ingredients_t) {
+        state_out = state + ((int64_t) sequence * H + h_idx) * (4 * S_v);
+    } else {
+        state_out = state + ((int64_t) sequence * H + h_idx) * S_v * S_v;
+    }
+
+    auto load_qk_lane = [&] __device__(float(&reg)[d_qk_per_lane], const float * base) {
+        if constexpr (S_v < warp_size) {
+            reg[0] = (lane < active_lanes) ? base[lane] : 0.0f;
+        } else {
+            ggml_cuda_memcpy_1<d_qk_per_lane * sizeof(float)>(reg, base + dqk_base);
+        }
+    };
+    auto store_qk_lane = [&] __device__(const float(&reg)[d_qk_per_lane], float * base) {
+        if constexpr (S_v < warp_size) {
+            if (lane < active_lanes) {
+                base[lane] = reg[0];
+            }
+        } else {
+            ggml_cuda_memcpy_1<d_qk_per_lane * sizeof(float)>(base + dqk_base, reg);
+        }
+    };
+    // full-state store of this warp's rows into a [S_v, S_v] slot (row r contiguous)
+    auto store_rows = [&] __device__(const float (&tile)[d_v_per_warp][d_qk_per_lane], float * slot) {
+#pragma unroll
+        for (int r = 0; r < d_v_per_warp; ++r) {
+            store_qk_lane(tile[r], slot + (int64_t) (dv_base + r) * S_v);
+        }
+    };
+
+    ggml_cuda_pdl_sync();
+
+    // state is stored transposed: M[row][c] = S[c][row], row contiguous
+    __align__(16) float s_tile[d_v_per_warp][d_qk_per_lane];
+#pragma unroll
+    for (int r = 0; r < d_v_per_warp; ++r) {
+        load_qk_lane(s_tile[r], curr_state + (int64_t) (dv_base + r) * S_v);
+    }
+
+    __align__(16) float k_reg[d_qk_per_lane];
+    load_qk_lane(k_reg, k + (int64_t) iq3 * sq3 + (int64_t) iq1 * sq1);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * v_t = v + (int64_t) sequence * sv3 + (int64_t) t * sv2 + (int64_t) h_idx * sv1;
+
+        const int64_t gb_off   = (int64_t) sequence * sb3 + (int64_t) t * sb2 + (int64_t) h_idx * sb1;
+        const float   beta_val = beta[gb_off];
+
+        __align__(16) float g_reg[d_qk_per_lane];  // raw g (KDA), kept for the ingredient slot
+        __align__(16) float alpha_lane[d_qk_per_lane];
+        float               alpha_scalar = 0.0f;
+        if constexpr (KDA) {
+            load_qk_lane(g_reg, g + gb_off * S_v);
+#pragma unroll
+            for (int c = 0; c < d_qk_per_lane; ++c) {
+                alpha_lane[c] = expf(g_reg[c]);
+            }
+        } else {
+            alpha_scalar = expf(g[gb_off]);
+        }
+
+        // only the first d_v_per_warp lanes hold a real v[dv_base + lane]; broadcast via shuffle
+        float v_local = 0.0f;
+        if (lane < d_v_per_warp) {
+            v_local = v_t[dv_base + lane];
+        }
+
+        // stage A: state update S = g*S + k*delta, per owned row
+#pragma unroll
+        for (int r = 0; r < d_v_per_warp; ++r) {
+            float partial = 0.0f;
+#pragma unroll
+            for (int c = 0; c < d_qk_per_lane; ++c) {
+                if constexpr (KDA) {
+                    partial += alpha_lane[c] * s_tile[r][c] * k_reg[c];
+                } else {
+                    partial += s_tile[r][c] * k_reg[c];
+                }
+            }
+            partial = warp_reduce_sum<warp_size>(partial);
+
+            const float v_r   = __shfl_sync(0xffffffff, v_local, r, warp_size);
+            const float delta = beta_val * (v_r - (KDA ? 1.0f : alpha_scalar) * partial);
+
+#pragma unroll
+            for (int c = 0; c < d_qk_per_lane; ++c) {
+                if constexpr (KDA) {
+                    s_tile[r][c] = alpha_lane[c] * s_tile[r][c] + delta * k_reg[c];
+                } else {
+                    s_tile[r][c] = alpha_scalar * s_tile[r][c] + delta * k_reg[c];
+                }
+            }
+        }
+
+        // retained-state outputs for token t (post-update state, k_reg still holds k_t)
+        if constexpr (keep_rs_t) {
+            const int target_slot = emit_ingredients_t ? ((int) t - ((int) n_tokens - K)) : ((int) n_tokens - 1 - t);
+            if (target_slot >= 0 && target_slot < K) {
+                if constexpr (emit_ingredients_t) {
+                    float * ingr_slot = state_out + (int64_t) target_slot * state_slot_stride;
+                    if (col0_warp) {
+                        store_qk_lane(k_reg, ingr_slot);
+                        if constexpr (KDA) {
+                            store_qk_lane(g_reg, ingr_slot + 2 * S_v);
+                        } else {
+                            __align__(16) float g_raw[d_qk_per_lane];
+                            __align__(16) float b_rep[d_qk_per_lane];
+#pragma unroll
+                            for (int c = 0; c < d_qk_per_lane; ++c) {
+                                g_raw[c] = g[gb_off];
+                                b_rep[c] = beta_val;
+                            }
+                            store_qk_lane(g_raw, ingr_slot + 2 * S_v);
+                            store_qk_lane(b_rep, ingr_slot + 3 * S_v);
+                        }
+                        if constexpr (KDA) {
+                            __align__(16) float b_rep[d_qk_per_lane];
+#pragma unroll
+                            for (int c = 0; c < d_qk_per_lane; ++c) {
+                                b_rep[c] = beta_val;
+                            }
+                            store_qk_lane(b_rep, ingr_slot + 3 * S_v);
+                        }
+                    }
+                    if (lane < d_v_per_warp) {
+                        ingr_slot[S_v + dv_base + lane] = v_local;
+                    }
+                } else {
+                    store_rows(s_tile, state_out + (int64_t) target_slot * state_slot_stride);
+                }
+            }
+
+            if constexpr (emit_ingredients_t) {
+                // state immediately before the K-token retained window starts
+                const int t_ckpt = (int) n_tokens - K - 1;
+                if (t_ckpt >= 0 && t == t_ckpt) {
+                    float * ckpt_slot = state + (int64_t) K * state_slot_stride +
+                                        (int64_t) S_v * S_v * H * n_seqs + ((int64_t) sequence * H + h_idx) * S_v * S_v;
+                    store_rows(s_tile, ckpt_slot);
+                }
+            }
+        }
+
+        // prefetch k for the next token while issuing the q load for this token
+        if (t + 1 < n_tokens) {
+            load_qk_lane(k_reg, k + (int64_t) iq3 * sq3 + (int64_t) (t + 1) * sq2 + (int64_t) iq1 * sq1);
+        }
+
+        __align__(16) float q_reg[d_qk_per_lane];
+        load_qk_lane(q_reg, q + (int64_t) iq3 * sq3 + (int64_t) t * sq2 + (int64_t) iq1 * sq1);
+
+        // stage B: attention output attn[row] = (S^T q)[row]
+        float attn_val = 0.0f;
+#pragma unroll
+        for (int r = 0; r < d_v_per_warp; ++r) {
+            float partial = 0.0f;
+#pragma unroll
+            for (int c = 0; c < d_qk_per_lane; ++c) {
+                partial += s_tile[r][c] * q_reg[c];
+            }
+            partial = warp_reduce_sum<warp_size>(partial);
+            if (lane == r) {
+                attn_val = partial;
+            }
+        }
+
+        if (lane < d_v_per_warp) {
+            attn_data[(int64_t) t * S_v * H + dv_base + lane] = attn_val * scale;
+        }
+    }
+
+    if constexpr (emit_ingredients_t) {
+        store_rows(s_tile, state + (int64_t) K * state_slot_stride + ((int64_t) sequence * H + h_idx) * S_v * S_v);
+    }
+    if constexpr (!keep_rs_t) {
+        store_rows(s_tile, state_out);
+    }
+}
+
 template <bool KDA, bool keep_rs_t, bool emit_ingredients_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -253,6 +495,24 @@ static void launch_gated_delta_net(
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
+
+    static const bool gdn_legacy = getenv("GGML_CUDA_GDN_LEGACY") != nullptr;
+    if (!gdn_legacy && S_v % GDN_ROWS_BLOCK_DV == 0) {
+        const dim3 rows_grid(H, n_seqs, (S_v + GDN_ROWS_BLOCK_DV - 1) / GDN_ROWS_BLOCK_DV);
+        const dim3 rows_block(warp_size, GDN_ROWS_NUM_WARPS, 1);
+        const ggml_cuda_kernel_launch_params rows_params = ggml_cuda_kernel_launch_params(rows_grid, rows_block, 0, stream);
+#define GDN_ROWS_CASE(SV) case SV: ggml_cuda_kernel_launch(gated_delta_net_rows_cuda<SV, KDA, keep_rs_t, emit_ingredients_t>, rows_params, \
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K); return;
+        switch (S_v) {
+            GDN_ROWS_CASE(16)
+            GDN_ROWS_CASE(32)
+            GDN_ROWS_CASE(64)
+            GDN_ROWS_CASE(128)
+            default: break;
+        }
+#undef GDN_ROWS_CASE
+    }
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {

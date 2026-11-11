@@ -1882,12 +1882,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            int32_t i_row0 = i_batch_beg[seq_id];
+            // accept() indexes verify_h by the number of accepted drafts, which only means something for a
+            // verify batch (1 + n_draft rows). For prompt batches keep just the last row instead of copying
+            // every row (~20 KiB each; 8192-token batches spent ~70 ms here).
+            if (n_rows > 1 + std::max<int32_t>(params.n_max, 16)) {
+                i_row0 += n_rows - 1;
+                n_rows  = 1;
+            }
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_row0 + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 

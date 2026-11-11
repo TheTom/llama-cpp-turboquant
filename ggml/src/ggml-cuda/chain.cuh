@@ -28,7 +28,9 @@ struct tq_chain_desc {
     int           code   [TQ_CHAIN_MAX_OPS];
     const float * other  [TQ_CHAIN_MAX_OPS];   // binary operand, or nullptr for unary
     int           chain_is_lhs[TQ_CHAIN_MAX_OPS]; // for non-commutative ops (DIV)
-    int           bcast  [TQ_CHAIN_MAX_OPS];   // operand is a single value broadcast over all elements
+    int           bcast  [TQ_CHAIN_MAX_OPS];   // 1: single value broadcast over all elements
+                                               // 2: one contiguous row of row_len values repeated over all rows
+    int64_t       row_len;                     // ne[0] of the chain, for bcast == 2
     float         p0     [TQ_CHAIN_MAX_OPS];
     float         p1     [TQ_CHAIN_MAX_OPS];
 };

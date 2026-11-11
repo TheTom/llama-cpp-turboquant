@@ -139,6 +139,40 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// Narrow dim-0 concat of non-contiguous sources: the generic kernel below launches one block per row, so
+// rows of a few elements leave almost every thread idle (Qwen3.5/3.8 GDN conv input over an MTP verify
+// batch: [3 + n_tokens, 10240] from a transposed source, 10240 blocks with ~7 active threads each).
+// One thread per element instead, with i1 fastest so a transposed src1 (nb11 == element size) is read
+// coalesced.
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_non_cont_narrow_dim0(
+        const char * src0, const char * src1, char * dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t n,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    ggml_cuda_pdl_sync();
+
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+
+    const int64_t i1 = idx % ne1;
+    int64_t       r  = idx / ne1;
+    const int64_t i0 = r % ne0;
+    r /= ne0;
+    const int64_t i2 = r % ne2;
+    const int64_t i3 = r / ne2;
+
+    const T * x = i0 < ne00 && i1 < ne01 && i2 < ne02
+        ? (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00)
+        : (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+
+    *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +194,16 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 0 && dst->ne[0] <= 32 && src0->ne[3] == dst->ne[3] && !ggml_is_quantized(src0->type)) {
+        const int64_t n = ggml_nelements(dst);
+        const int64_t n_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+        concat_non_cont_narrow_dim0<T><<<n_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src0->ne[1], src0->ne[2],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], n,
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 

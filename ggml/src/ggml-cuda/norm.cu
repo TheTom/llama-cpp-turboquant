@@ -499,6 +499,61 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
+// One row per block. Pass 1 forms s = a + b, stores it (the residual stream) and reduces s^2; pass 2
+// reads back this thread's own stores, so sum may alias a or b exactly. The block reduction
+// synchronizes the block between the passes, so dst may alias a or b exactly too.
+template <int block_size>
+static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, float * sum, const float * w,
+                                            float * dst, const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int64_t off = (int64_t) blockIdx.x * ncols;
+    a   += off;
+    b   += off;
+    sum += off;
+    dst += off;
+
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = threadIdx.x; col < ncols; col += block_size) {
+        const float s = a[col] + b[col];
+        sum[col] = s;
+        tmp += s * s;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    for (int col = threadIdx.x; col < ncols; col += block_size) {
+        dst[col] = scale * sum[col] * w[col];
+    }
+}
+
+void ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm, ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+
+    const int     ncols = (int) add->ne[0];
+    const int64_t nrows = ggml_nrows(add);
+    GGML_ASSERT(nrows <= INT_MAX);
+
+    const float * a_d = (const float *) add->src[0]->data;
+    const float * b_d = (const float *) add->src[1]->data;
+    float *       s_d = (float *) add->data;
+    const float * w_d = (const float *) w->data;
+    float *       d_d = (float *) mul->data;
+
+    const dim3 blocks((unsigned) nrows, 1, 1);
+    if (ncols < 1024) {
+        const ggml_cuda_kernel_launch_params lp = {blocks, dim3(256, 1, 1), 32 * sizeof(float), ctx.stream()};
+        ggml_cuda_kernel_launch(add_rms_norm_mul_f32<256>, lp, a_d, b_d, s_d, w_d, d_d, ncols, eps);
+    } else {
+        const ggml_cuda_kernel_launch_params lp = {blocks, dim3(1024, 1, 1), 32 * sizeof(float), ctx.stream()};
+        ggml_cuda_kernel_launch(add_rms_norm_mul_f32<1024>, lp, a_d, b_d, s_d, w_d, d_d, ncols, eps);
+    }
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
