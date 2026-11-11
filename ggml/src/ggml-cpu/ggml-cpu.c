@@ -248,6 +248,9 @@ static void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
 static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_tq3_4s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
@@ -507,6 +510,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_TQ4_1S] = {
         .from_float               = (ggml_from_float_t) quantize_row_tq4_1s_ref,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4_1s_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ3_4S] = {
+        .from_float               = (ggml_from_float_t) quantize_row_tq3_4s_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq3_4s_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
@@ -4264,6 +4273,16 @@ static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
 
     ggml_vec_dot_tq_q8_0_impl(GGML_TYPE_TQ4_1S, n, s, vx, vy);
+}
+
+// TQ3_4S vec_dot: dequantize to f32 a chunk at a time, then dot with q8_0.
+static void ggml_vec_dot_tq3_4s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    ggml_vec_dot_tq_q8_0_impl(GGML_TYPE_TQ3_4S, n, s, vx, vy);
 }
 
 void ggml_cpu_fp32_to_fp32(const float * x, float * y, int64_t n) {
