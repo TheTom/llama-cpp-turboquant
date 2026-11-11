@@ -216,12 +216,13 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
-// The 3-bit index extraction of the TQ3_1S MMQ tile loader, transcribed from
-// ggml/src/ggml-cuda/mmq-load-tiles.cuh (tq3_1s_qs_to_int8x4). The CUDA side
-// picks one of four groups and returns four indices; this copy does the same so
-// the test can compare it with the CPU codec's unpacking.
+// One-time derivation checks for the TQ3_1S MMQ tile loader (tq3_1s_qs_to_int8x4 in
+// ggml/src/ggml-cuda/mmq-load-tiles.cuh). The functions and constants below are copies
+// typed in from the loader and the CPU codec, so editing either side does not fail
+// these tests. The gate for the loader itself is
+// GGML_TQ_MMQ=1 test-backend-ops -o MUL_MAT -p type_a=tq3_1s (and -o MUL_MAT_ID).
 //
-// Keep in sync with the CUDA loader: the test below fails if the two disagree.
+// The loader's 3-bit index extraction: pick one of four groups, return four indices.
 static void tq3_1s_unpack_indices_cuda(const uint8_t * qs, int kqsx, int idx[4]) {
     const int g    = kqsx >> 1;        // group 0..3
     const int sub  = (kqsx & 1) * 4;   // first element within the group
