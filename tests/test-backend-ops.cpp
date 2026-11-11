@@ -9992,9 +9992,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // TQ3_1S / TQ4_1S: odd m at n = 3..8, so the last warp of the two-row decode kernels owns one
-    // real row and one past the end.
+    // real row and one past the end. Not m = 1: with 3-8 outputs the int8 activation rounding
+    // alone can exceed the NMSE threshold.
     for (ggml_type type_a : { GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S }) {
-        for (int m : { 1, 5, 33 }) {
+        for (int m : { 5, 33, 65 }) {
             for (int n = 3; n <= 8; n++) {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
             }
