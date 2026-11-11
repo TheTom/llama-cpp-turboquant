@@ -501,24 +501,22 @@ static size_t ggml_backend_rpc_query_alloc_size(ggml_backend_buffer_t buffer, co
     return response.alloc_size;
 }
 
-// The server converts TQ4_1S weights to q8_0 when it loads them (the conversion
-// is on by default for prefill speed). The local CUDA path retypes the tensor
-// after the conversion; over RPC the retyping happened on the server only, so
-// the client kept the TQ4_1S type while the buffer held q8_0 and every matmul
-// read the wrong bytes. Ask the server how much it allocated: if that is
-// larger than the tensor's own size, the server converted it and the client
-// has to retype the tensor the same way the local path does.
-static void ggml_backend_rpc_retype_converted_tq4_1s(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+// The server may have converted a TQ4_1S weight to q8_0, so the buffer can hold
+// q8_0 while the tensor still says TQ4_1S. The alloc size tells which it is.
+static void ggml_backend_rpc_retype_converted_tq4_1s(ggml_backend_buffer_t buffer, ggml_tensor * tensor, size_t offset, size_t size) {
     if (tensor->type != GGML_TYPE_TQ4_1S) {
+        return;
+    }
+
+    // the server converts only on a full write, so a partial write leaves the
+    // TQ4_1S bytes in place. Checked before the type changes.
+    if (offset != 0 || size != ggml_nbytes(tensor)) {
         return;
     }
 
     const size_t alloc = ggml_backend_rpc_query_alloc_size(buffer, tensor);
 
-    // The server converts TQ4_1S to q8_0 unless it runs with GGML_TQ_NATIVE=1.
-    // When it does, it allocates the q8_0 size: n_blocks * sizeof(block_q8_0)
-    // plus the row padding, which is q8_0 sized too. Mirror that formula here so
-    // the test is exact and cannot fire when the server kept the TQ4_1S bytes.
+    // the q8_0 alloc size: n_blocks * sizeof(block_q8_0) plus the q8_0 sized row padding
     constexpr int64_t row_padding = 512; // MATRIX_ROW_PADDING on the CUDA backends
     const int64_t qk = ggml_blck_size(GGML_TYPE_Q8_0);
     const int64_t n_blocks = ggml_nelements(tensor) / qk;
@@ -542,6 +540,8 @@ static void ggml_backend_rpc_retype_converted_tq4_1s(ggml_backend_buffer_t buffe
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+
+    bool cached = false;
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
@@ -550,21 +550,23 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
-        if (response.result) {
-            // the server has the same data, no need to send it
-            return;
-        }
+        cached = response.result != 0;
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-    RPC_STATUS_ASSERT(status);
 
-    ggml_backend_rpc_retype_converted_tq4_1s(buffer, tensor);
+    if (!cached) {
+        // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
+        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+        std::vector<uint8_t> input(input_size, 0);
+        memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
+        memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+        RPC_STATUS_ASSERT(status);
+    }
+
+    // the server converts the weight whether it took it from the cache or from
+    // this write, so retype in both cases
+    ggml_backend_rpc_retype_converted_tq4_1s(buffer, tensor, offset, size);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -676,9 +678,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     // See comments in init_tensor.
     rpc_get |= ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr);
 
-    // TQ4_1S is converted to q8_0 at load time on the server, so the server
-    // allocates q8_0-sized space for it (1.7x the tensor's nbytes). The
-    // client must not assume nbytes: ask the server for the real size.
+    // the server may convert TQ4_1S to q8_0, so ask it for the real size
     rpc_get |= tensor->type == GGML_TYPE_TQ4_1S;
 
     // ops that require additional memory for fleeting data on certain backends
