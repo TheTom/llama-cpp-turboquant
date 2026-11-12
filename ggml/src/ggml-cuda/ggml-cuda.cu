@@ -2831,15 +2831,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-// GGML_TQ_MMQ gates the native TQ MMQ prefill path. Read it once: getenv() is short-circuited
-// away on NVIDIA but is a libc call per mul_mat node on the AMD path.
-static bool ggml_cuda_tq_mmq_enabled() {
-    static const bool enabled = getenv("GGML_TQ_MMQ") != nullptr;
-    return enabled;
+// GGML_TQ_MMQ: unset = native TQ MMQ prefill for TQ3_1S only, 0 = off, any other value = on for
+// TQ3_1S and TQ4_1S. Read once: it is a libc call per mul_mat node otherwise.
+static int ggml_cuda_tq_mmq_env() {
+    static const int env = [] {
+        const char * e = getenv("GGML_TQ_MMQ");
+        return e == nullptr ? -1 : strcmp(e, "0") == 0 ? 0 : 1;
+    }();
+    return env;
 }
 
 static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
-    if (!ggml_cuda_tq_mmq_enabled()) {
+    const int env = ggml_cuda_tq_mmq_env();
+    if (env == 0 || (env == -1 && src0->type != GGML_TYPE_TQ3_1S)) {
         return false;
     }
 
@@ -3076,7 +3080,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
             && ggml_cuda_tq_mmq_supported(src0, cc)) {
         // Phase 2: native int8 MMQ prefill via activation pre-rotation.
-        // A/B against the cuBLAS path below (unset GGML_TQ_MMQ to fall back).
+        // GGML_TQ_MMQ=0 falls back to the cuBLAS path below.
         if (src0->type == GGML_TYPE_TQ3_1S) {
             ggml_cuda_mul_mat_tq3_1s_mmq(ctx, src0, src1, dst);
         } else {
@@ -3141,7 +3145,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // only when ne2 > MMVQ_MAX_BATCH_SIZE (the small-batch TQ path above returns for decode).
         // Pre-rotates the activation once, then runs MMQ_ID with the TQ4_1S int8-centroid load_tiles,
         // avoiding the 2x-slower dequant-to-f16 cuBLAS fallback so native (GGML_TQ_NATIVE) experts
-        // keep their ~1.7x-smaller 5bpw footprint without a prefill penalty. Env-gated by GGML_TQ_MMQ.
+        // keep their ~1.7x-smaller 5bpw footprint without a prefill penalty. See ggml_cuda_tq_mmq_env.
         if (is_tq_weight_id && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S)
                 && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
                 && ggml_is_contiguous(src1) && ggml_cuda_tq_mmq_supported(src0, cc)) {

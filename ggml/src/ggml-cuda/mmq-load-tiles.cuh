@@ -555,7 +555,7 @@ static __device__ __forceinline__ int tq4_1s_qs_to_int8x4(const uint8_t * __rest
 // 32-bit load: the fourth byte of a 32-bit load would run past the end of the
 // block for its last group.
 //
-// The gate for this loader is GGML_TQ_MMQ=1 test-backend-ops -o MUL_MAT -p type_a=tq3_1s.
+// The gate for this loader is test-backend-ops -o MUL_MAT -p type_a=tq3_1s.
 // The centroids are one byte permute over the 8-byte int8 table (TQ3_KV_LO/HI).
 static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __restrict__ qs, const int kqsx) {
     const int g   = kqsx >> 1;        // group 0..3
