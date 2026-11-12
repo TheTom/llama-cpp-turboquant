@@ -5732,7 +5732,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
 
-                if (a->type == GGML_TYPE_Q8_CR || a->type == GGML_TYPE_Q5_CR || a->type == GGML_TYPE_Q6_CR) {
+                // TQ3_4S has no SYCL kernel: fall back to the CPU vec_dot
+                if (a->type == GGML_TYPE_Q8_CR || a->type == GGML_TYPE_Q5_CR || a->type == GGML_TYPE_Q6_CR ||
+                    a->type == GGML_TYPE_TQ3_4S) {
                     return false;
                 }
 

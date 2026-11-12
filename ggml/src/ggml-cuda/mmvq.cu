@@ -285,6 +285,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // TQ3_4S has no kernel here: like the other TQ weight types, its decode runs in mmvq-tq.cu.
+    if (type == GGML_TYPE_TQ3_4S) {
+        return false;
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
@@ -1301,8 +1305,11 @@ void ggml_cuda_mul_mat_vec_q(
                     qc.retired.push_back({ qc.ptr, qc.cap, qc.dev });
                 }
                 // Plain device memory, not pool memory: the pool frees strict LIFO, and this
-                // buffer is taken while transient pool allocations sit below it. CUDA graph
-                // capture runs in relaxed mode, which allows cudaMalloc during capture.
+                // buffer is taken while transient pool allocations sit below it. Growing it
+                // inside a graph capture is not portable: HIP on RDNA2 captures in ThreadLocal
+                // mode, where the malloc fails and invalidates the capture. It does not happen
+                // in practice because each graph runs once uncaptured before it is captured,
+                // which sizes the buffer first.
                 CUDA_CHECK(ggml_cuda_device_malloc((void **) &qc.ptr, q8_bytes, ctx.device));
                 qc.cap = q8_bytes;
                 qc.dev = ctx.device;

@@ -2565,7 +2565,7 @@ struct test_set_rows : public test_case {
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
-        if (type_dst == GGML_TYPE_TQ3_1S || type_dst == GGML_TYPE_TQ4_1S) {
+        if (type_dst == GGML_TYPE_TQ3_1S || type_dst == GGML_TYPE_TQ4_1S || type_dst == GGML_TYPE_TQ3_4S) {
             // Reduction order matters; both TurboQuant weight types have a
             // 32-element WHT inside the dot product which amplifies fp
             // reduction differences slightly.
@@ -6746,7 +6746,7 @@ struct test_mul_mat_shared_src1 : public test_case {
     // numeric-only rather than reporting a missing fusion on a correct build. Native TQ weights
     // quantize their activation on their own path, so those cases are numeric-only too.
     const char * required_fusion() override {
-        const bool tq = type == GGML_TYPE_TQ4_1S || type == GGML_TYPE_TQ3_1S;
+        const bool tq = type == GGML_TYPE_TQ4_1S || type == GGML_TYPE_TQ3_1S || type == GGML_TYPE_TQ3_4S;
         return n <= 4 && !tq ? "q8_cache_hits" : nullptr;
     }
 
@@ -8896,7 +8896,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S,
+    GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S, GGML_TYPE_TQ3_4S,
 };
 
 static const ggml_type base_types[] = {
@@ -8946,6 +8946,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int ntok : {1, 4}) {
             test_cases.emplace_back(new test_moe_reduce_fusion(type, 64, 256, 8, 4, ntok));
         }
+    }
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1(GGML_TYPE_TQ3_4S, 64, n, 256));
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
@@ -9971,6 +9974,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // TQ3_4S dense MUL_MAT: n <= 8 runs the fused decode kernels (n >= 3 on the two-rows-per-warp
+    // variant), n = 64 the MMQ or dequantize + f16 matmul path.
+    for (int k : { 1536, 2560 }) {
+        for (int m : { 256, 2048 }) {
+            for (int n : { 1, 3, 8, 64 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_4S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // TQ3_1S: DeepSeek-V4 MLA head_dim=512 batched-prefill shape.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 128, 512, 512, {1, 1}, {1, 1}));
 
@@ -9989,6 +10002,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int nb : { 1, 2, 4, 8 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 1024, nb, 4096, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 24, nb, 16384, {1, 1}, {1, 1}));
+    }
+
+    // TQ3_1S / TQ4_1S: odd m at n = 3..8, so the last warp of the two-row decode kernels owns one
+    // real row and one past the end. Not m = 1: with 3-8 outputs the int8 activation rounding
+    // alone can exceed the NMSE threshold.
+    for (ggml_type type_a : { GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S }) {
+        for (int m : { 5, 33, 65 }) {
+            for (int n = 3; n <= 8; n++) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+            }
+        }
     }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
@@ -10201,7 +10225,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // ggml_vk_use_mul_mat_vec_id() splits on (mul_mat_vec_id vs mul_mm_id), several
     // n_used counts, and broadcast -- which exercises the expert-index wrap that a
     // single non-broadcast case never touches.
-    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S, GGML_TYPE_TQ3_4S}) {
         for (int n_used : {1, 2, 4}) {
             for (bool b : {false, true}) {
                 for (int n : {1, 4, 8, 9, 17, 32}) {
@@ -10217,11 +10241,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // counts in the hundreds change how the routing is built and how few slots each expert
     // gets, and n spans both sides of MMVQ_MAX_BATCH_SIZE so this covers the decode matvec and
     // the MMQ prefill path rather than only one of them.
-    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S, GGML_TYPE_TQ3_4S}) {
         for (int n : {1, 9, 32}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  512, n, 2048)); // gate/up
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n,  512)); // down
         }
+    }
+
+    // TQ3_4S at Qwen3.8-Flash-Next's expert shapes: 512 experts, gate/up [2560 x 640] and down
+    // [640 x 2560]. A 640-value row is five 128-value super-blocks, so the MMQ prefill tile, which
+    // covers two super-blocks, runs one past the end of every row; n spans the decode matvec,
+    // the speculative batch widths and prefill.
+    for (int n : {1, 3, 9, 32, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ3_4S, GGML_TYPE_F32, 512, 8, false,  640, n, 2560)); // gate/up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ3_4S, GGML_TYPE_F32, 512, 8, false, 2560, n,  640)); // down
     }
 
     for (ggml_type type_a : base_types) {

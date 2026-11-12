@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 extern void quantize_row_turbo3_0_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo3_0(const void * x, float * y, long long k);
@@ -31,6 +32,31 @@ extern void turbo_cpu_fwht_inverse(float * x, int group_size);
  * future row dequant that carries state across blocks -- or a wrong stride in
  * the vec_dot pointer advance -- fails here rather than silently corrupting a
  * CPU-offloaded matmul. */
+/* Relative RMSE of a quantize -> dequantize round trip on a Gaussian row of the given sigma. */
+static double roundtrip_rel_rmse(enum ggml_type type, float sigma, int64_t k) {
+    const struct ggml_type_traits * tr = ggml_get_type_traits(type);
+    float * src = malloc((size_t) k * sizeof(float));
+    float * out = malloc((size_t) k * sizeof(float));
+    void  * q   = malloc(ggml_row_size(type, k));
+    uint32_t state = 12345u;
+    for (int64_t i = 0; i < k; i += 2) {
+        state = state * 1664525u + 1013904223u; const float u1 = ((state >> 8) + 1.0f) / 16777217.0f;
+        state = state * 1664525u + 1013904223u; const float u2 = (state >> 8) / 16777216.0f;
+        const float r = sqrtf(-2.0f * logf(u1));
+        src[i]     = sigma * r * cosf(6.2831853f * u2);
+        src[i + 1] = sigma * r * sinf(6.2831853f * u2);
+    }
+    ggml_quantize_chunk(type, src, q, 0, 1, k, NULL);
+    tr->to_float(q, out, k);
+    double err = 0.0, ref = 0.0;
+    for (int64_t i = 0; i < k; i++) {
+        err += (double) (out[i] - src[i]) * (out[i] - src[i]);
+        ref += (double) src[i] * src[i];
+    }
+    free(src); free(out); free(q);
+    return sqrt(err / ref);
+}
+
 static int check_chunked_dequant(enum ggml_type type, const char * name, int64_t k) {
     const struct ggml_type_traits * tr = ggml_get_type_traits(type);
 
@@ -200,11 +226,11 @@ int main(void) {
     printf("Test 4: chunked dequant == whole-row dequant\n");
     {
         const enum ggml_type types[] = {
-            GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S,
+            GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S, GGML_TYPE_TQ3_4S,
             GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
             GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0,
         };
-        const char * names[] = { "tq3_1s", "tq4_1s", "turbo2_0", "turbo3_0", "turbo4_0", "turbo6_0", "turbo5_0" };
+        const char * names[] = { "tq3_1s", "tq4_1s", "tq3_4s", "turbo2_0", "turbo3_0", "turbo4_0", "turbo6_0", "turbo5_0" };
         /* straddle TQ_DOT_CHUNK from both sides, plus a realistic row */
         const int64_t lens[] = { 128, 256, 384, 512, 4096 };
 
@@ -217,6 +243,28 @@ int main(void) {
         printf("\n");
         if (failures) {
             printf("=== FAILED: %d chunk-boundary mismatches ===\n", failures);
+            return 1;
+        }
+    }
+
+    /* Test 5: small-magnitude rows keep their precision (the fp16 block scales must not underflow) */
+    printf("Test 5: round-trip relative RMSE on small Gaussian rows\n");
+    {
+        const enum ggml_type types[] = { GGML_TYPE_TQ3_1S, GGML_TYPE_TQ3_4S };
+        const char * names[] = { "tq3_1s", "tq3_4s" };
+        const float sigmas[] = { 1e-2f, 1e-4f, 1e-5f, 1e-6f };
+        int failures = 0;
+        for (int t = 0; t < 2; t++) {
+            for (int i = 0; i < 4; i++) {
+                const double e = roundtrip_rel_rmse(types[t], sigmas[i], 4096);
+                const int ok = e < 0.25;
+                printf("  %-9s sigma=%-6g rel_rmse=%.4f %s\n", names[t], (double) sigmas[i], e, ok ? "ok" : "FAIL");
+                failures += !ok;
+            }
+        }
+        printf("\n");
+        if (failures) {
+            printf("=== FAILED: %d small-scale round trips ===\n", failures);
             return 1;
         }
     }

@@ -569,3 +569,36 @@ static __device__ __forceinline__ void dequantize_tq3_1s(const void * vx, const 
     v.x = buf[iqs];
     v.y = buf[iqs + 1];
 }
+
+// TQ3_4S: TQ3_1S indices under 6-bit half-block scales, 128-value super-blocks. iqs indexes
+// the super-block (0..126, even); the 32-value sub-block holding it is decoded and rotated.
+static __device__ __forceinline__ void dequantize_tq3_4s(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_tq3_4s * x = (const block_tq3_4s *) vx;
+    const int sub = iqs / 32;
+    const float2 d = tq3_4s_sub_scales(&x[ib], sub);
+    const uint8_t * qs = x[ib].qs + 12*sub;
+
+    float buf[32];
+    for (int g = 0; g < 4; g++) {
+        const uint8_t * qp = qs + g * 3;
+        const uint32_t packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
+        for (int i = 0; i < 8; i++) {
+            const int j = g * 8 + i;
+            buf[j] = TQ3_CENTROIDS_WEIGHT[(packed >> (3 * i)) & 7] * (j < 16 ? d.x : d.y);
+        }
+    }
+
+    // Inverse RHT: WHT butterfly then normalize+unsign
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j], b = buf[j + step];
+                buf[j] = a + b; buf[j + step] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt32 = 0.17677669529663688f;
+    const int j0 = iqs % 32;
+    v.x = buf[j0    ] * inv_sqrt32 * TQ_WEIGHT_SIGNS[j0    ];
+    v.y = buf[j0 + 1] * inv_sqrt32 * TQ_WEIGHT_SIGNS[j0 + 1];
+}
