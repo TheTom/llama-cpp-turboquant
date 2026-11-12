@@ -231,7 +231,7 @@ static int test_vec_dot_q(bool verbose) {
 //
 // This is a check on the derivation, not on the loader: the copy can drift from
 // the CUDA code without the test noticing. The loader is covered by
-// test-backend-ops -o MUL_MAT -p type_a=tq3_1s with GGML_TQ_MMQ=1.
+// test-backend-ops -o MUL_MAT -p type_a=tq3_1s.
 static void tq3_1s_unpack_indices_cuda(const uint8_t * qs, int kqsx, int idx[4]) {
     const int g    = kqsx >> 1;        // group 0..3
     const int sub  = (kqsx & 1) * 4;   // first element within the group
