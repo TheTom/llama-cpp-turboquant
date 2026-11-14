@@ -28,8 +28,8 @@ llama-cli -m model.gguf -c 8192 -ngl 99 \
 The flag parser accepts any combination of `f32`, `f16`, `bf16`, `q8_0`,
 `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` and `turbo2` to `turbo6` for K and V.
 Which combinations have backend kernels is narrower and backend-dependent;
-`turbo5` and `turbo6` support a smaller set of pairs, listed below. Mixing
-quantized V with unquantized K is the common configuration.
+`turbo5` and `turbo6` support a smaller set of pairs, listed below. A
+quantized V cache with a `q8_0` K cache is the common configuration.
 
 On Metal, flash attention accepts exactly three mixed pairs: turbo K + turbo V,
 `q8_0` K + turbo V, and turbo K + `q8_0` V, where turbo is `turbo2/3/4`. Any
