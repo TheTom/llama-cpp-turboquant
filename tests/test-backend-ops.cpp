@@ -10730,7 +10730,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Gemma 4 global layers: head dim 512 with mixed turbo K/V pairs (CUDA runs these on the MMA-f16 path)
+    // Gemma 4 global layers: head dim 512 with mixed turbo K/V pairs
     for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{
             {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0},
             {GGML_TYPE_Q8_0, GGML_TYPE_TURBO5_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_Q8_0}}) {
@@ -10739,10 +10739,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {4, 1}, kv, nb, true, false, 0, 0,
                                                                 GGML_PREC_F32, kv_types.first, kv_types.second));
             }
-            for (int nb : { 1, 2, 4 }) { // the real Gemma 4 shape: 2 KV heads, 8 query heads each (decode and drafts)
+        }
+    }
+    // the fused MMA-turbo pairs at head dim 512 (plus turbo6/turbo4, which falls through to the f16 conversion):
+    // the real Gemma 4 shape, 2 KV heads x 8 query heads (1 token, 2- and 4-token draft batches), and GQA 2
+    for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{
+            {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0},
+            {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0},
+            {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0}}) {
+        for (int kv : { 512, 1024 }) {
+            for (int nb : { 1, 2, 4 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, nb, true, false, 0, 0,
                                                                 GGML_PREC_F32, kv_types.first, kv_types.second));
             }
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, kv, 4, true, false, 0, 0,
+                                                            GGML_PREC_F32, kv_types.first, kv_types.second));
         }
     }
 

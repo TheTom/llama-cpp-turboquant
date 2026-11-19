@@ -2675,7 +2675,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
 // ---------------------------------------------------------------------------
 // turbo4 fused MMA decode dispatch (mirrors the f16 switch helpers, type-parametric).
-// Only reached from the gate for turbo4 K==V, D in {128,256}, Q->ne[1] <= 4, turing MMA.
+// Only reached from the gate: turbo K/V at D in {128,256}, and the turbo6/turbo5 K pairs at D=512 (turbo6/turbo5,
+// turbo5/turbo4, turbo6/turbo6, turbo5/turbo5); Q->ne[1] <= 4, turing MMA.
 //
 // The reachable (ncols1, ncols2) set for Q->ne[1] in {1..4} with GQA-packing is exactly
 // {(1,8),(2,8),(4,8),(2,4),(4,4),(4,2),(8,1)} — the 7 compiled instances per D. Each ncols2
@@ -3301,8 +3302,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (is_turbo(V->type) && V->ne[0] % 64 != 0)) {
             return BEST_FATTN_KERNEL_NONE;
         }
-        // turbo5_0/turbo6_0 pack 128 values per block. VEC/MMA-turbo instances exist for head dims 128 and 256 only;
-        // on CUDA, head dim 512 (Gemma 4 global layers) goes to the generic MMA-f16 kernel, which converts K/V to f16 first.
+        // turbo5_0/turbo6_0 pack 128 values per block. VEC instances exist for head dims 128 and 256 only. On CUDA,
+        // head dim 512 (Gemma 4 global layers) decodes on the fused MMA-turbo kernel for turbo6/turbo5, turbo5/turbo4,
+        // turbo6/turbo6 and turbo5/turbo5 (see ggml_cuda_flash_attn_ext); the rest goes to the generic MMA-f16
+        // kernel, which converts K/V to f16 first.
         auto is_turbo56 = [](ggml_type t) {
             return t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
         };
@@ -3492,7 +3495,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
 
     // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
-    // Routes turbo2/3/4 K==V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed
+    // Routes turbo K/V at D in {128,256} and the turbo6/turbo5 K pairs at D=512, decode (Q->ne[1] <= 4), onto the GQA-packed
     // MMA path (KV read once per head-group instead of per query head). Q is ALREADY
     // graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there, so this
     // path does NO inline FWHT and NO src swap. GGML_TURBO_MMA_FUSED=0 falls straight through
@@ -3509,13 +3512,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             // turbo6_0 / turbo5_0 K over a turbo3 V: the pair they are meant for, K and V decoded by
             // their own tile loaders into the same GQA-packed tile.
             ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO3_0) ||
-            // turbo4 V under a turbo6_0 / turbo5_0 K, and turbo5_0 V under a turbo6_0 K (head dims 256 and 512)
-            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO4_0 && (Q->ne[0] == 256 || Q->ne[0] == 512)) ||
+            // turbo4 V under a turbo6_0 / turbo5_0 K (head dim 256; at 512 only under turbo5_0 K),
+            // and turbo5_0 V under a turbo6_0 K (head dims 256 and 512)
+            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
+            (K->type == GGML_TYPE_TURBO5_0 && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 512) ||
             (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0 && (Q->ne[0] == 256 || Q->ne[0] == 512));
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
             // head dim 512 (Gemma 4 global layers): turbo6/turbo5 K pairs decoded straight into the MMA tile
-            // instead of converting the whole K/V cache to f16 first. Other turbo types at 512 fall through.
+            // instead of converting the whole K/V cache to f16 first. Other turbo pairs at 512 (turbo2/3/4 K==V,
+            // turbo6/turbo5 K over turbo3 V) match no branch below either (they test D 128/256) and fall through
+            // to the generic dispatch, which converts K/V to f16.
             if (Q->ne[0] == 512) {
                 if (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0>(ctx, dst); return; }
                 if (K->type == GGML_TYPE_TURBO5_0 && V->type == GGML_TYPE_TURBO4_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
