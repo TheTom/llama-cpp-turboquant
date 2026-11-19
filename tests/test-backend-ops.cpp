@@ -10741,14 +10741,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // the fused MMA-turbo pairs at head dim 512 (plus turbo6/turbo4, which falls through to the f16 conversion):
-    // the real Gemma 4 shape, 2 KV heads x 8 query heads (1 token, 2- and 4-token draft batches), and GQA 2
+    // the fused MMA-turbo pairs at head dim 512, plus pairs that take the f16 conversion there (turbo6/turbo4,
+    // turbo6/turbo3, turbo5/turbo3, q8_0/turbo5, turbo5/q8_0): the real Gemma 4 shape, 2 KV heads x 8 query heads
+    // (1 token and 2-4 token draft batches), and GQA 2
     for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{
             {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0},
             {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0},
-            {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0}}) {
+            {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0},
+            {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_Q8_0, GGML_TYPE_TURBO5_0},
+            {GGML_TYPE_TURBO5_0, GGML_TYPE_Q8_0}}) {
         for (int kv : { 512, 1024 }) {
-            for (int nb : { 1, 2, 4 }) {
+            for (int nb : { 1, 2, 3, 4 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, nb, true, false, 0, 0,
                                                                 GGML_PREC_F32, kv_types.first, kv_types.second));
             }
