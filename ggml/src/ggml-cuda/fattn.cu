@@ -3301,12 +3301,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (is_turbo(V->type) && V->ne[0] % 64 != 0)) {
             return BEST_FATTN_KERNEL_NONE;
         }
-        // turbo5_0/turbo6_0 pack 128 values per block and are instantiated for head dims 128 and 256 only
+        // turbo5_0/turbo6_0 pack 128 values per block. VEC/MMA-turbo instances exist for head dims 128 and 256 only;
+        // on CUDA, head dim 512 (Gemma 4 global layers) goes to the generic MMA-f16 kernel, which converts K/V to f16 first.
         auto is_turbo56 = [](ggml_type t) {
             return t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
         };
         auto turbo56_head_size_ok = [](int64_t ne0) {
+#ifdef GGML_USE_HIP
             return ne0 == 128 || ne0 == 256;
+#else
+            return ne0 == 128 || ne0 == 256 || ne0 == 512;
+#endif
         };
         if ((is_turbo56(K->type) && !turbo56_head_size_ok(K->ne[0])) ||
             (is_turbo56(V->type) && !turbo56_head_size_ok(V->ne[0]))) {

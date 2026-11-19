@@ -10730,6 +10730,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Gemma 4 global layers: head dim 512 with mixed turbo K/V pairs (CUDA runs these on the MMA-f16 path)
+    for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{
+            {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0},
+            {GGML_TYPE_Q8_0, GGML_TYPE_TURBO5_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_Q8_0}}) {
+        for (int kv : { 512, 1024 }) {
+            for (int nb : { 1, 3, 32 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {4, 1}, kv, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, kv_types.first, kv_types.second));
+            }
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
@@ -10766,7 +10778,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         if (is_turbo_kv && hsk < 128) continue;
                                                         // turbo MMA/VEC kernels are also instantiated at hsk=256 (fattn-mma-turbo.cuh
                                                         // DECL_FATTN_MMA_TURBO_ALL(256,256,...)); exercise the swizzled-write path there too.
-                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128 && !(is_turbo_kv && hsk == 256)) continue;
+                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128 && !(is_turbo_kv && (hsk == 256 || hsk == 512))) continue;
                                                         // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                         const bool v_is_view_of_k = hsk == 576;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
