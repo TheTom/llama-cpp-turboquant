@@ -2676,7 +2676,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 // ---------------------------------------------------------------------------
 // turbo4 fused MMA decode dispatch (mirrors the f16 switch helpers, type-parametric).
 // Only reached from the fused gate in ggml_cuda_flash_attn_ext (turbo KV decode, Q->ne[1] <= 4, turing MMA; which
-// pairs at which head dims: turbo_matched there).
+// pairs at which head dims: turbo56_matched and turbo234_matched there).
 //
 // The reachable (ncols1, ncols2) set for Q->ne[1] in {1..4} with GQA-packing is exactly
 // {(1,8),(2,8),(4,8),(2,4),(4,4),(4,2),(8,1)} — the 7 compiled instances per D. Each ncols2
@@ -3340,8 +3340,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
         // turbo5_0/turbo6_0 pack 128 values per block. VEC instances exist for head dims 128 and 256 only. On CUDA at
         // head dim 512 (Gemma 4 global layers), decode on Turing+ uses the fused MMA-turbo kernel for the turbo pairs
-        // with instances (ggml_cuda_fattn_mma_turbo56_pair_compiled, gate in ggml_cuda_flash_attn_ext); everything else converts K/V to f16 first and runs the
-        // generic MMA-f16 (or tile) kernel.
+        // with instances (ggml_cuda_fattn_mma_turbo56_pair_compiled, gate in ggml_cuda_flash_attn_ext); everything
+        // else converts K/V to f16 first and runs the generic MMA-f16 (or tile) kernel.
         auto is_turbo56 = [](ggml_type t) {
             return t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
         };
@@ -3562,20 +3562,23 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 switch (Q->ne[0]) {
                     case 128: ggml_cuda_flash_attn_ext_mma_turbo56<128>(ctx, dst); return;
                     case 256: ggml_cuda_flash_attn_ext_mma_turbo56<256>(ctx, dst); return;
-                    default:  ggml_cuda_flash_attn_ext_mma_turbo56<512>(ctx, dst); return;
+                    case 512: ggml_cuda_flash_attn_ext_mma_turbo56<512>(ctx, dst); return;
+                    default:  GGML_ABORT("fatal error");
                 }
             }
             if (Q->ne[0] == 128) {
                 switch (K->type) {
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    default:                 ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
+                    case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
+                    default: GGML_ABORT("fatal error");
                 }
             }
-            if (K->type == GGML_TYPE_TURBO4_0) {
-                ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
+            switch (K->type) {
+                case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
+                case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                default: GGML_ABORT("fatal error"); // turbo2 + head dim 256 is not matched above
             }
-            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
         }
     }
 

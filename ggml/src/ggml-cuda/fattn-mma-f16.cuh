@@ -782,7 +782,8 @@ static __device__ __forceinline__ float flash_attn_ext_turbo6_centroid(const flo
 
 // K/V tile width (in half2) for the turbo MMA path. The turbo loaders decode whole rows, except at head
 // dim 512 with 32 columns: there full rows plus the Q tile need ~66 KB of shared memory (Turing allows
-// 64 KB), so rows are loaded in 128-wide pieces (turbo4-flat/turbo5/turbo6 loaders take a column offset).
+// 64 KB), so rows are loaded in 128-wide pieces (the turbo5/turbo6 and flat turbo2/3/4 loaders take a column
+// offset; only pairs with a turbo5/turbo6 side have head dim 512 instances).
 static constexpr __host__ __device__ int ggml_cuda_fattn_mma_turbo_nbatch_2(const int D, const int ncols) {
     return D == 512 && ncols >= 32 ? 128 : D/2;
 }
