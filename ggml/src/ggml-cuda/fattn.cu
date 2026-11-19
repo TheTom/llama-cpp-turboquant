@@ -2675,7 +2675,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
 // ---------------------------------------------------------------------------
 // turbo4 fused MMA decode dispatch (mirrors the f16 switch helpers, type-parametric).
-// Only reached from the gate for turbo4 K==V, D in {128,256}, Q->ne[1] <= 4, turing MMA.
+// Only reached from the fused gate in ggml_cuda_flash_attn_ext (turbo KV decode, Q->ne[1] <= 4, turing MMA; which
+// pairs at which head dims: turbo56_matched and turbo234_matched there).
 //
 // The reachable (ncols1, ncols2) set for Q->ne[1] in {1..4} with GQA-packing is exactly
 // {(1,8),(2,8),(4,8),(2,4),(4,4),(4,2),(8,1)} — the 7 compiled instances per D. Each ncols2
@@ -2737,6 +2738,42 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
         return;
     }
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 1, type_K, type_V>(ctx, dst); // ncols2 = 1 -> (8,1)
+}
+
+// Fused turbo MMA decode for a K/V pair with a turbo5_0 / turbo6_0 side: maps the runtime K/V types onto the
+// compiled instances. The gate in ggml_cuda_flash_attn_ext calls this only for a pair that
+// ggml_cuda_fattn_mma_turbo56_pair_compiled accepts.
+template <int D, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_turbo56_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if constexpr (ggml_cuda_fattn_mma_turbo56_pair_compiled(type_K, type_V)) {
+        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<D, D, type_K, type_V>(ctx, dst);
+    } else {
+        GGML_ABORT("fatal error");
+    }
+}
+
+template <int D, ggml_type type_K>
+static void ggml_cuda_flash_attn_ext_mma_turbo56_v(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->src[2]->type) {
+        case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo56_pair<D, type_K, GGML_TYPE_TURBO2_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo56_pair<D, type_K, GGML_TYPE_TURBO3_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo56_pair<D, type_K, GGML_TYPE_TURBO4_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO5_0: ggml_cuda_flash_attn_ext_mma_turbo56_pair<D, type_K, GGML_TYPE_TURBO5_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO6_0: ggml_cuda_flash_attn_ext_mma_turbo56_pair<D, type_K, GGML_TYPE_TURBO6_0>(ctx, dst); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+template <int D>
+static void ggml_cuda_flash_attn_ext_mma_turbo56(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo56_v<D, GGML_TYPE_TURBO2_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo56_v<D, GGML_TYPE_TURBO3_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo56_v<D, GGML_TYPE_TURBO4_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO5_0: ggml_cuda_flash_attn_ext_mma_turbo56_v<D, GGML_TYPE_TURBO5_0>(ctx, dst); break;
+        case GGML_TYPE_TURBO6_0: ggml_cuda_flash_attn_ext_mma_turbo56_v<D, GGML_TYPE_TURBO6_0>(ctx, dst); break;
+        default: GGML_ABORT("fatal error");
+    }
 }
 
 // Env latch for the fused turbo MMA decode path. DEFAULT ON.
@@ -3301,12 +3338,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (is_turbo(V->type) && V->ne[0] % 64 != 0)) {
             return BEST_FATTN_KERNEL_NONE;
         }
-        // turbo5_0/turbo6_0 pack 128 values per block and are instantiated for head dims 128 and 256 only
+        // turbo5_0/turbo6_0 pack 128 values per block. VEC instances exist for head dims 128 and 256 only. On CUDA at
+        // head dim 512 (Gemma 4 global layers), decode on Turing+ uses the fused MMA-turbo kernel for the turbo pairs
+        // with instances (ggml_cuda_fattn_mma_turbo56_pair_compiled, gate in ggml_cuda_flash_attn_ext); everything
+        // else converts K/V to f16 first and runs the generic MMA-f16 (or tile) kernel.
         auto is_turbo56 = [](ggml_type t) {
             return t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
         };
         auto turbo56_head_size_ok = [](int64_t ne0) {
+#ifdef GGML_USE_HIP
             return ne0 == 128 || ne0 == 256;
+#else
+            return ne0 == 128 || ne0 == 256 || ne0 == 512;
+#endif
         };
         if ((is_turbo56(K->type) && !turbo56_head_size_ok(K->ne[0])) ||
             (is_turbo56(V->type) && !turbo56_head_size_ok(V->ne[0]))) {
@@ -3487,69 +3531,53 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
 
     // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
-    // Routes turbo2/3/4 K==V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed
-    // MMA path (KV read once per head-group instead of per query head). Q is ALREADY
-    // graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there, so this
+    // Routes turbo KV decode (Q->ne[1] <= 4, Turing+ MMA) for the pairs and head dims in turbo56_matched and
+    // turbo234_matched onto the GQA-packed MMA path (KV read once per head-group instead of per query head). Q is
+    // ALREADY graph-rotated (src/llama-graph.cpp) and the FA output is inverse-rotated there, so this
     // path does NO inline FWHT and NO src swap. GGML_TURBO_MMA_FUSED=0 falls straight through
-    // to the original VEC dispatch (kill-switch).
+    // to the generic dispatch (kill-switch): VEC at D 128/256, f16 conversion + MMA-f16 at D=512.
     {
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const bool turbo_matched =
-            (K->type == V->type &&
-             (K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 ||
-              K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0)) ||
-            // turbo6_0 / turbo5_0 K over a turbo3 V: the pair they are meant for, K and V decoded by
-            // their own tile loaders into the same GQA-packed tile.
-            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO3_0) ||
-            // turbo4 V under a turbo6_0 / turbo5_0 K, and turbo5_0 V under a turbo6_0 K (head dim 256 only)
-            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
-            (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0 && Q->ne[0] == 256);
-        if (ggml_cuda_turbo_mma_fused() && turbo_matched
+        // a turbo5_0 / turbo6_0 side with a turbo partner, at head dims 128, 256 and 512 (Gemma 4 global layers):
+        // the pairs with instances in fattn-mma-turbo.cuh. At 512 every other turbo pair gets the f16 conversion, and
+        // so does turbo6/turbo6 for a single token: there the fused kernel was 14% slower than the conversion
+        // (RTX 2080 Ti, 32k KV, 2 KV heads x GQA 8), while 2-4 token batches were 1.5x faster fused.
+        const bool turbo56_matched = ggml_cuda_fattn_mma_turbo56_pair_compiled(K->type, V->type) &&
+            (Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) &&
+            !(Q->ne[0] == 512 && Q->ne[1] == 1 && K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO6_0);
+        // turbo4/turbo4 and turbo3/turbo3 at head dims 128 and 256, turbo2/turbo2 at 128 only. turbo2 + head dim 256
+        // intentionally has NO fused case (routes to VEC): at 2-bit KV the fused path's GQA-pack saving is tiny
+        // while the dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and regresses
+        // ~1-2.5% on bandwidth-limited ones (tester @everson: Gemma-12B / RTX 5060 Ti). VEC == baseline there.
+        // turbo2 + hd128 keeps fused (a +6.6..+69% depth win on dense models).
+        const bool turbo234_matched = K->type == V->type &&
+            (((K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_0) && (Q->ne[0] == 128 || Q->ne[0] == 256)) ||
+             (K->type == GGML_TYPE_TURBO2_0 && Q->ne[0] == 128));
+        if (ggml_cuda_turbo_mma_fused() && (turbo56_matched || turbo234_matched)
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
-            if (V->type == GGML_TYPE_TURBO3_0 && (K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0)) {
-                if (Q->ne[0] == 128) {
-                    if (K->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
-                    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+            if (turbo56_matched) {
+                switch (Q->ne[0]) {
+                    case 128: ggml_cuda_flash_attn_ext_mma_turbo56<128>(ctx, dst); return;
+                    case 256: ggml_cuda_flash_attn_ext_mma_turbo56<256>(ctx, dst); return;
+                    case 512: ggml_cuda_flash_attn_ext_mma_turbo56<512>(ctx, dst); return;
+                    default:  GGML_ABORT("fatal error");
                 }
-                if (Q->ne[0] == 256) {
-                    if (K->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }
-                    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                }
-            }
-            if (Q->ne[0] == 256 && V->type == GGML_TYPE_TURBO4_0) {
-                if (K->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
-                if (K->type == GGML_TYPE_TURBO5_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
-            }
-            if (Q->ne[0] == 256 && K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0) {
-                ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0>(ctx, dst); return;
             }
             if (Q->ne[0] == 128) {
                 switch (K->type) {
                     case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
                     case GGML_TYPE_TURBO2_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO6_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO5_0>(ctx, dst); return;
-                    default: break;
+                    default: GGML_ABORT("fatal error");
                 }
             }
-            if (Q->ne[0] == 256) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO6_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO6_0,    GGML_TYPE_TURBO6_0>(ctx, dst); return;
-                    case GGML_TYPE_TURBO5_0:    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO5_0,    GGML_TYPE_TURBO5_0>(ctx, dst); return;
-                    // turbo2 + head_dim 256: intentionally NO fused case (routes to VEC via
-                    // default below). At 2-bit KV the fused path's GQA-pack saving is tiny while the
-                    // dequant/no-pipeline overhead is unchanged, so it is neutral on high-BW GPUs and
-                    // regresses ~1-2.5% on bandwidth-limited ones (tester @everson: Gemma-12B / RTX
-                    // 5060 Ti). VEC == baseline there. turbo2 + hd128 keeps fused (a +6.6..+69% depth
-                    // win on dense models); turbo3/turbo4 stay fused at both head dims.
-                    default: break;
-                }
+            switch (K->type) {
+                case GGML_TYPE_TURBO4_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst); return;
+                case GGML_TYPE_TURBO3_0: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst); return;
+                default: GGML_ABORT("fatal error"); // turbo2 + head dim 256 is not matched above
             }
         }
     }
