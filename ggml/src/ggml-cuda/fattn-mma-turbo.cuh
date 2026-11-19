@@ -30,8 +30,8 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int  nbatch_K2      = ggml_cuda_fattn_mma_turbo_nbatch_2(DKQ, ncols); // same widths as the kernel
+    const int  nbatch_V2      = ggml_cuda_fattn_mma_turbo_nbatch_2(DV,  ncols);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
 
@@ -133,3 +133,8 @@ DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0);
+// head dim 512 (Gemma 4 global layers): turbo6/turbo5 K with their usual V partners
+DECL_FATTN_MMA_TURBO_ALL(512, 512, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0);
+DECL_FATTN_MMA_TURBO_ALL(512, 512, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0);
+DECL_FATTN_MMA_TURBO_ALL(512, 512, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0);
+DECL_FATTN_MMA_TURBO_ALL(512, 512, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0);

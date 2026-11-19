@@ -3509,11 +3509,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             // turbo6_0 / turbo5_0 K over a turbo3 V: the pair they are meant for, K and V decoded by
             // their own tile loaders into the same GQA-packed tile.
             ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO3_0) ||
-            // turbo4 V under a turbo6_0 / turbo5_0 K, and turbo5_0 V under a turbo6_0 K (head dim 256 only)
-            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256) ||
-            (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0 && Q->ne[0] == 256);
+            // turbo4 V under a turbo6_0 / turbo5_0 K, and turbo5_0 V under a turbo6_0 K (head dims 256 and 512)
+            ((K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0) && V->type == GGML_TYPE_TURBO4_0 && (Q->ne[0] == 256 || Q->ne[0] == 512)) ||
+            (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0 && (Q->ne[0] == 256 || Q->ne[0] == 512));
         if (ggml_cuda_turbo_mma_fused() && turbo_matched
                 && Q->ne[1] <= 4 && V->ne[0] == Q->ne[0] && turing_mma_available(cc)) {
+            // head dim 512 (Gemma 4 global layers): turbo6/turbo5 K pairs decoded straight into the MMA tile
+            // instead of converting the whole K/V cache to f16 first. Other turbo types at 512 fall through.
+            if (Q->ne[0] == 512) {
+                if (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO5_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0>(ctx, dst); return; }
+                if (K->type == GGML_TYPE_TURBO5_0 && V->type == GGML_TYPE_TURBO4_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0>(ctx, dst); return; }
+                if (K->type == GGML_TYPE_TURBO6_0 && V->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0>(ctx, dst); return; }
+                if (K->type == GGML_TYPE_TURBO5_0 && V->type == GGML_TYPE_TURBO5_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<512, 512, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0>(ctx, dst); return; }
+            }
             if (V->type == GGML_TYPE_TURBO3_0 && (K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0)) {
                 if (Q->ne[0] == 128) {
                     if (K->type == GGML_TYPE_TURBO6_0) { ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0>(ctx, dst); return; }

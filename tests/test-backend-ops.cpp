@@ -10739,6 +10739,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {4, 1}, kv, nb, true, false, 0, 0,
                                                                 GGML_PREC_F32, kv_types.first, kv_types.second));
             }
+            for (int nb : { 1, 2, 4 }) { // the real Gemma 4 shape: 2 KV heads, 8 query heads each (decode and drafts)
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, kv_types.first, kv_types.second));
+            }
         }
     }
 

@@ -780,6 +780,13 @@ static __device__ __forceinline__ float flash_attn_ext_turbo6_centroid(const flo
     return __uint_as_float(__float_as_uint(v) ^ ((uint32_t) neg & 0x80000000u));
 }
 
+// K/V tile width (in half2) for the turbo MMA path. The turbo loaders decode whole rows, except at head
+// dim 512 with 32 columns: there full rows plus the Q tile need ~66 KB of shared memory (Turing allows
+// 64 KB), so rows are loaded in 128-wide pieces (turbo4-flat/turbo5/turbo6 loaders take a column offset).
+static constexpr __host__ __device__ int ggml_cuda_fattn_mma_turbo_nbatch_2(const int D, const int ncols) {
+    return D == 512 && ncols >= 32 ? 128 : D/2;
+}
+
 // One lane decodes sixteen consecutive values (eight half2) per iteration and writes two
 // aligned uint4: every thread of the block works, and the packed reads of a row stay
 // inside one cache line. Sixteen values need only six 16-bit loads (eight qs bytes, four
@@ -1155,13 +1162,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
     constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
-    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     // turbo4 KV is dequantized synchronously into SRAM in the load tile; the cp.async
     // multi-stage pipeline (nstages>1) would copy raw turbo bytes as half2 => garbage.
     // Force single-stage synchronous loading for the turbo path.
     constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    // turbo KV tile widths: see ggml_cuda_fattn_mma_turbo_nbatch_2.
+    constexpr int  nbatch_K2       = is_turbo_kv ? ggml_cuda_fattn_mma_turbo_nbatch_2(DKQ, ncols) : ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
+    constexpr int  nbatch_V2       = is_turbo_kv ? ggml_cuda_fattn_mma_turbo_nbatch_2(DV,  ncols) : ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
+    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     // swizzle the tile stride for K and V based on the batch size.
@@ -1210,17 +1218,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 ||
                           type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0,
                           "only turbo2/3/4, turbo6 or turbo5 K supported on the MMA turbo path");
-            static_assert(nbatch_K2 == DKQ/2, "turbo MMA load assumes full-row K tiles (nbatch_K2==DKQ/2)");
+            static_assert(nbatch_K2 == DKQ/2 || type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0,
+                          "turbo2/3/4 K MMA loads assume full-row K tiles (nbatch_K2==DKQ/2)");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * K_raw = (const char *) K_h2 + int64_t(k_VKQ_0) * stride_K;
             if constexpr (type_K == GGML_TYPE_TURBO4_0) {
                 flash_attn_ext_turbo4_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO6_0) {
-                flash_attn_ext_turbo6_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check>
+                flash_attn_ext_turbo6_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, nbatch_K2, oob_check>
                     (K_raw, tile_K, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO5_0) {
-                flash_attn_ext_turbo5_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check>
+                flash_attn_ext_turbo5_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, nbatch_K2, oob_check>
                     (K_raw, tile_K, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
                 flash_attn_ext_turbo3_load_tile<stride_tile_K, swz_K, nbatch_fa, nthreads_turbo, oob_check>
@@ -1590,23 +1599,25 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                           type_V == GGML_TYPE_TURBO5_0 || type_V == GGML_TYPE_TURBO6_0,
                           "only turbo2/3/4, turbo6 or turbo5 V supported on the MMA turbo path");
             static_assert(!V_is_K_view, "turbo MMA path never uses V_is_K_view");
-            static_assert(nbatch_V2 == DV/2, "turbo MMA load assumes full-row V tiles (nbatch_V2==DV/2)");
+            static_assert(nbatch_V2 == DV/2 || type_V == GGML_TYPE_TURBO5_0 || type_V == GGML_TYPE_TURBO6_0 ||
+                          (type_V == GGML_TYPE_TURBO4_0 && (type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0)),
+                          "turbo2/3/4 V MMA loads assume full-row V tiles (nbatch_V2==DV/2)");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * V_raw = (const char *) V_h2 + int64_t(k_VKQ_0) * stride_V;
             if constexpr (type_V == GGML_TYPE_TURBO4_0) {
                 if constexpr (type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0) {
-                    // turbo6/turbo5 K only ever pairs with full-row V tiles, so the wider flat loader applies
-                    flash_attn_ext_turbo4_load_tile_flat<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
+                    // under turbo6/turbo5 K the wider flat loader applies (full rows or 128-wide pieces)
+                    flash_attn_ext_turbo4_load_tile_flat<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, nbatch_V2, oob_check>
                         (V_raw, tile_V, stride_V, i0_start/2, k_VKQ_sup);
                 } else {
                     flash_attn_ext_turbo4_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
                         (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
                 }
             } else if constexpr (type_V == GGML_TYPE_TURBO6_0) {
-                flash_attn_ext_turbo6_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
+                flash_attn_ext_turbo6_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, nbatch_V2, oob_check>
                     (V_raw, tile_V, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO5_0) {
-                flash_attn_ext_turbo5_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>
+                flash_attn_ext_turbo5_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, nbatch_V2, oob_check>
                     (V_raw, tile_V, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
                 flash_attn_ext_turbo3_load_tile<stride_tile_V, swz_V, nbatch_fa, nthreads_turbo, oob_check>
@@ -1817,12 +1828,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  cols_per_thread = get_cols_per_thread();
     constexpr int  np              = cols_per_warp > ncols ? nwarps : nwarps * cols_per_warp/ncols; // Number of parallel CUDA warps per Q column.
     constexpr int  nbatch_fa       = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols);
-    constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols);
-    constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
-    constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
-    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     // Force single-stage synchronous loading for the turbo path (see iter for rationale).
     constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
+    constexpr int  nbatch_K2       = is_turbo_kv ? ggml_cuda_fattn_mma_turbo_nbatch_2(DKQ, ncols) : ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
+    constexpr int  nbatch_V2       = is_turbo_kv ? ggml_cuda_fattn_mma_turbo_nbatch_2(DV,  ncols) : ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
+    constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
+    constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     if (cols_per_warp > ncols) {
