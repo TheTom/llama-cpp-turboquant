@@ -6,6 +6,7 @@
  */
 
 #include "mmvq-tq.cuh"
+#include "mmvq.cuh"
 #include "turbo-quant.cuh"
 #include "convert.cuh"
 #include "mmq.cuh"
@@ -150,9 +151,19 @@ static __global__ void tq_build_expert_table(
 //
 // claim[] is reset each call and resolves collisions by lowest routed index, so the outcome does
 // not depend on thread scheduling.
+//
+// A call routes n_used experts for each of n_tokens tokens, and routed index i is expert k = i % n_used
+// of token t = i / n_used. With more than one token the same expert can appear several times.
+static __device__ __forceinline__ int tq_routed_expert(
+        const int32_t * __restrict__ ids, const int i, const int n_used, const int ids_stride) {
+    return ids[(i / n_used) * ids_stride + i % n_used];
+}
+
 static __global__ void tq_cache_probe(
         const int32_t * __restrict__ ids,
         const int                    n_routed,
+        const int                    n_used,
+        const int                    ids_stride,
         const int                    n_slots,
         const int32_t * __restrict__ slot_expert,
         int32_t       * __restrict__ claim,
@@ -161,7 +172,7 @@ static __global__ void tq_cache_probe(
     if (i >= n_routed) {
         return;
     }
-    const int e    = ids[i];
+    const int e    = tq_routed_expert(ids, i, n_used, ids_stride);
     const int slot = e % n_slots;
 
     if (slot_expert[slot] == e) {
@@ -181,6 +192,8 @@ static __global__ void tq_cache_probe(
 static __global__ void tq_cache_award(
         const int32_t * __restrict__ ids,
         const int                    n_routed,
+        const int                    n_used,
+        const int                    ids_stride,
         const int                    n_slots,
         const int32_t * __restrict__ claim,
         const int32_t * __restrict__ hit,
@@ -197,16 +210,19 @@ static __global__ void tq_cache_award(
         won[i] = 1;
         return;
     }
-    const int e    = ids[i];
+    const int e    = tq_routed_expert(ids, i, n_used, ids_stride);
     const int slot = e % n_slots;
 
     // claim[slot] == -1 means a hit reserved it, so no miss may take it this call
-    if (claim[slot] == i) {
+    const int c = claim[slot];
+    if (c == i) {
         slot_expert[slot] = e;
         const int k = atomicAdd(n_miss, 1);
         miss_expert[k] = e;
         miss_slot[k]   = slot;
         won[i] = 1;                       // will be resident once the copy runs
+    } else if (c >= 0 && tq_routed_expert(ids, c, n_used, ids_stride) == e) {
+        won[i] = 1;                       // another token routed the same expert and copies it once
     } else {
         won[i] = 0;                       // reserved or lost the collision: read this one in place
     }
@@ -245,6 +261,8 @@ static __global__ void tq_page_in_misses(
 static __global__ void tq_table_point(
         const int32_t * __restrict__ ids,
         const int                    n_routed,
+        const int                    n_used,
+        const int                    ids_stride,
         const int                    n_slots,
         const int32_t * __restrict__ won,
         const char    * __restrict__ base,
@@ -255,7 +273,7 @@ static __global__ void tq_table_point(
     if (i >= n_routed) {
         return;
     }
-    const int e = ids[i];
+    const int e = tq_routed_expert(ids, i, n_used, ids_stride);
     // a slot if this expert is or is about to be resident, otherwise its home address
     table[e] = won[i] ? (const void *) (slab + (int64_t) (e % n_slots) * nb_expert)
                       : (const void *) (base + (int64_t) e * nb_expert);
@@ -317,10 +335,30 @@ ggml_backend_cuda_context::moe_expert_slab * ggml_backend_cuda_context::moe_expe
     e.n_routed  = n_routed;
     e.dev       = dev;
 
+    // The slabs are allocated lazily at the first decode, after the compute buffers are reserved,
+    // so without a margin they take every byte that is left. Attention scratch at long context
+    // then has nowhere to grow and the next deep prompt fails with out-of-memory. Keep a reserve
+    // free and let any tensor that does not fit read its experts from host memory instead.
+    static const size_t reserve = [] {
+        const char * env = getenv("GGML_MOE_PAGE_RESERVE_MB");
+        const long   v   = env ? atol(env) : 1024;
+        return (size_t) (v > 0 ? v : 0) << 20;
+    }();
+    bool fits = true;
+    {
+        size_t free_mem = 0, total_mem = 0;
+        ggml_cuda_set_device(dev);
+        if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
+            fits = free_mem >= (size_t) e.n_slots * nb_expert + reserve;
+        }
+        (void) cudaGetLastError();
+    }
+
     auto alloc = [&](void ** p, size_t bytes) {
         return ggml_cuda_device_malloc(p, bytes, dev) == cudaSuccess;
     };
-    if (!alloc(&e.slab, (size_t) e.n_slots * nb_expert) ||
+    if (!fits ||
+        !alloc(&e.slab, (size_t) e.n_slots * nb_expert) ||
         !alloc((void **) &e.slot_expert, (size_t) e.n_slots * sizeof(int32_t)) ||
         !alloc((void **) &e.claim,       (size_t) e.n_slots * sizeof(int32_t)) ||
         !alloc((void **) &e.hit,         (size_t) n_routed * sizeof(int32_t)) ||
@@ -1302,18 +1340,24 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
 #else
     static const bool page_in_on = getenv("GGML_MOE_PAGE_IN") != nullptr;
 #endif
-    if (page_in_on && expert_tab && n_tokens == 1 && nb_expert % (int64_t) sizeof(uint4) == 0) {
+    // Every call that reads the table must run the plan, whatever its batch size: only routed
+    // experts get their entries repointed, so a skipped call can read a slot holding another expert.
+    const int n_routed       = n_expert_used * n_tokens;
+    if (page_in_on && expert_tab && nb_expert % (int64_t) sizeof(uint4) == 0) {
         const int n_expert_total = (int) src0->ne[2];
-        auto * cache = ctx.moe_expert_slab_get(src0, nb_expert, n_expert_total, n_expert_used, stream);
+        auto * cache = ctx.moe_expert_slab_get(src0, nb_expert, n_expert_total,
+                                               n_expert_used * MMVQ_MAX_BATCH_SIZE, stream);
+        GGML_ASSERT(!cache || n_routed <= cache->n_routed);
         if (cache) {
             const int nthr = 64;
-            const int nblk = (n_expert_used + nthr - 1) / nthr;
+            const int nblk = (n_routed + nthr - 1) / nthr;
             CUDA_CHECK(cudaMemsetAsync(cache->claim, 0x7f, (size_t) cache->n_slots * sizeof(int32_t), stream));
             CUDA_CHECK(cudaMemsetAsync(cache->n_miss, 0, sizeof(int32_t), stream));
             tq_cache_probe<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_expert_used, cache->n_slots, cache->slot_expert, cache->claim, cache->hit);
+                ids_d, n_routed, n_expert_used, ids_stride,
+                cache->n_slots, cache->slot_expert, cache->claim, cache->hit);
             tq_cache_award<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_expert_used, cache->n_slots, cache->claim, cache->hit,
+                ids_d, n_routed, n_expert_used, ids_stride, cache->n_slots, cache->claim, cache->hit,
                 cache->slot_expert, cache->miss_expert, cache->miss_slot, cache->n_miss, cache->won);
 
             const int64_t n_vec  = nb_expert / (int64_t) sizeof(uint4);
@@ -1322,13 +1366,13 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
             if (blocks > 64) {
                 blocks = 64;
             }
-            tq_page_in_misses<<<dim3((unsigned) blocks, (unsigned) n_expert_used), thr, 0, stream>>>(
+            tq_page_in_misses<<<dim3((unsigned) blocks, (unsigned) n_routed), thr, 0, stream>>>(
                 (const char *) src0->data, nb_expert,
                 cache->miss_expert, cache->miss_slot, cache->n_miss,
                 (char *) cache->slab, n_vec);
 
             tq_table_point<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_expert_used, cache->n_slots, cache->won,
+                ids_d, n_routed, n_expert_used, ids_stride, cache->n_slots, cache->won,
                 (const char *) src0->data, (char *) cache->slab, nb_expert, expert_tab);
         }
     }

@@ -12,8 +12,12 @@
 //     into the slab before returning and serves them in this node
 //   - fills per plan are bounded by inserts_per_plan (and queue_mb)
 //   - one pool per (expert_size, wtype), allocated lazily in begin()
-//   - UMA devices (memory type DEVICE_LOCAL|HOST_VISIBLE) use direct
-//     host-mapped slabs; discrete GPUs use DEVICE_LOCAL + staging copies
+//   - UMA devices (memory type DEVICE_LOCAL|HOST_VISIBLE with a large enough
+//     heap) use direct host-mapped slabs; discrete GPUs use DEVICE_LOCAL +
+//     staging copies. Discrete AMD often exposes a small CPU-visible aperture
+//     with the UMA flags; that aperture is rejected when smaller than the
+//     cache budget (see session_create). Override with
+//     GGML_VK_MOE_CACHE_FORCE_DEVICE_LOCAL=1.
 //   - fused SwiGLU returns NULL (stock CPU path handles the node)
 //
 // Register by calling ggml_vulkan_moe_cache_register() from
@@ -126,7 +130,8 @@ struct moe_cache_vulkan_device : public moe_cache_device {
     uint32_t vk_queue_family = 0;
     VkCommandPool vk_cmd_pool = VK_NULL_HANDLE;
 
-    // true when a DEVICE_LOCAL|HOST_VISIBLE memory type exists (UMA).
+    // true when a large-enough DEVICE_LOCAL|HOST_VISIBLE heap exists (real UMA).
+    // Small CPU-visible apertures on discrete GPUs must not set this.
     bool host_mapped = false;
 
     // Command pool and pipelines are created lazily on the first begin, so a
@@ -899,9 +904,14 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
         dev->vk_physical = vk_physical;
         dev->vk_queue_family = queue_family;
 
-        // Detect UMA: a memory type that is device-local AND host-visible.
+        // Detect UMA: DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT. Discrete AMD
+        // GPUs (Polaris, etc.) often expose a small CPU-visible aperture with
+        // these flags; allocating a multi-hundred-MiB expert slab there fails
+        // even when device-local VRAM is free. Only enable host-mapped when
+        // that heap can hold the configured cache budget.
         VkPhysicalDeviceMemoryProperties mem_props;
         vkGetPhysicalDeviceMemoryProperties(vk_physical, &mem_props);
+        size_t uma_heap_bytes = 0;
         for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
             const VkMemoryPropertyFlags flags = mem_props.memoryTypes[i].propertyFlags;
             if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
@@ -910,9 +920,47 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
                         (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-                dev->host_mapped = true;
-                break;
+                const uint32_t heap_index = mem_props.memoryTypes[i].heapIndex;
+                if (heap_index < mem_props.memoryHeapCount) {
+                    const size_t heap_size = (size_t)mem_props.memoryHeaps[heap_index].size;
+                    if (heap_size > uma_heap_bytes) {
+                        uma_heap_bytes = heap_size;
+                    }
+                }
             }
+        }
+
+        int64_t force_device_local = 0;
+        const bool force_dl = moe_cache_env_i64(
+                "GGML_VK_MOE_CACHE_FORCE_DEVICE_LOCAL", 0, 1, force_device_local) &&
+            force_device_local != 0;
+
+        // Prefer the configured budget; if still zero (auto not yet resolved),
+        // require at least 1 GiB of UMA heap before trusting host-mapped slabs.
+        const size_t budget_mb = session->config.budget_mb;
+        const size_t uma_need_bytes = budget_mb > 0
+            ? (budget_mb << 20)
+            : (size_t(1) << 30);
+
+        if (force_dl) {
+            dev->host_mapped = false;
+            MOE_CACHE_LOG("[moe-cache] Vulkan: FORCE_DEVICE_LOCAL=1 "
+                    "(ignoring UMA heap=%zu MiB)\n",
+                    uma_heap_bytes >> 20);
+        } else if (uma_heap_bytes >= uma_need_bytes) {
+            dev->host_mapped = true;
+            MOE_CACHE_LOG("[moe-cache] Vulkan: host-mapped UMA heap=%zu MiB "
+                    "(need=%zu MiB)\n",
+                    uma_heap_bytes >> 20, uma_need_bytes >> 20);
+        } else if (uma_heap_bytes > 0) {
+            dev->host_mapped = false;
+            MOE_CACHE_LOG("[moe-cache] Vulkan: UMA heap=%zu MiB < need=%zu MiB; "
+                    "using device-local + staging (discrete/aperture path). "
+                    "This path is slow on discrete GPUs; prefer --moe-cache off "
+                    "unless you have measured a win.\n",
+                    uma_heap_bytes >> 20, uma_need_bytes >> 20);
+        } else {
+            dev->host_mapped = false;
         }
 
         // GPU resources (command pool, pipelines) are created lazily on the
