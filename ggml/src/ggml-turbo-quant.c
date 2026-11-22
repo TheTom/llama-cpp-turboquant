@@ -1212,7 +1212,7 @@ size_t quantize_tq3_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
 
 /* Scale for one 16-value half-block: the TQ3_1S search (9 grid points around the RMS, then 6
  * least-squares refinements), run for each half on its own. TQ3_1S searches one grid multiplier
- * for both halves of a block; fitting them separately lowers the weight error by about 7%. */
+ * for both halves of a block. */
 static float tq3_fit_half(const float * x, float rms) {
     static const float grid[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.35f, 1.5f };
     float best = rms, best_err = 1e30f;

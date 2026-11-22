@@ -19,19 +19,6 @@ extern void turbo_cpu_fwht_inverse(float * x, int group_size);
 /* Must match GGML_TQ_DOT_CHUNK in ggml/src/ggml-cpu/ggml-cpu.c. */
 #define TQ_DOT_CHUNK 256
 
-/* Block-boundary invariant behind the chunked TurboQuant vec_dot kernels.
- *
- * ggml_vec_dot_{turbo,tq}_* stage their dequant through a fixed-size chunk
- * instead of a malloc'd whole-row buffer. That is only correct because every
- * TurboQuant row dequant is a pure per-block loop with no cross-block state:
- * dequantizing [0, k) in one call must be bit-identical to dequantizing it in
- * block-aligned pieces with the source pointer advanced by
- * (piece / blck_size) * type_size.
- *
- * This asserts exactly that, at row lengths that straddle the chunk size, so a
- * future row dequant that carries state across blocks -- or a wrong stride in
- * the vec_dot pointer advance -- fails here rather than silently corrupting a
- * CPU-offloaded matmul. */
 /* Relative RMSE of a quantize -> dequantize round trip on a Gaussian row of the given sigma. */
 static double roundtrip_rel_rmse(enum ggml_type type, float sigma, int64_t k) {
     const struct ggml_type_traits * tr = ggml_get_type_traits(type);
@@ -50,13 +37,27 @@ static double roundtrip_rel_rmse(enum ggml_type type, float sigma, int64_t k) {
     tr->to_float(q, out, k);
     double err = 0.0, ref = 0.0;
     for (int64_t i = 0; i < k; i++) {
-        err += (double) (out[i] - src[i]) * (out[i] - src[i]);
-        ref += (double) src[i] * src[i];
+        const double d = (double) out[i] - (double) src[i];
+        err += d * d;
+        ref += (double) src[i] * (double) src[i];
     }
     free(src); free(out); free(q);
     return sqrt(err / ref);
 }
 
+/* Block-boundary invariant behind the chunked TurboQuant vec_dot kernels.
+ *
+ * ggml_vec_dot_{turbo,tq}_* stage their dequant through a fixed-size chunk
+ * instead of a malloc'd whole-row buffer. That is only correct because every
+ * TurboQuant row dequant is a pure per-block loop with no cross-block state:
+ * dequantizing [0, k) in one call must be bit-identical to dequantizing it in
+ * block-aligned pieces with the source pointer advanced by
+ * (piece / blck_size) * type_size.
+ *
+ * This asserts exactly that, at row lengths that straddle the chunk size, so a
+ * future row dequant that carries state across blocks -- or a wrong stride in
+ * the vec_dot pointer advance -- fails here rather than silently corrupting a
+ * CPU-offloaded matmul. */
 static int check_chunked_dequant(enum ggml_type type, const char * name, int64_t k) {
     const struct ggml_type_traits * tr = ggml_get_type_traits(type);
 

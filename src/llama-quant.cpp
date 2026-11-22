@@ -436,7 +436,8 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             // a TQ3_4S super-block is four TQ3_1S blocks that share a scale, so a row that does
-            // not hold whole super-blocks keeps the same indices with per-block scales
+            // not hold whole super-blocks falls back to the same 3-bit layout with per-block
+            // scales; TQ3_1S runs its own scale search, so the indices can differ
             case GGML_TYPE_TQ3_4S:  return_type = GGML_TYPE_TQ3_1S; break;
             default:
                 if (qk_k <= 32) {
