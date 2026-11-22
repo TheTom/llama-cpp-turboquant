@@ -555,32 +555,27 @@ static __device__ __forceinline__ int tq4_1s_qs_to_int8x4(const uint8_t * __rest
 // 32-bit load: the fourth byte of a 32-bit load would run past the end of the
 // block for its last group.
 //
-// The index extraction is mirrored by tests/test-quantize-fns.cpp, which checks
-// the derivation against the CPU codec exhaustively over all 2^24 group words.
-// That test does not run this code; this loader is covered by
-// test-backend-ops -o MUL_MAT -p type_a=tq3_1s with GGML_TQ_MMQ=1.
-//
-// Unlike the TQ4 loader above, this selects the centroids with four table
-// loads instead of a byte permute, because the 8-entry table does not fit the
-// v_perm_b32 path. A register-resident selection is the obvious next lever and
-// has not been measured.
+// The gate for this loader is test-backend-ops -o MUL_MAT -p type_a=tq3_1s.
+// The centroids are one byte permute over the 8-byte int8 table (TQ3_KV_LO/HI).
 static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __restrict__ qs, const int kqsx) {
     const int g   = kqsx >> 1;        // group 0..3
     const int sub = (kqsx & 1) * 4;    // first element within the group
     const uint8_t * qp = qs + 3*g;
     const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
-    const int i0 = (packed >> (3*sub + 0)) & 7;
-    const int i1 = (packed >> (3*sub + 3)) & 7;
-    const int i2 = (packed >> (3*sub + 6)) & 7;
-    const int i3 = (packed >> (3*sub + 9)) & 7;
-    // Cast through uint8_t: a negative int8 would otherwise sign-extend into the
-    // upper bytes of the packed word. The shifts are done in uint32_t for the same
-    // reason - (int) 0x81 << 24 overflows a signed int.
-    const uint32_t w = (uint32_t) (uint8_t) kvalues_tq3[i0]
-                     | ((uint32_t) (uint8_t) kvalues_tq3[i1] << 8)
-                     | ((uint32_t) (uint8_t) kvalues_tq3[i2] << 16)
-                     | ((uint32_t) (uint8_t) kvalues_tq3[i3] << 24);
-    return (int) w;
+    const uint32_t q  = packed >> (3*sub);   // the quad's four 3-bit indices in bits 0-11
+    const uint32_t i0 =  q       & 7;
+    const uint32_t i1 = (q >> 3) & 7;
+    const uint32_t i2 = (q >> 6) & 7;
+    const uint32_t i3 = (q >> 9) & 7;
+    constexpr uint32_t TQ3_KV_LO = 0xF0D1AE81u;   // { -127, -82, -47, -16 }
+    constexpr uint32_t TQ3_KV_HI = 0x7F512E0Fu;   // {   15,  46,  81, 127 }
+#if defined(GGML_USE_HIP)
+    // v_perm_b32: selector bytes; source bytes 0-3 come from the second operand.
+    return (int) __builtin_amdgcn_perm(TQ3_KV_HI, TQ3_KV_LO, i0 | (i1 << 8) | (i2 << 16) | (i3 << 24));
+#else
+    // prmt: selector nibbles; source bytes 0-3 come from the first operand.
+    return (int) __byte_perm(TQ3_KV_LO, TQ3_KV_HI, i0 | (i1 << 4) | (i2 << 8) | (i3 << 12));
+#endif // defined(GGML_USE_HIP)
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_1s(
@@ -602,10 +597,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #else
     // dp4a consumes a different tile layout: rows are padded by one int and the scales start
     // after the (padded) quant region, not at a fixed 2*MMQ_TILE_NE_K offset.
-    // Unreachable today: TQ3_1S has an MMQ config entry only in mmq-config-rdna4.cuh, and
-    // RDNA4 defines AMD_WMMA_AVAILABLE, so it always takes the branch above. This branch
-    // becomes live when an arch that lacks MFMA/WMMA/MMA gets a TQ3_1S config entry, and
-    // it needs a run on that arch first.
+    // Taken on RDNA2, which has a TQ3_1S config entry but neither MFMA nor WMMA.
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_TQ3_1S, I);
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + txs.qs);
