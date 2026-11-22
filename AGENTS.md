@@ -8,7 +8,7 @@ This repo is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (upstr
 
 TurboQuant compresses the KV cache far beyond the standard `q8_0` by applying a fixed 128x128 orthonormal Walsh-Hadamard rotation (`GGML_OP_TURBO_WHT`) to cache vectors before quantization, which Gaussianizes the distribution, and inverse-rotating after dequantization. Head dims that are not multiples of 128 are zero-padded. MLA models (DeepSeek) have no separate V cache, so V rotation/padding is skipped for them, and K/V cache types must be identical.
 
-The ten fork-only GGML types (registered in `ggml/include/ggml.h`):
+The eleven fork-only GGML types (registered in `ggml/include/ggml.h`):
 
 | Type   | Enum                       | Purpose                             | Size         | Backends            |
 |--------|----------------------------|-------------------------------------|--------------|---------------------|
@@ -19,18 +19,19 @@ The ten fork-only GGML types (registered in `ggml/include/ggml.h`):
 | turbo6 | `GGML_TYPE_TURBO6_0` (52)  | KV cache only                       | 6.125 bits   | CPU, CUDA/HIP       |
 | TQ3_1S | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max| 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max| 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
+| TQ3_4S | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU |
 | Q8_CR  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot              | 8.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q5_CR  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot              | 5.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q6_CR  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot              | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
 
 The turbo blocks hold 128 values each (34, 50, 66, 82, 98 bytes for turbo2 to turbo6); the `static_assert`s in `ggml/src/ggml-common.h` are the authority, not the struct comments. ggml-sycl has no TQ weight kernels, and its generic dequantize path leaves TQ weights in the WHT-rotated domain, so TQ models are unsupported there. Vulkan and SYCL reject the `*_CR` types in `supports_op`.
 
-Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S and Q8_CR/Q5_CR/Q6_CR are `llama-quantize` targets.
+Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S/TQ3_4S and Q8_CR/Q5_CR/Q6_CR are `llama-quantize` targets. TQ3_4S has a CPU reference only; other backends leave it to the CPU.
 
 ### Key files
 
 - `ggml/src/ggml-turbo-quant.c` - the codec (keep byte-identical to fork tip)
-- `ggml/include/ggml.h` - type enum 43-52, `GGML_OP_TURBO_WHT`
+- `ggml/include/ggml.h` - type enum 43-53, `GGML_OP_TURBO_WHT`
 - `src/llama-kv-cache.cpp` - cache wiring, `get_k_idx`, layer-adaptive precision
 - `src/llama-graph.cpp` - inverse-WHT post-processing (FA and non-FA paths)
 - `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (only reached with `GGML_TQ_NATIVE=1`; by default `TQ4_1S` is converted to `q8_0` at load in `ggml-cuda.cu`)
