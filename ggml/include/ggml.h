@@ -440,7 +440,8 @@ extern "C" {
         GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
         GGML_TYPE_TURBO5_0 = 51, // TurboQuant 5-bit KV cache: WHT + 5-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_TURBO6_0 = 52, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_COUNT   = 53,
+        GGML_TYPE_TQ3_4S  = 53, // TQ3_1S indices, 6-bit half-block scales under one fp16 scale, block_size=128
+        GGML_TYPE_COUNT   = 54,
     };
 
     // precision
