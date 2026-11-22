@@ -29,7 +29,7 @@ Eleven fork-only GGML types (registered in `ggml/include/ggml.h`):
 | `turbo6` | `GGML_TYPE_TURBO6_0` (52)  | KV cache only               | 6.125 bits/value       | CPU, CUDA/HIP       |
 | `TQ3_1S` | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max | 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | `TQ4_1S` | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max | 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
-| `TQ3_4S` | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU |
+| `TQ3_4S` | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU, CUDA/HIP |
 | `Q8_CR`  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot      | 8.5 bits, group 256    | CPU, CUDA/HIP, Metal |
 | `Q5_CR`  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot      | 5.5 bits, group 256    | CPU, CUDA/HIP, Metal |
 | `Q6_CR`  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot      | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
@@ -129,7 +129,7 @@ llama-quantize model-f16.gguf model-tq3.gguf TQ3_1S
 
 `TQ3_1S` (4.00 bpw) and `TQ4_1S` (5.00 bpw) are supported on CPU, CUDA/HIP (warp-cooperative `mmvq` with fused `dp4a`), Metal and Vulkan, and work in `llama-cli`, `llama-server`, `llama-bench` and `llama-perplexity`. ggml-sycl has no TQ kernels, and its generic dequantize path leaves the weights in the WHT-rotated domain, so TQ models are not supported on SYCL.
 
-`TQ3_4S` (3.50 bpw) is `TQ3_1S` with four 32-value sub-blocks sharing one fp16 scale and 6-bit sub-scales. It is a `llama-quantize` target (`llama-quantize model-f16.gguf model-tq3_4s.gguf TQ3_4S`) with a CPU reference only: the GPU backends do not claim its ops, so they run on the CPU.
+`TQ3_4S` (3.50 bpw) is `TQ3_1S` with four 32-value sub-blocks sharing one fp16 scale and 6-bit sub-scales. It is a `llama-quantize` target (`llama-quantize model-f16.gguf model-tq3_4s.gguf TQ3_4S`) with CPU and CUDA/HIP kernels (fused decode, and opt-in int8 MMQ prefill on CDNA, RDNA2 and RDNA3 with `GGML_TQ_MMQ=1`). Metal, Vulkan and SYCL do not claim its ops, so they run on the CPU.
 
 On CUDA, `TQ4_1S` weights are converted to `q8_0` at load time by default (best prefill speed). Set `GGML_TQ_NATIVE=1` to keep them native: decode is about 30% faster and weight VRAM drops about 1.7x, but prefill is about 2x slower. Pick it for decode-heavy serving; keep the default for prefill-heavy or mixed workloads.
 
@@ -142,7 +142,7 @@ On CUDA, `TQ4_1S` weights are converted to `q8_0` at load time by default (best 
 | Flash attention (turbo2/3/4) | yes     | yes   | yes    | yes  | yes | no     |
 | Flash attention (turbo5/6)  | yes      | no    | no     | no   | yes | no     |
 | `TQ3_1S` / `TQ4_1S` weights | yes      | yes   | yes    | no   | yes | no     |
-| `TQ3_4S` weights            | no       | no    | no     | no   | yes | no     |
+| `TQ3_4S` weights            | yes      | no    | no     | no   | yes | no     |
 | `Q8_CR` / `Q5_CR` / `Q6_CR` weights | yes | yes | no    | no   | yes | no     |
 | `GGML_TQ_NATIVE`            | yes      | n/a   | n/a    | n/a  | n/a | n/a    |
 
