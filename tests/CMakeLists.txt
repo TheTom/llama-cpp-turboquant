@@ -155,6 +155,7 @@ llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
+    llama_build_and_test(test-drama3-rope.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
@@ -376,7 +377,6 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 # TurboQuant WHT round-trip test (links ggml turbo codec symbols via llama)
 llama_build_and_test(test-turbo-quant.c LABEL "turbo")
-llama_build_and_test(test-drama3-rope.cpp)
 
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
