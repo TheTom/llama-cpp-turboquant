@@ -10,13 +10,19 @@ TurboQuant compresses the KV cache far beyond the standard `q8_0` by applying a 
 
 The ten fork-only GGML types (registered in `ggml/include/ggml.h`):
 
+The type IDs are the upstream ones where upstream has a type: the persisted
+upstream IDs keep their values and only the runtime-only fork types move. So
+`F8_E4M3=43`, `TURBO2_0=44`, `TQ3_1S=45`, `TQ4_1S=46`, `TURBO3_0=47`,
+`Q8_CR=48`, `Q5_CR=49`, `Q6_CR=50`, `TURBO4_0=51`, `TURBO5_0=52`,
+`TURBO6_0=53`.
+
 | Type   | Enum                       | Purpose                             | Size         | Backends            |
 |--------|----------------------------|-------------------------------------|--------------|---------------------|
-| turbo2 | `GGML_TYPE_TURBO2_0` (43)  | KV cache only                       | 2.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| turbo3 | `GGML_TYPE_TURBO3_0` (44)  | KV cache only                       | 3.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| turbo4 | `GGML_TYPE_TURBO4_0` (47)  | KV cache only                       | 4.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| turbo5 | `GGML_TYPE_TURBO5_0` (51)  | KV cache only                       | 5.125 bits   | CPU, CUDA/HIP       |
-| turbo6 | `GGML_TYPE_TURBO6_0` (52)  | KV cache only                       | 6.125 bits   | CPU, CUDA/HIP       |
+| turbo2 | `GGML_TYPE_TURBO2_0` (44)  | KV cache only                       | 2.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo3 | `GGML_TYPE_TURBO3_0` (47)  | KV cache only                       | 3.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo4 | `GGML_TYPE_TURBO4_0` (51)  | KV cache only                       | 4.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo5 | `GGML_TYPE_TURBO5_0` (52)  | KV cache only                       | 5.125 bits   | CPU, CUDA/HIP       |
+| turbo6 | `GGML_TYPE_TURBO6_0` (53)  | KV cache only                       | 6.125 bits   | CPU, CUDA/HIP       |
 | TQ3_1S | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max| 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max| 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | Q8_CR  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot              | 8.5 bits, group 256 | CPU, CUDA/HIP, Metal |
