@@ -690,10 +690,7 @@ llama_kv_cache::llama_kv_cache(
             turbo_innerq_copies.push_back(turbo_innerq_scale_inv);
         }
 
-        // TurboQuant InnerQ: give every layer a scale_inv in its own KV context. TURBO_WHT reads
-        // it, and the scheduler places an op on the backend of its weight-like inputs, so a single
-        // shared tensor pulled each attention layer of a layer-split model onto the first device:
-        // 4 cross-GPU splits per layer, which also serialized pipeline parallelism.
+        // one InnerQ scale_inv per KV device context, so TURBO_WHT stays on the layer's device
         if (turbo_innerq_scale_inv != nullptr) {
             ggml_context * turbo_ctx = ctx;
             if (kv_stream_buft != nullptr && buft == kv_stream_buft) {

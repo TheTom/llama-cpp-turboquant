@@ -2864,9 +2864,10 @@ static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
 static bool ggml_cuda_mixed_gpu_archs() {
 #if defined(GGML_USE_HIP)
     static const bool mixed = [] {
-        // Escape hatch to test whether the ROCm in use still needs the workaround
-        // (rocBLAS "solution library per gfx", ROCm/rocm-libraries#4781, ROCm >= 7.12).
-        if (getenv("GGML_CUDA_NO_MIXED_ARCH_WORKAROUND") != nullptr) {
+        // a non-zero value sends float GEMMs back to rocBLAS, to test a ROCm that has
+        // ROCm/rocm-libraries#4781
+        const char * no_workaround = getenv("GGML_CUDA_NO_MIXED_ARCH_WORKAROUND");
+        if (no_workaround != nullptr && std::atoi(no_workaround) != 0) {
             return false;
         }
         const ggml_cuda_device_info & info = ggml_cuda_info();
@@ -2905,11 +2906,6 @@ static void ggml_cuda_mul_mat_f_chunked(ggml_backend_cuda_context & ctx,
 
 // The mixed-arch chunked-mmf workaround applies only to a 2D float GEMM whose src0 meets
 // mmf's structural preconditions (checked with a representative 16-column batch).
-// NB: the original patch guarded this with `!split` at the call site. Upstream has since
-// removed CUDA split *buffer types* altogether -- ggml_backend_buft_is_cuda_split no longer
-// exists, and only default_tensor_split (a VRAM proportion, unrelated) remains -- so there is
-// no split buffer path left to exclude. Upstream dropped their own `!split` guard here for
-// the same reason.
 static bool ggml_cuda_can_chunk_mmf(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!ggml_cuda_mixed_gpu_archs()) {
@@ -2937,8 +2933,7 @@ static void ggml_cuda_mul_mat_vec_f_chunked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // One launch instead of ncols/MMVF_MAX_BATCH_SIZE: view the full column blocks of src1/dst
     // as channels of MMVF_MAX_BATCH_SIZE columns each and let mmvf broadcast the single src0
-    // channel over them (channel_x = channel_dst / channel_ratio). Prefill on a mixed-arch
-    // qwen3.8 split used to issue ~98k 8-column launches per 4K prompt (~8% of GPU time).
+    // channel over them (channel_x = channel_dst / channel_ratio).
     const int64_t ncols   = src1->ne[1];
     const int64_t nfull   = ncols / MMVF_MAX_BATCH_SIZE;
     const int64_t c_tail  = nfull * MMVF_MAX_BATCH_SIZE;

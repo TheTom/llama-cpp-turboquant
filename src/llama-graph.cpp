@@ -2912,7 +2912,7 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = static_cast<const llama_memory_context_i *>(mctx_cur)->get_turbo_innerq_scale_inv(il);
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv(il);
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
@@ -3045,7 +3045,7 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = static_cast<const llama_memory_context_i *>(mctx_cur)->get_turbo_innerq_scale_inv(il);
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv(il);
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
     }
 
@@ -3246,7 +3246,7 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = static_cast<const llama_memory_context_i *>(mctx_cur)->get_turbo_innerq_scale_inv(il);
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv(il);
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
     }
 

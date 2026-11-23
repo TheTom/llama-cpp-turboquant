@@ -238,9 +238,7 @@ public:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
-    // Per-layer variant: returns the copy that lives on the same device as layer il, so the
-    // TURBO_WHT ops of a layer-split model stay on the layer's GPU instead of hopping to the
-    // device that holds the first layer (which forced 4 cross-GPU splits per attention layer).
+    // per-layer variant: the copy on the same device as layer il
     ggml_tensor * get_turbo_innerq_scale_inv(int32_t il) const;
     const std::vector<ggml_tensor *> & get_turbo_innerq_copies() const { return turbo_innerq_copies; }
 
