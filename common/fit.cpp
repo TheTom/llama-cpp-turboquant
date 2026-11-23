@@ -5,8 +5,10 @@
 #include "llama-cpp.h"
 #include "log.h"
 
+#include "../ggml/src/ggml-backend-moe-cache.h"
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
@@ -28,6 +30,254 @@ enum common_layer_fraction_t {
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+const char * common_moe_cache_tensor_override_pattern() {
+    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+}
+
+struct common_moe_cache_fit_pool {
+    ggml_type type = GGML_TYPE_COUNT;
+    size_t expert_size = 0;
+    size_t pool_bytes = 0;
+    size_t tensor_bytes = 0;
+    size_t scratch_bytes = 0;
+};
+
+common_moe_cache_fit_result common_moe_cache_plan_fit(
+        const std::vector<common_moe_cache_fit_device_input> & device_inputs,
+        const std::vector<common_moe_cache_fit_shape_input> & shapes,
+        size_t reserve_bytes,
+        size_t budget_bytes,
+        int min_devices,
+        size_t minimum_slab_bytes) {
+    common_moe_cache_fit_result result;
+
+    for (const common_moe_cache_fit_device_input & input : device_inputs) {
+        if (input.physical_device < 0 || input.free_bytes < 0 || input.used_bytes > INT64_MAX) {
+            result.reason = "device memory accounting overflowed";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+            return result;
+        }
+
+        size_t device_index = result.devices.size();
+        for (size_t candidate = 0; candidate < result.devices.size(); candidate++) {
+            if (result.devices[candidate].physical_device == input.physical_device) {
+                device_index = candidate;
+                break;
+            }
+        }
+        if (device_index == result.devices.size()) {
+            common_moe_cache_fit_device device;
+            device.physical_device = input.physical_device;
+            device.compute_capability = input.compute_capability;
+            device.free_bytes = input.free_bytes;
+            result.devices.push_back(device);
+        }
+
+        common_moe_cache_fit_device & device = result.devices[device_index];
+        device.free_bytes = std::min(device.free_bytes, input.free_bytes);
+        device.compute_capability = std::min(device.compute_capability, input.compute_capability);
+        if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
+            result.reason = "device memory accounting overflowed";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+            return result;
+        }
+        device.used_bytes += (int64_t)input.used_bytes;
+    }
+    if (result.devices.empty()) {
+        result.reason = "no selected device satisfies the cache hardware policy";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+        return result;
+    }
+
+    for (common_moe_cache_fit_device & device : result.devices) {
+        const int64_t projected_free = device.free_bytes - device.used_bytes;
+        if (projected_free <= 0 || (uint64_t)projected_free <= reserve_bytes) {
+            continue;
+        }
+        device.cache_bytes = (size_t)projected_free - reserve_bytes;
+        if (budget_bytes > 0) {
+            device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
+        }
+    }
+
+    std::vector<common_moe_cache_fit_pool> pools;
+    for (const common_moe_cache_fit_shape_input & shape : shapes) {
+        if (shape.tensor_bytes == 0 || shape.tensor_bytes > SIZE_MAX - result.expert_bytes) {
+            result.reason = "the routed expert tensor inventory overflowed";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+            return result;
+        }
+        result.expert_bytes += shape.tensor_bytes;
+        if (!shape.cacheable) {
+            continue;
+        }
+        bool found = false;
+        for (common_moe_cache_fit_pool & pool : pools) {
+            if (pool.type == shape.type && pool.expert_size == shape.expert_size) {
+                pool.pool_bytes = std::max(pool.pool_bytes, shape.pool_bytes);
+                pool.tensor_bytes += shape.tensor_bytes;
+                pool.scratch_bytes = std::max(pool.scratch_bytes, shape.scratch_bytes);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            pools.push_back({shape.type, shape.expert_size, shape.pool_bytes,
+                    shape.tensor_bytes, shape.scratch_bytes});
+        }
+    }
+
+    size_t scratch_bytes = 0;
+    size_t supported_bytes = 0;
+    for (const common_moe_cache_fit_pool & pool : pools) {
+        if (pool.tensor_bytes < pool.pool_bytes) {
+            continue;
+        }
+        supported_bytes += pool.tensor_bytes;
+        scratch_bytes = std::max(scratch_bytes, pool.scratch_bytes);
+    }
+    if (supported_bytes == 0) {
+        result.reason = "no routed expert shape is cacheable";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+        return result;
+    }
+    if (supported_bytes != result.expert_bytes) {
+        result.reason = "some routed expert weights would remain permanently uncached";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+        return result;
+    }
+
+    size_t minimum_pool_bytes = 0;
+    for (const common_moe_cache_fit_pool & pool : pools) {
+        if (pool.tensor_bytes < pool.pool_bytes) {
+            continue;
+        }
+        if (pool.pool_bytes > SIZE_MAX - minimum_pool_bytes) {
+            result.reason = "the minimum cache pool inventory overflowed";
+            return result;
+        }
+        minimum_pool_bytes += pool.pool_bytes;
+    }
+    minimum_pool_bytes = std::max(minimum_pool_bytes, minimum_slab_bytes);
+    if (minimum_pool_bytes > SIZE_MAX - scratch_bytes) {
+        result.reason = "the minimum cache pool inventory overflowed";
+        return result;
+    }
+    result.minimum_device_bytes = scratch_bytes + minimum_pool_bytes;
+
+    int useful_devices = 0;
+    for (const common_moe_cache_fit_device & device : result.devices) {
+        if (device.cache_bytes < result.minimum_device_bytes) {
+            continue;
+        }
+        useful_devices++;
+        if (device.cache_bytes > SIZE_MAX - result.cache_bytes) {
+            result.cache_bytes = SIZE_MAX;
+        } else {
+            result.cache_bytes += device.cache_bytes;
+        }
+    }
+    if (useful_devices < min_devices) {
+        result.reason = "too few devices can hold the minimum expert pools";
+        LOG_INF("%s: MoE cache fit: %s (useful=%d, min=%d, min_device_bytes=%zu MiB)\n", __func__,
+                result.reason.c_str(), useful_devices, min_devices,
+                result.minimum_device_bytes >> 20);
+        return result;
+    }
+
+    result.feasible = true;
+    result.reason = "cache pools are feasible";
+    return result;
+}
+
+static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
+        const common_moe_cache_params * params,
+        const std::vector<llama_moe_tensor_info> & tensors,
+        const std::vector<ggml_backend_dev_t> & devices,
+        const std::vector<llama_device_memory_data> & memory,
+        const std::vector<int64_t> & margins) {
+    common_moe_cache_fit_result result;
+    if (!params || params->mode == COMMON_MOE_CACHE_MODE_OFF) {
+        result.reason = "disabled";
+        return result;
+    }
+    // Probe the provider that owns the fitted devices; fall back to the
+    // thread's active provider (first registered) when no device is given.
+    ggml_moe_cache_api api = ggml_moe_cache_active();
+    if (!devices.empty()) {
+        const ggml_moe_cache_api owned =
+            ggml_moe_cache_get(ggml_backend_dev_backend_reg(devices[0]));
+        if (owned.owner) {
+            api = owned;
+        }
+    }
+    if (!api.query_config || !api.query_device || !api.query_shape) {
+        result.reason = "no cache provider is loaded";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+        return result;
+    }
+
+    int automatic = -1;
+    if (params->mode_explicit) {
+        automatic = params->mode == COMMON_MOE_CACHE_MODE_AUTO ? 1 : 0;
+    }
+    ggml_moe_cache_config config = {};
+    if (!api.query_config(automatic, params->budget_mib, &config)) {
+        result.reason = "the cache provider is disabled";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+        return result;
+    }
+    if (tensors.empty()) {
+        result.reason = "the model has no routed expert weight tensors";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+        return result;
+    }
+    if (memory.size() != devices.size() + 1 || margins.size() != devices.size()) {
+        result.reason = "the fitted device inventory changed";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+        return result;
+    }
+
+    std::vector<common_moe_cache_fit_device_input> device_inputs;
+    size_t min_expert_bytes = 0;
+    for (size_t index = 0; index < devices.size(); index++) {
+        ggml_moe_cache_device_caps caps = {};
+        if (!api.query_device(devices[index], &config, &caps)) {
+            continue;
+        }
+        if (margins[index] < 0 || memory[index].free < margins[index]) {
+            result.reason = "the fitted device margin exceeds free memory";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+            return result;
+        }
+        device_inputs.push_back({caps.physical_device, caps.compute_capability,
+                memory[index].free - margins[index], memory[index].mb.total()});
+        min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
+    }
+
+    std::vector<common_moe_cache_fit_shape_input> shape_inputs;
+    shape_inputs.reserve(tensors.size());
+    for (const llama_moe_tensor_info & tensor : tensors) {
+        if (tensor.n_expert <= 0 || tensor.expert_size == 0 ||
+            (uint64_t)tensor.n_expert > SIZE_MAX / tensor.expert_size) {
+            result.reason = "the model has an invalid routed expert tensor size";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
+            return result;
+        }
+        const size_t tensor_bytes = (size_t)tensor.n_expert * tensor.expert_size;
+        ggml_moe_cache_shape_caps caps = {};
+        const bool cacheable = tensor.expert_size >= min_expert_bytes &&
+            api.query_shape(tensor.type, tensor.n_input, tensor.n_output,
+                    tensor.n_expert, tensor.expert_size, &caps);
+        shape_inputs.push_back({tensor.type, tensor.expert_size, tensor_bytes,
+                caps.scratch_bytes, caps.pool_bytes, cacheable});
+    }
+
+    return common_moe_cache_plan_fit(
+            device_inputs, shape_inputs, config.reserve_bytes, config.budget_bytes,
+            config.min_devices, config.minimum_slab_bytes);
+}
 
 // RAII: send llama logs below min_level to the debug log
 struct common_fit_log_scope {
@@ -64,7 +314,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        std::vector<llama_moe_tensor_info> * moe_tensors = nullptr) {
     common_fit_log_scope log_scope(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -74,6 +325,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_model * model = common_model_load(paths_model, mparams_copy);
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
+    }
+
+    if (moe_tensors) {
+        const size_t count = llama_model_get_moe_tensor_info(model, nullptr, 0);
+        moe_tensors->resize(count);
+        const size_t written = llama_model_get_moe_tensor_info(model, moe_tensors->data(), moe_tensors->size());
+        GGML_ASSERT(written == count);
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
@@ -264,7 +522,7 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const std::vector<std::string> & paths_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -277,6 +535,12 @@ static void common_params_fit_impl(
     uint32_t hp_nsk = 0; // number of skipped NextN layers, counted by the model loader but not by hp_ngl
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+
+    std::vector<llama_moe_tensor_info> moe_tensors; // routed expert weight tensors of the model
+
+    if (moe_cache) {
+        moe_cache->fit_selected = false;
+    }
 
     // with non-unified kv, we need to take into account n_streams
     // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
@@ -348,7 +612,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level, &moe_tensors);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -366,6 +630,14 @@ static void common_params_fit_impl(
     add_extra_memory(dmds_full);
 
     const size_t nd = devs.size(); // number of devices
+
+    auto log_stock_fit = [&] {
+        if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF &&
+            !moe_tensors.empty() &&
+            (!mparams->tensor_buft_overrides || !mparams->tensor_buft_overrides[0].pattern)) {
+            LOG_INF("%s: MoE cache fit kept stock placement because the complete model already meets the fit targets\n", __func__);
+        }
+    };
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -410,6 +682,7 @@ static void common_params_fit_impl(
         if (sum_projected_free >= margins[0]) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
                 __func__, sum_projected_free/MiB, margins[0]/MiB);
+            log_stock_fit();
             return;
         }
     } else {
@@ -440,6 +713,7 @@ static void common_params_fit_impl(
             if (projected_free_per_device[0] >= margins[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+                log_stock_fit();
                 return;
             }
         } else {
@@ -452,6 +726,7 @@ static void common_params_fit_impl(
             }
             if (!changes_needed) {
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+                log_stock_fit();
                 return;
             }
         }
@@ -714,6 +989,72 @@ static void common_params_fit_impl(
         return ret;
     };
 
+    auto set_cache_layer_split = [&](const std::vector<uint32_t> & layers,
+            llama_model_params & candidate, float * split,
+            llama_model_tensor_buft_override * overrides) {
+        GGML_ASSERT(layers.size() == nd);
+        std::fill(split, split + llama_max_devices(), 0.0f);
+        candidate.n_gpu_layers = 0;
+        for (size_t id = 0; id < nd; id++) {
+            if ((uint64_t)candidate.n_gpu_layers + layers[id] > INT32_MAX) {
+                throw std::runtime_error("cache candidate layer count overflowed");
+            }
+            candidate.n_gpu_layers += layers[id];
+            if (nd > 1) {
+                split[id] = layers[id];
+            }
+        }
+        // the skipped NextN layers follow the output layer, keep them on the same device
+        if (hp_nsk > 0 && candidate.n_gpu_layers > 0) {
+            candidate.n_gpu_layers += hp_nsk;
+            if (nd > 1) {
+                size_t id_last = nd - 1;
+                while (layers[id_last] == 0) {
+                    id_last--;
+                }
+                split[id_last] += hp_nsk;
+            }
+        }
+        candidate.tensor_split = split;
+        overrides[0] = {common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type()};
+        overrides[1] = {nullptr, nullptr};
+        candidate.tensor_buft_overrides = overrides;
+        candidate.use_extra_bufts = false;
+    };
+
+    auto get_cache_candidate_memory = [&](const std::vector<uint32_t> & layers,
+            dmds_t & candidate_memory) {
+        std::vector<float> candidate_split(llama_max_devices(), 0.0f);
+        std::vector<llama_model_tensor_buft_override> candidate_overrides(ntbo, {nullptr, nullptr});
+        llama_model_params candidate = *mparams;
+        set_cache_layer_split(layers, candidate, candidate_split.data(), candidate_overrides.data());
+
+        std::vector<ggml_backend_dev_t> candidate_devs;
+        uint32_t candidate_ngl = 0;
+        uint32_t candidate_nsk = 0;
+        uint32_t candidate_nct = 0;
+        uint32_t candidate_nex = 0;
+        candidate_memory = common_get_device_memory_data_impl(
+                paths_model, &candidate, cparams, candidate_devs,
+                candidate_ngl, candidate_nsk, candidate_nct, candidate_nex, log_level);
+        add_extra_memory(candidate_memory);
+        if (candidate_devs != devs || candidate_memory.size() != nd + 1) {
+            return false;
+        }
+        for (size_t id = 0; id < nd; id++) {
+            if (candidate_memory[id].mb.total() > INT64_MAX ||
+                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<uint32_t> cache_layers;
+    dmds_t cache_memory;
+    bool cache_candidate_valid = false;
+    bool cache_candidate_main = false;
+
     int64_t global_surplus_cpu_moe = 0;
     if (hp_nex > 0) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
@@ -828,6 +1169,34 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
+    if (hp_nex > 0 && global_surplus_cpu_moe > 0 && moe_cache &&
+        moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF && !moe_tensors.empty() && ntbo >= 2) {
+        std::vector<uint32_t> dense_layers(nd, 0);
+        uint64_t assigned_layers = 0;
+        for (size_t id = 0; id < nd; id++) {
+            dense_layers[id] = ngl_per_device[id].n_layer;
+            assigned_layers += dense_layers[id];
+        }
+
+        const uint64_t required_layers = (uint64_t)hp_ngl + 1;
+        if (assigned_layers == required_layers) {
+            const int main_gpu = mparams->main_gpu;
+            if (main_gpu >= 0 && main_gpu < (int)nd && required_layers <= UINT32_MAX) {
+                std::vector<uint32_t> main_layers(nd, 0);
+                main_layers[main_gpu] = (uint32_t)required_layers;
+                if (get_cache_candidate_memory(main_layers, cache_memory)) {
+                    cache_layers = std::move(main_layers);
+                    cache_candidate_valid = true;
+                    cache_candidate_main = true;
+                }
+            }
+            if (!cache_candidate_valid && get_cache_candidate_memory(dense_layers, cache_memory)) {
+                cache_layers = std::move(dense_layers);
+                cache_candidate_valid = true;
+            }
+        }
+    }
+
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
@@ -974,6 +1343,217 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
+    bool stock_spills_experts = false;
+    for (const ngl_t & layers : ngl_per_device) {
+        if (layers.n_part > 0) {
+            stock_spills_experts = true;
+            break;
+        }
+    }
+
+    if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF) {
+        if (!stock_spills_experts) {
+            LOG_INF("%s: MoE cache fit kept stock placement because all routed expert weights fit in VRAM\n", __func__);
+        } else if (moe_cache->mode == COMMON_MOE_CACHE_MODE_SOFT) {
+            // Step 1: try spare-VRAM (stock placement, no expert eviction)
+            common_moe_cache_fit_result soft_fit = common_moe_cache_evaluate_fit(
+                    moe_cache, moe_tensors, devs, dmds_full, margins);
+            if (soft_fit.feasible) {
+                moe_cache->fit_selected = true;
+
+                const double coverage = soft_fit.expert_bytes > 0
+                    ? 100.0 * (double)std::min(soft_fit.cache_bytes, soft_fit.expert_bytes) /
+                        (double)soft_fit.expert_bytes
+                    : 0.0;
+                LOG_INF("%s: MoE cache soft mode selected stock placement with %" PRId64 " MiB projected cache capacity for %" PRId64 " MiB of routed expert weights (up to %.1f%% coverage, no expert eviction)\n",
+                        __func__,
+                        (int64_t)(soft_fit.cache_bytes / MiB), (int64_t)(soft_fit.expert_bytes / MiB), coverage);
+                for (const common_moe_cache_fit_device & device : soft_fit.devices) {
+                    LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+                            __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+                            (int64_t)(soft_fit.minimum_device_bytes / MiB));
+                }
+            } else if (cache_candidate_valid) {
+                // Step 2: spare-VRAM insufficient, try partial expert eviction
+                // Binary search for minimum evicted layers where cache pools fit
+                LOG_INF("%s: MoE cache soft mode: spare-VRAM insufficient (%s), searching for minimum expert eviction\n",
+                        __func__, soft_fit.reason.c_str());
+
+                const int total_layers = (int)(hp_ngl + 1);
+                static std::vector<std::string> pattern_strings;
+                pattern_strings.clear();
+                pattern_strings.reserve(total_layers);
+
+                // Per-layer routed-expert bytes from tensor metadata. Evicting
+                // layers in ascending footprint order makes the search minimize
+                // the bytes evicted, not just the number of prefix layers.
+                std::vector<int64_t> layer_bytes(total_layers, 0);
+                for (const llama_moe_tensor_info & tensor : moe_tensors) {
+                    if (tensor.layer >= 0 && tensor.layer < total_layers &&
+                        tensor.n_expert > 0 && tensor.expert_size > 0 &&
+                        (uint64_t)tensor.n_expert <= (uint64_t)(INT64_MAX / (int64_t)tensor.expert_size)) {
+                        layer_bytes[tensor.layer] +=
+                            (int64_t)tensor.n_expert * (int64_t)tensor.expert_size;
+                    }
+                }
+                std::vector<int> order(total_layers);
+                for (int i = 0; i < total_layers; i++) {
+                    order[i] = i;
+                }
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                    return layer_bytes[a] != layer_bytes[b]
+                        ? layer_bytes[a] < layer_bytes[b] : a < b;
+                });
+
+                int lo = 0, hi = total_layers;
+                int best_n_evict = -1;
+                int64_t best_evicted_bytes = 0;
+                dmds_t best_memory;
+                common_moe_cache_fit_result best_cache_fit;
+
+                while (lo <= hi) {
+                    const int mid = lo + (hi - lo) / 2;
+
+                    // Build candidate: all layers on main GPU, the 'mid'
+                    // smallest-footprint layers' experts moved to CPU
+                    std::vector<float> candidate_split(llama_max_devices(), 0.0f);
+                    std::vector<llama_model_tensor_buft_override> candidate_overrides(ntbo, {nullptr, nullptr});
+                    llama_model_params candidate = *mparams;
+
+                    candidate.n_gpu_layers = 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        if ((uint64_t)candidate.n_gpu_layers + cache_layers[id] > INT32_MAX) break;
+                        candidate.n_gpu_layers += cache_layers[id];
+                        if (nd > 1) candidate_split[id] = (float)cache_layers[id];
+                    }
+                    candidate.tensor_split = candidate_split.data();
+
+                    // Per-layer overrides: evict the chosen layers' experts to CPU
+                    pattern_strings.clear();
+                    int n_overrides = 0;
+                    for (int i = 0; i < mid && n_overrides < (int)ntbo - 1; i++) {
+                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+                        candidate_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
+                    }
+                    candidate_overrides[n_overrides] = {nullptr, nullptr};
+                    candidate.tensor_buft_overrides = candidate_overrides.data();
+                    candidate.use_extra_bufts = false;
+
+                    // Evaluate memory and cache for this candidate
+                    std::vector<ggml_backend_dev_t> candidate_devs;
+                    uint32_t c_ngl = 0, c_nsk = 0, c_nct = 0, c_nex = 0;
+                    dmds_t candidate_memory = common_get_device_memory_data_impl(
+                            paths_model, &candidate, cparams, candidate_devs,
+                            c_ngl, c_nsk, c_nct, c_nex, log_level);
+                    add_extra_memory(candidate_memory);
+
+                    bool candidate_valid = (candidate_devs == devs && candidate_memory.size() == nd + 1);
+                    if (candidate_valid) {
+                        for (size_t id = 0; id < nd; id++) {
+                            if (candidate_memory[id].mb.total() > INT64_MAX ||
+                                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+                                candidate_valid = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (candidate_valid) {
+                        common_moe_cache_fit_result cf = common_moe_cache_evaluate_fit(
+                                moe_cache, moe_tensors, devs, candidate_memory, margins);
+                        if (cf.feasible) {
+                            best_n_evict = mid;
+                            best_evicted_bytes = 0;
+                            for (int i = 0; i < mid; i++) {
+                                best_evicted_bytes += layer_bytes[order[i]];
+                            }
+                            best_memory = std::move(candidate_memory);
+                            best_cache_fit = cf;
+                            hi = mid - 1;  // Try fewer evictions
+                        } else {
+                            lo = mid + 1;  // Need more evictions
+                        }
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+
+                if (best_n_evict >= 0) {
+                    // Apply the best placement with minimal expert eviction
+                    std::fill(tensor_split, tensor_split + llama_max_devices(), 0.0f);
+                    mparams->n_gpu_layers = 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        mparams->n_gpu_layers += cache_layers[id];
+                        if (nd > 1) tensor_split[id] = (float)cache_layers[id];
+                    }
+                    mparams->tensor_split = tensor_split;
+
+                    // Generate final per-layer overrides
+                    pattern_strings.clear();
+                    int n_overrides = 0;
+                    for (int i = 0; i < best_n_evict && n_overrides < (int)ntbo - 1; i++) {
+                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+                        tensor_buft_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
+                    }
+                    tensor_buft_overrides[n_overrides] = {nullptr, nullptr};
+                    mparams->tensor_buft_overrides = tensor_buft_overrides;
+                    mparams->use_extra_bufts = false;
+                    moe_cache->fit_selected = true;
+
+                    const int n_kept = total_layers - best_n_evict;
+                    const double coverage = best_cache_fit.expert_bytes > 0
+                        ? 100.0 * (double)std::min(best_cache_fit.cache_bytes, best_cache_fit.expert_bytes) /
+                            (double)best_cache_fit.expert_bytes
+                        : 0.0;
+                    const int64_t kept_bytes = best_cache_fit.expert_bytes > (size_t)best_evicted_bytes
+                        ? (int64_t)best_cache_fit.expert_bytes - best_evicted_bytes : 0;
+                    LOG_INF("%s: MoE cache soft mode selected partial-eviction placement: %d/%d layers keep experts GPU-resident, "
+                            "%" PRId64 " MiB of %" PRId64 " MiB routed expert bytes evicted (%" PRId64 " MiB kept), "
+                            "%" PRId64 " MiB projected cache capacity (up to %.1f%% coverage)\n",
+                            __func__, n_kept, total_layers,
+                            (int64_t)(best_evicted_bytes / MiB), (int64_t)(best_cache_fit.expert_bytes / MiB),
+                            (int64_t)(kept_bytes / MiB),
+                            (int64_t)(best_cache_fit.cache_bytes / MiB), coverage);
+                    for (const common_moe_cache_fit_device & device : best_cache_fit.devices) {
+                        LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+                                __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+                                (int64_t)(best_cache_fit.minimum_device_bytes / MiB));
+                    }
+                    return;
+                }
+                LOG_INF("%s: MoE cache soft mode kept stock placement (partial eviction could not fit cache pools)\n",
+                        __func__);
+            } else {
+                LOG_INF("%s: MoE cache soft mode kept stock placement (spare-VRAM insufficient): %s\n",
+                        __func__, soft_fit.reason.c_str());
+            }
+        } else if (!cache_candidate_valid) {
+            LOG_INF("%s: MoE cache fit kept stock placement because canonical dense weights do not meet the fit targets\n", __func__);
+        } else {
+            common_moe_cache_fit_result cache_fit = common_moe_cache_evaluate_fit(
+                    moe_cache, moe_tensors, devs, cache_memory, margins);
+            if (cache_fit.feasible) {
+                set_cache_layer_split(cache_layers, *mparams, tensor_split, tensor_buft_overrides);
+                moe_cache->fit_selected = true;
+
+                const double coverage = cache_fit.expert_bytes > 0
+                    ? 100.0 * (double)std::min(cache_fit.cache_bytes, cache_fit.expert_bytes) /
+                        (double)cache_fit.expert_bytes
+                    : 0.0;
+                LOG_INF("%s: MoE cache fit selected %s dense placement with %" PRId64 " MiB projected cache capacity for %" PRId64 " MiB of routed expert weights (up to %.1f%% coverage)\n",
+                        __func__, cache_candidate_main ? "main-device" : "packed",
+                        (int64_t)(cache_fit.cache_bytes / MiB), (int64_t)(cache_fit.expert_bytes / MiB), coverage);
+                for (const common_moe_cache_fit_device & device : cache_fit.devices) {
+                    LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+                            __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+                            (int64_t)(cache_fit.minimum_device_bytes / MiB));
+                }
+                return;
+            }
+            LOG_INF("%s: MoE cache fit kept stock placement: %s\n", __func__, cache_fit.reason.c_str());
+        }
+    }
+
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
@@ -983,6 +1563,7 @@ enum common_params_fit_status common_fit_params(
         llama_context_params * cparams,
         float * tensor_split,
         llama_model_tensor_buft_override * tensor_buft_overrides,
+        common_moe_cache_params * moe_cache,
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
@@ -990,7 +1571,7 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

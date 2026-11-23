@@ -387,8 +387,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
 
-# TODO: test-moe-cache-fit.cpp needs the MoE-cache-aware fit planner, which is not ported yet
-#llama_build_and_test(test-moe-cache-fit.cpp  LABEL "main behavior")
+llama_build_and_test(test-moe-cache-fit.cpp  LABEL "main behavior")
 
 # TurboQuant WHT round-trip test (links ggml turbo codec symbols via llama)
 llama_build_and_test(test-turbo-quant.c  LABEL "turbo")

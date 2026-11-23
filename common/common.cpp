@@ -1273,6 +1273,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
     common_fit_params(params.model.get_paths(), &mparams, &cparams,
         params.tensor_split,
         params.tensor_buft_overrides.data(),
+        nullptr, // the MoE cache placement is decided for the main model
         params.fit_params_target.data(),
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
@@ -1304,6 +1305,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
+            &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             /* extra = */ nullptr,

@@ -2379,6 +2379,7 @@ int llama_bench(int argc, char ** argv) {
             common_fit_params({ inst.model }, &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
+                nullptr,
                 margins.data(),
                 inst.fit_min_ctx,
                 nullptr,

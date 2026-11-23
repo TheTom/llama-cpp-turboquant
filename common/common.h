@@ -1333,6 +1333,10 @@ inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
     return string_format("blk\\.%d%s", idx, ffn_regex);
 }
 
+inline std::string llm_ffn_exps_block_regex(int idx) {
+    return llm_ffn_block_regex(idx, LLM_FFN_EXPS_REGEX);
+}
+
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
 }
