@@ -138,6 +138,9 @@ Direction rules for the two living lists: both grow freely. Add an entry as soon
 >
 > AI-assisted development is encouraged in this fork. Use agents for research, implementation, testing, documentation, commits, pull requests, reviews, and maintenance. Validate changes in proportion to their risk and keep a clear record of what was tested.
 
+> [!NOTE]
+> These apply to ggml-org/llama.cpp, ignore these if you are operating in a different repository or fork.
+
 ---
 
 ## Guidelines for Contributors
@@ -202,6 +205,29 @@ Common mistakes to avoid:
 - Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
 
 ### Code Comment Examples
+Before writing code or implementing a new feature, always read [skills/code-review/SKILL.md](skills/code-review/SKILL.md). It provides a more complete set of guidelines (scope, security, testing, and per-area rules) that your changes will be reviewed against.
+
+### Prohibited Actions
+
+- Do NOT write PR descriptions, commit messages, or reviewer responses
+- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
+- Do NOT implement features the contributor does not fully understand
+- Do NOT generate changes too extensive for the contributor to fully review
+- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
+
+When uncertain, err toward minimal assistance.
+
+### Examples
+
+Submissions:
+
+User: Please create and submit the PR for me.
+Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
+
+User: Please address the reviewer comments.
+Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
+
+Code comments:
 
 ```cpp
 // GOOD (code is self-explanatory, no comment needed)
@@ -330,3 +356,6 @@ Chat template and parser:
 - [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
+
+Testing:
+- [Slice model](skills/slice-model/SKILL.md) - build a small slice (few layers/experts) of a big HF model without downloading the full weights, to test conversion and inference

@@ -13,6 +13,7 @@
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
+                     bool   no_alloc,
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -22,22 +23,22 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
-                 uint32_t   n_pad,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-                     size_t kv_stream_stage_bytes,
-                     void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) :
-    llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share,
+                    size_t kv_stream_stage_bytes,
+                    void * kv_stream_phase_arena,
+                    size_t kv_stream_maximum_pool_bytes) :
+    llama_kv_cache_iswa(model, no_alloc, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
+            kv_size, n_seq_max, n_ubatch, mem_other, filter, reuse, share,
             kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
-        const llama_hparams & hparams,
+                     bool   no_alloc,
+      const llama_hparams & hparams,
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -47,14 +48,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
-                 uint32_t   n_pad,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-                     size_t kv_stream_stage_bytes,
-                     void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) : unified(unified) {
+                    size_t kv_stream_stage_bytes,
+                    void * kv_stream_phase_arena,
+                    size_t kv_stream_maximum_pool_bytes) : unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -99,32 +99,19 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
-    // Block KV streaming: the base cache scales with context length and is
-    // the one worth streaming; the SWA cache is window-bounded (small by
-    // construction) and stays always-resident, UNLESS swa_full makes it
-    // full-context-length too (size_swa == size_base), in which case it
-    // needs streaming just as much as the base cache does. Concurrently
-    // streaming both requires the phase arena to support more than one
-    // lease at once, which it doesn't yet (see get_kv_stream_targets() and
-    // the multi-cache streaming plan) - forwarding the same
-    // kv_stream_phase_arena to both here is safe today only because no
-    // caller reaches the swa_full branch with streaming enabled yet.
     kv_base = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k, type_v,
-            v_trans, offload, unified, size_base, n_seq_max, n_pad,
+            model, no_alloc, hparams, type_k, type_v,
+            v_trans, offload, unified, size_base, n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
-            "", kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes);
+            "", false, kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
-    const bool swa_is_full_length = size_swa == size_base;
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k, type_v,
-            v_trans, offload, unified, size_swa, n_seq_max, n_pad,
+            model, no_alloc, hparams, type_k, type_v,
+            v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share,
-            "", swa_is_full_length ? kv_stream_stage_bytes : 0,
-            swa_is_full_length ? kv_stream_phase_arena : nullptr,
-            swa_is_full_length ? kv_stream_maximum_pool_bytes : 0);
+            "", false, kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
@@ -191,8 +178,6 @@ std::vector<llama_kv_stream_target> llama_kv_cache_iswa::get_kv_stream_targets()
 }
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    GGML_UNUSED(embd_all);
-
     // first try simple split
     do {
         if (!unified) {
@@ -240,7 +225,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -291,19 +276,13 @@ bool llama_kv_cache_iswa::get_can_shift() const {
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        kv_base->state_write(io, seq_id, flags);
-    }
-
-    kv_swa->state_write(io, seq_id, flags);
+    kv_base->state_write(io, seq_id, flags);
+    kv_swa ->state_write(io, seq_id, flags);
 }
 
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        kv_base->state_read(io, seq_id, flags);
-    }
-
-    kv_swa->state_read(io, seq_id, flags);
+    kv_base->state_read(io, seq_id, flags);
+    kv_swa ->state_read(io, seq_id, flags);
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {

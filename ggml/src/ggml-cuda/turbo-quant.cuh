@@ -13,6 +13,15 @@
 #include <cstdlib>
 #include <cmath>
 
+// HIP dropped the deprecated cuda* aliases for the symbol copy API
+#ifdef GGML_USE_HIP
+#define TURBO_MEMCPY_TO_SYMBOL   hipMemcpyToSymbol
+#define TURBO_MEMCPY_FROM_SYMBOL hipMemcpyFromSymbol
+#else
+#define TURBO_MEMCPY_TO_SYMBOL   cudaMemcpyToSymbol
+#define TURBO_MEMCPY_FROM_SYMBOL cudaMemcpyFromSymbol
+#endif
+
 // ---- Quantization ratios for dequantize_block template ----
 #define QR_TURBO3 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO2 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
@@ -191,10 +200,10 @@ static void turbo_innerq_init(void) {
     // Zero accumulators and set calibrating flag on device
     float zeros[INNERQ_MAX_CHANNELS] = {0};
     int zero = 0, one = 1;
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_sq_accum, zeros, sizeof(zeros)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_active, &zero, sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_calibrating, &one, sizeof(int)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_sq_accum, zeros, sizeof(zeros)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_count, &zero, sizeof(int)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_active, &zero, sizeof(int)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_calibrating, &one, sizeof(int)));
 
     GGML_LOG_INFO("%s: InnerQ calibration started (target=%d tokens, strength=%.2f)\n",
                    __func__, innerq_target_tokens, innerq_strength);
@@ -205,14 +214,14 @@ static void turbo_innerq_finalize(int group_size) {
     // Read accumulators from device
     float sq_accum[INNERQ_MAX_CHANNELS];
     int count = 0;
-    CUDA_CHECK(cudaMemcpyFromSymbol(sq_accum, d_innerq_sq_accum, group_size * sizeof(float)));
-    CUDA_CHECK(cudaMemcpyFromSymbol(&count, d_innerq_count, sizeof(int)));
+    CUDA_CHECK(TURBO_MEMCPY_FROM_SYMBOL(sq_accum, d_innerq_sq_accum, group_size * sizeof(float)));
+    CUDA_CHECK(TURBO_MEMCPY_FROM_SYMBOL(&count, d_innerq_count, sizeof(int)));
 
     if (count <= 0) {
         GGML_LOG_WARN("%s: InnerQ calibration got 0 tokens, disabling\n", __func__);
         innerq_enabled = 0;
         int zero = 0;
-        CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_calibrating, &zero, sizeof(int)));
+        CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_calibrating, &zero, sizeof(int)));
         return;
     }
 
@@ -246,17 +255,17 @@ static void turbo_innerq_finalize(int group_size) {
                        __func__, max_ratio);
         innerq_enabled = 0;
         int zero = 0;
-        CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_calibrating, &zero, sizeof(int)));
+        CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_calibrating, &zero, sizeof(int)));
         return;
     }
 
     // Stop calibrating, upload scales, activate
     int zero = 0, one = 1;
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_calibrating, &zero, sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_scale, scale, group_size * sizeof(float)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_scale_inv, scale_inv, group_size * sizeof(float)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_calibrating, &zero, sizeof(int)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_scale, scale, group_size * sizeof(float)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_scale_inv, scale_inv, group_size * sizeof(float)));
     CUDA_CHECK(cudaDeviceSynchronize());  // ensure scales are visible before activating
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_active, &one, sizeof(int)));
+    CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_active, &one, sizeof(int)));
 
     innerq_enabled = 2;  // active
 
@@ -287,7 +296,7 @@ static void turbo_innerq_check_finalize(int group_size, int64_t ne00) {
                            __func__, (long long)ne00, group_size);
             innerq_enabled = 0;
             int zero = 0;
-            CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_calibrating, &zero, sizeof(int)));
+            CUDA_CHECK(TURBO_MEMCPY_TO_SYMBOL(d_innerq_calibrating, &zero, sizeof(int)));
         }
         return;
     }
@@ -295,7 +304,7 @@ static void turbo_innerq_check_finalize(int group_size, int64_t ne00) {
     // Check if calibration is complete
     if (innerq_enabled == 1) {
         int count = 0;
-        CUDA_CHECK(cudaMemcpyFromSymbol(&count, d_innerq_count, sizeof(int)));
+        CUDA_CHECK(TURBO_MEMCPY_FROM_SYMBOL(&count, d_innerq_count, sizeof(int)));
         if (count >= innerq_target_tokens) {
             turbo_innerq_finalize(group_size);
         }

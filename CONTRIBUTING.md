@@ -16,13 +16,25 @@ The project differentiates between 3 levels of contributors:
 >
 > Detailed information regarding permissible and restricted uses of AI can be found in the [AGENTS.md](AGENTS.md) file.
 
+### Requirements
+
 If AI is used to generate any portion of the code, contributors must adhere to the following requirements:
 
 1. Explicitly disclose the manner in which AI was employed.
 2. Check for an existing PR addressing the same change; if one exists, comment there to work with its author instead of opening a duplicate.
-3. Perform a comprehensive manual review prior to submitting the pull request.
-4. Be prepared to explain every line of code they submitted when asked about it by a maintainer.
+3. Perform a comprehensive manual review prior to submitting the pull request. A proper code review usually takes something like one hour per 200-400 LOC and you should be spending **at least that much time on code review alone**.
+4. Be prepared to explain every line of code you submit when asked about it by a maintainer.
 5. It is strictly prohibited to use AI to write your posts for you (bug reports, feature requests, pull request descriptions, Github discussions, responding to humans, ...).
+
+### Checklist
+
+> [!IMPORTANT]
+>
+> **If you use AI, do all of the following:**
+>
+> 1. **Make sure [AGENTS.md](AGENTS.md) is loaded into your agent's context.** Skipping this step is one of the most common reasons PRs get rejected.
+> 2. **Search for related discussions, PRs and issues** to get the broader context before writing any code.
+> 3. **Run a local review pass before pushing anything**, using the [`code-review`](skills/code-review/SKILL.md) skill, once the change is implemented. Fix what it finds.
 
 For more info, please refer to the [AGENTS.md](AGENTS.md) file.
 
@@ -74,6 +86,7 @@ For more info, please refer to the [AGENTS.md](AGENTS.md) file.
 - If a PR does not warrant a new release, add `[no release]` in the squashed commit to spare CI resources
 - Be mindful of maintenance: most of the work going into a feature happens after the PR is merged. If the PR author is not committed to contribute long-term, someone else needs to take responsibility (you)
 - Add the ["merge ready"](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr+is%3Aopen+draft%3Ano+sort%3Aupdated-desc+label%3A%22merge+ready%22+) label to a PR to indicate when a PR can be fast-merged without waiting for 2 independent reviews. [(more info)](https://github.com/ggml-org/llama.cpp/pull/26178)
+- Wait for CI results before merging
 
 Maintainers reserve the right to decline review or close pull requests for any reason, without any questions, particularly under any of the following conditions:
 - The proposed change is already mentioned in the roadmap or an existing issue, and it has been assigned to someone.

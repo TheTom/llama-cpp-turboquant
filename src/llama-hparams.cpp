@@ -71,6 +71,31 @@ uint32_t llama_hparams::n_ff(uint32_t il) const {
     GGML_ABORT("fatal error");
 }
 
+uint32_t llama_hparams::n_ff_exp(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_ff_exp_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_expert_used_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used_max() const {
+    uint32_t val = 0;
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        val = std::max(val, n_expert_used(il));
+    }
+
+    return val;
+}
+
 uint32_t llama_hparams::n_gqa(uint32_t il) const {
     const uint32_t n_head    = this->n_head(il);
     const uint32_t n_head_kv = this->n_head_kv(il);
@@ -186,9 +211,19 @@ uint32_t llama_hparams::n_embd_r() const {
         return token_shift_count * n_embd;
     }
 
+    if (n_sconv_channels != 0) {
+        // for Inkling2 models, checked before LFM2 as they set n_shortconv_l_cache too
+        return n_sconv_channels * (n_shortconv_l_cache - 1);
+    }
+
     if (n_shortconv_l_cache != 0) {
         // for LFM2 models
         return n_embd * (n_shortconv_l_cache - 1);
+    }
+
+    if (n_cca_qk != 0) {
+        // for ZAYA1 CCA layers: depthwise + grouped conv, each with d_conv - 1 columns of history
+        return 2 * (ssm_d_conv - 1) * n_cca_qk;
     }
 
     if (n_embd_head_kda != 0) {
@@ -203,6 +238,8 @@ uint32_t llama_hparams::n_embd_r() const {
     // Corresponds to Mamba's conv_states size
     const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 
+    // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
+    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
     return n_conv;
 }
 
@@ -212,11 +249,23 @@ uint32_t llama_hparams::n_embd_s() const {
         return n_embd * wkv_head_size;
     }
 
+    if (n_cca_qk != 0) {
+        // for ZAYA CCA layers: the delayed value of the previous token
+        return n_embd_v_gqa() / 2;
+    }
+
     if (n_embd_head_kda != 0) {
         // for Kimi KDA layers
         // Full recurrent state: head_dim * head_dim * n_head
         // h tensor shape for delta attention: [head_dim, head_dim, n_head]
         return n_embd_head_kda * n_embd_head_kda * n_head();  // 128 * 128 * 32 = 524288
+    }
+
+    if (n_embd_head_la != 0) {
+        // for MiniMax-Text-01 linear attention layers
+        // Full recurrent state: head_dim * head_dim * n_head
+        // tensor shape for linear attention: [head_dim, head_dim, n_head]
+        return n_embd_head_la * n_embd_head_la * n_head();  // 128 * 128 * 64 = 1048576
     }
 
     // corresponds to Mamba's ssm_states size
@@ -269,7 +318,8 @@ bool llama_hparams::is_ple(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_pos_per_embd() const {
-    return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
+    return (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE)
+            ? GGML_MROPE_SECTIONS : 1;
 }
 
 bool llama_hparams::is_swa(uint32_t il) const {
@@ -304,16 +354,29 @@ uint32_t llama_hparams::n_embd_head_v_mla() const {
 }
 
 bool llama_hparams::has_kv(uint32_t il) const {
-    if (n_layer_kv_from_start >= 0) {
-        if (il < (uint32_t) n_layer_kv_from_start) {
-            return true;
-        }
+    return kv_source(il) == il;
+}
 
+uint32_t llama_hparams::kv_source(uint32_t il) const {
+    if (il < n_layer_all) {
+        return kv_source_impl[il];
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+}
+
+bool llama_hparams::has_rope(uint32_t il) const {
+    // the router layer stores adapter routing signal, not positional info,
+    // so it must not be RoPE-shifted
+    if (router_layer >= 0 && (int32_t) il == router_layer) {
         return false;
     }
 
-    // by default, all layers have kv
-    return true;
+    if (il < n_layer_all) {
+        return rope_pattern[il] != 0;
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
 uint32_t llama_hparams::n_layer() const {

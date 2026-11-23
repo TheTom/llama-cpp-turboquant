@@ -10,12 +10,12 @@
 
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -37,6 +37,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
+        no_alloc,
         model.hparams,
         type_k,
         type_v,
@@ -45,7 +46,6 @@ llama_memory_hybrid::llama_memory_hybrid(
         unified,
         kv_size,
         n_seq_max,
-        n_pad,
         n_swa,
         swa_type,
         nullptr,
@@ -55,12 +55,14 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         nullptr,
         "",
+        false,
         kv_stream_stage_bytes,
         kv_stream_phase_arena,
         kv_stream_maximum_pool_bytes
     )),
     mem_recr(new llama_memory_recurrent(
         model,
+        no_alloc,
         type_r,
         type_s,
         offload,
@@ -205,17 +207,21 @@ std::vector<llama_kv_stream_target> llama_memory_hybrid::get_kv_stream_targets()
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_write(io, seq_id, flags);
-    }
+    mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_read(io, seq_id, flags);
+    mem_attn->state_read(io, seq_id, flags);
+
+    try {
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        // a failed restore leaves the sequence empty in both caches
+        mem_attn->state_clear(seq_id);
+
+        throw;
     }
-    mem_recr->state_read(io, seq_id, flags);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

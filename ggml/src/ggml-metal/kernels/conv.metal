@@ -1,0 +1,1080 @@
+#include "common.h"
+
+typedef void (im2col_t)(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
+template <typename T>
+kernel void kernel_im2col(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+//    const int64_t IC = tgpg[0];
+    const int64_t OH = tgpg[1];
+    const int64_t OW = tgpg[2];
+
+    const int64_t KH = ntg[1];
+    const int64_t KW = ntg[2];
+
+          int64_t in  = tpitg[0];
+    const int64_t ikh = tpitg[1];
+    const int64_t ikw = tpitg[2];
+
+    const int64_t iic = tgpig[0];
+    const int64_t ioh = tgpig[1];
+    const int64_t iow = tgpig[2];
+
+    const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+    const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+
+    int64_t offset_dst = (in*OH*OW + ioh*OW + iow)*args.CHW + (iic*(KH*KW) + ikh*KW + ikw);
+
+    device T * pdst = (device T *) (dst);
+
+    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
+        while (in < args.N) {
+            pdst[offset_dst] = 0.0f;
+            offset_dst += ntg[0]*args.CHW*OH*OW;
+
+            in += ntg[0];
+        }
+    } else {
+        int64_t offset_src = in*args.ofs0 + iic*args.ofs1 + iih*args.IW + iiw;
+
+        while (in < args.N) {
+            pdst[offset_dst] = x[offset_src];
+
+            offset_dst += ntg[0]*args.CHW*OH*OW;
+            offset_src += ntg[0]*args.ofs0;
+
+            in += ntg[0];
+        }
+    }
+}
+
+template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
+template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
+
+// TODO: optimize
+typedef void (im2col_ext_t)(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
+template <typename T>
+kernel void kernel_im2col_ext(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],      // tgpg[0] = D x IC x KH x KW, CHW = IC x KH x KW
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {  // [M, 1, 1]
+    const int64_t KHW = (int64_t)args.KHW;
+
+    const int64_t d   = tgpig[0] / args.CHW;
+    const int64_t chw = tgpig[0] % args.CHW;
+    const int64_t tgpig_0 = chw / KHW;  // 0 ~ (IC - 1)
+    const int64_t HW = tgpig[0] % KHW;
+
+    const int64_t tpitg_0 = (d * ntg[0]) + tpitg[0];
+    if (tpitg_0 >= args.N) {
+        return;
+    }
+
+    const int64_t tpitg_1 = HW / args.KW;
+    const int64_t tpitg_2 = HW % args.KW;
+
+    const int64_t iiw = tgpig[2] * args.s0 + tpitg_2 * args.d0 - args.p0;
+    const int64_t iih = tgpig[1] * args.s1 + tpitg_1 * args.d1 - args.p1;
+
+    const int64_t offset_dst =
+        (tpitg_0 * tgpg[1] * tgpg[2] + tgpig[1] * tgpg[2] + tgpig[2]) * args.CHW +
+        (tgpig_0 * KHW + tpitg_1 * args.KW + tpitg_2);
+
+    device T * pdst = (device T *) (dst);
+
+    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
+        pdst[offset_dst] = 0.0f;
+    } else {
+        const int64_t offset_src = tpitg_0 * args.ofs0 + tgpig_0 * args.ofs1;
+        pdst[offset_dst] = x[offset_src + iih * args.IW + iiw];
+    }
+}
+
+template [[host_name("kernel_im2col_ext_f32")]] kernel im2col_ext_t kernel_im2col_ext<float>;
+template [[host_name("kernel_im2col_ext_f16")]] kernel im2col_ext_t kernel_im2col_ext<half>;
+
+template <typename T>
+kernel void kernel_col2im_1d(
+        constant ggml_metal_kargs_col2im_1d & args,
+        device const T * col,
+        device       T * dst,
+        uint         tgpig [[threadgroup_position_in_grid]],
+        uint         tpitg [[thread_position_in_threadgroup]],
+        uint         ntg   [[threads_per_threadgroup]]) {
+
+    const int idx = tgpig * ntg + tpitg;
+    if (idx >= args.T_out * args.OC) {
+        return;
+    }
+
+    const int t_out = idx % args.T_out;
+    const int oc    = idx / args.T_out;
+    const int t_abs = t_out + args.p0;  // absolute position in uncropped signal
+
+    int t_in_min = (t_abs - args.K + args.s0) / args.s0;  // ceil((t_abs - K + 1) / s0)
+    if (t_in_min < 0) {
+        t_in_min = 0;
+    }
+    int t_in_max = t_abs / args.s0;
+    if (t_in_max >= args.T_in) {
+        t_in_max = args.T_in - 1;
+    }
+
+    float sum = 0.0f;
+    for (int t_in = t_in_min; t_in <= t_in_max; t_in++) {
+        const int k = t_abs - t_in * args.s0;
+        sum += float(col[(oc * args.K + k) + t_in * args.K_OC]);
+    }
+
+    dst[t_out + oc * args.T_out] = T(sum);
+}
+
+template [[host_name("kernel_col2im_1d_f32")]]  kernel void kernel_col2im_1d<float>(constant ggml_metal_kargs_col2im_1d &, device const float *, device float *, uint, uint, uint);
+template [[host_name("kernel_col2im_1d_f16")]]  kernel void kernel_col2im_1d<half>(constant ggml_metal_kargs_col2im_1d &, device const half *, device half *, uint, uint, uint);
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_col2im_1d_bf16")]] kernel void kernel_col2im_1d<bfloat>(constant ggml_metal_kargs_col2im_1d &, device const bfloat *, device bfloat *, uint, uint, uint);
+#endif
+
+template <typename TK>
+kernel void kernel_conv_2d(
+        constant ggml_metal_kargs_conv_2d & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3    tgpg[[threadgroups_per_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]) {
+
+    const uint threads_per_tg = ntg.x * ntg.y * ntg.z;
+    const uint tg_index = (tgpig.z * tgpg.y + tgpig.y) * tgpg.x + tgpig.x;
+    const uint local_thread = tpitg.z * (ntg.x * ntg.y) + tpitg.y * ntg.x + tpitg.x;
+    const uint thread_index = tg_index * threads_per_tg + local_thread;
+    const uint64_t total_threads = (uint64_t) threads_per_tg * tgpg.x * tgpg.y * tgpg.z;
+    const uint64_t total_outputs = (uint64_t) args.N * args.OC * args.OH * args.OW;
+
+    for (uint64_t index = thread_index; index < total_outputs; index += total_threads) {
+        uint64_t tmp = index;
+
+        const int32_t ow = tmp % args.OW; tmp /= args.OW;
+        const int32_t oh = tmp % args.OH; tmp /= args.OH;
+        const int32_t oc = tmp % args.OC; tmp /= args.OC;
+        const int32_t  n = tmp;
+
+        float acc = 0.0f;
+
+        const int32_t base_x = ow*args.s0 - args.p0;
+        const int32_t base_y = oh*args.s1 - args.p1;
+
+        int32_t ky_start = 0;
+        if (base_y < 0) {
+            ky_start = (-base_y + args.d1 - 1)/args.d1;
+        }
+        int32_t ky_end = args.KH;
+        const int32_t y_max = args.IH - 1 - base_y;
+        if (y_max < 0) {
+            ky_end = ky_start;
+        } else if (base_y + (args.KH - 1)*args.d1 >= args.IH) {
+            ky_end = min(ky_end, y_max/args.d1 + 1);
+        }
+
+        int32_t kx_start = 0;
+        if (base_x < 0) {
+            kx_start = (-base_x + args.d0 - 1)/args.d0;
+        }
+        int32_t kx_end = args.KW;
+        const int32_t x_max = args.IW - 1 - base_x;
+        if (x_max < 0) {
+            kx_end = kx_start;
+        } else if (base_x + (args.KW - 1)*args.d0 >= args.IW) {
+            kx_end = min(kx_end, x_max/args.d0 + 1);
+        }
+
+        if (ky_start < ky_end && kx_start < kx_end) {
+            const uint64_t src_base_n = (uint64_t) n  * args.nb13;
+            const uint64_t w_base_oc  = (uint64_t) oc * args.nb03;
+
+            for (int32_t ic = 0; ic < args.IC; ++ic) {
+                const uint64_t src_base_nc = src_base_n + (uint64_t) ic * args.nb12;
+                const uint64_t w_base_ocic = w_base_oc  + (uint64_t) ic * args.nb02;
+
+                for (int32_t ky = ky_start; ky < ky_end; ++ky) {
+                    const int32_t iy = base_y + ky*args.d1;
+                    const uint64_t src_base_row = src_base_nc + (uint64_t) iy * args.nb11;
+                    const uint64_t w_base_row   = w_base_ocic + (uint64_t) ky * args.nb01;
+
+                    for (int32_t kx = kx_start; kx < kx_end; ++kx) {
+                        const int32_t ix = base_x + kx*args.d0;
+                        const uint64_t src_offs = src_base_row + (uint64_t) ix * args.nb10;
+                        const uint64_t w_offs   = w_base_row   + (uint64_t) kx * args.nb00;
+
+                        const float x = *(device const float *)(src + src_offs);
+                        const float w = (float) (*(device const TK *)(weights + w_offs));
+
+                        acc += x * w;
+                    }
+                }
+            }
+        }
+
+        const uint64_t dst_offs =
+            (uint64_t) n  * args.nb3 +
+            (uint64_t) oc * args.nb2 +
+            (uint64_t) oh * args.nb1 +
+            (uint64_t) ow * args.nb0;
+
+        *(device float *)(dst + dst_offs) = acc;
+    }
+}
+
+template [[host_name("kernel_conv_2d_f32_f32")]]
+kernel void kernel_conv_2d<float>(
+        constant ggml_metal_kargs_conv_2d & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3    tgpg[[threadgroups_per_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_2d_f16_f32")]]
+kernel void kernel_conv_2d<half>(
+        constant ggml_metal_kargs_conv_2d & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3    tgpg[[threadgroups_per_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
+
+template <typename TK, short NR0, short NR1>
+kernel void kernel_conv_2d_mm(
+        constant ggml_metal_kargs_conv_2d & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = N_SG_CONV_2D;
+    constexpr short NTH = 32*NSG;
+    constexpr short NK  = 32;
+    constexpr short NKB = NK/8;
+
+    constexpr short NB = 72;
+
+    constexpr short SGY = NR0/32;
+
+    threadgroup half * sa = (threadgroup half *) shmem;
+    threadgroup half * sb = (threadgroup half *) shmem + (NR0/8)*NKB*NB;
+
+    const int K  = args.IC*args.KH*args.KW;
+    const int NP = args.N*args.OH*args.OW;
+
+    // this threadgroup reduces [k_begin, k_end), the splits are summed by kernel_conv_2d_mm_reduce
+    const int k_begin = tgpig.z*args.nk;
+    const int k_end   = min(K, k_begin + args.nk);
+
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    constexpr short NPL = NR1/32;
+
+    const short lb_n = 8*sgitg + tiisg%8;
+    const short lb_k = 8*(tiisg/8);
+
+    // the patches are walked with 32-bit byte offsets inside the image, the host checks that an image fits
+    const uint nb10 = args.nb10;
+    const uint nb11 = args.nb11;
+    const uint nb12 = args.nb12;
+
+    int  ix0[NPL];
+    int  iy0[NPL];
+    uint off0[NPL];
+    bool ip_ok[NPL];
+
+    device const char * srcb[NPL];
+
+    FOR_UNROLL (short t = 0; t < NPL; t++) {
+        const int ip = r1 + 32*t + lb_n;
+
+        const int iow = ip % args.OW;
+        const int ioh = (ip / args.OW) % args.OH;
+        const int in  = ip / (args.OW*args.OH);
+
+        ix0[t] = iow*args.s0 - args.p0;
+        iy0[t] = ioh*args.s1 - args.p1;
+
+        off0[t] = iy0[t]*nb11 + ix0[t]*nb10;
+
+        ip_ok[t] = ip < NP;
+
+        srcb[t] = src + in*args.nb13;
+    }
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_half8x8  mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int k0 = k_begin; k0 < k_end; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            const short k  = tiisg;
+            const int   kk = k0 + k;
+
+            FOR_UNROLL (short j = 0; j < NR0/NSG; j++) {
+                const short row = (NR0/NSG)*sgitg + j;
+                const int   oc  = r0 + row;
+
+                half v = 0;
+                if (kk < k_end && oc < args.OC) {
+                    v = *((device const TK *)(weights + oc*args.nb03) + kk);
+                }
+
+                const short ib = NKB*(row/8) + k/8;
+
+                sa[NB*ib + 8*(row%8) + k%8] = v;
+            }
+        }
+
+        {
+            int kk = k0 + lb_k;
+
+            int kw = kk % args.KW;
+            int kh = (kk / args.KW) % args.KH;
+            int dx = kw*args.d0;
+            int dy = kh*args.d1;
+
+            // byte offset of the reduction index kk, relative to the patch origin
+            uint offk = (kk / (args.KW*args.KH))*nb12 + dy*nb11 + dx*nb10;
+
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                const short k = lb_k + i;
+
+                FOR_UNROLL (short t = 0; t < NPL; t++) {
+                    const short n = 32*t + lb_n;
+
+                    const int ix = ix0[t] + dx;
+                    const int iy = iy0[t] + dy;
+
+                    half v = 0;
+                    if (ip_ok[t] && kk < k_end && (uint) ix < (uint) args.IW && (uint) iy < (uint) args.IH) {
+                        v = *(device const float *)(srcb[t] + (off0[t] + offk));
+                    }
+
+                    const short ib = NKB*(n/8) + k/8;
+
+                    sb[NB*ib + 8*(k%8) + n%8] = v;
+                }
+
+                kk++;
+                dx   += args.d0;
+                offk += args.d0*nb10;
+                if (++kw == args.KW) {
+                    kw    = 0;
+                    dx    = 0;
+                    dy   += args.d1;
+                    offk += args.d1*nb11 - args.KW*args.d0*nb10;
+                    if (++kh == args.KH) {
+                        kh    = 0;
+                        dy    = 0;
+                        offk += nb12 - args.KH*args.d1*nb11;
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const short nkb = min((k_end - k0 + 7)/8, (int) NKB);
+
+        for (short ik = 0; ik < nkb; ik++) {
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], sa + NB*(NKB*(4*(sgitg%SGY) + i) + ik), 8, 0, false);
+            }
+
+            FOR_UNROLL (short j = 0; j < 2; j++) {
+                simdgroup_load(mb[j], sb + NB*(NKB*(2*(sgitg/SGY) + j) + ik), 8, 0, false);
+            }
+
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], ma[i%4], mb[i/4], mc[i]);
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * sc = (threadgroup float *) shmem;
+
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], sc + NR1*(32*(sgitg%SGY) + 8*(i%4)) + 16*(sgitg/SGY) + 8*(i/4), NR1, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short cn = tiitg%NR1;
+    const int   p  = r1 + cn;
+
+    if (p >= NP) {
+        return;
+    }
+
+    const int ow = p % args.OW;
+    const int oh = (p / args.OW) % args.OH;
+    const int n  = p / (args.OW*args.OH);
+
+    // with several splits, dst is the partial sum buffer, one contiguous output per split
+    device char * dstp = dst + (uint64_t) tgpig.z*args.N*args.nb3 + n*args.nb3 + oh*args.nb1 + ow*args.nb0;
+
+    for (short j = 0; j < NR0*NR1/NTH; j++) {
+        const short row = tiitg/NR1 + (NTH/NR1)*j;
+        const int   oc  = r0 + row;
+
+        if (oc < args.OC) {
+            *(device float *)(dstp + oc*args.nb2) = sc[NR1*row + cn];
+        }
+    }
+}
+
+#ifdef GGML_METAL_HAS_TENSOR
+// conv_2d as a matmul on the tensor cores, like kernel_mul_mm
+// The patches of NRA output positions are gathered into threadgroup memory, the kernel rows are read from device memory.
+// One threadgroup computes NRA positions of one image times NRB output channels, over the reduction range of its split.
+template <typename TK>
+kernel void kernel_conv_2d_mm_tensor(
+        constant ggml_metal_kargs_conv_2d & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tgpg[[threadgroups_per_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]]) {
+    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X; // output channels
+    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y; // output positions
+    constexpr int NK  = N_MM_NK_TOTAL;
+    constexpr int NTH = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+
+    // each thread gathers NK/(NTH/NRA) consecutive reduction indices of one position
+    constexpr int KPT = NK/(NTH/NRA);
+
+    const int K   = args.IC*args.KH*args.KW;
+    const int OHW = args.OH*args.OW;
+
+    const int nsplit = tgpg.z/args.N;
+    const int img    = tgpig.z/nsplit;
+    const int split  = tgpig.z%nsplit;
+
+    const int k_begin = split*args.nk;
+    const int k_end   = min(K, k_begin + args.nk);
+
+    const int ra = tgpig.y*NRA;
+    const int rb = tgpig.x*NRB;
+
+    threadgroup half * sa = (threadgroup half *) shmem;
+
+    // the position this thread gathers
+    const int  row = tiitg%NRA;
+    const int  kc  = (tiitg/NRA)*KPT;
+    const int  p   = ra + row;
+    const bool pok = p < OHW;
+    const int  ix0 = (p%args.OW)*args.s0 - args.p0;
+    const int  iy0 = (p/args.OW)*args.s1 - args.p1;
+
+    device const char * srcb = src + img*args.nb13;
+
+    // the patch is walked with 32-bit byte offsets inside the image, the host checks that an image fits
+    const uint nb10 = args.nb10;
+    const uint nb11 = args.nb11;
+    const uint nb12 = args.nb12;
+
+    const uint off0 = iy0*nb11 + ix0*nb10;
+
+    device TK * ptrB = (device TK *) weights;
+    const int strideB = args.nb03/sizeof(TK);
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+
+    auto tB0 = tensor(ptrB, dextents<int32_t, 2>(K, args.OC), array<int, 2>({1, strideB}));
+    auto tA0 = tensor(sa,   dextents<int32_t, 2>(NK, NRA));
+    auto cT  = mm.get_destination_cooperative_tensor<decltype(tB0), decltype(tA0), float>();
+
+    for (int k0 = k_begin; k0 < k_end; k0 += NK) {
+        // the reduction indices past k_end are beyond the extent given to the matmul, they are not gathered
+        if (k0 + kc < k_end) {
+            // gather KPT patch values of this position, walking the reduction index incrementally
+            int kk = k0 + kc;
+            int kw = kk % args.KW;
+            int kh = (kk / args.KW) % args.KH;
+            int dx = kw*args.d0;
+            int dy = kh*args.d1;
+
+            // byte offset of the reduction index kk, relative to the patch origin
+            uint offk = (kk / (args.KW*args.KH))*nb12 + dy*nb11 + dx*nb10;
+
+            FOR_UNROLL (short i = 0; i < KPT; i++) {
+                const int ix = ix0 + dx;
+                const int iy = iy0 + dy;
+
+                half v = 0;
+                if (pok && kk < k_end && (uint) ix < (uint) args.IW && (uint) iy < (uint) args.IH) {
+                    v = *(device const float *)(srcb + (off0 + offk));
+                }
+                sa[row*NK + kc + i] = v;
+
+                kk++;
+                dx   += args.d0;
+                offk += args.d0*nb10;
+                if (++kw == args.KW) {
+                    kw    = 0;
+                    dx    = 0;
+                    dy   += args.d1;
+                    offk += args.d1*nb11 - args.KW*args.d0*nb10;
+                    if (++kh == args.KH) {
+                        kh    = 0;
+                        dy    = 0;
+                        offk += nb12 - args.KH*args.d1*nb11;
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // clamp the reduction extent so neither operand is read past the end of the split
+        const int kExt = min(NK, k_end - k0);
+
+        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, NK}));
+        auto tBv = tensor(ptrB + k0 + rb*strideB, dextents<int32_t, 2>(kExt, args.OC - rb), array<int, 2>({1, strideB}));
+
+        mm.run(tBv, tAv, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // dst holds [OHW, OC] per image, with several splits it is the partial sum buffer, one contiguous output per split
+    const int tileM = min(NRA, OHW - ra);
+    const int tileN = min(NRB, args.OC - rb);
+
+    device float * dstTile = (device float *) (dst + (uint64_t) split*args.N*args.nb3 + img*args.nb3) + (uint64_t) rb*OHW + ra;
+
+    auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, OHW}));
+    cT.store(tD);
+}
+
+typedef decltype(kernel_conv_2d_mm_tensor<float>) kernel_conv_2d_mm_tensor_t;
+
+template [[host_name("kernel_conv_2d_mm_tensor_f32_f32")]] kernel kernel_conv_2d_mm_tensor_t kernel_conv_2d_mm_tensor<float>;
+template [[host_name("kernel_conv_2d_mm_tensor_f16_f32")]] kernel kernel_conv_2d_mm_tensor_t kernel_conv_2d_mm_tensor<half>;
+#endif
+
+kernel void kernel_conv_2d_mm_reduce(
+        constant ggml_metal_kargs_conv_2d_reduce & args,
+        device const float * tmp,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    if ((int) tpig >= args.ne) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int s = 0; s < args.nsplit; ++s) {
+        sum += tmp[(uint64_t) s*args.ne + tpig];
+    }
+    dst[tpig] = sum;
+}
+
+typedef decltype(kernel_conv_2d_mm<float, 64, 32>) kernel_conv_2d_mm_t;
+
+template [[host_name("kernel_conv_2d_mm_f32_f32_64x32")]] kernel kernel_conv_2d_mm_t kernel_conv_2d_mm<float, 64, 32>;
+template [[host_name("kernel_conv_2d_mm_f16_f32_64x32")]] kernel kernel_conv_2d_mm_t kernel_conv_2d_mm<half,  64, 32>;
+template [[host_name("kernel_conv_2d_mm_f32_f32_32x64")]] kernel kernel_conv_2d_mm_t kernel_conv_2d_mm<float, 32, 64>;
+template [[host_name("kernel_conv_2d_mm_f16_f32_32x64")]] kernel kernel_conv_2d_mm_t kernel_conv_2d_mm<half,  32, 64>;
+
+typedef void (conv_transpose_1d_t)(
+        constant ggml_metal_kargs_conv_transpose_1d & args,
+        device const float * src0,
+        device const float * src1,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3    tgpg[[threadgroups_per_grid]]);
+
+template <typename T>
+kernel void kernel_conv_transpose_1d(
+        constant ggml_metal_kargs_conv_transpose_1d & args,
+        device const     T * src0,
+        device const float * src1,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tgpg[[threadgroups_per_grid]]) {
+
+    // For output position j on the time axis, only input positions
+    //   i such that i*s0 <= j < i*s0 + K
+    // contribute -- i.e. i in [ceil((j - K + 1)/s0), floor(j/s0)]
+    // intersected with [0, IL-1]. That's at most ceil(K/s0) values
+    // (typically 2 for stride==K/2 transposed convs).
+    const int32_t j  = tgpig[0];
+    const int32_t s0 = args.s0;
+    const int32_t K  = args.K;
+    const int32_t IL = args.IL;
+
+    int32_t i_min;
+    {
+        int32_t a = j - K + 1;
+        i_min = a <= 0 ? 0 : (a + s0 - 1) / s0; // ceil(a/s0) for a>0
+    }
+    int32_t i_max = j / s0;
+    if (i_max > IL - 1) i_max = IL - 1;
+
+    float v = 0.0f;
+    if (i_min <= i_max) {
+        for (int64_t c = 0; c < args.IC; c++) {
+            const int32_t kernel_offset = c * tgpg[1] * K + K * tgpig[1];
+            const int32_t input_offset  = c * IL;
+
+            for (int32_t i = i_min; i <= i_max; i++) {
+                v += float(src0[kernel_offset + j - i * s0]) * src1[input_offset + i];
+            }
+        }
+    }
+
+    device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
+
+    dst_ptr[0] = v;
+}
+
+template [[host_name("kernel_conv_transpose_1d_f32_f32")]]
+kernel void kernel_conv_transpose_1d<float>(
+    constant ggml_metal_kargs_conv_transpose_1d & args,
+    device const float * src0,
+    device const float * src1,
+    device        char * dst,
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    uint3    tgpg[[threadgroups_per_grid]]);
+
+template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
+kernel void kernel_conv_transpose_1d<half>(
+    constant ggml_metal_kargs_conv_transpose_1d & args,
+    device const half  * src0,
+    device const float * src1,
+    device        char * dst,
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    uint3    tgpg[[threadgroups_per_grid]]);
+
+
+typedef void (conv_transpose_2d_t)(
+        constant ggml_metal_kargs_conv_transpose_2d & args,
+        device const float * src0,
+        device const float * src1,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3    tgpg[[threadgroups_per_grid]]);
+
+template <typename T>
+kernel void kernel_conv_transpose_2d(
+        constant ggml_metal_kargs_conv_transpose_2d & args,
+        device const T * src0,
+        device const float * src1,
+        device        char * dst,
+        threadgroup float * shared_sum [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]) {
+
+    const int64_t out_x = tgpig[0];
+    const int64_t out_y = tgpig[1];
+    const int64_t batch = tgpig[2] / args.OC;
+    const int64_t out_c = tgpig[2] % args.OC;
+
+    const int64_t kw = tpitg[0];
+    const int64_t kh = tpitg[1];
+
+    float v = 0.0f;
+
+    for (int64_t in_c = 0; in_c < args.IC; in_c++) {
+        int64_t in_y = out_y - kh;
+
+        if (in_y < 0 || in_y % args.s0) continue;
+
+        in_y /= args.s0;
+
+        if (in_y >= args.IH) continue;
+
+        int64_t in_x = out_x - kw;
+
+        if (in_x < 0 || in_x % args.s0) continue;
+
+        in_x /= args.s0;
+
+        if (in_x >= args.IW) continue;
+
+        const int64_t input_idx = (args.IW * args.IH) * (args.IC * batch + in_c) + (args.IW) * in_y + in_x;
+        const int64_t kernel_idx = (args.KH * args.KW * args.OC) * in_c + (args.KH * args.KW) * out_c + (args.KW) * kh + kw;
+
+        v += (float)src0[kernel_idx] * src1[input_idx];
+    }
+
+    const uint tid = tpitg.y * ntg.x + tpitg.x;
+    shared_sum[tid] = v;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total = 0.0f;
+        const uint num_threads = ntg.x * ntg.y;
+        for (uint i = 0; i < num_threads; i++) {
+            total += shared_sum[i];
+        }
+
+        device float * dst_ptr = (device float *) (dst + batch*args.nb3 + out_c*args.nb2 + out_y * args.nb1 + out_x*args.nb0);
+        dst_ptr[0] = total;
+    }
+}
+
+template [[host_name("kernel_conv_transpose_2d_f32_f32")]]
+kernel void kernel_conv_transpose_2d<float>(
+    constant ggml_metal_kargs_conv_transpose_2d & args,
+    device const float * src0,
+    device const float * src1,
+    device        char * dst,
+    threadgroup float * shared_sum [[threadgroup(0)]],
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    uint3   tpitg[[thread_position_in_threadgroup]],
+    uint3     ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_transpose_2d_f16_f32")]]
+kernel void kernel_conv_transpose_2d<half>(
+    constant ggml_metal_kargs_conv_transpose_2d & args,
+    device const half  * src0,
+    device const float * src1,
+    device        char * dst,
+    threadgroup float * shared_sum [[threadgroup(0)]],
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    uint3   tpitg[[thread_position_in_threadgroup]],
+    uint3     ntg[[threads_per_threadgroup]]);
+
+// grid: x = C tile, y = OH, z = OW * N (for channel-contiguous layouts)
+template <typename TK>
+kernel void kernel_conv_2d_dw_tiled(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]) {
+
+    const int32_t c = (int32_t)(tgpig.x * ntg.x + tpitg.x);
+    if (c >= args.C) {
+        return;
+    }
+
+    const int32_t oh = tgpig.y;
+    const int32_t own = tgpig.z;
+    const int32_t ow = own % args.OW;
+    const int32_t n  = own / args.OW;
+
+    const int32_t base_y = oh*args.s1 - args.p1;
+
+    int32_t ky_start = 0;
+    if (base_y < 0) {
+        ky_start = (-base_y + args.d1 - 1)/args.d1;
+    }
+    int32_t ky_end = args.KH;
+    const int32_t y_max = args.IH - 1 - base_y;
+    if (y_max < 0) {
+        ky_end = ky_start;
+    } else if (base_y + (args.KH - 1)*args.d1 >= args.IH) {
+        ky_end = min(ky_end, y_max/args.d1 + 1);
+    }
+
+    const int32_t base_x = ow*args.s0 - args.p0;
+
+    int32_t kx_start = 0;
+    if (base_x < 0) {
+        kx_start = (-base_x + args.d0 - 1)/args.d0;
+    }
+    int32_t kx_end = args.KW;
+    const int32_t x_max = args.IW - 1 - base_x;
+    if (x_max < 0) {
+        kx_end = kx_start;
+    } else if (base_x + (args.KW - 1)*args.d0 >= args.IW) {
+        kx_end = min(kx_end, x_max/args.d0 + 1);
+    }
+
+    float acc = 0.0f;
+
+    if (ky_start < ky_end && kx_start < kx_end) {
+        const uint64_t w_base   = (uint64_t) c * args.nb02;
+        const uint64_t src_base = (uint64_t) n * args.nb13 + (uint64_t) c * args.nb12;
+
+        for (int32_t ky = ky_start; ky < ky_end; ++ky) {
+            const int32_t iy = base_y + ky*args.d1;
+            const uint64_t src_row = src_base + (uint64_t) iy * args.nb11;
+            const uint64_t w_row = w_base + (uint64_t) ky * args.nb01;
+
+            for (int32_t kx = kx_start; kx < kx_end; ++kx) {
+                const int32_t ix = base_x + kx*args.d0;
+                const float x = *(device const float *)(src + src_row + (uint64_t) ix * args.nb10);
+                const float w = (float)(*(device const TK *)(weights + w_row + (uint64_t) kx * args.nb00));
+                acc += x * w;
+            }
+        }
+    }
+
+    const uint64_t dst_offs =
+        (uint64_t) n  * args.nb3 +
+        (uint64_t) c  * args.nb2 +
+        (uint64_t) oh * args.nb1 +
+        (uint64_t) ow * args.nb0;
+
+    *(device float *)(dst + dst_offs) = acc;
+}
+
+// grid: x = OW tile, y = OH, z = C * N (for spatially-contiguous layouts)
+template <typename TK>
+kernel void kernel_conv_2d_dw(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]) {
+
+    const int32_t oh = tgpig.y;
+    const int32_t cn = tgpig.z;
+    const int32_t c  = cn % args.C;
+    const int32_t n  = cn / args.C;
+
+    const int32_t base_y = oh*args.s1 - args.p1;
+
+    int32_t ky_start = 0;
+    if (base_y < 0) {
+        ky_start = (-base_y + args.d1 - 1)/args.d1;
+    }
+    int32_t ky_end = args.KH;
+    const int32_t y_max = args.IH - 1 - base_y;
+    if (y_max < 0) {
+        ky_end = ky_start;
+    } else if (base_y + (args.KH - 1)*args.d1 >= args.IH) {
+        ky_end = min(ky_end, y_max/args.d1 + 1);
+    }
+
+    const uint64_t w_base   = (uint64_t) c * args.nb02;
+    const uint64_t src_base = (uint64_t) n * args.nb13 + (uint64_t) c * args.nb12;
+
+    const int32_t ow = (int32_t)(tgpig.x * ntg.x + tpitg.x);
+    if (ow >= args.OW) {
+        return;
+    }
+
+    float acc = 0.0f;
+
+    const int32_t base_x = ow*args.s0 - args.p0;
+
+    int32_t kx_start = 0;
+    if (base_x < 0) {
+        kx_start = (-base_x + args.d0 - 1)/args.d0;
+    }
+    int32_t kx_end = args.KW;
+    const int32_t x_max = args.IW - 1 - base_x;
+    if (x_max < 0) {
+        kx_end = kx_start;
+    } else if (base_x + (args.KW - 1)*args.d0 >= args.IW) {
+        kx_end = min(kx_end, x_max/args.d0 + 1);
+    }
+
+    if (ky_start < ky_end && kx_start < kx_end) {
+        for (int32_t ky = ky_start; ky < ky_end; ++ky) {
+            const int32_t iy = base_y + ky*args.d1;
+            const uint64_t src_row = src_base + (uint64_t) iy * args.nb11;
+            const uint64_t w_row = w_base + (uint64_t) ky * args.nb01;
+
+            for (int32_t kx = kx_start; kx < kx_end; ++kx) {
+                const int32_t ix = base_x + kx*args.d0;
+                const float x = *(device const float *)(src + src_row + (uint64_t) ix * args.nb10);
+                const float w = (float)(*(device const TK *)(weights + w_row + (uint64_t) kx * args.nb00));
+                acc += x * w;
+            }
+        }
+    }
+
+    const uint64_t dst_offs =
+        (uint64_t) n  * args.nb3 +
+        (uint64_t) c  * args.nb2 +
+        (uint64_t) oh * args.nb1 +
+        (uint64_t) ow * args.nb0;
+
+    *(device float *)(dst + dst_offs) = acc;
+}
+
+template [[host_name("kernel_conv_2d_dw_f32_f32")]]
+kernel void kernel_conv_2d_dw<float>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_2d_dw_f16_f32")]]
+kernel void kernel_conv_2d_dw<half>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_2d_dw_tiled_f32_f32")]]
+kernel void kernel_conv_2d_dw_tiled<float>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_2d_dw_tiled_f16_f32")]]
+kernel void kernel_conv_2d_dw_tiled<half>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const char * weights,
+        device const char * src,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
+
+template <typename T>
+kernel void kernel_conv_3d(
+        constant ggml_metal_kargs_conv_3d & args,
+        device const  char * src0, // Weights [IC * OC, KD, KH, KW]
+        device const  char * src1, // Inputs  [IC * N,  ID, IH, IW]
+        device       char  * dst,  // Outputs [OC * N,  OD, OH, OW]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]]) {
+
+    // 1. Un-flatten the spatial dimension from Grid X
+    int64_t spatial_idx = tgpig.x * 32 + tpitg.x;
+
+    if (spatial_idx >= args.OW * args.OH * args.OD) {
+        return; // Thread falls outside the spatial volume
+    }
+
+    int64_t od = spatial_idx / (args.OW * args.OH);
+    int64_t oh = (spatial_idx / args.OW) % args.OH;
+    int64_t ow = spatial_idx % args.OW;
+
+    // 2. Map Y to Channels, Z to Batch
+    int64_t oc = tgpig.y;
+    int64_t batch_idx = tgpig.z;
+
+    // 3. Calculate anchor coordinates in the Input volume
+    int64_t i_w_base = ow * args.s0 - args.p0;
+    int64_t i_h_base = oh * args.s1 - args.p1;
+    int64_t i_d_base = od * args.s2 - args.p2;
+
+    float sum = 0.0f;
+
+    // 4. Gather Loop (Iterate over Input Channels -> Depth -> Height -> Width)
+    for (int64_t ic = 0; ic < args.IC; ++ic) {
+
+        // ggml packs batch and channel together in the 4th dimension
+        int64_t src_cn_idx = batch_idx * args.IC + ic;
+        int64_t w_cn_idx   = oc * args.IC + ic;
+
+        for (int64_t kz = 0; kz < args.KD; ++kz) {
+            int64_t id = i_d_base + kz * args.d2;
+            if (id < 0 || id >= args.ID) continue; // Boundary check (Padding)
+
+            for (int64_t ky = 0; ky < args.KH; ++ky) {
+                int64_t ih = i_h_base + ky * args.d1;
+                if (ih < 0 || ih >= args.IH) continue;
+
+                for (int64_t kx = 0; kx < args.KW; ++kx) {
+                    int64_t iw = i_w_base + kx * args.d0;
+                    if (iw < 0 || iw >= args.IW) continue;
+
+                    // Convert multi-dimensional coordinates to flat byte offsets
+                    int64_t w_idx = kx*args.nb00 + ky*args.nb01 + kz*args.nb02 + w_cn_idx*args.nb03;
+                    int64_t i_idx = iw*args.nb10 + ih*args.nb11 + id*args.nb12 + src_cn_idx*args.nb13;
+
+                    // Dereference memory and cast weights to f32 if they were f16
+                    float w_val = (float)*(device const T*)((device const char*)src0 + w_idx);
+                    float i_val = *(device const float*)((device const char*)src1 + i_idx);
+
+                    sum += w_val * i_val;
+                }
+            }
+        }
+    }
+
+    // 5. Write the accumulated value out to RAM
+    int64_t dst_cn_idx = batch_idx * args.OC + oc;
+    int64_t d_idx = ow*args.nb0 + oh*args.nb1 + od*args.nb2 + dst_cn_idx*args.nb3;
+
+    *(device float*)(dst + d_idx) = sum;
+}
+
+// Explicit instantiations so the JIT compiler can find them by name
+template [[host_name("kernel_conv_3d_f32_f32")]]
+kernel void kernel_conv_3d<float>(
+    constant ggml_metal_kargs_conv_3d & args,
+    device const char * src0,
+    device const char * src1,
+    device       char  * dst,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]]);
+
+// Explicit instantiation for f16 weights
+template [[host_name("kernel_conv_3d_f16_f32")]]
+kernel void kernel_conv_3d<half>(
+    constant ggml_metal_kargs_conv_3d & args,
+    device const char  * src0,
+    device const char * src1,
+    device       char  * dst,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]]);
