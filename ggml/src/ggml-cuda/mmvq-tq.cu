@@ -80,11 +80,11 @@ static constexpr float TQ3_CENTROID_I8_RESCALE = 1.996684f / 127.0f;
 // TQ decode path: int8 dp4a on NVIDIA, CDNA, RDNA2 and RDNA3.0, scalar float elsewhere.
 // TQ3_1S takes dp4a on HIP only. GGML_TQ_DP4A=1/0 forces either path.
 static bool tq_use_dp4a(int cc, ggml_type type) {
-    if (type != GGML_TYPE_TQ4_1S && type != GGML_TYPE_TQ3_1S) {
+    if (type != GGML_TYPE_TQ4_1S && type != GGML_TYPE_TQ3_1S && type != GGML_TYPE_TQ3_4S) {
         return false;
     }
 #ifndef GGML_USE_HIP
-    if (type == GGML_TYPE_TQ3_1S) {
+    if (type == GGML_TYPE_TQ3_1S || type == GGML_TYPE_TQ3_4S) {
         return false;
     }
 #endif
@@ -169,6 +169,34 @@ static __device__ __forceinline__ void tq3_groups(const uint8_t * __restrict__ q
     g1 = (w0 >> 24) | ((w1 & 0x0000FFFFu) << 8);
     g2 = (w1 >> 16) | ((w2 & 0x000000FFu) << 16);
     g3 =  w2 >> 8;
+}
+
+// TQ3_1S and TQ3_4S share the 3-bit index packing of a 32-value block and differ only in where
+// its two half-block scales live: in the block itself, or as 6-bit multiples in the header of
+// the 128-value super-block holding it. These give a row's length in bytes and, for block ib of
+// a row, its index bytes and scales, so a kernel written for one serves both.
+template <ggml_type T>
+static __device__ __forceinline__ int64_t tq3_row_bytes(const int blocks_per_row) {
+    static_assert(T == GGML_TYPE_TQ3_1S || T == GGML_TYPE_TQ3_4S, "TQ3 types only");
+    return T == GGML_TYPE_TQ3_1S ? (int64_t) blocks_per_row * (int64_t) sizeof(block_tq3_1s)
+                                 : (int64_t) (blocks_per_row / 4) * (int64_t) sizeof(block_tq3_4s);
+}
+
+template <ggml_type T>
+static __device__ __forceinline__ const uint8_t * tq3_block_at(const char * __restrict__ x_row, const int ib,
+                                                              float & d0, float & d1) {
+    if constexpr (T == GGML_TYPE_TQ3_1S) {
+        const block_tq3_1s * blk = (const block_tq3_1s *) x_row + ib;
+        d0 = __half2float(blk->d0);
+        d1 = __half2float(blk->d1);
+        return blk->qs;
+    } else {
+        const block_tq3_4s * sb = (const block_tq3_4s *) x_row + (ib >> 2);
+        const float2 d = tq3_4s_sub_scales(sb, ib & 3);
+        d0 = d.x;
+        d1 = d.y;
+        return sb->qs + 12*(ib & 3);
+    }
 }
 
 // ============================================================================
@@ -617,7 +645,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multi(
 
 // Multi-token TQ3_1S dp4a kernel (ncols_dst <= 8): the TQ4_1S kernel above with the 3-bit
 // unpack. The four 8-element index groups of a block expand through tq3_cents8_reg.
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>   // T: TQ3_1S or TQ3_4S, see tq3_block_at
 static __global__ void mul_mat_tq3_1s_dp4a_multi(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,
@@ -632,19 +660,18 @@ static __global__ void mul_mat_tq3_1s_dp4a_multi(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row = ((const block_tq3_1s *) vx) + (int64_t)row * blocks_per_row;
+    const char * x_row = (const char *) vx + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
 
     float sumf[ncols_dst] = {};
 
     for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
-        const block_tq3_1s * blk = &x_row[ib];
-        const float fd0 = __half2float(blk->d0);
-        const float fd1 = __half2float(blk->d1);
+        float fd0, fd1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, fd0, fd1);
 
         // Load weight once, reuse across all tokens. 3-bit indices pack 8-per-3-bytes,
         // so the block's 12 qs bytes give four 8-element groups.
         uint32_t g0, g1, g2, g3;
-        tq3_groups(blk->qs, g0, g1, g2, g3);
+        tq3_groups(qs, g0, g1, g2, g3);
 
         int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
         tq3_cents8_reg(g0, c0_0, c1_0);
@@ -688,7 +715,7 @@ static __global__ void mul_mat_tq3_1s_dp4a_multi(
 
 // Multi-row TQ3_1S dp4a kernel: each warp owns nrows_per_warp rows and reads each activation
 // block once for all of them, instead of once per row.
-template <int ncols_dst, int nrows_per_warp>
+template <int ncols_dst, int nrows_per_warp, ggml_type T = GGML_TYPE_TQ3_1S>   // T: see tq3_block_at
 static __global__ void mul_mat_tq3_1s_dp4a_multirow(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,
@@ -703,7 +730,8 @@ static __global__ void mul_mat_tq3_1s_dp4a_multirow(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_base = (const block_tq3_1s *) vx;
+    const char * x_base = (const char *) vx;
+    const int64_t row_bytes = tq3_row_bytes<T>(blocks_per_row);
 
     float sumf[nrows_per_warp][ncols_dst] = {};
 
@@ -729,12 +757,11 @@ static __global__ void mul_mat_tq3_1s_dp4a_multirow(
                 break;
             }
 
-            const block_tq3_1s * blk = x_base + (int64_t) row * blocks_per_row + ib;
-            const float fd0 = __half2float(blk->d0);
-            const float fd1 = __half2float(blk->d1);
+            float fd0, fd1;
+            const uint8_t * qs = tq3_block_at<T>(x_base + (int64_t) row * row_bytes, ib, fd0, fd1);
 
             uint32_t g0, g1, g2, g3;
-            tq3_groups(blk->qs, g0, g1, g2, g3);
+            tq3_groups(qs, g0, g1, g2, g3);
 
             int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
             tq3_cents8_reg(g0, c0_0, c1_0);
@@ -893,7 +920,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multirow(
 // Multi-token TQ3_1S scalar kernel (ncols_dst ≤ 8)
 // ============================================================================
 
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>   // T: TQ3_1S or TQ3_4S, see tq3_block_at
 static __global__ void mul_mat_tq3_1s_multi(
         const void  * __restrict__ vx,
         const float * __restrict__ vy_rot,
@@ -916,13 +943,15 @@ static __global__ void mul_mat_tq3_1s_multi(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row = ((const block_tq3_1s *) vx) + (int64_t)row * blocks_per_row;
+    const char * x_row = (const char *) vx + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
 
     float sumf[ncols_dst] = {};
 
     for (int ib = 0; ib < blocks_per_row; ib++) {
-        const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+        float d0, d1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, d0, d1);
+        const float d = (lane < 16) ? d0 : d1;
+        const uint32_t idx = tq3_extract_index_fast(qs, lane);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         const float w = tq3_cent_reg(idx) * d;
 #else
@@ -1055,18 +1084,18 @@ static void launch_tq4_1s_scalar_multi(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>
 static void launch_tq3_1s_multi(
         const void * src0_d, const float * act_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
-    mul_mat_tq3_1s_multi<ncols_dst><<<grid, block, 0, stream>>>(
+    mul_mat_tq3_1s_multi<ncols_dst, T><<<grid, block, 0, stream>>>(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
-template <int ncols_dst, int nrows_per_warp>
+template <int ncols_dst, int nrows_per_warp, ggml_type T>
 static void launch_tq3_1s_dp4a_multirow_impl(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
@@ -1074,24 +1103,24 @@ static void launch_tq3_1s_dp4a_multirow_impl(
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const int rows_per_block = MMVQ_TQ_NWARPS * nrows_per_warp;
     const dim3 grid((nrows_x + rows_per_block - 1) / rows_per_block);
-    mul_mat_tq3_1s_dp4a_multirow<ncols_dst, nrows_per_warp><<<grid, block, 0, stream>>>(
+    mul_mat_tq3_1s_dp4a_multirow<ncols_dst, nrows_per_warp, T><<<grid, block, 0, stream>>>(
         src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
-template <int ncols_dst>
+template <int ncols_dst, ggml_type T = GGML_TYPE_TQ3_1S>
 static void launch_tq3_1s_dp4a_multi(
         const void * src0_d, const block_q8_1 * q8_buf,
         float * dst_d, int ncols_x, int nrows_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
     // Two rows per warp pay from 3 columns up (measured on CDNA, RDNA2 and RDNA3).
     if constexpr (ncols_dst >= 3) {
-        launch_tq3_1s_dp4a_multirow_impl<ncols_dst, 2>(
+        launch_tq3_1s_dp4a_multirow_impl<ncols_dst, 2, T>(
             src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);
         return;
     }
     const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
     const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
-    mul_mat_tq3_1s_dp4a_multi<ncols_dst><<<grid, block, 0, stream>>>(
+    mul_mat_tq3_1s_dp4a_multi<ncols_dst, T><<<grid, block, 0, stream>>>(
         src0_d, q8_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
@@ -1395,12 +1424,11 @@ static void launch_tq3_1s_wmma(
 //   grid.z = token/sample (ne2)            one dot product per (row, expert_slot, sample)
 // ============================================================================
 
-// Fills a per-expert address table. Every entry is base + i*nb_expert here, which reproduces the
-// contiguous layout exactly; the point is that an entry can instead be made to point at a VRAM
-// cache slot or at mapped host memory for an expert that is not resident, with the kernels none
-// the wiser. Built on the device so nothing is read back to the host, which would be illegal
-// inside a graph capture.
-template <bool USE_TABLE>
+// USE_TABLE swaps the contiguous base + expert*nb_expert addressing for a lookup in the
+// per-expert address table built by tq_build_expert_table, so an expert can be read from a VRAM
+// cache slot or from host memory with the kernel none the wiser. false reproduces the original
+// contiguous addressing exactly.
+template <bool USE_TABLE, ggml_type T = GGML_TYPE_TQ3_1S>   // T: TQ3_1S or TQ3_4S, see tq3_block_at
 static __global__ void mul_mat_tq3_1s_moe(
         const void    * __restrict__ vx,       // all experts, base pointer
         const float   * __restrict__ vy_rot,   // pre-rotated activations
@@ -1434,16 +1462,18 @@ static __global__ void mul_mat_tq3_1s_moe(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row =
-        (const block_tq3_1s *) (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
-                             : (const char *) vx + (int64_t) expert * nb_expert)
-        + (int64_t) row * blocks_per_row;
+    const char * x_row =
+        (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
+                   : (const char *) vx + (int64_t) expert * nb_expert)
+        + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
     const float * act = vy_rot + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
     float sumf = 0.0f;
     for (int ib = 0; ib < blocks_per_row; ib++) {
-        const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+        float d0, d1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, d0, d1);
+        const float d = (lane < 16) ? d0 : d1;
+        const uint32_t idx = tq3_extract_index_fast(qs, lane);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         const float w = tq3_cent_reg(idx) * d;
 #else
@@ -1600,8 +1630,8 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
 }
 
 // TQ3_1S dp4a MoE variant: mul_mat_tq4_1s_dp4a_moe with the 3-bit unpack of
-// mul_mat_tq3_1s_dp4a_multi.
-template <int LPR, bool USE_TABLE>   // LPR: lanes cooperating on one output row (must divide WARP_SIZE)
+// mul_mat_tq3_1s_dp4a_multi. T: TQ3_1S or TQ3_4S, see tq3_block_at.
+template <int LPR, bool USE_TABLE, ggml_type T = GGML_TYPE_TQ3_1S>   // LPR: lanes cooperating on one output row (must divide WARP_SIZE)
 static __global__ void mul_mat_tq3_1s_dp4a_moe(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,      // pre-rotated activations (q8_1)
@@ -1635,20 +1665,19 @@ static __global__ void mul_mat_tq3_1s_dp4a_moe(
 
     const int lane = lane_in_row;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row =
-        (const block_tq3_1s *) (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
-                             : (const char *) vx + (int64_t) expert * nb_expert)
-        + (int64_t) row * blocks_per_row;
+    const char * x_row =
+        (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
+                   : (const char *) vx + (int64_t) expert * nb_expert)
+        + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
     const block_q8_1 * a_base = vy_q8 + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
     float sumf = 0.0f;
     for (int ib = lane; ib < blocks_per_row; ib += LPR) {
-        const block_tq3_1s * blk = &x_row[ib];
-        const float fd0 = __half2float(blk->d0);
-        const float fd1 = __half2float(blk->d1);
+        float fd0, fd1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, fd0, fd1);
 
         uint32_t g0, g1, g2, g3;
-        tq3_groups(blk->qs, g0, g1, g2, g3);
+        tq3_groups(qs, g0, g1, g2, g3);
 
         int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
         tq3_cents8_reg(g0, c0_0, c1_0);
@@ -1760,7 +1789,7 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
                              const ggml_tensor * src1,
                              const ggml_tensor * ids,
                              ggml_tensor * dst) {
-    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(ids->type  == GGML_TYPE_I32);
@@ -1886,23 +1915,22 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         const dim3 grid_l((unsigned) ((nrows_x + rows_per_wg - 1) / rows_per_wg),
                           (unsigned) n_expert_used, (unsigned) n_tokens);
 
-        const bool is_tq3 = src0->type == GGML_TYPE_TQ3_1S;
-        #define TQ_LAUNCH_MOE_K(K, L) do {                                                             \
-            if (expert_tab) {                                                                          \
-                K<L, true><<<grid_l, block, 0, stream>>>(                                              \
-                    (const void *) expert_tab, q8_act, dst_d, ids_d, ncols_x, nrows_x,                 \
-                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,             \
-                    stride_channel_dst, stride_sample_dst);                                            \
-            } else {                                                                                   \
-                K<L, false><<<grid_l, block, 0, stream>>>(                                             \
-                    src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x,                                \
-                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,             \
-                    stride_channel_dst, stride_sample_dst);                                            \
-            }                                                                                          \
+        const void * expert_vx = expert_tab ? (const void *) expert_tab : src0->data;
+        #define TQ_MOE_ARGS expert_vx, q8_act, dst_d, ids_d, ncols_x, nrows_x,                   \
+            nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,              \
+            stride_channel_dst, stride_sample_dst
+        #define TQ_LAUNCH_MOE_T(L, TAB) do {                                                     \
+            if (src0->type == GGML_TYPE_TQ3_1S) {                                                 \
+                mul_mat_tq3_1s_dp4a_moe<L, TAB><<<grid_l, block, 0, stream>>>(TQ_MOE_ARGS);        \
+            } else if (src0->type == GGML_TYPE_TQ3_4S) {                                          \
+                mul_mat_tq3_1s_dp4a_moe<L, TAB, GGML_TYPE_TQ3_4S>                                  \
+                    <<<grid_l, block, 0, stream>>>(TQ_MOE_ARGS);                                   \
+            } else {                                                                              \
+                mul_mat_tq4_1s_dp4a_moe<L, TAB><<<grid_l, block, 0, stream>>>(TQ_MOE_ARGS);        \
+            }                                                                                     \
         } while (0)
-        #define TQ_LAUNCH_MOE(L) do {                                                                  \
-            if (is_tq3) { TQ_LAUNCH_MOE_K(mul_mat_tq3_1s_dp4a_moe, L); }                               \
-            else        { TQ_LAUNCH_MOE_K(mul_mat_tq4_1s_dp4a_moe, L); }                               \
+        #define TQ_LAUNCH_MOE(L) do {                                                            \
+            if (expert_tab) { TQ_LAUNCH_MOE_T(L, true); } else { TQ_LAUNCH_MOE_T(L, false); }    \
         } while (0)
 
         switch (lpr) {
@@ -1914,7 +1942,8 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
             default: TQ_LAUNCH_MOE(32); break;
         }
         #undef TQ_LAUNCH_MOE
-        #undef TQ_LAUNCH_MOE_K
+        #undef TQ_LAUNCH_MOE_T
+        #undef TQ_MOE_ARGS
     } else {
         // Pre-rotate activations to float (WHT), contiguous [ncols_x, nchannels_y, n_tokens].
         ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_act_elements);
@@ -1927,7 +1956,19 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         }
         const int64_t stride_channel_y = ncols_x;                                // float elems to next y-channel
         const int64_t stride_sample_y  = (int64_t) nchannels_y * ncols_x;        // float elems to next token
-        if (src0->type == GGML_TYPE_TQ3_1S) {
+        if (src0->type == GGML_TYPE_TQ3_4S) {
+            if (expert_tab) {
+                mul_mat_tq3_1s_moe<true, GGML_TYPE_TQ3_4S><<<grid, block, 0, stream>>>(
+                    (const void *) expert_tab, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            } else {
+                mul_mat_tq3_1s_moe<false, GGML_TYPE_TQ3_4S><<<grid, block, 0, stream>>>(
+                    src0->data, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            }
+        } else if (src0->type == GGML_TYPE_TQ3_1S) {
             if (expert_tab) {
                 mul_mat_tq3_1s_moe<true><<<grid, block, 0, stream>>>(
                     (const void *) expert_tab, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
@@ -1960,7 +2001,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                            const ggml_tensor * src0,
                            const ggml_tensor * src1,
                            ggml_tensor * dst) {
-    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -1968,6 +2009,8 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
     const int nrows_x   = src0->ne[1];
     const int ncols_dst = ggml_nrows(src1);   // every src1 row: the caller passes contiguous src1/dst and a 2D weight
     GGML_ASSERT(ncols_x % 32 == 0);
+    // TQ3_4S has kernels for the decode widths only (the caller sends ncols_dst <= MMVQ_MAX_BATCH_SIZE).
+    GGML_ASSERT(src0->type != GGML_TYPE_TQ3_4S || (ncols_x % 128 == 0 && ncols_dst <= 8));
 
     const void  * src0_d = src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -1996,29 +2039,30 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
         }
 
         // Phase 2: dispatch based on ncols_dst
-        const bool is_tq3 = src0->type == GGML_TYPE_TQ3_1S;
         const int stride_col_y   = ncols_x / 32;  // q8_1 blocks per column
         const int stride_col_dst = nrows_x;
 
+        #define TQ_LAUNCH_DENSE_DP4A(N) do {                                                           \
+            if (src0->type == GGML_TYPE_TQ3_1S) {                                                      \
+                launch_tq3_1s_dp4a_multi<N>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);              \
+            } else if (src0->type == GGML_TYPE_TQ3_4S) {                                               \
+                launch_tq3_1s_dp4a_multi<N, GGML_TYPE_TQ3_4S>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); \
+            } else {                                                                                   \
+                launch_tq4_1s_multi<N>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream);                   \
+            }                                                                                          \
+        } while (0)
         if (ncols_dst <= 8) {
             switch (ncols_dst) {
-                case 1: is_tq3 ? launch_tq3_1s_dp4a_multi<1>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<1>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 2: is_tq3 ? launch_tq3_1s_dp4a_multi<2>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<2>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 3: is_tq3 ? launch_tq3_1s_dp4a_multi<3>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<3>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 4: is_tq3 ? launch_tq3_1s_dp4a_multi<4>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<4>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 5: is_tq3 ? launch_tq3_1s_dp4a_multi<5>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<5>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 6: is_tq3 ? launch_tq3_1s_dp4a_multi<6>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<6>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 7: is_tq3 ? launch_tq3_1s_dp4a_multi<7>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<7>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                case 8: is_tq3 ? launch_tq3_1s_dp4a_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream)
-                                 : launch_tq4_1s_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 1: TQ_LAUNCH_DENSE_DP4A(1); break;
+                case 2: TQ_LAUNCH_DENSE_DP4A(2); break;
+                case 3: TQ_LAUNCH_DENSE_DP4A(3); break;
+                case 4: TQ_LAUNCH_DENSE_DP4A(4); break;
+                case 5: TQ_LAUNCH_DENSE_DP4A(5); break;
+                case 6: TQ_LAUNCH_DENSE_DP4A(6); break;
+                case 7: TQ_LAUNCH_DENSE_DP4A(7); break;
+                case 8: TQ_LAUNCH_DENSE_DP4A(8); break;
             }
+            #undef TQ_LAUNCH_DENSE_DP4A
         } else {
 #if defined(GGML_CUDA_USE_WMMA)
             if (fp16_mma_hardware_available(cc)) {
@@ -2072,6 +2116,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
         // Macro to dispatch to the right kernel based on quant type
         #define LAUNCH_SCALAR(N, src0_ptr, act_ptr, dst_ptr) \
             if (is_tq4) { launch_tq4_1s_scalar_multi<N>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); } \
+            else if (src0->type == GGML_TYPE_TQ3_4S) { launch_tq3_1s_multi<N, GGML_TYPE_TQ3_4S>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); } \
             else        { launch_tq3_1s_multi<N>(src0_ptr, act_ptr, dst_ptr, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); }
 
         if (ncols_dst <= 8) {

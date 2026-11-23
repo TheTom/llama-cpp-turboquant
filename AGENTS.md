@@ -19,14 +19,14 @@ The eleven fork-only GGML types (registered in `ggml/include/ggml.h`):
 | turbo6 | `GGML_TYPE_TURBO6_0` (52)  | KV cache only                       | 6.125 bits   | CPU, CUDA/HIP       |
 | TQ3_1S | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max| 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max| 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
-| TQ3_4S | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU |
+| TQ3_4S | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU, CUDA/HIP |
 | Q8_CR  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot              | 8.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q5_CR  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot              | 5.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q6_CR  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot              | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
 
 The turbo blocks hold 128 values each (34, 50, 66, 82, 98 bytes for turbo2 to turbo6); the `static_assert`s in `ggml/src/ggml-common.h` are the authority, not the struct comments. ggml-sycl has no TQ weight kernels, and its generic dequantize path leaves TQ weights in the WHT-rotated domain, so TQ models are unsupported there. Vulkan and SYCL reject the `*_CR` types in `supports_op`.
 
-Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S/TQ3_4S and Q8_CR/Q5_CR/Q6_CR are `llama-quantize` targets. TQ3_4S has a CPU reference only; other backends leave it to the CPU.
+Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S/TQ3_4S and Q8_CR/Q5_CR/Q6_CR are `llama-quantize` targets. TQ3_4S has CPU and CUDA/HIP kernels only; other backends leave it to the CPU.
 
 ### Key files
 
@@ -57,7 +57,7 @@ Any combination of `f32`/`f16`/`bf16`/`q8_0`/`q4_0`/`q4_1`/`iq4_nl`/`q5_0`/`q5_1
 | `TURBO_AUTO_ASYMMETRIC`     | `1`     | Auto-select asymmetric K/V types for large-GQA models (`0` disables) |
 | `TURBO_SPARSE_V`            | `1`     | Sparse-V dequant skip in flash attention, Metal and `turbo3` V only (`0` disables) |
 | `GGML_TQ_NATIVE`            | unset   | CUDA: `1` keeps `TQ4_1S` weights native and uses the fused TQ kernels instead of converting them to `q8_0` at load; decode about 30% faster and weight VRAM about 1.7x smaller, prefill about 2x slower |
-| `GGML_TQ_MMQ`               | unset   | CUDA: native int8 MMQ prefill for TQ3_1S/TQ4_1S instead of the dequant-to-f16 + cuBLAS fallback. AMD only: the TQ MMQ config exists for CDNA/RDNA2/RDNA3/RDNA4, for both types. Unset: on for TQ3_1S, off for TQ4_1S. `0` turns it off for both, `1` turns it on for both. TQ4_1S also needs `GGML_TQ_NATIVE=1`, because otherwise the weights are converted to q8_0 at load and this path is not reached; TQ3_1S is never converted, so it needs only this knob |
+| `GGML_TQ_MMQ`               | unset   | CUDA: native int8 MMQ prefill for TQ3_1S/TQ4_1S/TQ3_4S instead of the dequant-to-f16 + cuBLAS fallback. AMD only: the TQ MMQ config exists for CDNA/RDNA2/RDNA3/RDNA4 for TQ3_1S and TQ4_1S, and for CDNA/RDNA2/RDNA3 for TQ3_4S. Unset: on for TQ3_1S, off for TQ4_1S and TQ3_4S. `0` turns it off for all three, `1` turns it on for all three. TQ4_1S also needs `GGML_TQ_NATIVE=1`, because otherwise the weights are converted to q8_0 at load and this path is not reached; TQ3_1S and TQ3_4S are never converted, so they need only this knob |
 | `GGML_CUDA_FUSE_CHAIN`      | unset   | CUDA: `0` disables elementwise chain fusion, so ADD/MUL/DIV/SCALE/CLAMP/SQR and the SILU/SIGMOID/SOFTPLUS/GELU/RELU/NEG unaries run as separate kernels |
 | `GGML_CUDA_Q8CACHE`         | unset   | CUDA: `0` disables the per-graph shared `q8_1` activation cache in `mmvq`, so a repeated activation is quantized again per use |
 | `GGML_TQ_DP4A`              | unset   | CUDA: TQ decode kernel override for measurements: unset = per architecture (dp4a on NVIDIA, CDNA, RDNA2, RDNA3.0), `1`/`0` force dp4a/scalar. TQ3_1S ignores it on non-HIP builds |

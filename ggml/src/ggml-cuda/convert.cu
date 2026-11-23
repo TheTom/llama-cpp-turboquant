@@ -468,6 +468,43 @@ static void dequantize_tq4_1s_warp_nc_cuda(const void * vx, dst_t * y,
     dequantize_block_cuda<QK_TQ4_1S, QR_TQ4_1S, dequantize_tq4_1s, dst_t>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
 }
 
+// Warp-cooperative TQ3_4S dequant: one 32-lane group per 32-value sub-block, inverse WHT
+// through shuffles, as for TQ4_1S above.
+template <typename dst_t>
+static __global__ void k_dequantize_tq3_4s_warp(
+        const block_tq3_4s * __restrict__ vx, dst_t * __restrict__ y,
+        const int64_t n_elements) {
+    const int64_t sub_idx = (int64_t)blockIdx.x * blockDim.y + threadIdx.y;   // 32-value sub-block
+    const int lane = threadIdx.x;
+    if (sub_idx * 32 + lane >= n_elements) return;
+
+    const block_tq3_4s * sb = &vx[sub_idx / 4];
+    const int sub = (int) (sub_idx % 4);
+    const float2 d = tq3_4s_sub_scales(sb, sub);
+    const uint8_t * qp = sb->qs + 12*sub + 3*(lane / 8);
+    const uint32_t packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
+    float val = TQ3_CENTROIDS_WEIGHT[(packed >> (3 * (lane % 8))) & 7] * (lane < 16 ? d.x : d.y);
+
+    #pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+    val *= 0.17677669529663688f * TQ_WEIGHT_SIGNS[lane];
+
+    y[sub_idx * 32 + lane] = (dst_t)val;
+}
+
+template <typename dst_t>
+static void dequantize_tq3_4s_warp_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TQ3_4S == 0);
+    const int64_t n_sub = k / 32;
+    const int wpb = 4;
+    const dim3 block(32, wpb);
+    const dim3 grid((n_sub + wpb - 1) / wpb);
+    k_dequantize_tq3_4s_warp<<<grid, block, 0, stream>>>((const block_tq3_4s *)vx, y, k);
+}
+
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
@@ -816,6 +853,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_tq4_1s_warp_cuda<half>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
             return dequantize_block_cont_cuda<QK_TQ3_0, QR_TQ3_1S, dequantize_tq3_1s>;
+        case GGML_TYPE_TQ3_4S:
+            return dequantize_tq3_4s_warp_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -893,6 +932,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_tq4_1s_warp_cuda<float>;  // fast warp-cooperative WHT
         case GGML_TYPE_TQ3_1S:
             return dequantize_block_cont_cuda<QK_TQ3_0, QR_TQ3_1S, dequantize_tq3_1s>;
+        case GGML_TYPE_TQ3_4S:
+            return dequantize_tq3_4s_warp_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -934,6 +975,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_TQ4_1S, QR_TQ4_1S, dequantize_tq4_1s>;
         case GGML_TYPE_TQ3_1S:
             return dequantize_block_cuda<QK_TQ3_0, QR_TQ3_1S, dequantize_tq3_1s>;
+        case GGML_TYPE_TQ3_4S:
+            return dequantize_block_cuda<QK_TQ3_4S, 1, dequantize_tq3_4s>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:
@@ -998,6 +1041,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK_TQ4_1S, QR_TQ4_1S, dequantize_tq4_1s>;
         case GGML_TYPE_TQ3_1S:
             return dequantize_block_cuda<QK_TQ3_0, QR_TQ3_1S, dequantize_tq3_1s>;
+        case GGML_TYPE_TQ3_4S:
+            return dequantize_block_cuda<QK_TQ3_4S, 1, dequantize_tq3_4s>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
         default:
