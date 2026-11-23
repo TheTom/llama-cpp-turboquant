@@ -8416,6 +8416,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_TURBO5_0 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
+                // turbo2/3/4 and the TQ weight types read back to f32 through the same
+                // dequantizers the KV cache and the weight loader use
+                if ((src0_type == GGML_TYPE_TURBO2_0 || src0_type == GGML_TYPE_TURBO3_0 ||
+                     src0_type == GGML_TYPE_TURBO4_0 || src0_type == GGML_TYPE_TQ3_1S ||
+                     src0_type == GGML_TYPE_TQ4_1S) && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0) {
                     return true;
                 }

@@ -134,6 +134,68 @@ static __device__ void cpy_blck_turbo5_0_f32(const char * cxi, char * cdsti) {
     }
 }
 
+// turbo2/3/4 dequant pairs are consecutive elements, like turbo5/turbo6
+static __device__ void cpy_blck_turbo4_0_f32(const char * cxi, char * cdsti) {
+    float * cdstf = (float *)(cdsti);
+
+#pragma unroll
+    for (int j = 0; j < QK_TURBO4; j += 2) {
+        float2 dq;
+        dequantize_turbo4_0(cxi, 0, j, dq);
+        *(cdstf + j) = dq.x;
+        *(cdstf + j + 1) = dq.y;
+    }
+}
+
+static __device__ void cpy_blck_turbo3_0_f32(const char * cxi, char * cdsti) {
+    float * cdstf = (float *)(cdsti);
+
+#pragma unroll
+    for (int j = 0; j < QK_TURBO3; j += 2) {
+        float2 dq;
+        dequantize_turbo3_0(cxi, 0, j, dq);
+        *(cdstf + j) = dq.x;
+        *(cdstf + j + 1) = dq.y;
+    }
+}
+
+static __device__ void cpy_blck_turbo2_0_f32(const char * cxi, char * cdsti) {
+    float * cdstf = (float *)(cdsti);
+
+#pragma unroll
+    for (int j = 0; j < QK_TURBO2; j += 2) {
+        float2 dq;
+        dequantize_turbo2_0(cxi, 0, j, dq);
+        *(cdstf + j) = dq.x;
+        *(cdstf + j + 1) = dq.y;
+    }
+}
+
+// TQ3_1S/TQ4_1S: the dequantizer already applies the inverse WHT, so the copy is in the primal basis
+static __device__ void cpy_blck_tq4_1s_f32(const char * cxi, char * cdsti) {
+    float * cdstf = (float *)(cdsti);
+
+#pragma unroll
+    for (int j = 0; j < QK_TQ4_1S; j += 2) {
+        float2 dq;
+        dequantize_tq4_1s(cxi, 0, j, dq);
+        *(cdstf + j) = dq.x;
+        *(cdstf + j + 1) = dq.y;
+    }
+}
+
+static __device__ void cpy_blck_tq3_1s_f32(const char * cxi, char * cdsti) {
+    float * cdstf = (float *)(cdsti);
+
+#pragma unroll
+    for (int j = 0; j < QK_TQ3_0; j += 2) {
+        float2 dq;
+        dequantize_tq3_1s(cxi, 0, j, dq);
+        *(cdstf + j) = dq.x;
+        *(cdstf + j + 1) = dq.y;
+    }
+}
+
 template<dequantize_kernel_t dequant, int qk>
 static __device__ void cpy_blck_q_f32(const char * cxi, char * cdsti) {
     float * cdstf = (float *)(cdsti);
@@ -317,11 +379,28 @@ static void ggml_cpy_turbo5_0_f32_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+#define GGML_CPY_TURBO_F32_LAUNCHER(name, qk)                                              \
+static void ggml_cpy_##name##_f32_cuda(                                                     \
+    const char * cx, char * cdst, const int64_t ne,                                        \
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02, \
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) { \
+                                                                                           \
+    const int64_t num_blocks = (ne/(qk) + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;  \
+    GGML_ASSERT(num_blocks <= INT_MAX);                                                     \
+    cpy_q_f32<cpy_blck_##name##_f32, qk><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>    \
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13); \
+}
+
+GGML_CPY_TURBO_F32_LAUNCHER(turbo4_0, QK_TURBO4)
+GGML_CPY_TURBO_F32_LAUNCHER(turbo3_0, QK_TURBO3)
+GGML_CPY_TURBO_F32_LAUNCHER(turbo2_0, QK_TURBO2)
+GGML_CPY_TURBO_F32_LAUNCHER(tq4_1s,    QK_TQ4_1S)
+GGML_CPY_TURBO_F32_LAUNCHER(tq3_1s,    QK_TQ3_0)
+
 static void ggml_cpy_f32_q4_0_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
-
     GGML_ASSERT(ne % QK4_0 == 0);
     const int64_t num_blocks = (ne/QK4_0 + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
@@ -594,6 +673,21 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_TURBO5_0 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_turbo5_0_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TURBO4_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_turbo4_0_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TURBO3_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_turbo3_0_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TURBO2_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_turbo2_0_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TQ4_1S && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_tq4_1s_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_TQ3_1S && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_tq3_1s_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q4_0) {
         ggml_cpy_f32_q4_0_cuda

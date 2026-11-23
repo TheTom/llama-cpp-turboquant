@@ -1296,14 +1296,30 @@ static void mul_mat_vec_q_switch_ncols_dst(
     };
 
     if (has_ids && ncols_dst > 1) {
-        // Multi-token MUL_MAT_ID path - dedicated MoE kernel
-        mul_mat_vec_q_moe_launch<type>(
-            vx, vy, ids, fusion, nullptr, nullptr, nullptr, dst,
-            ncols_x, nchannels_y_fd, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst,
-            0.0f, 0.0f, 0.0f, 0.0f, stream);
+        // Multi-token MUL_MAT_ID path - dedicated MoE kernel.
+        // The fusion flags are template arguments, so pick the instantiation here.
+        // The shared expert adds a grid block, so the kernel has to know about the
+        // fusion even when only the shared expert is fused.
+        const bool use_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr ||
+                                fusion.gate_bias != nullptr || fusion.x_scale != nullptr ||
+                                fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
+        if (use_fusion) {
+            mul_mat_vec_q_moe_launch<type, true>(
+                vx, vy, ids, fusion, nullptr, nullptr, nullptr, dst,
+                ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst,
+                0.0f, 0.0f, 0.0f, 0.0f, stream);
+        } else {
+            mul_mat_vec_q_moe_launch<type, false>(
+                vx, vy, ids, fusion, nullptr, nullptr, nullptr, dst,
+                ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst,
+                0.0f, 0.0f, 0.0f, 0.0f, stream);
+        }
         return;
     }
 
