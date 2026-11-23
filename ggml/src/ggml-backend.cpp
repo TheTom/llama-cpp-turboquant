@@ -2399,10 +2399,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                   sched->moe_cache_api.session_leave,
                   sched->moe_cache_api);
 
-    ggml_tensor * prev_ids_tensor = nullptr;
-    std::vector<int32_t> ids;
-    std::vector<ggml_bitset_t> used_ids;
-
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
