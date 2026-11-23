@@ -10763,6 +10763,58 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Gemma 4 global layers: head dim 512 with mixed turbo K/V pairs
+    for (auto kv_types : std::vector<std::pair<ggml_type, ggml_type>>{
+            {GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0},
+            {GGML_TYPE_Q8_0, GGML_TYPE_TURBO5_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_Q8_0}}) {
+        for (int kv : { 512, 1024 }) {
+            for (int nb : { 1, 3, 32 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {4, 1}, kv, nb, true, false, 0, 0,
+                                                                GGML_PREC_F32, kv_types.first, kv_types.second));
+            }
+        }
+    }
+    // every turbo pair with a turbo5_0 / turbo6_0 side (fused MMA decode at head dims 128, 256 and 512 for the pairs
+    // compiled in this build, f16 conversion for the others), plus q8_0/turbo5 and turbo5/q8_0 (f16 conversion at
+    // 512): the Gemma 4 global-layer shape, 2 KV heads x 8 query heads (1 token and 2-4 token draft batches), and
+    // GQA 4, 2 and 1, so every fused column config runs at 128 and 256; kv 113 ends in a partial KV tile. At 512
+    // the op needs GQA > 1 and kv % 256 == 0, so the GQA 1 and kv 113 cases report "not supported" there
+    {
+        std::vector<std::pair<ggml_type, ggml_type>> kv_pairs = {
+            {GGML_TYPE_Q8_0, GGML_TYPE_TURBO5_0}, {GGML_TYPE_TURBO5_0, GGML_TYPE_Q8_0}};
+        const ggml_type turbo_types[] = {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
+                                         GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0};
+        for (ggml_type k : turbo_types) {
+            for (ggml_type v : turbo_types) {
+                if (k == GGML_TYPE_TURBO5_0 || k == GGML_TYPE_TURBO6_0 || v == GGML_TYPE_TURBO5_0 || v == GGML_TYPE_TURBO6_0) {
+                    kv_pairs.emplace_back(k, v);
+                }
+            }
+        }
+        for (int hs : { 128, 256, 512 }) {
+            for (auto kv_types : kv_pairs) {
+                for (int kv : { 512, 1024 }) {
+                    for (int nr : { 8, 4 }) {
+                        for (int nb : { 1, 2, 3, 4 }) {
+                            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nr == 8 ? 2 : 4, {nr, 1}, kv, nb, true, false, 0, 0,
+                                                                            GGML_PREC_F32, kv_types.first, kv_types.second));
+                        }
+                    }
+                    for (int nr : { 2, 1 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {nr, 1}, kv, 4, true, false, 0, 0,
+                                                                        GGML_PREC_F32, kv_types.first, kv_types.second));
+                    }
+                }
+                for (int nb : { 1, 3 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 113, nb, true, false, 0, 0,
+                                                                    GGML_PREC_F32, kv_types.first, kv_types.second));
+                }
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 113, 3, true, false, 0, 0,
+                                                                GGML_PREC_F32, kv_types.first, kv_types.second));
+            }
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
@@ -10799,7 +10851,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         if (is_turbo_kv && hsk < 128) continue;
                                                         // turbo MMA/VEC kernels are also instantiated at hsk=256 (fattn-mma-turbo.cuh
                                                         // DECL_FATTN_MMA_TURBO_ALL(256,256,...)); exercise the swizzled-write path there too.
-                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128 && !(is_turbo_kv && hsk == 256)) continue;
+                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128 && !(is_turbo_kv && (hsk == 256 || hsk == 512))) continue;
                                                         // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                         const bool v_is_view_of_k = hsk == 576;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
@@ -10835,7 +10887,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0));
         }
     }
-    // turbo6_0 / turbo5_0 against the unfused partners, which always take the VEC path
+    // turbo6_0 / turbo5_0 against non-turbo partners (no fused instances), and turbo pairs at GQA 1
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO6_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO5_0, GGML_TYPE_F16));
@@ -11319,6 +11371,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int nr : { 1, 4, 8, }) {
                 for (int nb : { 1, 4096, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hsv, 8, {nr, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, v_view));
+                }
+            }
+        }
+    }
+
+    // turbo KV decode at depth, every pair with a turbo5_0 / turbo6_0 side (compare with GGML_TURBO_MMA_FUSED=0):
+    // head dim 512 as the Gemma 4 global layers (2 KV heads, GQA 8), 256 as its sliding layers (8 KV heads, GQA 2),
+    // 128 with 8 KV heads and GQA 4; 1 token and a 4-token draft batch
+    {
+        const ggml_type turbo_types[] = {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0,
+                                         GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0};
+        for (int hs : { 128, 256, 512 }) {
+            const int nh = hs == 512 ? 2 : 8;
+            const int nr = hs == 512 ? 8 : hs == 256 ? 2 : 4;
+            for (ggml_type k : turbo_types) {
+                for (ggml_type v : turbo_types) {
+                    if (k != GGML_TYPE_TURBO5_0 && k != GGML_TYPE_TURBO6_0 && v != GGML_TYPE_TURBO5_0 && v != GGML_TYPE_TURBO6_0) {
+                        continue;
+                    }
+                    for (int nb : { 1, 4 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, k, v));
+                    }
                 }
             }
         }

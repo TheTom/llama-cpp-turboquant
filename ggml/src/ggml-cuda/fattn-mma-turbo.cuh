@@ -30,8 +30,8 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
-    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
-    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
+    const int  nbatch_K2      = ggml_cuda_fattn_mma_turbo_nbatch_2(DKQ, ncols); // same widths as the kernel
+    const int  nbatch_V2      = ggml_cuda_fattn_mma_turbo_nbatch_2(DV,  ncols);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
 
@@ -120,16 +120,50 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
-DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0);
-DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0);
-DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0);
-DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0);
-// turbo6_0 / turbo5_0 K over a turbo3 V: the 6-or-5-bit K, 3-bit V pairs
-DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0);
-DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0);
-DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0);
-DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0);
-// turbo4 V under a turbo6_0 / turbo5_0 K, and turbo5_0 V under a turbo6_0 K (head dim 256 only)
-DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0);
-DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0);
-DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0);
+
+// Pairs with a turbo5_0 / turbo6_0 side, at head dims 128, 256 and 512 (Gemma 4 global layers): turbo6/turbo5 K
+// over a turbo V, and turbo2/3/4 K over a turbo6/turbo5 V. Without GGML_CUDA_FA_ALL_QUANTS only the pairs that
+// ggml_cuda_fattn_turbo56_pair_supported (fattn.cu) accepts are compiled; keep in sync with
+// ggml_cuda_fattn_mma_turbo56_pair_compiled below and with the fattn-mma-turbo-instance-dkq*-k5/k6/v56 files.
+#define DECL_FATTN_MMA_TURBO_56_BASE(D) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO5_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO4_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO3_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO4_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0)
+
+#define DECL_FATTN_MMA_TURBO_56_EXTRA(D) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO2_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO2_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO6_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO6_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO5_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO6_0) \
+    DECL_FATTN_MMA_TURBO_ALL(D, D, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO5_0)
+
+DECL_FATTN_MMA_TURBO_56_BASE(128)
+DECL_FATTN_MMA_TURBO_56_BASE(256)
+DECL_FATTN_MMA_TURBO_56_BASE(512)
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+DECL_FATTN_MMA_TURBO_56_EXTRA(128)
+DECL_FATTN_MMA_TURBO_56_EXTRA(256)
+DECL_FATTN_MMA_TURBO_56_EXTRA(512)
+#endif // GGML_CUDA_FA_ALL_QUANTS
+
+// true if the fused MMA path has instances for this K/V pair with a turbo5_0 / turbo6_0 side (see the lists above)
+static constexpr bool ggml_cuda_fattn_mma_turbo56_pair_compiled(const ggml_type k, const ggml_type v) {
+    const bool k56 = k == GGML_TYPE_TURBO5_0 || k == GGML_TYPE_TURBO6_0;
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    const bool v56 = v == GGML_TYPE_TURBO5_0 || v == GGML_TYPE_TURBO6_0;
+    const bool k_turbo = k56 || k == GGML_TYPE_TURBO2_0 || k == GGML_TYPE_TURBO3_0 || k == GGML_TYPE_TURBO4_0;
+    const bool v_turbo = v56 || v == GGML_TYPE_TURBO2_0 || v == GGML_TYPE_TURBO3_0 || v == GGML_TYPE_TURBO4_0;
+    return (k56 && v_turbo) || (v56 && k_turbo);
+#else
+    return k56 && (v == k || v == GGML_TYPE_TURBO3_0 || v == GGML_TYPE_TURBO4_0 ||
+                   (k == GGML_TYPE_TURBO6_0 && v == GGML_TYPE_TURBO5_0));
+#endif // GGML_CUDA_FA_ALL_QUANTS
+}
