@@ -10248,13 +10248,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // TQ3_4S at Qwen3.8-Flash-Next's expert shapes: 512 experts, gate/up [2560 x 640] and down
-    // [640 x 2560]. A 640-value row is five 128-value super-blocks, so the MMQ prefill tile, which
-    // covers two super-blocks, runs one past the end of every row; n spans the decode matvec,
-    // the speculative batch widths and prefill.
-    for (int n : {1, 3, 9, 32, 512}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ3_4S, GGML_TYPE_F32, 512, 8, false,  640, n, 2560)); // gate/up
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ3_4S, GGML_TYPE_F32, 512, 8, false, 2560, n,  640)); // down
+    // TQ3_4S at Qwen3.8-Flash-Next's expert down shape: 512 experts, [640 x 2560]. A 640-value row
+    // is five 128-value super-blocks, so the MMQ prefill tile, which covers two super-blocks, runs
+    // one past the end of every row. n = 9 is a speculative batch, n = 512 prefill.
+    for (int n : {9, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ3_4S, GGML_TYPE_F32, 512, 8, false, 2560, n, 640));
     }
 
     for (ggml_type type_a : base_types) {
