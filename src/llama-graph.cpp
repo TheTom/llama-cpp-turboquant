@@ -3143,6 +3143,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    // TurboQuant pre-rotate-queries: the K cache holds WHT-rotated values, so Q has to be
+    // rotated the same way before the attention. For zero-padded models (head_dim not
+    // 128-aligned), pad Q to match the padded K dim first.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 ||
+        k->type == GGML_TYPE_TURBO5_0 || k->type == GGML_TYPE_TURBO6_0) {
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward
+    }
+
     // split the batch into streams if needed
     const auto n_stream = kv_rows ? kv_rows->ne[1] : k->ne[3];
 
@@ -3358,20 +3372,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
-
-    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
-    // Q shape: (n_embd_head, n_head, n_tokens)
-    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO5_0 || k->type == GGML_TYPE_TURBO6_0) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
-    }
 
     // the KV values and the KQ bias are padded with zeros up to the KV dimension of the mask
     const int64_t n_kv_pad = kq_mask->ne[0] - k->ne[2];
