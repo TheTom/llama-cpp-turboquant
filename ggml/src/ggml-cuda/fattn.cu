@@ -3271,9 +3271,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     fattn_vec_case_t vec_case = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type);
     if (vec_case == nullptr) {
-        // The f16 fallback needs a generic f16 dequantizer. The turbo KV types have none,
-        // so they must have a compiled vector kernel instance.
-        if (ggml_get_to_fp16_cuda(K->type) == nullptr || ggml_get_to_fp16_cuda(V->type) == nullptr) {
+        // The f16 fallback needs a generic f16 dequantizer for the types that are not f16 already.
+        // The turbo KV types have none, so they must have a compiled vector kernel instance.
+        const bool k_needs_f16 = K->type != GGML_TYPE_F16 && ggml_get_to_fp16_cuda(K->type) == nullptr;
+        const bool v_needs_f16 = V->type != GGML_TYPE_F16 && ggml_get_to_fp16_cuda(V->type) == nullptr;
+        if (k_needs_f16 || v_needs_f16) {
             GGML_ABORT("fatal error: no FlashAttention vector kernel compiled for K/V types %s-%s",
                 ggml_type_name(K->type), ggml_type_name(V->type));
         }
