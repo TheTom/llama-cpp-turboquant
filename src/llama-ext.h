@@ -165,3 +165,8 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
 // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
 LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+
+// chained MTP drafting: the draft rows after the first one take their inputs from the
+// previous row's in-graph argmax, so one decode drafts n_tokens tokens
+LLAMA_API bool llama_model_supports_mtp_chain(const struct llama_model * model);
+LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
