@@ -1611,6 +1611,15 @@ struct llama_model_dflash : public llama_model_base {
     variant_type  variant  = VARIANT_DFLASH;
     backbone_type backbone = BACKBONE_BASE;
 
+    // set when dflash.decoder_arch == "laguna": the draft layers follow the Laguna
+    // decoder contract (softplus attention gate, per-aux feature norms, context K/V
+    // through input_layernorm)
+    bool decoder_laguna = false;
+
+    // per-aux-feature RMSNorm weights stacked to [n_embd, n_aux], applied
+    // before concat + fc (Laguna drafters)
+    ggml_tensor * aux_norm = nullptr;
+
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
     void load_hparams_mistral_large4(llama_model_loader & ml);
@@ -1683,6 +1692,10 @@ struct llama_model_dflash : public llama_model_base {
     static ggml_tensor * build_inject_inp(llm_graph_context & g, const llama_model & model);
     static ggml_tensor * get_tok_embd(const llm_graph_context & g, const llama_model & model);
     static std::pair<ggml_tensor *, ggml_tensor *> get_lm_head(const llm_graph_context & g, const llama_model & model);
+
+    // per-aux-feature RMSNorm for Laguna drafters: norm each captured feature and
+    // scale it with the stacked per-aux weights
+    static ggml_tensor * build_aux_norm(llm_graph_context & g, const llama_model & model, ggml_tensor * cur);
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);

@@ -81,6 +81,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_ATTENTION_ROPE_PATTERN, hparams.rope_pattern, hparams.n_layer(), false);
 
+    // Laguna drafters follow the target-architecture decoder contract; see the
+    // decoder_laguna member for the behavioral differences.
+    std::string decoder_arch;
+    ml.get_key(LLM_KV_DECODER_ARCH, decoder_arch, false);
+    decoder_laguna = decoder_arch == "laguna";
+
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -112,6 +118,12 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     fc_in_s         = create_tensor(tn(LLM_TENSOR_FC,              "input_scale"), { 1 }, TENSOR_NOT_REQUIRED);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+
+    // Laguna drafters norm each captured target feature before concat + fc;
+    // the per-aux weights are stacked to [n_embd, n_aux] at conversion time
+    if (decoder_laguna) {
+        aux_norm = create_tensor(tn(LLM_TENSOR_ENC_AUX_NORM, "weight"), { n_embd, (int64_t) target_layer_ids.size() }, 0);
+    }
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
@@ -155,6 +167,20 @@ void llama_model_dflash::load_tensors_layers_base() {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
+        // Optional attention output gate (Laguna drafters). Per-head or
+        // per-element, distinguished by the stored width, same as the Laguna
+        // target arch. Absent on generic DFlash drafters.
+        if (decoder_laguna) {
+            const ggml_tensor * gate_meta = ml->get_tensor_meta(tn(LLM_TENSOR_ATTN_GATE, "weight", i).str().c_str());
+            const int64_t n_gate_out = gate_meta ? gate_meta->ne[1] : n_head;
+            if (n_gate_out != n_head && n_gate_out != n_embd_head_k * n_head) {
+                GGML_ABORT("DFlash: unexpected attention gate width %lld at layer %d "
+                           "(expected %lld per-head or %lld per-element)",
+                           (long long) n_gate_out, i, (long long) n_head, (long long) (n_embd_head_k * n_head));
+            }
+            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), { n_embd, n_gate_out }, 0);
+        }
+
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
         layer.ffn_post_norm  = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM,  "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
         layer.out_scale      = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), { 1 }, TENSOR_NOT_REQUIRED);
@@ -190,6 +216,8 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 template <>
 llama_model_dflash::graph<true>::graph(const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
+
+    cur = build_aux_norm(*this, model, cur);
 
     cur = build_lora_mm(model.fc, cur, model.fc_s);
     cb(cur, "fc_out", -1);
@@ -231,8 +259,34 @@ ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const 
 
     g.res->add_input(std::move(inp));
 
+    inp_target = build_aux_norm(g, model, inp_target);
+
     ggml_tensor * inp_g = g.build_lora_mm(model.fc, inp_target, model.fc_s);
     return g.build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+}
+
+// Laguna drafters RMS-norm each captured feature before concat + fc.
+// View the concatenated input as [n_feat, n_aux, n_tokens], norm over
+// n_feat, and multiply by the stacked per-aux weights [n_feat, n_aux].
+ggml_tensor * llama_model_dflash::build_aux_norm(llm_graph_context & g, const llama_model & model, ggml_tensor * cur) {
+    const auto & model_df = static_cast<const llama_model_dflash &>(model);
+
+    if (model_df.aux_norm == nullptr) {
+        return cur;
+    }
+
+    const int64_t n_aux  = model_df.aux_norm->ne[1];
+    const int64_t n_feat = g.hparams.n_embd_inp_enc() / n_aux;
+
+    GGML_ASSERT(n_feat == model_df.aux_norm->ne[0] && "DFlash: aux_norm width does not match the captured feature width");
+
+    cur = ggml_reshape_3d(g.ctx0, cur, n_feat, n_aux, g.n_tokens);
+    cur = ggml_rms_norm(g.ctx0, cur, g.hparams.f_norm_rms_eps);
+    cur = ggml_mul(g.ctx0, cur, model_df.aux_norm);
+    cur = ggml_reshape_2d(g.ctx0, cur, n_feat * n_aux, g.n_tokens);
+    g.cb(cur, "enc_aux_norm", -1);
+
+    return cur;
 }
 
 // tok_embd from the target model (shared via ctx_other) when the draft has none
@@ -303,9 +357,17 @@ ggml_tensor * llama_model_dflash::graph_base::build_inject() {
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
+        // Laguna draft layers project context K/V from the input_layernorm
+        // output, matching the query path (generic DFlash projects raw).
+        ggml_tensor * kv_inp = inp_g;
+        if (static_cast<const llama_model_dflash &>(model).decoder_laguna) {
+            kv_inp = build_norm(inp_g, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+            cb(kv_inp, "kv_inp_normed", il);
+        }
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, kv_inp, layer.wk_s);
         const bool shared_kv = layer.wv == nullptr;
-        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
+        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, kv_inp, layer.wv_s);
 
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -410,14 +472,41 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
 
-        // cache-aware, non-causal attention
+        // cache-aware attention (non-causal for generic DFlash, causal for
+        // Laguna -- the mask is controlled by the context's causal_attn flag).
+        // With a gate present, o_proj is deferred until after gating.
+        const bool    gated = layer.wqkv_gate != nullptr;
+        ggml_tensor * wo    = gated ? NULL : layer.wo;
+
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
 
         if (hparams.f_attn_value_scale != 0.0f) {
             cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);
             cb(cur, "attn_out_scaled", il);
+        }
+
+        if (gated) {
+            // Softplus output gate on the pre-attention hidden state, per-head
+            // (broadcast over head_dim) or per-element -- same as the Laguna
+            // target arch.
+            ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, noise_norm);
+            gate = ggml_softplus(ctx0, gate);
+            cb(gate, "attn_gate_softplus", il);
+
+            const int64_t n_tok = cur->ne[1];
+            if (layer.wqkv_gate->ne[1] == n_head) {
+                cur  = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_tok);
+                gate = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_tok);
+                cur  = ggml_mul(ctx0, cur, gate);
+                cur  = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tok);
+            } else {
+                cur = ggml_mul(ctx0, cur, gate);
+            }
+            cb(cur, "attn_gated", il);
+
+            cur = build_lora_mm(layer.wo, cur, layer.wo_s);
         }
 
         if (attn_dynamic) {
