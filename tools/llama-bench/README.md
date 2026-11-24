@@ -34,6 +34,7 @@ options:
   -v, --verbose                             verbose output
   --progress                                print test progress indicators
   --no-warmup                               skip warmup runs before benchmarking
+  --n-gen-warmup <n>                       generation tokens to run before timing (default: 1)
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 0)
   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
@@ -62,6 +63,9 @@ test parameters:
   --poll <0...100>                          (default: 50)
   -ngl, --n-gpu-layers <n>                  (default: -1)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
+  --moe-cache <auto|on|soft|off|0|MiB>      (default: auto)
+  --repack <auto|on|off|0|1>               weight repacking policy (default: auto)
+  -nr, --no-repack                         equivalent to --repack off
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)
@@ -76,7 +80,6 @@ test parameters:
                                             (default: disabled)
   -nopo, --no-op-offload <0|1>              (default: 0)
   --no-host <0|1>                           (default: 0)
-  --repack <0|1>                            (default: 1)
 
 Multiple values can be given for each parameter by separating them with ','
 or by specifying the parameter multiple times. Ranges can be given as
@@ -94,6 +97,21 @@ With the exception of `-r`, `-o` and `-v`, all options can be specified multiple
 Each test is repeated the number of times given by `-r`, and the results are averaged. The results are given in average tokens per second (t/s) and standard deviation. Some output formats (e.g. json) also include the individual results of each repetition.
 
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
+
+`--n-gen-warmup <n>` sets the number of generation tokens that run before the timed part of a generation test (default: 1). `--no-warmup` disables the warmup runs, including the generation warmup. The warmup tokens are not part of the measured time.
+
+`--repack <auto|on|off>` selects the weight repacking policy (default: `auto`). The legacy values `0` and `1` are still accepted and mean `off` and `auto`. `-nr` and `--no-repack` replace the repack policy with `off`. Like the other list-valued options, `--repack` accepts several policies, and each policy runs as a separate test.
+
+The repacking policy and the MoE cache mode interact. The MoE cache reads the expert weights with their canonical strides, so the canonical weights are required when the cache is active:
+
+- `--moe-cache auto`, `off` and `soft` keep the repacking policy.
+- `--moe-cache on` and a fixed MiB budget force the canonical weights and disable the repacking. `--repack on` is an error for these modes.
+
+The `soft` mode keeps the policy because it can run with the stock placement. The fit planner disables the repacking itself when it selects a placement that evicts experts.
+
+Use `--repack off` for a canonical-weight baseline, for example `--moe-cache off,4096 --repack off`.
+
+The `repack` output field reports the effective repacking policy, and `n_gen_warmup` reports the number of untimed warmup tokens.
 
 For a description of the other options, see the [completion example](../completion/README.md).
 
