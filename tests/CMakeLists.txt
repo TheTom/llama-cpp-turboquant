@@ -348,13 +348,44 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 llama_test(test-llama-context  NAME test-llama-context-model  LABEL "model behavior backend"  ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-llama-context-model PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+llama_build_and_test(test-state-restore-fragmented.cpp  LABEL "model"  ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+llama_build_and_test(test-save-load-state.cpp  LABEL "model"  ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-drama3-rope.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
+
+if (NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-kv-stream-plan.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-plan.cpp  LABEL behavior)
+    target_include_directories(test-kv-stream-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-kv-stream-config.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-stream-config.cpp  LABEL behavior)
+    target_include_directories(test-kv-stream-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
+llama_build_and_test(test-kv-stream-softmax.cpp llama-kv-stream-softmax.cpp  LABEL behavior)
+if (GGML_CUDA)
+    llama_build_and_test(
+        test-kv-stream-bench-config.cpp
+        ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp  LABEL behavior)
+    target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
+    llama_build_and_test(test-kv-stream-cuda-buffer.cpp  LABEL behavior)
+    target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
+    # on a GPU-less CI runner). ctest only treats that as a skip when
+    # SKIP_RETURN_CODE says so; without it the skip is recorded as a failure.
+    set_tests_properties(test-kv-stream-cuda-buffer PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build_and_test(test-kv-stream-cuda-attn.cpp  LABEL behavior)
+    target_include_directories(test-kv-stream-cuda-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    llama_build_and_test(test-kv-stream-cuda-set-rows.cpp  LABEL behavior)
+    target_include_directories(test-kv-stream-cuda-set-rows PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
@@ -395,6 +426,9 @@ llama_build_and_test(test-moe-cache-fit.cpp  LABEL "main behavior")
 llama_build_and_test(test-turbo-quant.c  LABEL "turbo")
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp  LABEL "turbo")
+
+# needs a recurrent or hybrid model, so it is built but not registered as a ctest case
+llama_build(test-recurrent-state-rollback.cpp)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)

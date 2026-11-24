@@ -1071,6 +1071,9 @@ protected:
             }
             if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
                 causal_attn = std::strcmp(buf, "true") == 0;
+            } else if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
+                // the Laguna drafters are trained with a causal noise block
+                causal_attn = std::strcmp(buf, "laguna") == 0;
             }
         }
 
@@ -1271,6 +1274,29 @@ public:
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                }
+
+                // sanitize non-finite feature values before fusing. on Metal, the
+                // mat-mat kernels stage f32 activations as f16 for the simdgroup
+                // multiply; Laguna's massive-activation rows (attention-sink tokens,
+                // |x| ~ 1e6 in the pre-final-norm residual) overflow f16 -> inf/nan.
+                // one poisoned row would otherwise NaN the whole drafter KV cache.
+                {
+                    size_t n_bad = 0;
+                    for (auto & v : features_buf) {
+                        if (!std::isfinite(v)) {
+                            v = v != v ? 0.0f : (v > 0.0f ? 65504.0f : -65504.0f);
+                            n_bad++;
+                        }
+                    }
+                    if (n_bad > 0) {
+                        static bool warned = false;
+                        if (!warned) {
+                            LOG_WRN("%s: sanitized %zu non-finite target feature values (f16 overflow on massive activations); "
+                                    "draft quality may degrade slightly on affected rows\n", __func__, n_bad);
+                            warned = true;
+                        }
                     }
                 }
 
