@@ -1177,10 +1177,11 @@ const char * llm_type_name(llm_type type) {
 
 static const char * llama_expert_gating_func_name(llama_expert_gating_func_type type) {
     switch (type) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: return "softmax";
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: return "sigmoid";
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: return "sqrtsoftplus";
-        default:                                    return "unknown";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:        return "softmax";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:        return "sigmoid";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "softmax_weight";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:  return "sqrtsoftplus";
+        default:                                           return "unknown";
     }
 }
 

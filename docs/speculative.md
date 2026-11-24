@@ -163,6 +163,32 @@ See:
 
 - #30506
 
+### Chained MTP (`--spec-chain N`)
+
+Chained MTP drafts N tokens in one GPU decode. It currently supports dense Qwen3.5-family models and requires flash attention. For recurrent models, batch and ubatch sizes below N + 2 are raised to N + 2.
+
+### Adaptive MTP (`draft-mtp-adaptive`)
+
+Multi Token Prediction (MTP) with an adaptive draft depth. Same machinery as `draft-mtp`
+(MTP heads from the main model, see the Qwen3 MTP head docs), but the number of draft tokens is
+tuned per sequence at runtime by a hysteresis controller instead of being fixed at
+`--spec-draft-n-max`.
+
+The depth starts at the floor `max(1, --spec-draft-n-min-adaptive)` (default 3) and stays in
+`[floor, n_max]`. It climbs one step after a run of consecutive verifies that accepted every
+drafted token (the run length required is low at the floor and at depth, high in the middle), and
+drops one step when accumulated misses reach a depth-scaled budget. Content that verifies well
+quickly reaches high depth; content that keeps missing sheds depth until it stops wasting
+drafting compute. Use `--spec-draft-n-min-adaptive` to keep the depth above 1 on difficult
+content:
+
+```bash
+llama-server -m Qwen3-4B.gguf --spec-type draft-mtp-adaptive \
+    --spec-draft-n-max 8 --spec-draft-n-min-adaptive 2
+```
+
+`--spec-draft-n-min-adaptive` must be in `[1, --spec-draft-n-max]`.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
