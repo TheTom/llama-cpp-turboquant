@@ -265,8 +265,10 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         if (extract_reasoning && inputs.enable_thinking) {
             // V4.1 renders a continuation without reasoning as "<｜Assistant｜></think>" even in thinking mode,
             // so consume the bare THINK_END too or it leaks into the content
-            reasoning = is_v41 ? p.optional((THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END) | p.literal(THINK_END))
-                               : p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            // Allow optional whitespace before <think> - some models emit a
+            // newline between the generation prompt and the thinking tag.
+            reasoning = is_v41 ? p.optional((p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END) | p.literal(THINK_END))
+                               : p.optional(p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
             reasoning_with_tc = THINK_START +
                 p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END })) +
                 p.space() + obligatory_tool_calls;

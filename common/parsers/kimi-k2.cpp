@@ -64,7 +64,9 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & 
 
         // Note: this model is CRAZY. It can diverge from its supposed tool calling pattern in so many ways it's not funny.
         // For example, it can call tools at the end of reasoning without closing reasoning...
-        auto reasoning = extract_reasoning ? p.optional(THINK_START + p.reasoning(
+        // Allow optional whitespace before <think> - some models emit a
+        // newline between the generation prompt and the thinking tag.
+        auto reasoning = extract_reasoning ? p.optional(p.space() + THINK_START + p.reasoning(
             p.until_one_of({ THINK_END, "<|tool_calls_section_begin|>", "<|tool_call_begin|>" })) +
             p.optional(p.literal(THINK_END))) : p.eps();
         auto generation_prompt = p.literal(GEN_PROMPT);

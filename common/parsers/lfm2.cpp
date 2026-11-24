@@ -70,7 +70,9 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
 
         auto reasoning = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            // Allow optional whitespace before <think> - some models emit a
+            // newline between the generation prompt and the thinking tag.
+            reasoning = p.optional(p.space() + THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         }
 
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
