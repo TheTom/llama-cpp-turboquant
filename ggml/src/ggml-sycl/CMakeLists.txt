@@ -224,18 +224,16 @@ endif()
 
 option(GGML_SYCL_SG32 "Use sub-group size 32 on Intel GPU (experimental)" OFF)
 
+if (GGML_SYCL_SUPPORT_XMX)
+    add_compile_definitions(GGML_SYCL_SUPPORT_XMX)
+endif()
+
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
     if (GGML_SYCL_SG32)
         add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
     else()
         add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
     endif()
-if (GGML_SYCL_SUPPORT_XMX)
-    add_compile_definitions(GGML_SYCL_SUPPORT_XMX)
-endif()
-
-if (GGML_SYCL_TARGET STREQUAL "INTEL")
-    add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
     # With AOT the option goes to ocloc inside -options (see GGML_SYCL_DEVICE_ARCH below): a bare
     # -Xs hands it to ocloc as a command-line flag, which fails the device link.
     if (NOT GGML_SYCL_DEVICE_ARCH)
