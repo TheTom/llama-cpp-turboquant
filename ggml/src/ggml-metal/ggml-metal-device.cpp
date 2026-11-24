@@ -2095,17 +2095,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     // do bounds checks for the mask?
     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
 
-    // Asymmetric K/V: always encode both K and V types in the pipeline name.
-    // Symmetric case: ktype == vtype, so the name just has the type twice.
-    // This avoids ambiguity if a type name contains underscores (e.g. q4_0).
-    snprintf(base, 256, "kernel_%s_k%s_v%s_dk%d_dv%d",
-            "flash_attn_ext",
-            ggml_type_name(op->src[1]->type),
-            ggml_type_name(op->src[2]->type),
-            type,
-            dk,
-            dv);
-
+    // Symmetric K/V uses the type name only, the same as the other kernels.
+    // Asymmetric K/V needs both type names to select the right instantiation.
+    if (use_kv_f16 || op->src[1]->type == op->src[2]->type) {
+        snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+                "flash_attn_ext",
+                type,
+                dk,
+                dv);
+    } else {
+        snprintf(base, 256, "kernel_%s_k%s_v%s_dk%d_dv%d",
+                "flash_attn_ext",
+                ggml_type_name(op->src[1]->type),
+                ggml_type_name(op->src[2]->type),
+                dk,
+                dv);
+    }
 
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d",
             base,
@@ -2207,12 +2212,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
 
     const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
 
-    // Asymmetric K/V: always encode both K and V types in the pipeline name.
-    // Uses k/v prefix to avoid ambiguity with type names containing underscores.
-    snprintf(base, 256, "kernel_%s_k%s_v%s_dk%d_dv%d",
-            "flash_attn_ext_vec",
-            ggml_type_name(op->src[1]->type),
-            ggml_type_name(op->src[2]->type),
     char qne_suffix[16] = {0};
     if (!(nqpsg == 1 && ne == ggml_metal_tuning::fa_vec_baseline_ne(dk, dv))) {
         snprintf(qne_suffix, sizeof(qne_suffix), "_q%d_ne%d", nqpsg, ne);
@@ -2225,8 +2224,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             dv,
             qne_suffix);
 
-
-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
     snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_sparse=%d_rows=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
             base,
             has_mask,

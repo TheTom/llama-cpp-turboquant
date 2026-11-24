@@ -3530,16 +3530,13 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
     // use vec kernel if the batch size is small and if the head size is supported
-    // EXPERIMENT: force non-vec for turbo3 on pre-M5 hardware.
-    // The vec kernel uses nl=8 (4 elements per dequant call) which has 4x more
-    // loop iterations than the non-vec nl=2 path. On M2 Pro, this loop overhead
-    // dominates — the non-vec path may be faster even for batch=1.
+    // The TurboQuant KV cache types have no vec kernel: they use the non-vec path.
     const ggml_type ktype = op->src[1]->type;
-    if (ktype == GGML_TYPE_TURBO2_0 || ktype == GGML_TYPE_TURBO3_0 || ktype == GGML_TYPE_TURBO4_0) {
-        const char * force_nonvec = getenv("TURBO_FORCE_NONVEC");
-        if (force_nonvec && force_nonvec[0] == '1') {
-            return false;  // force non-vec path
-        }
+    const ggml_type vtype = op->src[2]->type;
+    const bool is_turbo = (ktype == GGML_TYPE_TURBO2_0 || ktype == GGML_TYPE_TURBO3_0 || ktype == GGML_TYPE_TURBO4_0 ||
+                           vtype == GGML_TYPE_TURBO2_0 || vtype == GGML_TYPE_TURBO3_0 || vtype == GGML_TYPE_TURBO4_0);
+    if (is_turbo) {
+        return false;
     }
     return (ne01 < 20) && (ne00 % 32 == 0);
 }
@@ -3575,14 +3572,20 @@ static bool ggml_metal_op_flash_attn_ext_use_turbo_flash(const ggml_tensor * op)
     // Check environment variable to force enable (bypasses other checks)
     if (turbo_flash_env && turbo_flash_env[0] == '1') return true;
 
-    // Default: disabled — TurboFlash two-pass kernel produces corrupt output
+    // Default: disabled - TurboFlash two-pass kernel produces corrupt output
     // on Apple10 (M5 Max) and possibly other Metal4 GPUs. Use TURBO_FLASH=1
     // to opt-in for testing. See PR #91.
     return false;
-// ref: https://github.com/ggml-org/llama.cpp/pull/27390
+}
+
 // dequantize the quantized KV cache to F16 before running the F16 flash attention kernels
 static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    // the F16 pass has one kernel per K/V type, so it needs matching K and V types
+    if (op->src[1]->type != op->src[2]->type) {
+        return false;
+    }
 
     // depending on compute/bandwidth ratio, dequant to f16 kv is not always beneficial
     // ref: https://github.com/ggml-org/llama.cpp/pull/27390#issuecomment-5355152767
@@ -3657,6 +3660,12 @@ static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) 
 
     // K/V row lists are handled by the dense kernels, not by the sparse path
     if (op->src[5] != nullptr) {
+        return 0;
+    }
+
+    // the sparse path uses the vec kernels, which have no TurboQuant instantiation
+    if (op->src[1]->type == GGML_TYPE_TURBO2_0 || op->src[1]->type == GGML_TYPE_TURBO3_0 || op->src[1]->type == GGML_TYPE_TURBO4_0 ||
+        op->src[2]->type == GGML_TYPE_TURBO2_0 || op->src[2]->type == GGML_TYPE_TURBO3_0 || op->src[2]->type == GGML_TYPE_TURBO4_0) {
         return 0;
     }
 

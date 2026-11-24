@@ -1620,6 +1620,37 @@ static bool ggml_metal_supports_mul_mat_op(
     return mm_path;
 }
 
+// The turbo flash attention kernels exist only for these head size pairs.
+// A missing instantiation is a NULL pipeline dereference on the first turbo KV
+// write, so the device must reject the sizes that have no kernel.
+static bool ggml_metal_fa_turbo_head_size_supported(int64_t dk, int64_t dv, bool q8_0_side) {
+    static const int64_t turbo_head_sizes[] = { 32, 64, 96, 128, 192, 256, 320, 512, 576 };
+    static const int64_t q8_0_head_sizes[]  = { 32, 40, 48, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576 };
+
+    const int64_t * head_sizes = q8_0_side ? q8_0_head_sizes : turbo_head_sizes;
+    const int       n_head_sizes = q8_0_side ? (int) (sizeof(q8_0_head_sizes) / sizeof(q8_0_head_sizes[0]))
+                                             : (int) (sizeof(turbo_head_sizes) / sizeof(turbo_head_sizes[0]));
+
+    for (int i = 0; i < n_head_sizes; i++) {
+        if (head_sizes[i] == dk && head_sizes[i] == dv) {
+            return true;
+        }
+    }
+
+    // the K head size can be larger than the V head size
+    if (dk == 192 && dv == 128) {
+        return true;
+    }
+    if (dk == 320 && dv == 256) {
+        return true;
+    }
+    if (dk == 576 && dv == 512) {
+        return true;
+    }
+
+    return false;
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1908,6 +1939,24 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                                        (k_is_turbo && v_is_q8);
                 if (!supported) {
                     return false;
+                }
+            }
+            {
+                // the turbo kernels have fewer head size instantiations than the
+                // other types, so they need their own check
+                const bool k_is_turbo = (op->src[1]->type == GGML_TYPE_TURBO2_0 ||
+                                         op->src[1]->type == GGML_TYPE_TURBO3_0 ||
+                                         op->src[1]->type == GGML_TYPE_TURBO4_0);
+                const bool v_is_turbo = (op->src[2]->type == GGML_TYPE_TURBO2_0 ||
+                                         op->src[2]->type == GGML_TYPE_TURBO3_0 ||
+                                         op->src[2]->type == GGML_TYPE_TURBO4_0);
+                if (k_is_turbo || v_is_turbo) {
+                    // the q8_0 side has kernels for more head sizes
+                    const bool q8_0_side = (op->src[1]->type == GGML_TYPE_Q8_0 ||
+                                            op->src[2]->type == GGML_TYPE_Q8_0);
+                    if (!ggml_metal_fa_turbo_head_size_supported(op->src[1]->ne[0], op->src[2]->ne[0], q8_0_side)) {
+                        return false;
+                    }
                 }
             }
             switch (op->src[1]->type) {
