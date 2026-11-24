@@ -238,6 +238,9 @@ public:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
+    // per-layer variant: the copy on the same device as layer il
+    ggml_tensor * get_turbo_innerq_scale_inv(int32_t il) const;
+    const std::vector<ggml_tensor *> & get_turbo_innerq_copies() const { return turbo_innerq_copies; }
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -296,6 +299,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // TurboQuant InnerQ scale_inv on this layer's own device (see turbo_innerq_copies)
+        ggml_tensor * turbo_innerq_scale_inv = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -396,6 +402,9 @@ private:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;
+    // one InnerQ scale_inv per KV device context (turbo_innerq_scale_inv is copies[0]); all are
+    // kept identical: initialized together and updated together after InnerQ calibration
+    std::vector<ggml_tensor *> turbo_innerq_copies;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -498,6 +507,7 @@ public:
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const override;
+    ggml_tensor * get_turbo_innerq_scale_inv(int32_t il) const override;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
