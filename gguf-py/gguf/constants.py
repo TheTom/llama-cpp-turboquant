@@ -179,6 +179,7 @@ class Keys:
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
+        DECODER_ARCH                      = "{arch}.decoder_arch"
         REALTIME_DELAY_TOKENS             = "{arch}.realtime_delay_tokens"
         CLASSIFIER_FREE_GUIDANCE          = "{arch}.classifier_free_guidance"
 
@@ -281,6 +282,9 @@ class Keys:
         HEAD_VOCAB_SIZES   = "{arch}.ple.head_vocab_sizes"
         EOS_TOKEN_ID       = "{arch}.ple.eos_token_id"
         IMAGE_TOKEN_ID     = "{arch}.ple.image_token_id"
+
+    # the fork names the per-layer embedding keys PLE
+    PLE = PerLayerEmbedding
 
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
@@ -1099,6 +1103,7 @@ class MODEL_TENSOR(IntEnum):
     ENC_FFN_DOWN         = auto()
     ENC_FFN_UP           = auto()
     ENC_OUTPUT_NORM      = auto()
+    ENC_AUX_NORM         = auto()
     CLS                  = auto() # classifier
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
@@ -2113,6 +2118,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ENC_FFN_DOWN:              "enc.blk.{bid}.ffn_down",
     MODEL_TENSOR.ENC_FFN_UP:                "enc.blk.{bid}.ffn_up",
     MODEL_TENSOR.ENC_OUTPUT_NORM:           "enc.output_norm",
+    MODEL_TENSOR.ENC_AUX_NORM:              "enc.aux_norm",
     MODEL_TENSOR.CLS:                       "cls",
     MODEL_TENSOR.CLS_OUT:                   "cls.output",
     MODEL_TENSOR.CLS_NORM:                  "cls.norm",
@@ -6505,6 +6511,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FC,
         MODEL_TENSOR.ENC_OUTPUT_NORM,
+        MODEL_TENSOR.ENC_AUX_NORM,
         MODEL_TENSOR.D2T,
         # optional DSpark heads
         MODEL_TENSOR.DSPARK_MARKOV_W1,
@@ -7363,9 +7370,10 @@ class GGMLQuantizationType(IntEnum):
 
 
 class ExpertGatingFuncType(IntEnum):
-    SOFTMAX       = 1
-    SIGMOID       = 2
-    SQRTSOFTPLUS  = 4
+    SOFTMAX        = 1
+    SIGMOID        = 2
+    SOFTMAX_WEIGHT = 3
+    SQRTSOFTPLUS   = 4
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h

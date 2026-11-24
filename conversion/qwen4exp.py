@@ -57,6 +57,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     @classmethod
     def filter_tensors(cls, item):
         name, gen = item
+        # the checkpoint may hold the MTP head under "model.mtp." or "mtp."
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
         part = name.split(".")[1] if name.startswith("mtp.") else None
         if part in cls._MTP_EXTRA:
             if cls.no_mtp:

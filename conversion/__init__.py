@@ -20,6 +20,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "NEOChatModel": "sensenova_u1",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
+    "DFlashLagunaForCausalLM": "laguna",
+    "FishOmniBackboneForCausalLM": "fish_omni",
     "RicursiveForCausalLM": "ricursive",
     "FlintForCausalLM": "flint",
     "ApertusForCausalLM": "llama",
