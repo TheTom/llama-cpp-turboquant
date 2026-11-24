@@ -33,6 +33,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -157,7 +158,24 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 }
             }
         }
-        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+        // A non-contiguous tensor (e.g. a k_v view whose rows are strided over a
+        // wider base) must be written row by row. ggml_backend_tensor_set copies
+        // `size` bytes contiguously from tensor->data, so a single packed write
+        // lays row i at i*row_size instead of i*nb[1], leaving the tail of the
+        // logical extent holding whatever was there before.
+        if (!ggml_is_contiguous(tensor) && ggml_n_dims(tensor) >= 2) {
+            const size_t row_sz = ggml_row_size(tensor->type, tensor->ne[0]);
+            const int64_t nrows = ggml_nrows(tensor);
+            for (int64_t r = 0; r < nrows; r++) {
+                const int64_t i3 =  r / (tensor->ne[1]*tensor->ne[2]);
+                const int64_t i2 = (r / tensor->ne[1]) % tensor->ne[2];
+                const int64_t i1 =  r % tensor->ne[1];
+                const size_t off = i1*tensor->nb[1] + i2*tensor->nb[2] + i3*tensor->nb[3];
+                ggml_backend_tensor_set(tensor, dataq.data() + r*row_sz, off, row_sz);
+            }
+        } else {
+            ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+        }
     } else if (tensor->type == GGML_TYPE_I8 || tensor->type == GGML_TYPE_I16) {
         // This is going to create some weird integers though.
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * ggml_type_size(tensor->type));
@@ -1320,6 +1338,36 @@ struct test_case {
         }
     }
 
+    // Tensor types as they were when the graph was built. A backend can change
+    // the type of a tensor when it uploads the data: the CUDA backend converts
+    // TQ4_1S to q8_0 at load. A view that was created before the upload keeps
+    // the old strides and then reads garbage, so the case cannot run.
+    std::map<ggml_tensor *, ggml_type> types_before_upload;
+
+    void snapshot_types(ggml_context * ctx) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            types_before_upload[t] = t->type;
+        }
+    }
+
+    // true if a backend rewrite of a tensor type left a view with stale strides
+    bool has_stale_view(ggml_context * ctx) const {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            ggml_tensor * root = t;
+            while (root->view_src != nullptr) {
+                root = root->view_src;
+            }
+            if (root == t) {
+                continue;
+            }
+            const auto it = types_before_upload.find(root);
+            if (it != types_before_upload.end() && it->second != root->type) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // re-draw data-dependent inputs between timed perf iterations
     virtual void reinit_perf_iter(ggml_context * ctx) {
         GGML_UNUSED(ctx);
@@ -1474,6 +1522,13 @@ struct test_case {
         current_op_name   = op_desc(out);
         check_for_f16_tensor(ctx.get());
 
+        // the backend can rewrite the type of a tensor when it uploads the data
+        types_before_upload.clear();
+        snapshot_types(ctx.get());
+        if (ctx_weights) {
+            snapshot_types(ctx_weights.get());
+        }
+
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
             return test_status_t::SKIPPED;
@@ -1540,6 +1595,13 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+
+        if (has_stale_view(ctx.get()) || (ctx_weights && has_stale_view(ctx_weights.get()))) {
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", false, false,
+                               "not supported: the backend rewrote the tensor type at upload, the view is stale");
+            print_test_result_locked(output_printer, result);
+            return test_status_t::NOT_SUPPORTED;
         }
 
         // TODO: [TAG_MUL_MAT_ID_SKIP] @ngxson : remove this once CUDA implements mul_mat_id with -1 = skipped
@@ -10825,11 +10887,13 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_CR, GGML_TYPE_Q5_CR, GGML_TYPE_Q6_CR,
     GGML_TYPE_TQ2_0,
     GGML_TYPE_TQ1_0,
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S,
 };
 
 static const ggml_type base_types[] = {
@@ -11263,6 +11327,12 @@ struct test_mul_mat_cr : public test_mul_mat {
     const cr_activation_pattern pattern;
     const bool preprocess_activation;
 
+    // expected magnitude of one output: sqrt(k) * rms(weights) * rms(activation).
+    // The weights come from init_tensor_uniform with the default range, so
+    // rms(weights) = 1/sqrt(3). The value floors the denominator of the error
+    // metric.
+    double out_scale = 1.0;
+
     test_mul_mat_cr(ggml_type type_a, int64_t m, int64_t n, int64_t k,
             cr_activation_pattern pattern,
             std::array<int64_t, 2> bs = {1, 1},
@@ -11295,7 +11365,19 @@ struct test_mul_mat_cr : public test_mul_mat {
 
     double err(const float * a, const float * b, size_t n_values) override {
         if (pattern != cr_activation_pattern::ZERO) {
-            return test_mul_mat::err(a, b, n_values);
+            // The NMSE explodes when an output is near zero: a weight row that
+            // is nearly orthogonal to the activation gives a tiny output and a
+            // huge relative error. Floor the denominator with the expected
+            // output magnitude so the metric stays bounded.
+            double sum_a_2     = 0.0;
+            double sum_diff_2  = 0.0;
+            for (size_t i = 0; i < n_values; i++) {
+                const double a_i = a[i];
+                const double d_i = a_i - (double) b[i];
+                sum_a_2    += a_i * a_i;
+                sum_diff_2 += d_i * d_i;
+            }
+            return sum_diff_2 / std::max(sum_a_2, n_values*out_scale*out_scale);
         }
 
         double max_abs = 0.0;
@@ -11351,6 +11433,16 @@ struct test_mul_mat_cr : public test_mul_mat {
                             break;
                     }
                 }
+            }
+            double sum_sq = 0.0;
+            for (size_t i = 0; i < data.size(); i++) {
+                sum_sq += (double) data[i] * data[i];
+            }
+            const double rms_act = sqrt(sum_sq / (double) data.size());
+            out_scale = sqrt((double) k) * rms_act / sqrt(3.0);
+            if (preprocess_activation) {
+                // the graph scales the activation by 0.5
+                out_scale *= 0.5;
             }
             ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
         }
@@ -13381,6 +13473,87 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+
+    // TQ4_1S: Gemma-4 E2B dimensions. The fused mul_mat_vec kernel has a
+    // shared-memory WHT on the activation and dequantizes centroid*scale per
+    // thread; bugs in the butterfly or reduction only surface at production sizes.
+    for (int k : { 1536, 2048, 2304, 3072, 4096 }) {
+        for (int m : { 256, 1152, 1536, 2048, 5120, 6144 }) {
+            for (int n : { 1, 2, 4, 8 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // TQ4_1S: large-batch MUL_MAT exercises the dequant + f16 matmul path used
+    // during prompt processing (n > mul_mat_vec_max_cols = 8 forces this path).
+    // The fused mul_mat_vec kernel is NOT used for these cases; instead the weights
+    // are dequantized via pipeline_dequant[TQ4_1S] into a temporary f16 buffer and
+    // then the generic f16 matmul runs on them.
+    for (int k : { 1536, 2048 }) {
+        for (int m : { 256, 1536, 2048 }) {
+            for (int n : { 16, 64, 256 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // TQ3_1S: same two sweeps as TQ4_1S above, for the 3-bit sibling type.
+    // TQ3_1S packs 8 indices per 3 bytes rather than 2 per byte, so the
+    // per-thread unpack differs; the shared-memory WHT on the activation and
+    // the 32-thread workgroup are identical. Bugs in the packing offset only
+    // surface once k is large enough to cross many block boundaries.
+    for (int k : { 1536, 2048, 2304, 3072, 4096 }) {
+        for (int m : { 256, 1152, 1536, 2048, 5120, 6144 }) {
+            for (int n : { 1, 2, 4, 8 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F16, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // TQ3_1S: large-batch MUL_MAT, i.e. the pipeline_dequant[TQ3_1S] +
+    // generic f16 matmul path taken when n > mul_mat_vec_max_cols = 8.
+    // This is the only coverage the dequant shader's inverse WHT gets.
+    for (int k : { 1536, 2048 }) {
+        for (int m : { 256, 1536, 2048 }) {
+            for (int n : { 16, 64, 256 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // TQ3_1S: DeepSeek-V4 MLA head_dim=512 batched-prefill shape.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 128, 512, 512, {1, 1}, {1, 1}));
+
+    // TQ3_1S / TQ4_1S: non-contiguous src1 (k_v > k view) with batched n, to exercise
+    // the rotate-act contiguity fallback. rotate-act walks src1 as a flat array so it
+    // requires contiguous src1; non-contiguous must fall back to the standard mul_mm
+    // path (inverse-RHT dequant), which handles strides via nb1x.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 256, 256, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1600));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 256, 256, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1600));
+
+    // TQ3_1S: small-batch (n<=8) FUSED multi-token kernel path. This is DeepSeek-V4-Flash's
+    // real attn_q_a shape (n_embd=4096 -> q_lora_rank=1024) at an 8-token prefill batch,
+    // contiguous src1 -- the case found to diverge (~2% on real weights) via eval-callback
+    // node diffing against the CPU reference. The k=16384/m=24 pair mirrors hc_attn_fn's
+    // shape as a control that was observed numerically fine.
+    for (int nb : { 1, 2, 4, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 1024, nb, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 24, nb, 16384, {1, 1}, {1, 1}));
+    }
+
+    // TQ3_1S / TQ4_1S: odd m at n = 3..8, so the last warp of the two-row decode kernels owns one
+    // real row and one past the end. Not m = 1: with 3-8 outputs the int8 activation rounding
+    // alone can exceed the NMSE threshold.
+    for (ggml_type type_a : { GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S }) {
+        for (int m : { 5, 33, 65 }) {
+            for (int n = 3; n <= 8; n++) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
