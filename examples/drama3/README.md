@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > **COMPATIBILITY NOTE: DEVELOPED AND TESTED WITH [THETOM'S TURBOQUANT LLAMA.CPP FORK](https://github.com/TheTom/llama-cpp-turboquant).**
 >
-> Anyone is welcome to run or adapt this work under the applicable licenses. The tested speech route requires this fork's custom `llama-drama3-backbone` bridge plus the pinned external audio tower and codec. Other engines have not been validated and may not work; a `.gguf` file does not imply plug-and-play compatibility. See [PR #399](https://github.com/TheTom/llama-cpp-turboquant/pull/399) and the [setup instructions](https://github.com/TheTom/llama-cpp-turboquant/blob/feature/turboquant-kv-cache/examples/drama3/README.md). RTX 5090 fit and speed are still being verified.
+> Anyone is welcome to run or adapt this work under the applicable licenses. The tested speech route requires this fork's custom `llama-drama3-backbone` bridge plus the pinned external audio tower and codec. Other engines have not been validated and may not work; a `.gguf` file does not imply plug-and-play compatibility. See [PR #399](https://github.com/TheTom/llama-cpp-turboquant/pull/399) and the [setup instructions](https://github.com/TheTom/llama-cpp-turboquant/blob/feature/turboquant-kv-cache/examples/drama3/README.md). A short RTX 5090 smoke passed; longer-run stability and quality remain unverified.
 
 This lane runs the Fish Drama-3 backbone in this fork and the unmodified audio tower/codec in SGLang-Omni. It is a one-stream experimental bridge, not native FishOmni TTS support. Keep the original checkpoint's license with any derived model distribution.
 
@@ -16,7 +16,16 @@ The CUDA bridge built and ran on a DGX Spark (NVIDIA GB10, sm_121a, Linux aarch6
 
 Teacher replay has substantial unresolved drift: final hidden relative L2 0.61054 and semantic-logit relative L2 0.16747; semantic top-1 agreed, top-10 overlap was 4/10. This compares different backends and precision together. It does not isolate quantization error. The original-precision native control and listening/ASR/speaker evaluation are still pending. Positive listening feedback is not an objective quality pass.
 
-The RTX 5090 with 32 GiB is a target, not a verified platform. On Spark, llama reported a 26605.74 MiB CUDA model buffer and a 985.50 MiB CPU-mapped embedding buffer; the audio tower, codec, context caches, compute buffers and allocator overhead are additional. Spark unified memory does not prove a 5090 fit.
+A native SM120 build ran two EOS-complete requests on an RTX 5090 under WSL2, using seed 42, context 16384 and a 128-frame limit. Both synthesized "Hello, how are you?" as 47 frames / 2.183 seconds of audio. These are short diagnostic smoke measurements, not a quality pass or long-run benchmark.
+
+| Request | Prefill (s) | Generation (s) | Request to complete WAV (s) |
+| --- | ---: | ---: | ---: |
+| Cold | 24.372 | 1.619 | 220.491 |
+| Warm, reset sequence | 0.342 | 1.365 | 2.142 |
+
+Cold wall time includes asset verification, loading and first-use work. Total device memory sampled every 100 ms peaked at 31787 of 32607 MiB, leaving only 820 MiB of sampled headroom. This proves this short configuration fit; longer outputs and runtime scratch can require more memory. On Spark, llama reported a 26605.74 MiB CUDA model buffer and a 985.50 MiB CPU-mapped embedding buffer; audio, codec, caches, compute buffers and allocator overhead are additional.
+
+Long-form reliability is unresolved: the original FP8 source completed a 185-word passage as 67.38 seconds of audio, while C0 reached 4096 frames without EOS. A separate C0 attempt with a fixed synthetic voice reference also reached that limit. Both failures and their frame codes are retained.
 
 ## Run the compact release
 
@@ -28,6 +37,7 @@ cd llama-cpp-turboquant
 git clone https://github.com/sgl-project/sglang-omni.git ../sglang-omni
 git -C ../sglang-omni checkout 2cfb3b67becb437b70751defe37e63d3af4eedb0
 bash examples/drama3/setup_runtime.sh "$PWD/../drama3-venv" "$PWD/../sglang-omni"
+. ../drama3-venv/bin/activate
 ../drama3-venv/bin/python -m pip install cmake==4.1.0
 ../drama3-venv/bin/cmake -S . -B build-drama3 -DGGML_CUDA=ON -DLLAMA_BUILD_EXAMPLES=ON -DCMAKE_CUDA_ARCHITECTURES=121a
 ../drama3-venv/bin/cmake --build build-drama3 --target llama-drama3-backbone -j2
@@ -46,7 +56,7 @@ PYTHONPATH="$PWD/../sglang-omni" ../drama3-venv/bin/python examples/drama3/exter
 
 The compact runtime contains only the 192 original audio tensors, codec, tokenizer and configuration, about 4.04 GiB. The backbone is the separate 28,942,612,608-byte GGUF. `--runtime-manifest` verifies every asset and the GGUF SHA256, plus the complete audio tensor names, shapes and dtypes. It does not impersonate the original checkpoint receipt. The full original checkpoint path with `--verified-source-receipt` remains supported below.
 
-`setup_runtime.sh` pins the known working CUDA 13 Torch 2.13.0 / TorchAudio 2.11.0 pair and imported package census. It installs SGLang packages without their unrelated full serving extras. A clean environment does not need the private experiment's filtered base-package view. The private vLLM image tag used during bringup is not a public dependency or a pull command. See `check_runtime.py` for the CPU import check; importing successfully does not prove GPU or speech execution.
+`setup_runtime.sh` pins the known working CUDA 13 Torch 2.13.0 / TorchAudio 2.11.0 pair and imported package census. It installs SGLang packages without their unrelated full serving extras. A clean environment does not need the private experiment's filtered base-package view. The private vLLM image tag used during bringup is not a public dependency or a pull command. See `check_runtime.py` for the CPU import check; importing successfully does not prove GPU or speech execution. FlashInfer loads or builds its normalization kernel on first GPU use and requires the pinned Ninja executable on `PATH`; keep the runtime venv activated during inference. A fresh isolated aarch64 environment installed the public pinned wheels and passed this check plus `hf --help` on October 14, 2026, with CUDA devices hidden. After adding Ninja and activating the venv, that clean aarch64 environment generated EOS-complete speech on Spark using both the verified-source route and a fresh `--runtime-manifest` compact-bundle load. The compact 85-frame WAV was byte-identical to the earlier full-source C0 WAV. This verifies the public dependency path, not teacher parity or quality. The x86/5090 short smoke above also ran in a public-wheel venv; broader platform, long-run and quality validation remain separate gates.
 
 ## Backbone conversion
 
@@ -109,4 +119,4 @@ PYTHONPATH=gguf-py python examples/drama3/test_native_bridge.py build/bin/llama-
 
 CPU tests cover explicit architecture selection, namespace routing, block scales, zero-centered norms, existing Qwen MRoPE metadata, causal tower cache and row replacement. A CPU build covers the native bridge API. These do not establish speech correctness.
 
-Source/candidate integrity, byte-identical packed GGUF import, Spark CUDA execution and EOS speech have actual evidence. Remaining gates are diagnosis of teacher-forced backbone hidden/logit drift, controlled ASR/speaker/listening quality, long-form reference continuity and total peak device memory on the target 5090. Count both runtime processes, audio/codec weights, KV, graphs and scratch; a small GGUF file alone does not demonstrate a 32 GiB fit.
+Source/candidate integrity, byte-identical packed GGUF import, Spark CUDA execution and EOS speech have actual evidence. Remaining gates are diagnosis of teacher-forced backbone hidden/logit drift, controlled ASR/speaker/listening quality, long-form reference continuity and longer-output memory stability on the 5090. The sampled short-smoke peak is not a bound for every input. Count both runtime processes, audio/codec weights, KV, graphs and scratch; a small GGUF file alone does not demonstrate a 32 GiB fit.
