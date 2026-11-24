@@ -2886,7 +2886,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // Mirror the f16 use_gqa_opt computation. Quantized tensors are skipped in the nb%16 loop.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // A mask with a head dimension is not shared by the Q heads of a K/V head.
+    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
