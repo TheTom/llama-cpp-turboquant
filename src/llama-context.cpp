@@ -2528,7 +2528,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // chain mode: the logits are [2, n_chain] (token_id, prob) pairs, not [n_vocab, n_tokens]
+                const size_t logits_bytes =
+                    cparams.mtp_chain ? ggml_nbytes(t_logits) : (size_t) n_outputs*n_vocab*sizeof(float);
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, logits_bytes);
             }
         }
 

@@ -357,7 +357,10 @@ common_models_handler common_models_handler_init(const common_params & params, l
 
     const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
                                         params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()
+        || std::find(params.speculative.types.begin(),
+                                        params.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
 
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -1307,6 +1310,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (ctx_arg.params.completion) {
             common_params_print_completion(ctx_arg);
             exit(0);
+        }
+
+        const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        if (adaptive_mtp &&
+                (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
+            throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
         }
 
         params.lr.init();

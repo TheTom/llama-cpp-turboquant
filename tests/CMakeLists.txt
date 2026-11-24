@@ -277,6 +277,8 @@ llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
     -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
+llama_build_and_test(test-speculative-adaptive.cpp)
+
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context
