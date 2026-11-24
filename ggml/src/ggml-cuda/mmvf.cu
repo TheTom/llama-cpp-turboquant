@@ -3,6 +3,8 @@
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "mmf.cuh"
+
+#include <cstdlib>
 #include "convert.cuh"
 
 static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t * x, const int col2) {
@@ -866,6 +868,67 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// The band of weight widths for which the vector kernel beats a GEMM above the per-architecture
+// column limit. A GEMM whose output is a few columns wide is nearly all setup, which is ruinous for
+// narrow weights and fine for wide ones, so there is an upper edge. F16 on CDNA also has a lower
+// edge: at four rows the vector kernel loses there, which it does not at eight and which BF16 does
+// not do at all.
+//
+// Measured by forcing each path and comparing, k=10240, negative meaning the vector kernel wins,
+// as n=4 / n=8:
+//
+//                    m=4      m=8     m=128     m=256    m=1024    m=2048    m=3072    m=4096
+//   CDNA2  F16      +41%   -79/-70  -77/-61   -81/-71   -56/-24   -31/+25   -56/-20   -43/+2
+//   CDNA2  BF16     -90%   -86/-81  -84/-76   -83/-73   -54/-20   -49/-8    -17/+56   +13/+98
+//   RDNA3  F16      -86%   -86/-83  -50/-29   -25/+15   +43/+127  +58/+180  +116/+236 +119/+253
+//   RDNA3  BF16     -83%   -84/-79  -50/-41   -42/-1    +61/+114  +96/+144  +173/+248 +150/+242
+//   RDNA4  F16    -1/-96        -    -0/-91        -     -5/-56    +1/-19          -   +0/+8
+//   RDNA4  BF16  -96/-95        -   -91/-91        -    -65/-55   -41/-20          -   +1/+13
+//
+// RDNA4 measured on gfx1201 by @apollo-mg. It does not track RDNA3: its crossover is between 2048
+// and 4096 for both types, eight to sixteen times wider, and it wants no floor at all since the
+// vector kernel wins by 96% at four rows where CDNA F16 loses. Its F16 band only bites at n >= 6,
+// because RDNA4's own F16 limit already reaches five columns. RDNA3.5 is unmeasured and folded in
+// with RDNA3.
+//
+// The two batch widths disagree about where the edge is: n=4 keeps winning past the point where
+// n=8 has turned. These bands take the widest span that still wins at every n measured (3, 4 and
+// 8), which costs some n=4 ground and avoids regressing n=8. GGML_MMVF_NARROW_MIN and _MAX override
+// both edges; setting _MAX to 0 restores the upstream behaviour of stopping at the column limit
+// whatever the width.
+struct mmvf_narrow_band {
+    int64_t min;
+    int64_t max;
+};
+
+static mmvf_narrow_band ggml_cuda_mmvf_narrow_band(const int cc, const enum ggml_type type) {
+    mmvf_narrow_band band = { 0, 4096 };
+
+    if (GGML_CUDA_CC_IS_CDNA(cc)) {
+        band = type == GGML_TYPE_F16 ? mmvf_narrow_band{ 8, 1024 } : mmvf_narrow_band{ 0, 2048 };
+    } else if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        band = { 0, 2048 };
+    } else if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+        band = type == GGML_TYPE_F16 ? mmvf_narrow_band{ 0, 128 } : mmvf_narrow_band{ 0, 256 };
+    }
+
+    static const char * env_min = getenv("GGML_MMVF_NARROW_MIN");
+    static const char * env_max = getenv("GGML_MMVF_NARROW_MAX");
+    if (env_min) {
+        band.min = atoll(env_min);
+    }
+    if (env_max) {
+        band.max = atoll(env_max);
+    }
+
+    return band;
+}
+
+static bool ggml_cuda_mmvf_weight_is_narrow(const int cc, const enum ggml_type type, const int64_t ne01) {
+    const mmvf_narrow_band band = ggml_cuda_mmvf_narrow_band(cc, type);
+    return ne01 >= band.min && ne01 <= band.max;
+}
+
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11) {
     const ggml_type type = src0->type;
     const int64_t * src0_ne = src0->ne;
@@ -896,6 +959,14 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
+                    // The MFMA GEMM only earns its setup on wide weights. qwen4exp puts narrow F32
+                    // matmuls on the hot path - the MoE router at [2560, 512], the hyper-connection
+                    // injects at [10240, 4], the SSM gates - and dropping those onto a GEMM at four
+                    // columns costs about 31 ms per decode step, against roughly 4 ms per added row
+                    // either side of the boundary. Keep the vector kernel for narrow weights.
+                    if (ggml_cuda_mmvf_weight_is_narrow(cc, GGML_TYPE_F32, src0_ne[1])) {
+                        return ne11 <= 8;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= MMVF_MAX_BATCH_SIZE;
@@ -923,6 +994,13 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (fp16_mma_hardware_available(cc)) {
+                    // Same narrow-weight case as F32 and BF16. The per-architecture limits below
+                    // are tuned for weights wide enough to fill the GEMM; a narrow one has no rows
+                    // to fill it with. CDNA reaches neither of them and stops at two columns, so it
+                    // leaves the vector path earliest on exactly the tensors that need it most.
+                    if (ggml_cuda_mmvf_weight_is_narrow(cc, GGML_TYPE_F16, src0_ne[1])) {
+                        return ne11 <= 8;
+                    }
                     if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
                         return ne11 <= 3;
                     }
@@ -968,6 +1046,14 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (bf16_mma_hardware_available(cc)) {
+                    // Same narrow-weight case as F32 above, and worse here: on CDNA2 mmf refuses
+                    // BF16 outright, so above this limit there is no vector path left and the op
+                    // lands on a cuBLAS GEMM with a bf16 conversion on each side. qwen4exp keeps
+                    // its structural tensors in BF16 - the hyper-connection injects at [10240, 4],
+                    // the SSM gates at [2560, 48] - and they are on every token's path.
+                    if (ggml_cuda_mmvf_weight_is_narrow(cc, GGML_TYPE_BF16, src0_ne[1])) {
+                        return ne11 <= 8;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= MMVF_MAX_BATCH_SIZE;
