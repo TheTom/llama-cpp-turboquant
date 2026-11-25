@@ -261,7 +261,7 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
         // TurboQuant KV cache types are runtime-only and are never stored in GGUF.
-        // Their ids skip the persisted TurboQuant weight ids (45, 46, 48, 49, 50).
+        // Their ids skip the persisted TurboQuant weight ids (45, 46, 48, 49, 50, 53).
         GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
@@ -271,8 +271,9 @@ extern "C" {
         GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
         GGML_TYPE_TURBO4_0 = 51, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_TURBO5_0 = 52, // TurboQuant 5-bit KV cache: WHT + 5-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_TURBO6_0 = 53, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
-        GGML_TYPE_COUNT   = 54,
+        GGML_TYPE_TQ3_4S  = 53, // TQ3_1S indices, 6-bit half-block scales under one fp16 scale, block_size=128
+        GGML_TYPE_TURBO6_0 = 54, // TurboQuant 6-bit KV cache: WHT + 6-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_COUNT   = 55,
     };
 
     // [TAG_GGML_PREC]

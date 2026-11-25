@@ -3566,7 +3566,7 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 }
 
 // GGML_TQ_MMQ: unset = native TQ MMQ prefill for TQ3_1S only, 0 = off, any other value = on for
-// TQ3_1S and TQ4_1S. Read once: it is a libc call per mul_mat node otherwise.
+// every TQ type with a config. Read once: it is a libc call per mul_mat node otherwise.
 static int ggml_cuda_tq_mmq_env() {
     static const int env = [] {
         const char * e = getenv("GGML_TQ_MMQ");
@@ -3815,9 +3815,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Toggleable for the perplexity A/B: fused-on by default on gfx1100,
     // TQ3_FUSE_OFF=1 forces the verified dequant+hipBLAS path.
     static const bool tq3_fuse_off = (getenv("TQ3_FUSE_OFF") != nullptr);
-    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S) && tq3_fuse_off;
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S) && tq3_fuse_off;
 #else
-    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S);
 #endif
 
     if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && tq_ncols <= MMVQ_MAX_BATCH_SIZE) {
@@ -3826,12 +3826,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
         return;
     }
-    if (is_tq_weight && tq_fast_path_ok && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S)
+    if (is_tq_weight && tq_fast_path_ok
             && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
             && ggml_cuda_tq_mmq_supported(src0, cc)) {
         // Phase 2: native int8 MMQ prefill via activation pre-rotation.
         // GGML_TQ_MMQ=0 falls back to the cuBLAS path below.
-        if (src0->type == GGML_TYPE_TQ3_1S) {
+        if (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S) {
             ggml_cuda_mul_mat_tq3_1s_mmq(ctx, src0, src1, dst);
         } else {
             ggml_cuda_mul_mat_tq4_1s_mmq(ctx, src0, src1, dst);
@@ -3908,7 +3908,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weights: small batch uses the capture-safe device-routed matvec (ggml_cuda_mul_mat_id_tq);
     // large batch falls through to the dequant-to-f16 cuBLAS path, which synchronizes the stream.
-    const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S ||
+                                  src0->type == GGML_TYPE_TQ3_4S);
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         // up to 24 tokens few-row MMQ is faster than MMQ, on DGX Spark also faster than MMVQ
         const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, ids, cc);
@@ -3947,10 +3948,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // Pre-rotates the activation once, then runs MMQ_ID with the TQ4_1S int8-centroid load_tiles,
         // avoiding the 2x-slower dequant-to-f16 cuBLAS fallback so native (GGML_TQ_NATIVE) experts
         // keep their ~1.7x-smaller 5bpw footprint without a prefill penalty. See ggml_cuda_tq_mmq_env.
-        if (is_tq_weight_id && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S)
+        if (is_tq_weight_id && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S ||
+                                src0->type == GGML_TYPE_TQ3_4S)
                 && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
                 && ggml_is_contiguous(src1) && ggml_cuda_tq_mmq_supported(src0, cc)) {
-            if (src0->type == GGML_TYPE_TQ3_1S) {
+            if (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S) {
                 ggml_cuda_mul_mat_id_tq3_1s_mmq(ctx, src0, src1, ids, dst);
             } else {
                 ggml_cuda_mul_mat_id_tq4_1s_mmq(ctx, src0, src1, ids, dst);
@@ -4794,7 +4796,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             // read src[0] only here: source-less nodes (ARANGE, ...) have src[0] == NULL
-            const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S);
+            const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S ||
+                                  node->src[0]->type == GGML_TYPE_TQ3_4S);
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
@@ -8146,7 +8149,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // addresses experts through a table and so can be pointed at either place, and only
             // when explicitly opted in.
             if (op->op == GGML_OP_MUL_MAT_ID && i == 0 &&
-                (src->type == GGML_TYPE_TQ3_1S || src->type == GGML_TYPE_TQ4_1S) &&
+                (src->type == GGML_TYPE_TQ3_1S || src->type == GGML_TYPE_TQ4_1S || src->type == GGML_TYPE_TQ3_4S) &&
                 ggml_cuda_moe_host_experts_enabled()) {
                 continue;
             }
@@ -8304,6 +8307,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_4S:
                     case GGML_TYPE_TQ3_1S:
                         return true;
                     default:
@@ -8341,6 +8345,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_4S:
                     case GGML_TYPE_TQ3_1S:
                         return true;
                     case GGML_TYPE_IQ4_NL:

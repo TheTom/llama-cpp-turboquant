@@ -334,6 +334,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     switch (type) {
         case GGML_TYPE_TQ3_1S:
         case GGML_TYPE_TQ4_1S:
+        case GGML_TYPE_TQ3_4S:
         case GGML_TYPE_Q8_CR:
         case GGML_TYPE_Q5_CR:
         case GGML_TYPE_Q6_CR:

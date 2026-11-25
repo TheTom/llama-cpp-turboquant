@@ -2080,6 +2080,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor)) {
                 return false;
             }
+            // TQ3_4S has no Metal kernel
+            if (op->src[0]->type == GGML_TYPE_TQ3_4S) {
+                return false;
+            }
             // the FWHT kernels read an F16 source directly; every other F16 src1 path
             // still goes through ggml_metal_supports_mul_mat_op
             if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
@@ -2096,6 +2100,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             if (!ggml_metal_supports_mul_mat_src1_prec(op, dev->props.has_tensor)) {
+                return false;
+            }
+            // TQ3_4S has no Metal kernel
+            if (op->src[0]->type == GGML_TYPE_TQ3_4S) {
                 return false;
             }
             return ggml_metal_supports_mul_mat_op(
@@ -2172,6 +2180,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->src[0]->type != GGML_TYPE_NVFP4 &&
                    op->src[0]->type != GGML_TYPE_TQ1_0 &&
                    op->src[0]->type != GGML_TYPE_F8_E4M3 &&
+                op->src[0]->type != GGML_TYPE_TQ3_4S &&
                 op->src[0]->type != GGML_TYPE_Q8_CR &&
                 op->src[0]->type != GGML_TYPE_Q5_CR &&
                 op->src[0]->type != GGML_TYPE_Q6_CR;
