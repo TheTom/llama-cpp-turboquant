@@ -14932,6 +14932,11 @@ static bool ggml_vk_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int un
     if (other == nullptr || other->type != unary->type) {
         return false;
     }
+    // the fused shader reads the other operand from memory, so it cannot be the
+    // unary output: that tensor is not written yet
+    if (other == unary) {
+        return false;
+    }
     if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0])) {
         return false;
     }
