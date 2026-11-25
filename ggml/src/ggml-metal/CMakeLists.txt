@@ -30,6 +30,7 @@ set(METALLIB_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-common.h")
 set(METALLIB_KERNELS_COMMON     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common.h")
 set(METALLIB_KERNELS_DEQUANTIZE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/dequantize.h")
 set(METALLIB_KERNELS_QUANTIZE   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quantize.h")
+set(METALLIB_KERNELS_TQ         "${CMAKE_CURRENT_SOURCE_DIR}/kernels/tq.h")
 set(METALLIB_KERNELS_TURBO      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/turbo.h")
 set(METALLIB_KERNELS_FA_COMMON     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fa_common.metal")
 set(METALLIB_KERNELS_FA_VEC_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/kernels/fa_vec_common.metal")
@@ -76,6 +77,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/moe_cache.metal
     kernels/turbo.metal
 )
 
@@ -102,12 +104,16 @@ if (GGML_METAL_EMBED_LIBRARY)
         set(HEADERS_FOR_SRC ${METALLIB_KERNELS_COMMON})
         file(STRINGS ${SRC} _has_dequantize REGEX "#include \"dequantize\\.h\"")
         file(STRINGS ${SRC} _has_quantize   REGEX "#include \"quantize\\.h\"")
+        file(STRINGS ${SRC} _has_tq         REGEX "#include \"tq\\.h\"")
         file(STRINGS ${SRC} _has_turbo      REGEX "#include \"turbo\\.h\"")
         if(_has_dequantize)
             list(APPEND HEADERS_FOR_SRC ${METALLIB_KERNELS_DEQUANTIZE})
         endif()
         if(_has_quantize)
             list(APPEND HEADERS_FOR_SRC ${METALLIB_KERNELS_QUANTIZE})
+        endif()
+        if(_has_tq)
+            list(APPEND HEADERS_FOR_SRC ${METALLIB_KERNELS_TQ})
         endif()
         if(_has_turbo)
             list(APPEND HEADERS_FOR_SRC ${METALLIB_KERNELS_TURBO})
@@ -126,7 +132,7 @@ if (GGML_METAL_EMBED_LIBRARY)
             # Step 1: concatenate shared headers + this kernel source
             COMMAND cat ${HEADERS_FOR_SRC} ${SRC} > "${EMBED}.tmp1"
             # Step 2: remove internal #include and #pragma once
-            COMMAND sed -e "/\#include \"common.h\"/d" -e "/\#include \"dequantize.h\"/d" -e "/\#include \"quantize.h\"/d" -e "/\#include \"turbo.h\"/d" -e "/\#include \"fa_common.metal\"/d" -e "/\#include \"fa_vec_common.metal\"/d" -e "/\#pragma once/d" < "${EMBED}.tmp1" > "${EMBED}.tmp2"
+            COMMAND sed -e "/\#include \"common.h\"/d" -e "/\#include \"dequantize.h\"/d" -e "/\#include \"quantize.h\"/d" -e "/\#include \"tq.h\"/d" -e "/\#include \"turbo.h\"/d" -e "/\#include \"fa_common.metal\"/d" -e "/\#include \"fa_vec_common.metal\"/d" -e "/\#pragma once/d" < "${EMBED}.tmp1" > "${EMBED}.tmp2"
             # Step 3: inline ggml-common.h (replacing __embed_ggml-common.h__ sentinel)
             COMMAND sed -e "/__embed_ggml-common.h__/r ${METALLIB_COMMON}" -e "/__embed_ggml-common.h__/d" < "${EMBED}.tmp2" > "${EMBED}.tmp3"
             # Step 4: inline ggml-metal-impl.h
@@ -160,6 +166,7 @@ else()
     configure_file(kernels/common.h     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/kernels/common.h     COPYONLY)
     configure_file(kernels/dequantize.h ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/kernels/dequantize.h COPYONLY)
     configure_file(kernels/quantize.h   ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/kernels/quantize.h   COPYONLY)
+    configure_file(kernels/tq.h         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/kernels/tq.h         COPYONLY)
     configure_file(kernels/turbo.h      ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/kernels/turbo.h      COPYONLY)
     foreach(hdr ${METALLIB_KERNELS_FA_SHARED})
         get_filename_component(hdr_name ${hdr} NAME)
@@ -222,7 +229,7 @@ else()
         add_custom_command(
             OUTPUT ${AIR}
             COMMAND xcrun -sdk ${METAL_SDK} metal ${XC_FLAGS} -I ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} -c ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${src} -o ${AIR}
-            DEPENDS ${src} ${METALLIB_KERNELS_FA_SHARED} kernels/common.h kernels/dequantize.h kernels/quantize.h kernels/turbo.h ${METALLIB_COMMON} ggml-metal-impl.h
+            DEPENDS ${src} ${METALLIB_KERNELS_FA_SHARED} kernels/common.h kernels/dequantize.h kernels/quantize.h kernels/tq.h kernels/turbo.h ${METALLIB_COMMON} ggml-metal-impl.h
             COMMENT "Compiling ${src}"
             VERBATIM
         )

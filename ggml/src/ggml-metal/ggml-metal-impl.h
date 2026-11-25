@@ -124,9 +124,6 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
-#define FC_TURBO_WHT                   1700
-#define FC_TURBO_FLASH_P1              1800
-#define FC_TURBO_FLASH_P2              1900
 #define FC_NORM                        1700
 #define FC_TOPK_MOE                    1800
 #define FC_MOE_REDUCE                  1900
@@ -137,6 +134,9 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_TURBO_WHT                   2600
+#define FC_TURBO_FLASH_P1              2700
+#define FC_TURBO_FLASH_P2              2800
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8

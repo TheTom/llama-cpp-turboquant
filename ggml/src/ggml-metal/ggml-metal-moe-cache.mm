@@ -328,7 +328,7 @@ static struct ggml_metal_pipeline_with_params metal_pipeline_get(
 static bool metal_device_ensure_ready(moe_cache_metal_device & dev, size_t budget_mb) {
     std::call_once(dev.init_once, [&]() {
         // Load the shared kernel library (same embedded source as the
-        // backend; contains kernel_moe_cache_mv_* from ggml-metal.metal).
+        // backend; contains kernel_moe_cache_mv_* from kernels/moe_cache.metal).
         ggml_metal_library_t lib = ggml_metal_library_init(dev.ctx_dev);
         if (!lib) {
             MOE_CACHE_LOG("[moe-cache] Metal library init failed\n");

@@ -2804,19 +2804,6 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    const int32_t hint = ggml_get_op_params_i32(op, 1);
-
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
-        if (op->src[1]->type == GGML_TYPE_F32 &&
-            op->type == GGML_TYPE_F32 &&
-            ggml_is_contiguous(op->src[1]) &&
-            ggml_is_contiguous(op) &&
-            ggml_are_same_shape(op->src[1], op) &&
-            ggml_metal_fwht_supported_size(op->src[1]->ne[0])) {
-            return ggml_metal_op_fwht(ctx, idx);
-        }
-    }
-
     ggml_tensor op_cr;
     ggml_tensor src0_base;
     ggml_tensor src1_rot;
@@ -2983,17 +2970,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
-    } else if (
-        !ggml_is_transposed(op->src[0]) &&
-        !ggml_is_transposed(op->src[1]) &&
-        // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
-        // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && ne00 >= 64 &&
-        (ne11 > ne11_mm_min || op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S)) {
-        // Route all TQ weights through the rotated mul_mm path.
-        // Gemma4 decode still degrades on the fused mul_mv kernel even after the broader
-        // TQ backend fixes, while the rotated mul_mm path matches CPU behavior.
-    } else if (ggml_metal_op_mul_mat_use_mm(op, props_dev->has_simdgroup_mm)) {
+    } else if (ggml_metal_op_mul_mat_use_mm(op, props_dev->has_simdgroup_mm) ||
+               // route all TQ weights through the rotated mul_mm path:
+               // Gemma4 decode still degrades on the fused mul_mv kernel even after the broader
+               // TQ backend fixes, while the rotated mul_mm path matches CPU behavior
+               (!ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) &&
+                props_dev->has_simdgroup_mm && ne00 >= 64 &&
+                (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S))) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         const bool is_tq_weight = (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S);
@@ -3228,8 +3211,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // ne21 = n_rows (batch size)
     const int ne21_mm_id_min = is_tq_weight ? 1 : 32;
 
-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
-    if (ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm)) {
+    // the id map kernel stages ne02*ne20 ids in threadgroup memory - fall back to the
+    // matrix-vector kernel when that does not fit into the device limit
+    const size_t map0_smem = GGML_PAD(2*(size_t) ne02*sizeof(uint32_t) + (size_t) ne02*ne20*sizeof(uint16_t), 16);
+
+    if (props_dev->has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && (ne21 >= ne21_mm_id_min) &&
+            map0_smem <= props_dev->max_theadgroup_memory_size) {
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
@@ -3309,23 +3296,6 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_src1, 0);
                 ggml_metal_encoder_set_bytes   (enc, &n_act_val, sizeof(n_act_val), 1);
                 ggml_metal_encoder_dispatch_threadgroups(enc, (int)(n_act_val / 32), 1, 1, 32, 1, 1);
-            ggml_metal_kargs_mul_mm_id args = {
-                /*.ne00  =*/ ne00,
-                /*.ne02  =*/ ne02,
-                /*.nb01  =*/ nb01,
-                /*.nb02  =*/ nb02,
-                /*.nb03  =*/ nb03,
-                /*.ne11  =*/ ne11, // n_expert_used (bcast)
-                /*.nb10  =*/ nb10,
-                /*.nb11  =*/ nb11,
-                /*.nb12  =*/ nb12,
-                /*.nb13  =*/ nb13,
-                /*.ne20  =*/ ne20, // n_expert_used
-                /*.ne0   =*/ ne0,
-                /*.ne1   =*/ ne1,
-                /*.r2    =*/ r2,
-                /*.r3    =*/ r3,
-            };
 
                 ggml_metal_op_concurrency_reset(ctx);
 
@@ -3343,7 +3313,6 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     /*.nb12  =*/ nb12,
                     /*.nb13  =*/ nb13,
                     /*.ne20  =*/ ne20,
-                    /*.ne21  =*/ ne21,
                     /*.ne0   =*/ ne0,
                     /*.ne1   =*/ ne1,
                     /*.r2    =*/ r2,
@@ -3359,6 +3328,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
 
                 const size_t smem = pipeline.smem;
+
+                GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+
                 ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
                 ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
 
@@ -3387,7 +3359,6 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     /*.nb12  =*/ nb12,
                     /*.nb13  =*/ nb13,
                     /*.ne20  =*/ ne20,
-                    /*.ne21  =*/ ne21,
                     /*.ne0   =*/ ne0,
                     /*.ne1   =*/ ne1,
                     /*.r2    =*/ r2,
@@ -3403,16 +3374,15 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
 
                 const size_t smem = pipeline.smem;
+
+                GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+
                 ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-                ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+
+                const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
             }
-            GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
-
-            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-
-            const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
-
-            ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
@@ -4217,7 +4187,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     }
     // ==================== End TurboFlash ====================
 
-    if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
     ggml_metal_buffer_id bid_kv_f16 = bid_tmp;
     bid_kv_f16.offs += ggml_metal_op_flash_attn_ext_extra_tmp(op);
 

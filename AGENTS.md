@@ -41,7 +41,10 @@ Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S and Q8_C
 - `src/llama-graph.cpp` - inverse-WHT post-processing (FA and non-FA paths)
 - `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (only reached with `GGML_TQ_NATIVE=1`; by default `TQ4_1S` is converted to `q8_0` at load in `ggml-cuda.cu`)
 - `ggml/src/ggml-vulkan/` - turbo FA, SET_ROWS, dequant shaders
-- `ggml/src/ggml-metal/ggml-metal.metal` - TurboFlash kernels
+- `ggml/src/ggml-metal/kernels/turbo.metal` - TurboFlash and TurboQuant WHT kernels
+- `ggml/src/ggml-metal/kernels/fa_turbo.metal` - turbo flash attention kernels
+- `ggml/src/ggml-metal/kernels/tq.h` - TQ3_1S / TQ4_1S dequantize helpers
+- `ggml/src/ggml-metal/kernels/moe_cache.metal` - MoE expert cache matvec kernels
 - `docs/KV-cache-quantization.md` - usage doc (read before touching cache types; source of truth for the environment knobs)
 
 ### Usage
@@ -87,7 +90,7 @@ Use the narrowest set of gates that covers the change, with CPU as the numeric r
 |-------------------------------------------------------------|-----------------|
 | Codec `ggml/src/ggml-turbo-quant.c`                         | `test-turbo-quant` and `test-quantize-fns`, the two suites that execute the CPU codec directly |
 | TQ/Turbo CUDA kernels (`ggml/src/ggml-cuda/`, `mmvq-tq.cu`) | `test-backend-ops` `-o MUL_MAT -p type_a=tq4_1s` (or the matching turbo op) on an NVIDIA card; a clean compile is not a pass. Changes to the `mmvq-tq.cu` centroid LUT additionally require the AMD run (see Known pitfalls) |
-| Metal kernels (`ggml/src/ggml-metal/ggml-metal.metal`)      | `[[host_name]]` instantiations present, then `test-backend-ops` with the Metal backend |
+| Metal kernels (`ggml/src/ggml-metal/kernels/`)              | `[[host_name]]` instantiations present, then `test-backend-ops` with the Metal backend |
 | Vulkan shaders (`ggml/src/ggml-vulkan/`)                    | SET_ROWS pipeline registration incl. TURBO2_0/3_0/4_0, then `test-backend-ops` with the Vulkan backend |
 | Cache/graph wiring (`src/llama-kv-cache.cpp`, `src/llama-graph.cpp`) | `test-backend-ops`, `llama-bench -ctk/-ctv turboN`, and `llama-perplexity --kl-divergence` against a saved baseline run (usually `f16`): the first two only exercise the kernels, only the KL run compares token probabilities |
 | Docs/README only                                            | no tests |
