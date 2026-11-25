@@ -2971,6 +2971,11 @@ struct test_set_rows : public test_case {
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
+        if (type_dst == GGML_TYPE_TQ3_1S || type_dst == GGML_TYPE_TQ4_1S) {
+            // Reduction order matters; the TurboQuant weight types have a WHT inside the
+            // dot product which amplifies fp reduction differences slightly.
+            return 0.01;
+        }
         return 1e-7;
     }
 
@@ -12853,6 +12858,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+    // turbo6 / turbo5 dequant (KV cache read-back): 128 values per block, so ne0 must be a multiple of 128
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO6_0, GGML_TYPE_F32, {128, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO6_0, GGML_TYPE_F32, {256, 4, 4, 4}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO5_0, GGML_TYPE_F32, {128, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO5_0, GGML_TYPE_F32, {256, 4, 4, 4}));
     for (ggml_type type_src : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F8_E4M3, {32, 2, 3, 4}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {64, 2, 3, 4}));
         test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F8_E4M3, {32, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {1, 0, 2, 3}));
@@ -13972,6 +13982,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+        // n=1 as well as n=16: ggml_vk_use_mul_mat_vec_id() selects the mat-vec path only
+        // when src2->ne[1] <= 8, so the n=16 case above exercises mul_mm_id and never touches
+        // the decode path. A backend that claims MUL_MAT_ID support without a mul_mat_vec_id
+        // pipeline for the type passes at n=16 and asserts on a null pipeline at n=1.
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 1, 3*ggml_blck_size(type_a)));
+    }
+
+    // TQ weight against a src1 with batch dims. A hybrid model's GDN output projection takes
+    // [K, n_seq_tokens, n_seqs], so with several sequences in one ubatch the other sequences sit
+    // in ne[2]. nr = {s, 1} gives a 2D weight and src1 [K, n, s, 1]; n*s spans both sides of the
+    // fused decode limit (MMVQ_MAX_BATCH_SIZE columns). TQ4_1S needs GGML_TQ_NATIVE=1 to stay
+    // TQ4_1S on the device.
+    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+        for (int n : {1, 3, 8}) {
+            for (int s : {2, 3}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 512, {1, 1}, {s, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 1, 512, {1, 1}, {2, 2}));
+    }
+
+    // TurboQuant MUL_MAT_ID. TQ3_1S/TQ4_1S are in all_types but not base_types, so the
+    // two cases above are their only MUL_MAT_ID coverage and the rich sweep below never
+    // reaches them. Cover both sides of the n <= 8 threshold that
+    // ggml_vk_use_mul_mat_vec_id() splits on (mul_mat_vec_id vs mul_mm_id), several
+    // n_used counts, and broadcast -- which exercises the expert-index wrap that a
+    // single non-broadcast case never touches.
+    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+        for (int n_used : {1, 2, 4}) {
+            for (bool b : {false, true}) {
+                for (int n : {1, 4, 8, 9, 17, 32}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, n_used, b, 512, n, 256));
+                }
+            }
+        }
+    }
+
+    // TurboQuant MUL_MAT_ID at the shapes a real MoE model uses. The sweep above runs 4 experts
+    // with k=256, which is nothing like a real router: Qwen3.6-35B-A3B (qwen35moe) has 256
+    // experts with 8 used per token, gate/up of [2048 x 512] and down of [512 x 2048]. Expert
+    // counts in the hundreds change how the routing is built and how few slots each expert
+    // gets, and n spans both sides of MMVQ_MAX_BATCH_SIZE so this covers the decode matvec and
+    // the MMQ prefill path rather than only one of them.
+    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+        for (int n : {1, 9, 32}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  512, n, 2048)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n,  512)); // down
+        }
     }
 
     // Test IQP panel path for all grid IQ types
@@ -15228,6 +15286,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
+    // overflow: n_tokens > K - only the last K snapshots kept.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // emit_mode == 1 (replay ingredients): CPU-only for now (see ggml_backend_cuda_device_supports_op).
+    // Same shape matrix as the K > 1 block above - sanity-checks the ingredient path builds,
+    // runs, and produces finite output; bit-exact replay-vs-snapshot equivalence is checked
+    // separately in test-gdn-ingredient-replay.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16,   2, 1, 1, false, false, /*K=*/2, /*emit_mode=*/1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   4, 1, 1, false, false, /*K=*/4, /*emit_mode=*/1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4, /*emit_mode=*/1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3, /*emit_mode=*/1));
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
@@ -15274,6 +15344,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
+    test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
+    test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, false, 0.25f));
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
@@ -15520,6 +15594,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    for (ggml_type type_a : {GGML_TYPE_Q8_CR, GGML_TYPE_Q5_CR, GGML_TYPE_Q6_CR}) {
+        for (int64_t n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat_cr(
+                type_a, 33, n, 1024, cr_activation_pattern::RANDOM));
+            test_cases.emplace_back(new test_mul_mat_cr(
+                type_a, 10240, n, 5120, cr_activation_pattern::RANDOM));
+        }
+    }
+    for (const auto & pair : {
+            std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_CR},
+            std::pair{GGML_TYPE_Q5_0, GGML_TYPE_Q5_CR},
+            std::pair{GGML_TYPE_Q6_K, GGML_TYPE_Q6_CR}}) {
+        test_cases.emplace_back(new test_mul_mat(
+            pair.first, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            pair.first, GGML_TYPE_F32, 10240, 256, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_cr(
+            pair.second, 10240, 256, 5120, cr_activation_pattern::RANDOM));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
