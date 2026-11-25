@@ -1,8 +1,10 @@
 #pragma once
 
-#include "ggml-vulkan.h"
-
+// vulkan_core.h first: ggml-vulkan.h only declares the MoE cache handle
+// accessors when VK_VERSION_1_0 is already defined.
 #include <vulkan/vulkan_core.h>
+
+#include "ggml-vulkan.h"
 
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -108,6 +110,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixMaintenance1FeaturesEXT {
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-vulkan-shaders.hpp"
+
+extern "C" void ggml_vulkan_moe_cache_register(void * reg);
 
 #if !defined(VK_KHR_shader_bfloat16)
 
@@ -865,6 +869,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
+    // Activation pre-rotation for the TurboQuant rotated matmul path. One
+    // pipeline serves TQ3_1S and TQ4_1S: they share the 32-element sign pattern
+    // and butterfly, and the shader only touches the activation.
+    vk_pipeline pipeline_tq_rotate_act;
+
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
@@ -1009,6 +1018,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_pool1d_f32;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_pool2d_subgroup_f32;
+    vk_pipeline pipeline_turbo_wht;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;

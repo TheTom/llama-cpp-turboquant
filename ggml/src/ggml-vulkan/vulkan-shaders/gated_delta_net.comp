@@ -216,7 +216,7 @@ void main() {
                     // as 4 consecutive rows in that order.
                     const uint ingr_base = s_off + uint(target_slot) * state_size_per_snap + ingr_head_off;
                     // v: per-column scalar (v_val is this column's own element of the v vector)
-                    // -- every column writes its own element, via the lane that owns the column.
+                    // -- every column writes its own element, via lane 0.
                     if (lane == 0) {
                         data_dst[ingr_base + S_V + col] = v_val;
                     }
@@ -256,7 +256,7 @@ void main() {
     // the whole token loop) -- fixed cost, not scaled by K, unconditional on K.
     if (emit_ingr) {
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            data_dst[final_state_base + state_out_base + col * S_V + row_index(r, lane)] = s_shard[r];
+            data_dst[final_state_base + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
         }
     }
 }
