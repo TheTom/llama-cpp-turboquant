@@ -8,8 +8,8 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    10
 #define RPC_PROTO_MINOR_VERSION    0
+// upstream 8d60873df uses 2, the TurboQuant fork bumps it for GGML_OP_TURBO_WHT
 #define RPC_PROTO_PATCH_VERSION    3
-#define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
 // 102 = upstream 101 + TURBO_WHT (upstream already has LIGHTNING_INDEXER and DSV4_HC_*)

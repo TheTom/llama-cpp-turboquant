@@ -870,15 +870,12 @@ static size_t ggml_backend_rpc_query_alloc_size(ggml_backend_buffer_t buffer, co
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
 
-    rpc_msg_get_alloc_size_req request = {
-        /*.device =*/ buft_ctx->device,
-        /*.tensor =*/ serialize_tensor(tensor),
-        /*.srcs   =*/ {},
-    };
+    auto request = std::make_shared<rpc_msg_get_alloc_size_req>();
+    request->device = buft_ctx->device;
+    request->tensor = serialize_tensor(tensor);
 
     rpc_msg_get_alloc_size_rsp response;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    ctx->dispatcher->send(RPC_CMD_GET_ALLOC_SIZE, request, sizeof(*request), nullptr, 0, &response, sizeof(response));
 
     return response.alloc_size;
 }
@@ -922,33 +919,6 @@ static void ggml_backend_rpc_retype_converted_tq4_1s(ggml_backend_buffer_t buffe
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-
-    bool cached = false;
-    if (size > HASH_THRESHOLD) {
-        rpc_msg_set_tensor_hash_req request;
-        request.tensor = rpc_tensor;
-        request.offset = offset;
-        request.hash = fnv_hash((const uint8_t*)data, size);
-        rpc_msg_set_tensor_hash_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
-        cached = response.result != 0;
-    }
-
-    if (!cached) {
-        // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-        std::vector<uint8_t> input(input_size, 0);
-        memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-        memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
-    }
-
-    // the server converts the weight whether it took it from the cache or from
-    // this write, so retype in both cases
-    ggml_backend_rpc_retype_converted_tq4_1s(buffer, tensor, offset, size);
     uint8_t cache_flag = 0;
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), offset,
              rpc_log_format_size(size).c_str());
@@ -963,6 +933,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
                  request->hash, response.result ? "hit" : "miss");
         if (response.result) {
             // the server has the same data, no need to send it
+            // the server converts the weight whether it took it from the cache or from
+            // this write, so retype in both cases
+            ggml_backend_rpc_retype_converted_tq4_1s(buffer, tensor, offset, size);
             return;
         }
         // the server has no cache entry for this tensor - ask it to save one
@@ -971,6 +944,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     size_t header_size;
     auto header = serialize_set_tensor(rpc_tensor, cache_flag, offset, nullptr, 0, header_size);
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, header, header_size, data, size, nullptr, 0);
+    // the server converts the weight whether it took it from the cache or from
+    // this write, so retype in both cases
+    ggml_backend_rpc_retype_converted_tq4_1s(buffer, tensor, offset, size);
 }
 
 static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
