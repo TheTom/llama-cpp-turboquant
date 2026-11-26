@@ -129,7 +129,7 @@ llama-quantize model-f16.gguf model-tq3.gguf TQ3_1S
 
 `TQ3_1S` (4.00 bpw) and `TQ4_1S` (5.00 bpw) are supported on CPU, CUDA/HIP (warp-cooperative `mmvq` with fused `dp4a`), Metal and Vulkan, and work in `llama-cli`, `llama-server`, `llama-bench` and `llama-perplexity`. ggml-sycl has no TQ kernels, and its generic dequantize path leaves the weights in the WHT-rotated domain, so TQ models are not supported on SYCL.
 
-`TQ3_4S` (3.50 bpw) is `TQ3_1S` with four 32-value sub-blocks sharing one fp16 scale and 6-bit sub-scales. It is a `llama-quantize` target (`llama-quantize model-f16.gguf model-tq3_4s.gguf TQ3_4S`) with CPU and CUDA/HIP kernels (fused decode, and opt-in int8 MMQ prefill on CDNA, RDNA2 and RDNA3 with `GGML_TQ_MMQ=1`). Metal, Vulkan and SYCL do not claim its ops, so they run on the CPU.
+`TQ3_4S` (3.50 bpw) is `TQ3_1S` with four 32-value sub-blocks sharing one fp16 scale and 6-bit sub-scales. It is a `llama-quantize` target (`llama-quantize model-f16.gguf model-tq3_4s.gguf TQ3_4S`) with CPU and CUDA/HIP kernels (fused decode, and int8 MMQ prefill on CDNA, RDNA2 and RDNA3; `GGML_TQ_MMQ=0` turns it off). Metal, Vulkan and SYCL do not claim its ops, so they run on the CPU.
 
 On CUDA, `TQ4_1S` weights are converted to `q8_0` at load time by default (best prefill speed). Set `GGML_TQ_NATIVE=1` to keep them native: decode is about 30% faster and weight VRAM drops about 1.7x, but prefill is about 2x slower. Pick it for decode-heavy serving; keep the default for prefill-heavy or mixed workloads.
 

@@ -2835,19 +2835,18 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-// GGML_TQ_MMQ: unset = native TQ MMQ prefill for TQ3_1S only, 0 = off, any other value = on for
-// every TQ type with a config. Read once: it is a libc call per mul_mat node otherwise.
-static int ggml_cuda_tq_mmq_env() {
-    static const int env = [] {
+// GGML_TQ_MMQ: 0 = off, unset or any other value = native TQ MMQ prefill for every TQ type with a
+// config. Read once: it is a libc call per mul_mat node otherwise.
+static bool ggml_cuda_tq_mmq_env() {
+    static const bool env = [] {
         const char * e = getenv("GGML_TQ_MMQ");
-        return e == nullptr ? -1 : strcmp(e, "0") == 0 ? 0 : 1;
+        return e == nullptr || strcmp(e, "0") != 0;
     }();
     return env;
 }
 
 static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
-    const int env = ggml_cuda_tq_mmq_env();
-    if (env == 0 || (env == -1 && src0->type != GGML_TYPE_TQ3_1S)) {
+    if (!ggml_cuda_tq_mmq_env()) {
         return false;
     }
 
