@@ -42,7 +42,7 @@ The turbo KV cache blocks hold 128 values each: 34, 50, 66, 82 and 98 bytes for
 normalized Kronecker-Hadamard matrix; `mul_mat` rotates the other operand the
 same way before the dot products. Vulkan and SYCL reject them.
 
-Turbo KV cache types are **runtime-only**: they are never stored in model files. `TQ3_1S` / `TQ4_1S` and the `*_CR` types are first-class weight types usable in any GGUF via `llama-quantize`.
+Turbo KV cache types are **runtime-only**: they are never stored in model files. `TQ3_1S` / `TQ4_1S` / `TQ3_4S` and the `*_CR` types are first-class weight types usable in any GGUF via `llama-quantize`.
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v1)
 [![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
 [![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
