@@ -73,15 +73,25 @@ up to one, as for the other turbo types.
 CUDA flash attention (head dims 128 and 256 after padding) covers these K/V pairs
 in a default build:
 
-- `turbo5` or `turbo6` K with V of the same type, `turbo3`, `turbo4`, `q8_0` or `f16`
-- `turbo6` K with `turbo5` V
-- `q8_0` K with `turbo5` or `turbo6` V (the auto-asymmetric result)
+- any combination of `f16`, `q8_0`, `turbo2`, `turbo3` and `turbo4` for K and V
+- `turbo5` or `turbo6` on one side with `f16`, `q8_0` or any turbo type on the
+  other side
 
-`-DGGML_CUDA_FA_ALL_QUANTS=ON` adds the remaining pairs with `f16`, `q8_0`,
-`turbo2`, `turbo3` and `turbo4`. The fused GQA-packed MMA kernel, which is the fast
-path for long contexts, additionally covers `turbo5`/`turbo5`, `turbo6`/`turbo6`,
-`turbo5`/`turbo3`, `turbo6`/`turbo3` (head dims 128 and 256) and `turbo5`/`turbo4`,
-`turbo6`/`turbo4`, `turbo6`/`turbo5` (head dim 256).
+`turbo2`, `turbo3` and `turbo4` have vector kernel instances for head dims 64,
+128 and 256; `turbo5` and `turbo6` pack 128 values per block, so their instances
+cover head dims 128 and 256 only. `-DGGML_CUDA_FA_ALL_QUANTS=ON` adds the mixed
+pairs with `q4_0`, `q4_1`, `q5_0`, `q5_1`, `bf16` and `f8_e4m3`. The fused
+GQA-packed MMA kernel, which is the fast path for long contexts, additionally
+covers `turbo5`/`turbo5`, `turbo6`/`turbo6`, `turbo5`/`turbo3`, `turbo6`/`turbo3`
+(head dims 128 and 256) and `turbo5`/`turbo4`, `turbo6`/`turbo4`, `turbo6`/`turbo5`
+(head dim 256).
+
+A `q8_0` K cache with a turbo V cache is what the auto-asymmetric rule produces
+on models with GQA ratio 6 or more, so that mixed pair needs a vector kernel
+instance on every backend. On CUDA a missing instance is not an error: the
+backend reports the pair as unsupported and the attention falls back to the CPU,
+and over RPC the peer aborts instead, because the RPC backend accepts every op
+without asking the remote device.
 
 ## Model-specific quality
 

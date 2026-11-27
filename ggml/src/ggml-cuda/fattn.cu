@@ -3101,6 +3101,20 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_NO_D64(TURBO6_0, TURBO5_0)
     FATTN_VEC_CASES_NO_D64(TURBO6_0, TURBO6_0)
 
+    // TurboQuant V cache with a non-turbo K cache.
+    // The auto-asymmetric cache mode upgrades K to q8_0 while V stays turbo,
+    // so these pairs need a compiled vector kernel instance as well.
+    FATTN_VEC_CASES_ALL_D(F16,  TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(Q8_0, TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(F16,  TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(Q8_0, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(F16,  TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(Q8_0, TURBO4_0)
+    FATTN_VEC_CASES_NO_D64(F16,  TURBO5_0)
+    FATTN_VEC_CASES_NO_D64(Q8_0, TURBO5_0)
+    FATTN_VEC_CASES_NO_D64(F16,  TURBO6_0)
+    FATTN_VEC_CASES_NO_D64(Q8_0, TURBO6_0)
+
     return nullptr;
 }
 

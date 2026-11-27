@@ -14821,6 +14821,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO2_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0));
 
+    // turbo V cache with a f16/q8_0 K cache. The auto-asymmetric cache mode
+    // upgrades K to q8_0 while V stays turbo, so the CUDA VEC lookup table must
+    // route every one of these pairs. A missing row makes the backend report
+    // the pair as unsupported, which silently moves the attention to the CPU
+    // locally and aborts the peer over RPC.
+    for (ggml_type type_v : { GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0 }) {
+        for (ggml_type type_k : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 2, true, false, 0, 0, GGML_PREC_F32, type_k, type_v));
+        }
+    }
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
