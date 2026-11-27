@@ -342,7 +342,7 @@ static __global__ void mul_mat_vec_cr_cooperative(
         row_sum += exchange[row_in_cta][p + 32];
 #pragma unroll
         for (int stride = 16; stride > 0; stride /= 2) {
-            row_sum += ggml_cuda_shfl_down(row_sum, stride, WARP_SIZE);
+            row_sum += __shfl_down_sync(0xffffffff, row_sum, stride, WARP_SIZE);
         }
         if (p == 0 && active_row) {
             y[token*m + row] = row_sum;

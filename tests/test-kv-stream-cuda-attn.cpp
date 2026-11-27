@@ -263,7 +263,7 @@ std::vector<float> run_attention(
 
     ggml_tensor * out = ggml_flash_attn_ext(
         compute_ctx.get(), q, k, v, mask, 1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
     ggml_set_name(out, "streamed-attention-output");
 
     ggml_backend_buffer_ptr kv_buffer(
@@ -423,7 +423,7 @@ std::vector<float> run_attention_layers(
         current.out = ggml_flash_attn_ext(
             compute_ctx.get(), current.q, k, v, current.mask,
             1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(current.out, GGML_PREC_F32);
+        GGML_ASSERT(ggml_prec_set_acc(current.out, GGML_PREC_F32));
         tensors.push_back(current);
     }
 

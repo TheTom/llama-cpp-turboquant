@@ -199,6 +199,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
+    # uses the internal llama_model_create(llm_arch, params) constructor
+    llama_build_and_test(test-drama3-rope.cpp  LABEL behavior)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -358,7 +360,6 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
-llama_build_and_test(test-drama3-rope.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -375,16 +376,20 @@ if (GGML_CUDA)
         test-kv-stream-bench-config.cpp
         ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench/kv-stream-bench-config.cpp  LABEL behavior)
     target_include_directories(test-kv-stream-bench-config PRIVATE ${PROJECT_SOURCE_DIR}/tools/kv-stream-bench)
-    llama_build_and_test(test-kv-stream-cuda-buffer.cpp  LABEL behavior)
-    target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
-    # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
-    # on a GPU-less CI runner). ctest only treats that as a skip when
-    # SKIP_RETURN_CODE says so; without it the skip is recorded as a failure.
-    set_tests_properties(test-kv-stream-cuda-buffer PROPERTIES SKIP_RETURN_CODE 77)
-    llama_build_and_test(test-kv-stream-cuda-attn.cpp  LABEL behavior)
-    target_include_directories(test-kv-stream-cuda-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
-    llama_build_and_test(test-kv-stream-cuda-set-rows.cpp  LABEL behavior)
-    target_include_directories(test-kv-stream-cuda-set-rows PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    if (NOT GGML_BACKEND_DL)
+        # these tests call the CUDA backend's kv-stream internals directly, which
+        # are not exported when the backend is built as a separate library
+        llama_build_and_test(test-kv-stream-cuda-buffer.cpp  LABEL behavior)
+        target_include_directories(test-kv-stream-cuda-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+        # The test exits 77 when no CUDA device is present (e.g. a CUDA build run
+        # on a GPU-less CI runner). ctest only treats that as a skip when
+        # SKIP_RETURN_CODE says so; without it the skip is recorded as a failure.
+        set_tests_properties(test-kv-stream-cuda-buffer PROPERTIES SKIP_RETURN_CODE 77)
+        llama_build_and_test(test-kv-stream-cuda-attn.cpp  LABEL behavior)
+        target_include_directories(test-kv-stream-cuda-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+        llama_build_and_test(test-kv-stream-cuda-set-rows.cpp  LABEL behavior)
+        target_include_directories(test-kv-stream-cuda-set-rows PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    endif()
 endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
