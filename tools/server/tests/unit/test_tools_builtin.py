@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 
 import pytest
 from utils import *
@@ -10,6 +12,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 
 # marker for the grep_search test to find in this file
 GREP_MARKER = "llama_cpp_test_tools_builtin_marker_grep_search"
+
+# image the container runtime tests run their shell in
+CONTAINER_IMAGE = "busybox"
 
 
 @pytest.fixture(autouse=True)
@@ -48,22 +53,23 @@ def test_tools_builtin_grep_search():
     assert "Total matches: 1" in text
 
 
-def test_tools_builtin_read_file():
+def test_tools_builtin_read_file(tmp_path):
     global server
     server.start()
 
-    this_file = os.path.join(PROJECT_ROOT, "tools", "server", "tests", "unit", "test_tools_builtin.py")
-    res = call_tool("read_file", {"path": this_file})
-    text = res["plain_text_response"]
-    assert GREP_MARKER in text
-    assert "def test_tools_builtin_read_file" in text
+    # a file of its own keeps the test below the read limit, unlike this file which grows with every test
+    path = str(tmp_path / "read.txt")
+    with open(path, "w", newline="\n") as f:
+        f.write("line1\nline2\nline3\n")
+    res = call_tool("read_file", {"path": path})
+    assert res["plain_text_response"] == "line1\nline2\nline3\n"
 
 
-def test_tools_builtin_write_then_edit_file():
+def test_tools_builtin_write_then_edit_file(tmp_path):
     global server
     server.start()
 
-    log_path = os.path.join(PROJECT_ROOT, "test.log")
+    log_path = str(tmp_path / "test.log")
     try:
         write_res = call_tool("write_file", {"path": log_path, "content": "line1\nline2\nline3\n"})
         assert write_res["result"] == "file written successfully"
@@ -88,11 +94,11 @@ def test_tools_builtin_write_then_edit_file():
             os.remove(log_path)
 
 
-def test_tools_builtin_edit_file_rejects_non_unique_old_text():
+def test_tools_builtin_edit_file_rejects_non_unique_old_text(tmp_path):
     global server
     server.start()
 
-    log_path = os.path.join(PROJECT_ROOT, "test.log")
+    log_path = str(tmp_path / "test.log")
     try:
         call_tool("write_file", {"path": log_path, "content": "dup\ndup\n"})
         err = call_tool_expect_error("edit_file", {
@@ -123,34 +129,167 @@ def test_tools_builtin_exec_shell_command_stream():
     assert "[exit code: 0]" in chunks
 
 
-def test_tools_builtin_cwd_header():
+def test_tools_builtin_cwd_header(tmp_path):
     global server
     server.start()
 
-    cwd_dir = os.path.join(PROJECT_ROOT, "tools", "server", "tests", "unit")
-    headers = {"x-tool-cwd": cwd_dir}
+    headers = {"x-tool-cwd": str(tmp_path)}
 
-    res = call_tool("read_file", {"path": "test_tools_builtin.py"}, headers=headers)
-    assert GREP_MARKER in res["plain_text_response"]
+    (tmp_path / "cwd.txt").write_text("cwd-content")
+    res = call_tool("read_file", {"path": "cwd.txt"}, headers=headers)
+    assert "cwd-content" in res["plain_text_response"]
 
     # exec_shell_command should also run with that directory as its working directory:
-    # writing to a relative filename must land inside cwd_dir
+    # writing to a relative filename must land inside it
     marker_name = "llama_cpp_test_tools_builtin_cwd_marker.txt"
-    marker_path = os.path.join(cwd_dir, marker_name)
+    call_tool("exec_shell_command", {"command": f"echo hello > {marker_name}"}, headers=headers)
+    assert (tmp_path / marker_name).exists()
+
+
+def _container_engine_unavailable_reason(engine: str) -> str | None:
+    """None if `engine` can run the image these tests use, otherwise the reason it can't."""
+    engine_bin = shutil.which(engine)
+    if engine_bin is None:
+        return f"{engine} is not installed"
     try:
-        command = f"echo hello > {marker_name}"
-        call_tool("exec_shell_command", {"command": command}, headers=headers)
-        assert os.path.exists(marker_path)
+        # a daemon that answers `info` still cannot run a linux image when it serves windows
+        # containers, so probe the image itself, which also pulls it before the tests
+        subprocess.run([engine_bin, "run", "--rm", CONTAINER_IMAGE, "true"], capture_output=True, timeout=60, check=True)
+    except Exception as e:
+        return f"{engine} cannot run {CONTAINER_IMAGE}: {e}"
+    return None
+
+
+@pytest.fixture(params=["docker", "podman"])
+def container_engine(request):
+    engine = request.param
+    reason = _container_engine_unavailable_reason(engine)
+    if reason is not None:
+        pytest.skip(reason)  # ty: ignore[too-many-positional-arguments, invalid-argument-type]
+    return engine
+
+
+@pytest.fixture
+def container_id(container_engine: str):
+    proc = subprocess.run(
+        [container_engine, "run", "-d", "--rm", CONTAINER_IMAGE, "sleep", "300"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"failed to start {container_engine} container: {proc.stderr.strip()}")  # ty: ignore[too-many-positional-arguments, invalid-argument-type]
+
+    cid = proc.stdout.strip()
+    try:
+        yield cid
     finally:
-        if os.path.exists(marker_path):
-            os.remove(marker_path)
+        subprocess.run([container_engine, "rm", "-f", cid], capture_output=True)
 
 
-def test_tools_builtin_edit_file_rejects_overlapping_edits():
+def test_tools_builtin_runtime_header(container_engine: str, container_id: str):
     global server
     server.start()
 
-    log_path = os.path.join(PROJECT_ROOT, "test.log")
+    headers = {"x-tool-runtime": f"{container_engine}-container:{container_id}", "x-tool-cwd": "/tmp"}
+
+    write_res = call_tool("write_file", {"path": "test.log", "content": "hello container\n"}, headers=headers)
+    assert write_res["result"] == "file written successfully"
+
+    read_res = call_tool("read_file", {"path": "test.log"}, headers=headers)
+    assert read_res["plain_text_response"] == "hello container\n"
+
+    exec_res = call_tool("exec_shell_command", {"command": "cat test.log"}, headers=headers)
+    assert "hello container" in exec_res["plain_text_response"]
+
+
+def test_tools_builtin_runtime_header_refused_with_configured_runtime(container_engine: str, container_id: str):
+    global server
+    server.server_tools_runtime = f"{container_engine}-container:{container_id}"
+    server.start()
+
+    res = call_tool("exec_shell_command", {"command": "echo sandboxed"})
+    assert "sandboxed" in res["plain_text_response"]
+
+    for runtime in ["ssh:user@internal-host", f"{container_engine}-container:other", server.server_tools_runtime]:
+        res = server.make_request("POST", "/tools",
+                                  data={"tool": "exec_shell_command", "params": {"command": "echo hi"}},
+                                  headers={"x-tool-runtime": runtime})
+        assert res.status_code == 403, res.body
+
+
+def test_tools_builtin_runtime_header_unknown_scheme():
+    global server
+    server.start()
+
+    # an unknown runtime must fail, never silently fall back to running on the host
+    res = server.make_request("POST", "/tools",
+                              data={"tool": "exec_shell_command", "params": {"command": "echo hi"}},
+                              headers={"x-tool-runtime": "fake:does-not-exist"})
+    assert res.status_code == 500, res.body
+    assert "unknown tool runtime" in str(res.body)
+
+
+def test_tools_builtin_runtime_header_rejects_ssh_option_injection():
+    global server
+    server.start()
+
+    # ssh reads options from its argv, so a target starting with '-' must be rejected
+    res = server.make_request("POST", "/tools",
+                              data={"tool": "exec_shell_command", "params": {"command": "echo hi"}},
+                              headers={"x-tool-runtime": "ssh:-oProxyCommand=touch /tmp/pwned"})
+    assert res.status_code == 500, res.body
+    assert "invalid ssh target" in str(res.body)
+
+
+@pytest.mark.parametrize("engine", ["docker", "podman"])
+def test_tools_builtin_runtime_header_rejects_container_option_injection(engine: str):
+    global server
+    server.start()
+
+    # the container id lands on the `<engine> exec` command line, so an id that looks
+    # like an option must be rejected
+    res = server.make_request("POST", "/tools",
+                              data={"tool": "exec_shell_command", "params": {"command": "echo hi"}},
+                              headers={"x-tool-runtime": f"{engine}-container:--privileged"})
+    assert res.status_code == 500, res.body
+    assert "invalid container id" in str(res.body)
+
+
+def test_tools_builtin_docker_runtime_cleans_up_spawned_container():
+    # docker-only: this reads the container hostname to get the spawned id, which only docker
+    # sets to the short id. podman is covered by the attach path above
+    reason = _container_engine_unavailable_reason("docker")
+    if reason is not None:
+        pytest.skip(reason)  # ty: ignore[too-many-positional-arguments, invalid-argument-type]
+
+    global server
+    server.server_tools_runtime = f"docker:{CONTAINER_IMAGE}"
+    server.start()
+
+    # exec_shell_command runs inside the container spawned for --tools-runtime; docker sets
+    # the container's hostname to its own short id, so this also tells us which one to check
+    res = call_tool("exec_shell_command", {"command": "hostname"})
+    container_id = res["plain_text_response"].splitlines()[0].strip()
+    assert len(container_id) >= 8, res
+
+    running = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
+        capture_output=True, text=True,
+    )
+    assert running.returncode == 0 and running.stdout.strip() == "true", running.stderr
+
+    server.stop()
+
+    # a clean server shutdown must stop and remove the container it spawned (it runs with --rm),
+    # not leave it behind as an abandoned child
+    leftover = subprocess.run(["docker", "inspect", container_id], capture_output=True, text=True)
+    assert leftover.returncode != 0, f"container {container_id} was not cleaned up after server exit"
+
+
+def test_tools_builtin_edit_file_rejects_overlapping_edits(tmp_path):
+    global server
+    server.start()
+
+    log_path = str(tmp_path / "test.log")
     try:
         call_tool("write_file", {"path": log_path, "content": "line1\nline2\n"})
         err = call_tool_expect_error("edit_file", {

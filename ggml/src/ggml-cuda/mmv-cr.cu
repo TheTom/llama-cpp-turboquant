@@ -91,10 +91,10 @@ static __device__ __forceinline__ void convrot_inverse_registers(
 #pragma unroll
         for (int component = 0; component < 4; ++component) {
             const float v = values.value[component];
-            const float a = __shfl_sync(0xffffffff, v, base + col,          WARP_SIZE);
-            const float b = __shfl_sync(0xffffffff, v, base + half + col,   WARP_SIZE);
-            const float c = __shfl_sync(0xffffffff, v, base + 2*half + col, WARP_SIZE);
-            const float d = __shfl_sync(0xffffffff, v, base + 3*half + col, WARP_SIZE);
+            const float a = ggml_cuda_shfl(v, base + col,          WARP_SIZE);
+            const float b = ggml_cuda_shfl(v, base + half + col,   WARP_SIZE);
+            const float c = ggml_cuda_shfl(v, base + 2*half + col, WARP_SIZE);
+            const float d = ggml_cuda_shfl(v, base + 3*half + col, WARP_SIZE);
             values.value[component] = cr_radix4(a, b, c, d, radix_row);
         }
     }
@@ -141,10 +141,10 @@ static __device__ __forceinline__ float convrot_inverse_group(
         const int base = lane & ~(len - 1);
         const int r = (lane/half) & 3;
         const int col = lane & (half - 1);
-        const float a = __shfl_sync(0xffffffff, v, base + col,          WARP_SIZE);
-        const float b = __shfl_sync(0xffffffff, v, base + half + col,   WARP_SIZE);
-        const float c = __shfl_sync(0xffffffff, v, base + 2*half + col, WARP_SIZE);
-        const float d = __shfl_sync(0xffffffff, v, base + 3*half + col, WARP_SIZE);
+        const float a = ggml_cuda_shfl(v, base + col,          WARP_SIZE);
+        const float b = ggml_cuda_shfl(v, base + half + col,   WARP_SIZE);
+        const float c = ggml_cuda_shfl(v, base + 2*half + col, WARP_SIZE);
+        const float d = ggml_cuda_shfl(v, base + 3*half + col, WARP_SIZE);
         v = r == 0 ?  a + b + c - d :
             r == 1 ?  a + b - c + d :
             r == 2 ?  a - b + c + d :

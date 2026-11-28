@@ -43,7 +43,7 @@ static __global__ void tq_prerotate_q8_1(
 
     #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
     val *= 0.17677669529663688f;
@@ -51,12 +51,12 @@ static __global__ void tq_prerotate_q8_1(
     float amax = fabsf(val);
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+        amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, off));
 
     float sum = val;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        sum += __shfl_xor_sync(0xffffffff, sum, off);
+        sum += ggml_cuda_shfl_xor(sum, off);
 
     const float d = amax / 127.0f;
     const float id = (d > 0.0f) ? 127.0f / amax : 0.0f;
@@ -539,7 +539,7 @@ static __global__ void tq_prerotate_activation(
 
     #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
     val *= 0.17677669529663688f;
@@ -633,7 +633,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multi(
     for (int offset = 16; offset > 0; offset >>= 1) {
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++)
-            sumf[j] += __shfl_xor_sync(0xffffffff, sumf[j], offset);
+            sumf[j] += ggml_cuda_shfl_xor(sumf[j], offset);
     }
 
     if (lane == 0) {
@@ -703,7 +703,7 @@ static __global__ void mul_mat_tq3_1s_dp4a_multi(
     for (int offset = 16; offset > 0; offset >>= 1) {
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++)
-            sumf[j] += __shfl_xor_sync(0xffffffff, sumf[j], offset);
+            sumf[j] += ggml_cuda_shfl_xor(sumf[j], offset);
     }
 
     if (lane == 0) {
@@ -795,7 +795,7 @@ static __global__ void mul_mat_tq3_1s_dp4a_multirow(
         for (int r = 0; r < nrows_per_warp; r++) {
             #pragma unroll
             for (int j = 0; j < ncols_dst; j++) {
-                sumf[r][j] += __shfl_xor_sync(0xffffffff, sumf[r][j], offset);
+                sumf[r][j] += ggml_cuda_shfl_xor(sumf[r][j], offset);
             }
         }
     }
@@ -896,7 +896,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multirow(
         for (int r = 0; r < nrows_per_warp; r++) {
             #pragma unroll
             for (int j = 0; j < ncols_dst; j++) {
-                sumf[r][j] += __shfl_xor_sync(0xffffffff, sumf[r][j], offset);
+                sumf[r][j] += ggml_cuda_shfl_xor(sumf[r][j], offset);
             }
         }
     }
@@ -969,7 +969,7 @@ static __global__ void mul_mat_tq3_1s_multi(
     for (int offset = 16; offset > 0; offset >>= 1) {
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++)
-            sumf[j] += __shfl_xor_sync(0xffffffff, sumf[j], offset);
+            sumf[j] += ggml_cuda_shfl_xor(sumf[j], offset);
     }
 
     if (lane == 0) {
@@ -1026,7 +1026,7 @@ static __global__ void mul_mat_tq4_1s_scalar_multi(
     for (int offset = 16; offset > 0; offset >>= 1) {
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++)
-            sumf[j] += __shfl_xor_sync(0xffffffff, sumf[j], offset);
+            sumf[j] += ggml_cuda_shfl_xor(sumf[j], offset);
     }
 
     if (lane == 0) {
@@ -1484,7 +1484,7 @@ static __global__ void mul_mat_tq3_1s_moe(
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        sumf += __shfl_xor_sync(0xffffffff, sumf, offset);
+        sumf += ggml_cuda_shfl_xor(sumf, offset);
     }
 
     if (lane == 0) {
@@ -1540,7 +1540,7 @@ static __global__ void mul_mat_tq4_1s_scalar_moe(
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        sumf += __shfl_xor_sync(0xffffffff, sumf, offset);
+        sumf += ggml_cuda_shfl_xor(sumf, offset);
     }
 
     if (lane == 0) {
@@ -1621,7 +1621,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
     sumf *= TQ4_CENTROID_I8_RESCALE;
     #pragma unroll
     for (int offset = LPR / 2; offset > 0; offset >>= 1) {
-        sumf += __shfl_xor_sync(0xffffffff, sumf, offset, LPR);
+        sumf += ggml_cuda_shfl_xor(sumf, offset, LPR);
     }
 
     if (lane == 0) {
@@ -1700,7 +1700,7 @@ static __global__ void mul_mat_tq3_1s_dp4a_moe(
     sumf *= TQ3_CENTROID_I8_RESCALE;
     #pragma unroll
     for (int offset = LPR / 2; offset > 0; offset >>= 1) {
-        sumf += __shfl_xor_sync(0xffffffff, sumf, offset, LPR);
+        sumf += ggml_cuda_shfl_xor(sumf, offset, LPR);
     }
 
     if (lane == 0) {
@@ -2184,7 +2184,7 @@ static __global__ void k_convert_tq4_1s_to_q8_0(
 
     #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
     val *= 0.17677669529663688f;
@@ -2193,7 +2193,7 @@ static __global__ void k_convert_tq4_1s_to_q8_0(
     float amax = fabsf(val);
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+        amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, off));
 
     const float d = amax / 127.0f;
     const float id = (d > 0.0f) ? 127.0f / amax : 0.0f;
@@ -2258,9 +2258,9 @@ void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx,
     const float beta  = 0.0f;
     const int64_t ldc = dst->ne[0];  // M
 
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
     CUBLAS_CHECK(
-        cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+        cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
                 ne01, ne11, ne00,
                 &alpha, src0_f16.get(), CUDA_R_16F, ne00,
                         src1_f16.get(), CUDA_R_16F, ne10,
@@ -2290,7 +2290,7 @@ static void ggml_cuda_mul_mat_tq_mmq_impl(ggml_backend_cuda_context & ctx, const
     ggml_tensor src1_rot = *src1;
     src1_rot.data = act_buf.get();
 
-    ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, nullptr, dst, false);
+    ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, nullptr, dst, nullptr, false);
 }
 
 void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -2331,7 +2331,7 @@ static void ggml_cuda_mul_mat_id_tq_mmq_impl(ggml_backend_cuda_context & ctx, co
     ggml_tensor src1_rot = *src1;
     src1_rot.data = act_buf.get();
 
-    ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, ids, dst, false);
+    ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, ids, dst, nullptr, false);
 }
 
 void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,

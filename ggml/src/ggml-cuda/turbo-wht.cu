@@ -72,7 +72,7 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
     // Intra-warp butterfly (h = 1, 2, 4, 8, 16)
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h, WARP_SIZE);
+        float o = ggml_cuda_shfl_xor(val, h, WARP_SIZE);
         val = (lane & h) ? (o - val) : (val + o);
     }
 
@@ -184,10 +184,10 @@ static __global__ void k_turbo_wht_f32_fast(const float * __restrict__ src,
     // the low two bits of the index alone. The lower index forms a+b.
 #define WHT_SHFL_STAGE(m)                                       \
     {                                                           \
-        const float px = __shfl_xor_sync(0xffffffff, v.x, (m)); \
-        const float py = __shfl_xor_sync(0xffffffff, v.y, (m)); \
-        const float pz = __shfl_xor_sync(0xffffffff, v.z, (m)); \
-        const float pw = __shfl_xor_sync(0xffffffff, v.w, (m)); \
+        const float px = ggml_cuda_shfl_xor(v.x, (m)); \
+        const float py = ggml_cuda_shfl_xor(v.y, (m)); \
+        const float pz = ggml_cuda_shfl_xor(v.z, (m)); \
+        const float pw = ggml_cuda_shfl_xor(v.w, (m)); \
         const bool hi = (lane & (m)) != 0;                      \
         v.x = hi ? px - v.x : v.x + px;                         \
         v.y = hi ? py - v.y : v.y + py;                         \

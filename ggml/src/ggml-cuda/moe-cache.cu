@@ -2719,7 +2719,7 @@ static int moe_cache_dispatch_internal(
                 cudaMemcpyHostToDevice, device.compute_stream), "input upload", true);
     if (ok) {
         quantize_row_q8_1_cuda(
-                d_act, nullptr, device.d_act_q8, (ggml_type)wtype,
+                d_act, device.d_act_q8,
                 n_in, n_in, (int64_t)activation_rows * n_in,
                 (int64_t)activation_rows * n_in, padded_n_in,
                 activation_rows, 1, 1, device.compute_stream);

@@ -14,15 +14,12 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
-    bool     gdn_replay;      // DRC: ingredient-replay rollback instead of full K-snapshots (opt-in)
     uint32_t n_outputs_max;   // max outputs supported by the context
+    uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
-
-    enum llama_moe_cache_mode moe_cache_mode;
-    size_t moe_cache_budget_mib;
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -38,35 +35,46 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
-    bool mtp_chain;               // DECODER_MTP: chain rows in-graph from the first row's inputs
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
-    bool fused_lid;          // use fused lightning indexer
-    bool auto_flid;
-    bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
-    bool fused_gdn_ch;       // use fused gated delta net (chunked)
-    bool auto_fgdn;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_top_k_mask;   // use fused top-k sparse attention mask
+    bool auto_ftkm;
+    bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+    bool auto_fkvr;
     bool no_perf;
-    bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool training;           // set by llama_opt_init()
+    bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
+
+    bool     gdn_replay;      // DRC: ingredient-replay rollback instead of full K-snapshots (opt-in)
+    enum llama_moe_cache_mode moe_cache_mode;
+    size_t moe_cache_budget_mib;
+
+    bool mtp_chain;               // DECODER_MTP: chain rows in-graph from the first row's inputs
 
     uint32_t kv_stream_arena_mib;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
+    bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
 
     enum llama_context_type ctx_type;
+    enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
+    llama_context * ctx_state_src;
 };

@@ -134,7 +134,7 @@ __global__ void convrot_quantize_q8_1_cuda(
         float acc = 0.0f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            acc += h4_cr[r][j]*__shfl_sync(0xffffffff, x, blk + j*half + t, WARP_SIZE);
+            acc += h4_cr[r][j]*ggml_cuda_shfl(x, blk + j*half + t, WARP_SIZE);
         }
         x = acc;
     }
@@ -249,7 +249,7 @@ __global__ void convrot_quantize_q8_1_warp_cuda(
             float acc = 0.0f;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                acc += h4_cr[r][j]*__shfl_sync(0xffffffff, value, blk + j*half + t, WARP_SIZE);
+                acc += h4_cr[r][j]*ggml_cuda_shfl(value, blk + j*half + t, WARP_SIZE);
             }
             reg[k] = acc;
         }
@@ -261,10 +261,10 @@ __global__ void convrot_quantize_q8_1_warp_cuda(
         const float even = reg[k + 0];
         const float odd  = reg[k + 1];
         const int t = lane & 15;
-        const float v0 = __shfl_sync(0xffffffff, even, t,      WARP_SIZE);
-        const float v1 = __shfl_sync(0xffffffff, even, t + 16, WARP_SIZE);
-        const float v2 = __shfl_sync(0xffffffff, odd,  t,      WARP_SIZE);
-        const float v3 = __shfl_sync(0xffffffff, odd,  t + 16, WARP_SIZE);
+        const float v0 = ggml_cuda_shfl(even, t,      WARP_SIZE);
+        const float v1 = ggml_cuda_shfl(even, t + 16, WARP_SIZE);
+        const float v2 = ggml_cuda_shfl(odd,  t,      WARP_SIZE);
+        const float v3 = ggml_cuda_shfl(odd,  t + 16, WARP_SIZE);
         const float v[4] = {v0, v1, v2, v3};
         const int r_even = lane >> 4;
         const int r_odd = r_even + 2;

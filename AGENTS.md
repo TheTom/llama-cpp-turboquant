@@ -10,16 +10,22 @@ TurboQuant compresses the KV cache far beyond the standard `q8_0` by applying a 
 
 The eleven fork-only GGML types (registered in `ggml/include/ggml.h`):
 
+The type IDs are the upstream ones where upstream has a type: the persisted
+upstream IDs keep their values and only the runtime-only fork types move. So
+`F8_E4M3=43`, `TURBO2_0=44`, `TQ3_1S=45`, `TQ4_1S=46`, `TURBO3_0=47`,
+`Q8_CR=48`, `Q5_CR=49`, `Q6_CR=50`, `TURBO4_0=51`, `TURBO5_0=52`,
+`TQ3_4S=53`, `TURBO6_0=54`.
+
 | Type   | Enum                       | Purpose                             | Size         | Backends            |
 |--------|----------------------------|-------------------------------------|--------------|---------------------|
-| turbo2 | `GGML_TYPE_TURBO2_0` (43)  | KV cache only                       | 2.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| turbo3 | `GGML_TYPE_TURBO3_0` (44)  | KV cache only                       | 3.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| turbo4 | `GGML_TYPE_TURBO4_0` (47)  | KV cache only                       | 4.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| turbo5 | `GGML_TYPE_TURBO5_0` (51)  | KV cache only                       | 5.125 bits   | CPU, CUDA/HIP       |
-| turbo6 | `GGML_TYPE_TURBO6_0` (52)  | KV cache only                       | 6.125 bits   | CPU, CUDA/HIP       |
+| turbo2 | `GGML_TYPE_TURBO2_0` (44)  | KV cache only                       | 2.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo3 | `GGML_TYPE_TURBO3_0` (47)  | KV cache only                       | 3.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo4 | `GGML_TYPE_TURBO4_0` (51)  | KV cache only                       | 4.125 bits   | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| turbo5 | `GGML_TYPE_TURBO5_0` (52)  | KV cache only                       | 5.125 bits   | CPU, CUDA/HIP       |
+| turbo6 | `GGML_TYPE_TURBO6_0` (54)  | KV cache only                       | 6.125 bits   | CPU, CUDA/HIP       |
 | TQ3_1S | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max| 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max| 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
-| TQ3_4S | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU, CUDA/HIP |
+| TQ3_4S | `GGML_TYPE_TQ3_4S` (53)   | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU, CUDA/HIP |
 | Q8_CR  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot              | 8.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q5_CR  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot              | 5.5 bits, group 256 | CPU, CUDA/HIP, Metal |
 | Q6_CR  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot              | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
@@ -36,7 +42,10 @@ Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S/TQ3_4S a
 - `src/llama-graph.cpp` - inverse-WHT post-processing (FA and non-FA paths)
 - `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (only reached with `GGML_TQ_NATIVE=1`; by default `TQ4_1S` is converted to `q8_0` at load in `ggml-cuda.cu`)
 - `ggml/src/ggml-vulkan/` - turbo FA, SET_ROWS, dequant shaders
-- `ggml/src/ggml-metal/ggml-metal.metal` - TurboFlash kernels
+- `ggml/src/ggml-metal/kernels/turbo.metal` - TurboFlash and TurboQuant WHT kernels
+- `ggml/src/ggml-metal/kernels/fa_turbo.metal` - turbo flash attention kernels
+- `ggml/src/ggml-metal/kernels/tq.h` - TQ3_1S / TQ4_1S dequantize helpers
+- `ggml/src/ggml-metal/kernels/moe_cache.metal` - MoE expert cache matvec kernels
 - `docs/KV-cache-quantization.md` - usage doc (read before touching cache types; source of truth for the environment knobs)
 
 ### Usage
@@ -82,7 +91,7 @@ Use the narrowest set of gates that covers the change, with CPU as the numeric r
 |-------------------------------------------------------------|-----------------|
 | Codec `ggml/src/ggml-turbo-quant.c`                         | `test-turbo-quant` and `test-quantize-fns`, the two suites that execute the CPU codec directly |
 | TQ/Turbo CUDA kernels (`ggml/src/ggml-cuda/`, `mmvq-tq.cu`) | `test-backend-ops` `-o MUL_MAT -p type_a=tq4_1s` (or the matching turbo op) on an NVIDIA card; a clean compile is not a pass. Changes to the `mmvq-tq.cu` centroid LUT additionally require the AMD run (see Known pitfalls) |
-| Metal kernels (`ggml/src/ggml-metal/ggml-metal.metal`)      | `[[host_name]]` instantiations present, then `test-backend-ops` with the Metal backend |
+| Metal kernels (`ggml/src/ggml-metal/kernels/`)              | `[[host_name]]` instantiations present, then `test-backend-ops` with the Metal backend |
 | Vulkan shaders (`ggml/src/ggml-vulkan/`)                    | SET_ROWS pipeline registration incl. TURBO2_0/3_0/4_0, then `test-backend-ops` with the Vulkan backend |
 | Cache/graph wiring (`src/llama-kv-cache.cpp`, `src/llama-graph.cpp`) | `test-backend-ops`, `llama-bench -ctk/-ctv turboN`, and `llama-perplexity --kl-divergence` against a saved baseline run (usually `f16`): the first two only exercise the kernels, only the KL run compares token probabilities |
 | Docs/README only                                            | no tests |
@@ -130,6 +139,7 @@ Direction rules for the two living lists: both grow freely. Add an entry as soon
 - **Metal**: turbo kernels need their `[[host_name]]` instantiations; a missing one is a NULL-pipeline deref on the first turbo KV write.
 - **Vulkan**: turbo SET_ROWS pipelines pin `subgroup_size=32` with `require_full_subgroups=true` when the device advertises 32 in `[subgroup_min_size, subgroup_max_size]`; wave64-only GPUs (e.g. Polaris) leave the size unpinned (`0`) and rely on the wave64-safe ballot packing. TQ4_1S (`local_size_x=32`) must also drop `require_full_subgroups` when unpinned - with REQUIRE_FULL_SUBGROUPS and no pin, Vulkan requires `local_size_x` to be a multiple of `maxSubgroupSize` (32 is not a multiple of 64).
 - **CUDA dispatch**: TQ weights must be excluded from the mmvq path before the fused-TQ branch (`ggml_cuda_should_use_mmvq`), or `GGML_TQ_NATIVE=1` aborts.
+- **CUDA FA pair lookup**: `ggml_cuda_get_fattn_vec_case` is the authority on which K/V cache-type pairs the GPU FA supports, and a missing row is not an error. Locally the FA node falls back to the CPU (silent, about 9x slower attention); over RPC the peer aborts with `GGML_ABORT("fatal error")` in `ggml_cuda_flash_attn_ext`, because the RPC backend's `supports_op` always returns true and the remote backend never gets the chance to decline the op. `TURBO_AUTO_ASYMMETRIC=1` produces the mixed `K=q8_0`/`V=turboN` pairs, so every turbo type needs the `F16` and `Q8_0` rows on both sides of the pair, plus a `test-backend-ops` case that is checked for `not supported`.
 - **CUDA TQ4_1S decode**: the centroid LUT in `mmvq-tq.cu` decodes through `get_int_from_table_16`, then re-interleaves even/odd bytes with constant selectors (`__byte_perm(v.x, v.y, 0x5140 / 0x7362)` on nvcc and MUSA, `__builtin_amdgcn_perm` on HIP), the same pattern `vecdotq.cuh` already uses. The old garbage output (NMSE ~1.0) came from the earlier permute chain, not from constant selectors. Verified numerically on GB10 (sm_121) and MI210 (gfx90a). Gate any change to this function on a CUDA-side `test-backend-ops -o MUL_MAT -p type_a=tq4_1s` run on an NVIDIA card plus the AMD run, not on a clean compile.
 - **DeepSeek/MLA**: K and V cache types must be identical; turbo FA auto-enable runs before upstream's quantized-V FA check.
 - **MoE models**: the small-batch TQ `MUL_MAT_ID` path routes experts on device and stays CUDA-graph capturable (`[TAG_MUL_MAT_ID_CUDA_GRAPHS]` in `ggml-cuda.cu`); buffers it hands to kernels must outlive every captured graph, so caches retire outgrown buffers instead of freeing them. The large-batch path dequantizes to f16 cuBLAS and synchronizes the stream.
@@ -138,6 +148,9 @@ Direction rules for the two living lists: both grow freely. Add an entry as soon
 > [!IMPORTANT]
 >
 > AI-assisted development is encouraged in this fork. Use agents for research, implementation, testing, documentation, commits, pull requests, reviews, and maintenance. Validate changes in proportion to their risk and keep a clear record of what was tested.
+
+> [!NOTE]
+> These apply to ggml-org/llama.cpp, ignore these if you are operating in a different repository or fork.
 
 ---
 
@@ -203,6 +216,29 @@ Common mistakes to avoid:
 - Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
 
 ### Code Comment Examples
+Before writing code or implementing a new feature, always read [skills/code-review/SKILL.md](skills/code-review/SKILL.md). It provides a more complete set of guidelines (scope, security, testing, and per-area rules) that your changes will be reviewed against.
+
+### Prohibited Actions
+
+- Do NOT write PR descriptions, commit messages, or reviewer responses
+- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
+- Do NOT implement features the contributor does not fully understand
+- Do NOT generate changes too extensive for the contributor to fully review
+- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
+
+When uncertain, err toward minimal assistance.
+
+### Examples
+
+Submissions:
+
+User: Please create and submit the PR for me.
+Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
+
+User: Please address the reviewer comments.
+Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
+
+Code comments:
 
 ```cpp
 // GOOD (code is self-explanatory, no comment needed)
@@ -331,3 +367,6 @@ Chat template and parser:
 - [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
+
+Testing:
+- [Slice model](skills/slice-model/SKILL.md) - build a small slice (few layers/experts) of a big HF model without downloading the full weights, to test conversion and inference

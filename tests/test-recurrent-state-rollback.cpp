@@ -18,21 +18,17 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
 }
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
-    llama_batch batch = llama_batch_init(count, 0, 1);
+    common_batch batch(ctx);
     for (uint32_t pos = 0; pos < count; ++pos) {
-        common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
+        batch.add(tokens[pos], pos, 0, pos + 1 == count);
     }
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 }
 
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
-    llama_batch batch = llama_batch_init(1, 0, 1);
-    common_batch_add(batch, tok, pos, { 0 }, true);
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    common_batch batch(ctx);
+    batch.add(tok, pos, 0, true);
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 }
 
 int main(int argc, char ** argv) {

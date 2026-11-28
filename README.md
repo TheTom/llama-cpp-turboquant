@@ -1,6 +1,6 @@
 # llama.cpp (TurboQuant fork)
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
 
@@ -22,14 +22,14 @@ Eleven fork-only GGML types (registered in `ggml/include/ggml.h`):
 
 | Type     | Enum                       | Purpose                     | Size                   | Backends            |
 |----------|----------------------------|-----------------------------|------------------------|---------------------|
-| `turbo2` | `GGML_TYPE_TURBO2_0` (43)  | KV cache only               | 2.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| `turbo3` | `GGML_TYPE_TURBO3_0` (44)  | KV cache only               | 3.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| `turbo4` | `GGML_TYPE_TURBO4_0` (47)  | KV cache only               | 4.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| `turbo5` | `GGML_TYPE_TURBO5_0` (51)  | KV cache only               | 5.125 bits/value       | CPU, CUDA/HIP       |
-| `turbo6` | `GGML_TYPE_TURBO6_0` (52)  | KV cache only               | 6.125 bits/value       | CPU, CUDA/HIP       |
+| `turbo2` | `GGML_TYPE_TURBO2_0` (44)  | KV cache only               | 2.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| `turbo3` | `GGML_TYPE_TURBO3_0` (47)  | KV cache only               | 3.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| `turbo4` | `GGML_TYPE_TURBO4_0` (51)  | KV cache only               | 4.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
+| `turbo5` | `GGML_TYPE_TURBO5_0` (52)  | KV cache only               | 5.125 bits/value       | CPU, CUDA/HIP       |
+| `turbo6` | `GGML_TYPE_TURBO6_0` (54)  | KV cache only               | 6.125 bits/value       | CPU, CUDA/HIP       |
 | `TQ3_1S` | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max | 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
 | `TQ4_1S` | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max | 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
-| `TQ3_4S` | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU, CUDA/HIP |
+| `TQ3_4S` | `GGML_TYPE_TQ3_4S` (53)   | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU, CUDA/HIP |
 | `Q8_CR`  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot      | 8.5 bits, group 256    | CPU, CUDA/HIP, Metal |
 | `Q5_CR`  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot      | 5.5 bits, group 256    | CPU, CUDA/HIP, Metal |
 | `Q6_CR`  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot      | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
@@ -43,6 +43,21 @@ normalized Kronecker-Hadamard matrix; `mul_mat` rotates the other operand the
 same way before the dot products. Vulkan and SYCL reject them.
 
 Turbo KV cache types are **runtime-only**: they are never stored in model files. `TQ3_1S` / `TQ4_1S` / `TQ3_4S` and the `*_CR` types are first-class weight types usable in any GGUF via `llama-quantize`.
+[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v1)
+[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
+[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
+[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+
+[v1.0.0](https://huggingface.co/blog/ggml-org/llama-cpp-v1) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+
+</div>
+
+## Description
+
+The main goal of `llama.cpp` is to enable LLM (and MLLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware - locally and in the cloud.
+
+The `llama.cpp` project is built on top of the [ggml](https://github.com/ggml-org/ggml) library.
 
 ## Quick start
 
@@ -56,6 +71,18 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
 # Upstream releases (github.com/ggml-org/llama.cpp/releases) reject turbo types.
 # The ghcr.io/ggml-org/llama.cpp images in docs/docker.md are upstream builds and do too.
 ```
+```bash
+# curl
+curl -LsSf https://llama.app/install.sh | sh
+
+# powershell
+irm https://llama.app/install.ps1 | iex
+```
+
+- Visit https://llama.app and follow the instructions
+- Run with Docker - see our [Docker documentation](docs/docker.md)
+- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
+- Build from source by cloning this repository - check out [our build guide](docs/build.md)
 
 Once installed:
 
@@ -76,6 +103,8 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF -c 32768 -ngl 99 -ctk q8_0 -ctv turbo
         <td align="center">
             <img width="1392" height="958" alt="Built-in web UI against `llama serve`" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
             <i>Built-in web UI against <b>llama serve</b></i>
+            <img width="1392" height="958" alt="Llama Chat, the built-in chat app, against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
+            <i>Llama Chat, the built-in chat app, against <b>llama serve</b></i>
         </td>
     </tr>
 </table>
@@ -188,6 +217,7 @@ Plain C/C++ implementation on top of the [ggml](https://github.com/ggml-org/ggml
 - [cli](tools/cli/README.md)
 - [completion](tools/completion/README.md)
 - [server](tools/server/README.md)
+- [Text-to-speech (TTS) models](docs/multimodal/tts.md)
 - [GBNF grammars](grammars/README.md)
 
 #### Development
@@ -200,6 +230,7 @@ Plain C/C++ implementation on top of the [ggml](https://github.com/ggml-org/ggml
 - [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
 - [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
 - [Models](docs/models.md)
+- [Release process](docs/release.md)
 
 ## Contributing
 
@@ -218,7 +249,7 @@ This project is licensed under [MIT](LICENSE), the same as upstream. All TurboQu
 ## Acknowledgements
 
 - [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
+- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
+- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain

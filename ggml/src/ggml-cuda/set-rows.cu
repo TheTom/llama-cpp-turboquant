@@ -9,8 +9,8 @@ typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 // cache's staged writes reuse this same quantized path when the streamed
 // KV type itself is quantized, via ggml_cuda_op_set_rows_staged's `staged`
 // tensor mirroring the real cache's dst->type).
-template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *), bool DstRowBase>
-static __global__ void k_set_rows_quant(const float * __restrict__ src0,
+template <typename src_t, typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *), bool DstRowBase>
+static __global__ void k_set_rows_quant(const src_t * __restrict__ src0,
                                         const idx_t * __restrict__ src1,
                                         block_type * __restrict__ dst,
                                         const int64_t ne_total,
@@ -63,13 +63,23 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     const int64_t src1_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
     const int64_t dst_row  = DstRowBase ? src1_row - dst_row_base : src1_row;
 
-    const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_type * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_type);
 
-    const float * src_block = src0_row + i00;
+    const src_t * src_block = src0_row + i00;
     block_type * dst_block = dst_row_ptr + i00 / qk;
 
-    quantize_func(src_block, dst_block);
+    if constexpr (std::is_same_v<src_t, float>) {
+        quantize_func(src_block, dst_block);
+    } else {
+        // the quantize functions take F32 input: widen the block first
+        float src_block_f32[qk];
+#pragma unroll
+        for (int j = 0; j < qk; ++j) {
+            src_block_f32[j] = ggml_cuda_cast<float>(src_block[j]);
+        }
+        quantize_func(src_block_f32, dst_block);
+    }
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
@@ -78,9 +88,9 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
 }
 
 // Template dispatch function for quantized set_rows
-template<typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*), bool DstRowBase>
+template<typename src_t, typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*), bool DstRowBase>
 static void set_rows_cuda_quant(
-        const float * src0_d, const idx_t * src1_d, block_type * dst_d,
+        const src_t * src0_d, const idx_t * src1_d, block_type * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const size_t nb01, const size_t nb02, const size_t nb03,
@@ -95,9 +105,9 @@ static void set_rows_cuda_quant(
     const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
     const dim3 grid_size(num_blocks);
 
-    const int64_t s01 = nb01/sizeof(float);
-    const int64_t s02 = nb02/sizeof(float);
-    const int64_t s03 = nb03/sizeof(float);
+    const int64_t s01 = nb01/sizeof(src_t);
+    const int64_t s02 = nb02/sizeof(src_t);
+    const int64_t s03 = nb03/sizeof(src_t);
     const int64_t s10 = nb10/sizeof(idx_t);
     const int64_t s11 = nb11/sizeof(idx_t);
     const int64_t s12 = nb12/sizeof(idx_t);
@@ -112,7 +122,7 @@ static void set_rows_cuda_quant(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_quant<idx_t, block_type, qk, quantize_func, DstRowBase><<<grid_size, block_size, 0, stream>>>(
+        k_set_rows_quant<src_t, idx_t, block_type, qk, quantize_func, DstRowBase><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd, dst_row_base);
     }
@@ -320,7 +330,7 @@ static __global__ void k_set_rows_turbo3(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
+        v2 += ggml_cuda_shfl_xor(v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -352,7 +362,7 @@ static __global__ void k_set_rows_turbo3(
 
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
 
@@ -400,7 +410,7 @@ static __global__ void k_set_rows_turbo3(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
+        uint8_t contrib = ggml_cuda_shfl(my_low2, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[qs_byte_idx] = qs_byte;
@@ -413,7 +423,7 @@ static __global__ void k_set_rows_turbo3(
     uint8_t signs_byte = 0;
 #pragma unroll
     for (int sb = 0; sb < 8; sb++) {
-        signs_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+        signs_byte |= (uint8_t)(ggml_cuda_shfl(my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
     }
     if (lane % 8 == 0) blk->signs[global_signs_byte] = signs_byte;
 
@@ -421,7 +431,7 @@ static __global__ void k_set_rows_turbo3(
     const float c = TURBO_CENTROIDS_3BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
+        rc += ggml_cuda_shfl_xor(rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();
@@ -506,7 +516,7 @@ static __global__ void k_set_rows_turbo3_tail(
     __shared__ float warp_accum[4];  // max 3 warps (tail ≤ 96)
     float v2 = val * val;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
+        v2 += ggml_cuda_shfl_xor(v2, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = v2;
     __syncthreads();
 
@@ -533,7 +543,7 @@ static __global__ void k_set_rows_turbo3_tail(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
+        uint8_t contrib = ggml_cuda_shfl(my_low2, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[lane / 4] = qs_byte;
@@ -543,7 +553,7 @@ static __global__ void k_set_rows_turbo3_tail(
     uint8_t signs_byte = 0;
 #pragma unroll
     for (int sb = 0; sb < 8; sb++) {
-        signs_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+        signs_byte |= (uint8_t)(ggml_cuda_shfl(my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
     }
     if (lane % 8 == 0) blk->signs[signs_byte_idx] = signs_byte;
 
@@ -551,7 +561,7 @@ static __global__ void k_set_rows_turbo3_tail(
     const float c = TURBO_CENTROIDS_3BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
+        rc += ggml_cuda_shfl_xor(rc, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = rc;
     __syncthreads();
 
@@ -709,7 +719,7 @@ static __global__ void k_set_rows_turbo2(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
+        v2 += ggml_cuda_shfl_xor(v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -741,7 +751,7 @@ static __global__ void k_set_rows_turbo2(
 
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
 
@@ -787,7 +797,7 @@ static __global__ void k_set_rows_turbo2(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k, WARP_SIZE);
+        uint8_t contrib = ggml_cuda_shfl(my_bits, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[elem_in_block / 4] = qs_byte;
@@ -798,7 +808,7 @@ static __global__ void k_set_rows_turbo2(
     const float c = TURBO_CENTROIDS_2BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
+        rc += ggml_cuda_shfl_xor(rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();
@@ -874,7 +884,7 @@ static __global__ void k_set_rows_turbo2_tail(
     __shared__ float warp_accum[4];
     float v2 = val * val;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
+        v2 += ggml_cuda_shfl_xor(v2, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = v2;
     __syncthreads();
 
@@ -901,7 +911,7 @@ static __global__ void k_set_rows_turbo2_tail(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k, WARP_SIZE);
+        uint8_t contrib = ggml_cuda_shfl(my_bits, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[lane / 4] = qs_byte;
@@ -910,7 +920,7 @@ static __global__ void k_set_rows_turbo2_tail(
     const float c = TURBO_CENTROIDS_2BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
+        rc += ggml_cuda_shfl_xor(rc, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = rc;
     __syncthreads();
 
@@ -1065,7 +1075,7 @@ static __global__ void k_set_rows_turbo4(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
+        v2 += ggml_cuda_shfl_xor(v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -1093,7 +1103,7 @@ static __global__ void k_set_rows_turbo4(
 
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
 
@@ -1128,7 +1138,7 @@ static __global__ void k_set_rows_turbo4(
     const uint8_t my_nibble = idx & 0xF;
     uint8_t qs_byte = 0;
     // Gather nibble from partner thread
-    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
+    uint8_t partner_nibble = ggml_cuda_shfl(my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         qs_byte = my_nibble | (partner_nibble << 4);
         blk->qs[j / 2] = qs_byte;
@@ -1138,7 +1148,7 @@ static __global__ void k_set_rows_turbo4(
     const float c = TURBO_CENTROIDS_4BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
+        rc += ggml_cuda_shfl_xor(rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();
@@ -1274,7 +1284,7 @@ static __global__ void k_set_rows_turbo6(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
+        v2 += ggml_cuda_shfl_xor(v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -1302,7 +1312,7 @@ static __global__ void k_set_rows_turbo6(
 
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
 
@@ -1336,16 +1346,16 @@ static __global__ void k_set_rows_turbo6(
     // The shuffles run on the full warp, the stores are what is masked off.
     const uint8_t my_nibble = idx & 0xF;
     const uint8_t my_high   = (idx >> 4) & 0x3;
-    const uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
+    const uint8_t partner_nibble = ggml_cuda_shfl(my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
     }
 
     const int quad = lane & ~3;
-    const uint8_t h0 = __shfl_sync(0xffffffff, my_high, quad + 0, WARP_SIZE);
-    const uint8_t h1 = __shfl_sync(0xffffffff, my_high, quad + 1, WARP_SIZE);
-    const uint8_t h2 = __shfl_sync(0xffffffff, my_high, quad + 2, WARP_SIZE);
-    const uint8_t h3 = __shfl_sync(0xffffffff, my_high, quad + 3, WARP_SIZE);
+    const uint8_t h0 = ggml_cuda_shfl(my_high, quad + 0, WARP_SIZE);
+    const uint8_t h1 = ggml_cuda_shfl(my_high, quad + 1, WARP_SIZE);
+    const uint8_t h2 = ggml_cuda_shfl(my_high, quad + 2, WARP_SIZE);
+    const uint8_t h3 = ggml_cuda_shfl(my_high, quad + 3, WARP_SIZE);
     if (j % 4 == 0) {
         blk->qh[j / 4] = h0 | (h1 << 2) | (h2 << 4) | (h3 << 6);
     }
@@ -1354,7 +1364,7 @@ static __global__ void k_set_rows_turbo6(
     const float c = TURBO6_CENTROIDS[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
+        rc += ggml_cuda_shfl_xor(rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();
@@ -1452,7 +1462,7 @@ static __global__ void k_set_rows_turbo5(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
+        v2 += ggml_cuda_shfl_xor(v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -1480,7 +1490,7 @@ static __global__ void k_set_rows_turbo5(
 
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = ggml_cuda_shfl_xor(val, h);
         val = (lane & h) ? (o - val) : (val + o);
     }
 
@@ -1515,7 +1525,7 @@ static __global__ void k_set_rows_turbo5(
     // self-contained on wave64 (__ballot_sync truncates the 64-bit mask to uint32_t there).
     const uint8_t my_nibble = turbo5_code_to_mag(idx);
     const uint8_t my_high   = turbo5_code_to_neg(idx);
-    const uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
+    const uint8_t partner_nibble = ggml_cuda_shfl(my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
     }
@@ -1523,7 +1533,7 @@ static __global__ void k_set_rows_turbo5(
     uint8_t qh_byte = 0;
 #pragma unroll
     for (int sb = 0; sb < 8; sb++) {
-        qh_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_high, (lane & ~7) + sb, WARP_SIZE) << sb);
+        qh_byte |= (uint8_t)(ggml_cuda_shfl(my_high, (lane & ~7) + sb, WARP_SIZE) << sb);
     }
     if (lane % 8 == 0) {
         blk->qh[j / 8] = qh_byte;
@@ -1533,7 +1543,7 @@ static __global__ void k_set_rows_turbo5(
     const float c = TURBO5_CENTROIDS[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
+        rc += ggml_cuda_shfl_xor(rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();
@@ -1675,8 +1685,18 @@ static void set_rows_cuda(
             nb1, nb2, nb3,
             stream, dst_row_base
         );
+    } else if (dst->type == GGML_TYPE_F8_E4M3) {
+        set_rows_cuda<src_t, idx_t, ggml_fp8_e4m3_t, DstRowBase>(
+            src0_d, src1_d, (ggml_fp8_e4m3_t *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream, dst_row_base
+        );
     } else if (dst->type == GGML_TYPE_Q4_0) {
-        set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block, DstRowBase>(
+        set_rows_cuda_quant<src_t, idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block, DstRowBase>(
             src0_d, src1_d, (block_q4_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -1686,7 +1706,7 @@ static void set_rows_cuda(
             stream, dst_row_base
         );
     } else if (dst->type == GGML_TYPE_Q4_1) {
-        set_rows_cuda_quant<idx_t, block_q4_1, QK4_1, quantize_f32_q4_1_block, DstRowBase>(
+        set_rows_cuda_quant<src_t, idx_t, block_q4_1, QK4_1, quantize_f32_q4_1_block, DstRowBase>(
             src0_d, src1_d, (block_q4_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -1696,7 +1716,7 @@ static void set_rows_cuda(
             stream, dst_row_base
         );
     } else if (dst->type == GGML_TYPE_Q5_0) {
-        set_rows_cuda_quant<idx_t, block_q5_0, QK5_0, quantize_f32_q5_0_block, DstRowBase>(
+        set_rows_cuda_quant<src_t, idx_t, block_q5_0, QK5_0, quantize_f32_q5_0_block, DstRowBase>(
             src0_d, src1_d, (block_q5_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -1706,7 +1726,7 @@ static void set_rows_cuda(
             stream, dst_row_base
         );
     } else if (dst->type == GGML_TYPE_Q5_1) {
-        set_rows_cuda_quant<idx_t, block_q5_1, QK5_1, quantize_f32_q5_1_block, DstRowBase>(
+        set_rows_cuda_quant<src_t, idx_t, block_q5_1, QK5_1, quantize_f32_q5_1_block, DstRowBase>(
             src0_d, src1_d, (block_q5_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -1716,7 +1736,7 @@ static void set_rows_cuda(
             stream, dst_row_base
         );
     } else if (dst->type == GGML_TYPE_Q8_0) {
-        set_rows_cuda_quant<idx_t, block_q8_0, QK8_0, quantize_f32_q8_0_block, DstRowBase>(
+        set_rows_cuda_quant<src_t, idx_t, block_q8_0, QK8_0, quantize_f32_q8_0_block, DstRowBase>(
             src0_d, src1_d, (block_q8_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -1726,7 +1746,7 @@ static void set_rows_cuda(
             stream, dst_row_base
         );
     } else if (dst->type == GGML_TYPE_IQ4_NL) {
-        set_rows_cuda_quant<idx_t, block_iq4_nl, QK4_NL, quantize_f32_iq4_nl_block, DstRowBase>(
+        set_rows_cuda_quant<src_t, idx_t, block_iq4_nl, QK4_NL, quantize_f32_iq4_nl_block, DstRowBase>(
             src0_d, src1_d, (block_iq4_nl*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -1806,12 +1826,11 @@ void set_rows_cuda<half, int64_t, false>(
     }
 }
 
-
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     if (src0->type == GGML_TYPE_F32) {
@@ -1825,6 +1844,12 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             set_rows_cuda<half, int64_t>(ctx, src0, src1, dst);
         } else {
             set_rows_cuda<half, int32_t>(ctx, src0, src1, dst);
+        }
+    } else if (src0->type == GGML_TYPE_BF16) {
+        if (src1->type == GGML_TYPE_I64) {
+            set_rows_cuda<nv_bfloat16, int64_t>(ctx, src0, src1, dst);
+        } else {
+            set_rows_cuda<nv_bfloat16, int32_t>(ctx, src0, src1, dst);
         }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));

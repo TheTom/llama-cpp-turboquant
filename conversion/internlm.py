@@ -14,6 +14,7 @@ from .llama import LlamaModel
 
 
 @ModelBase.register("InternLM2ForCausalLM")
+@ModelBase.example("internlm/internlm2-chat-7b")
 class InternLM2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.INTERNLM2
 
@@ -35,7 +36,7 @@ class InternLM2Model(TextModel):
             logger.error(f'Error: Missing {tokenizer_path}')
             sys.exit(1)
 
-        sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[missing-attribute]
         sentencepiece_model.ParseFromString(open(tokenizer_path, "rb").read())
         add_prefix = sentencepiece_model.normalizer_spec.add_dummy_prefix
 
@@ -170,6 +171,7 @@ class InternLM2Model(TextModel):
 
 
 @ModelBase.register("InternLM3ForCausalLM")
+@ModelBase.example("internlm/internlm3-8b-instruct")
 class InternLM3Model(TextModel):
     model_arch = gguf.MODEL_ARCH.LLAMA
 

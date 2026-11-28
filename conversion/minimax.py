@@ -1,16 +1,130 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+
+from typing import Iterable, Sequence, TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import ModelBase, TextModel, MmprojModel, gguf
+from .base import ModelBase, TextModel, MmprojModel, gguf, logger
+from .qwen import DSparkModel
+
+
+@ModelBase.register("MiniMaxText01ForCausalLM")
+@ModelBase.register("MiniMaxM1ForCausalLM")
+@ModelBase.example("MiniMaxAI/MiniMax-Text-01", "MiniMaxAI/MiniMax-M1-40k")
+class MiniMaxText01Model(TextModel):
+    model_arch = gguf.MODEL_ARCH.MINIMAX01
+
+    def _get_suppress_tokens(self) -> Sequence[int] | None:
+        import json
+        from transformers import AutoTokenizer
+        from .base import LazyTorchTensor
+
+        # check added tokens embeddings in embeddings tensor for zero-valued embeddings
+        # they get in the way of the token sampling process and must be suppressed
+
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
+        assert tokenizer is not None
+        tokenizer_vocab_size = tokenizer.vocab_size
+
+        with open(self.dir_model / "model.safetensors.index.json", "r", encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+
+        embeddings_tensor_name = "model.embed_tokens.weight"
+        embeddings_shard_name = weight_map[embeddings_tensor_name]
+        with gguf.utility.SafetensorsLocal(self.dir_model / embeddings_shard_name) as model_shard:
+            embeddings_data = model_shard[embeddings_tensor_name]
+
+        embeddings_weights_dtype = LazyTorchTensor._dtype_str_map[embeddings_data.dtype]
+        embeddings_weights = torch.from_numpy(embeddings_data.mmap_bytes()).view(embeddings_weights_dtype).reshape(embeddings_data.shape)
+        embeddings_vocab_size = embeddings_weights.shape[0]
+
+        embeddings_added_tokens = embeddings_weights[tokenizer_vocab_size:embeddings_vocab_size]
+        embeddings_zero_rows = torch.all(embeddings_added_tokens == 0, dim=1)
+        tokens_zero_embeddings_ids = (torch.nonzero(embeddings_zero_rows, as_tuple=False).flatten() + tokenizer_vocab_size).tolist()
+
+        return tokens_zero_embeddings_ids
+
+    def set_vocab(self) -> None:
+        from pathlib import Path
+
+        self._set_vocab_gpt2()
+
+        for tmpl_file in [
+            self.dir_model / "chat_template.jinja",
+            Path(__file__).parent.parent / "models" / "templates" / "MiniMax-M1.jinja"
+        ]:
+            if tmpl_file.is_file():
+                self.gguf_writer.add_chat_template(tmpl_file.read_text(encoding="utf-8"))
+                logger.info(f"Chat template overridden with {tmpl_file}.")
+                break
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        suppress_tokens = self._get_suppress_tokens()
+        if suppress_tokens:
+            logger.info(f"Suppressing tokens with zero embeddings {suppress_tokens}")
+            self.gguf_writer.add_suppress_tokens(suppress_tokens)
+
+        layernorm_full_attention_alpha = self.hparams["layernorm_full_attention_alpha"]
+        layernorm_full_attention_beta = self.hparams["layernorm_full_attention_beta"]
+        layernorm_linear_attention_alpha = self.hparams["layernorm_linear_attention_alpha"]
+        layernorm_linear_attention_beta = self.hparams["layernorm_linear_attention_beta"]
+        layernorm_mlp_alpha = self.hparams["layernorm_mlp_alpha"]
+        layernorm_mlp_beta = self.hparams["layernorm_mlp_beta"]
+        assert layernorm_full_attention_alpha == layernorm_linear_attention_alpha == layernorm_mlp_alpha
+        assert layernorm_full_attention_beta == layernorm_linear_attention_beta == layernorm_mlp_beta == 1.0
+        # we do not store the layernorm betas as they are all 1.0
+        # layernorm alphas are stored as single residual_scale hparam
+        self.gguf_writer.add_residual_scale(layernorm_full_attention_alpha)
+
+        self.gguf_writer.add_rope_dimension_count(self.hparams["rotary_dim"])
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # process the experts separately
+        if name.find("block_sparse_moe.experts") != -1:
+            n_experts = self.hparams["num_local_experts"]
+
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+
+            if len(self._experts[bid]) >= n_experts * 3:
+                # merge the experts into a single 3d tensor
+                for wid in ["w1", "w2", "w3"]:
+                    datas: list[Tensor] = []
+
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{bid}.block_sparse_moe.experts.{xid}.{wid}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+
+                    data_torch = torch.stack(datas, dim=0)
+
+                    merged_name = f"layers.{bid}.feed_forward.experts.{wid}.weight"
+
+                    new_name = self.map_tensor_name(merged_name)
+
+                    yield from super().modify_tensors(data_torch, new_name, bid)
+                return
+            else:
+                return
+
+        yield from super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("MiniMaxM2ForCausalLM")
+@ModelBase.example("MiniMaxAI/MiniMax-M2")
 class MiniMaxM2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.MINIMAXM2
     _experts_cache: dict[int, dict[str, Tensor]] = {}
@@ -55,8 +169,18 @@ class MiniMaxM2Model(TextModel):
 
 
 @ModelBase.register("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
+@ModelBase.example("MiniMaxAI/MiniMax-M3")
 class MiniMaxM3Model(MiniMaxM2Model):
     model_arch = gguf.MODEL_ARCH.MINIMAXM3
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # transformers 5.x folds sparse_attention_config and moe_layer_freq into other keys
+        with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
+            raw_hparams = json.load(f)
+        for key, value in raw_hparams.get("text_config", raw_hparams).items():
+            self.hparams.setdefault(key, value)
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         if ".indexer." in new_name:
@@ -76,6 +200,7 @@ class MiniMaxM3Model(MiniMaxM2Model):
         self.gguf_writer.add_indexer_top_k(sac["sparse_topk_blocks"])
         self.gguf_writer.add_indexer_block_size(sac["sparse_block_size"])
         self.gguf_writer.add_indexer_local_blocks(sac["sparse_local_block"])
+        self.gguf_writer.add_indexer_types([bool(v) for v in sac["sparse_attention_freq"]])
 
         moe_layer_freq = self.find_hparam(["moe_layer_freq"])
         n_dense = 0
@@ -89,12 +214,53 @@ class MiniMaxM3Model(MiniMaxM2Model):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
         # Gemma-style (1 + w) RMSNorm: bake the +1 in so llama.cpp can use plain RMSNorm
         if name.endswith("norm.weight"):
-            data_torch = data_torch + 1.0
+            data_torch = data_torch.float() + 1.0
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DSparkMiniMaxDraftModel")
+class MiniMaxM3DSparkModel(DSparkModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, dir_model, *args, **kwargs):
+        # transformers drops the draft keys when it parses the minimax_m3_vl config
+        with open(dir_model / "config.json", "r", encoding="utf-8") as f:
+            kwargs["hparams"] = json.load(f)
+        super().__init__(dir_model, *args, **kwargs)
+
+        # draft layers use a dense FFN, the MoE keys are copied from the target config
+        self.hparams["intermediate_size"] = self.hparams["dspark_ffn_hidden_size"]
+        for key in ("num_local_experts", "num_experts_per_tok", "scoring_func"):
+            self.hparams.pop(key, None)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        self.gguf_writer.add_hidden_act(self.hparams["hidden_act"])
+
+        layer_types = self.hparams["layer_types"]
+        self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])
+        self.gguf_writer.add_sliding_window_pattern([t == "sliding_attention" for t in layer_types])
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        name = name.removeprefix("language_model.model.dspark.").replace(".decoder_layer.", ".")
+        if name == "final_norm.weight":
+            name = "norm.weight"
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
+        # Gemma-style (1 + w) RMSNorm, same as the target
+        if name.endswith("norm.weight"):
+            data_torch = data_torch.float() + 1.0
 
         yield from super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("MiniMaxM3SparseForConditionalGeneration", "MiniMaxM3VLForConditionalGeneration")
+@ModelBase.example("MiniMaxAI/MiniMax-M3")
 class MiniMaxM3VisionModel(MmprojModel):
     @classmethod
     def filter_tensors(cls, item):
